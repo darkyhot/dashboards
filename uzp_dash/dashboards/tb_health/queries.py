@@ -84,17 +84,86 @@ WHERE g.tb_id=:tb_id AND c.report_dt = :ref
   AND c.org_type = 'inn'   -- только организации по ИНН (не holding/head_holding)
 """
 
-# Активности воронки за 3 месяца до :ref_funnel. Задачи по метрикам идут
-# месяцем позже метрик, поэтому :ref_funnel = :ref + 1 месяц.
-FUNNEL_TB = """
+# Окно активностей: три КАЛЕНДАРНЫХ месяца — от первого дня месяца T-2 до конца
+# месяца T (:ref_funnel). Задачи по метрикам идут месяцем позже метрик, поэтому
+# :ref_funnel = :ref + 1 месяц. Пример: ref_funnel = 31.07 -> май, июнь, июль.
+_FUNNEL_BASE = """
+base AS (
+  SELECT g.new_gosb_id, f.inn, f.role_code, f.task_type, f.last_active_type,
+         f.task_text_status, f.is_task_closed_success, f.last_active_dttm,
+         COALESCE(f.plan_staff_deal_qty, 0)      AS plan_staff_deal_qty,
+         COALESCE(f.fact_staff_deal_qty, 0)      AS fact_staff_deal_qty,
+         COALESCE(f.unrealized_deal_potential,0) AS unrealized_deal_potential,
+         (COALESCE(btrim(f.task_comment), '') <> ''
+          OR COALESCE(btrim(f.task_questionnaire), '') <> '') AS has_text
+  FROM {schema}.uzp_dwh_sale_funnel_task f
+  LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
+  WHERE f.tb_id = :tb_id
+    AND f.task_create_dt >= CAST(:funnel_from AS date)
+    AND f.task_create_dt <= CAST(:ref_funnel  AS date)
+)"""
+
+# Агрегат по (ГОСБ, ИНН) — по ВСЕМ активностям за 3 мес (не по последней задаче).
+# Тяжёлые тексты не тянем: только флаг has_text.
+FUNNEL_AGG = """
+WITH gmap AS (""" + _GMAP + """),
+""" + _FUNNEL_BASE + """
+SELECT new_gosb_id, inn,
+       count(*)                                                        AS n_tasks,
+       sum(CASE WHEN last_active_type='Звонок'  THEN 1 ELSE 0 END)      AS n_calls,
+       sum(CASE WHEN last_active_type='Встреча' THEN 1 ELSE 0 END)      AS n_meetings,
+       sum(CASE WHEN is_task_closed_success THEN 1 ELSE 0 END)          AS n_success,
+       bool_or(is_task_closed_success)                                  AS any_success,
+       sum(CASE WHEN task_text_status='Не закрыта: Просрочена' THEN 1 ELSE 0 END) AS n_overdue,
+       sum(CASE WHEN task_type='Отток' THEN 1 ELSE 0 END)               AS n_outflow,
+       sum(plan_staff_deal_qty)                                         AS plan_deal,
+       sum(fact_staff_deal_qty)                                         AS fact_deal,
+       sum(unrealized_deal_potential)                                   AS unrealized,
+       bool_or(has_text)                                                AS any_text,
+       max(last_active_dttm)                                            AS last_active
+FROM base
+GROUP BY new_gosb_id, inn
+"""
+
+# Итоги активностей по ТБ (для блока «Активности за 3 месяца»)
+ACTIVITY_TOTALS = """
+WITH gmap AS (""" + _GMAP + """),
+""" + _FUNNEL_BASE + """
+SELECT count(*) AS n, count(DISTINCT inn) AS orgs,
+       sum(CASE WHEN last_active_type='Звонок'  THEN 1 ELSE 0 END) AS calls,
+       sum(CASE WHEN last_active_type='Встреча' THEN 1 ELSE 0 END) AS meetings,
+       avg(CASE WHEN is_task_closed_success THEN 1.0 ELSE 0.0 END) AS success_rate,
+       sum(CASE WHEN task_text_status='Не закрыта: Просрочена' THEN 1 ELSE 0 END) AS overdue,
+       sum(plan_staff_deal_qty) AS plan_deal,
+       sum(fact_staff_deal_qty) AS fact_deal,
+       sum(unrealized_deal_potential) AS unrealized
+FROM base
+"""
+
+# Разрезы активностей: по ролям / типам задач / статусам отработки
+ACTIVITY_BREAKDOWN = """
+WITH gmap AS (""" + _GMAP + """),
+""" + _FUNNEL_BASE + """
+SELECT 'role' AS dim, COALESCE(role_code,'—') AS k, count(*) AS n FROM base GROUP BY 2
+UNION ALL
+SELECT 'type', COALESCE(task_type,'—'), count(*) FROM base GROUP BY 2
+UNION ALL
+SELECT 'status', COALESCE(task_text_status,'—'), count(*) FROM base GROUP BY 2
+"""
+
+# Свободный текст ТОЛЬКО по приоритетным ИНН — все содержательные активности
+# каждой пары (ГОСБ, ИНН) за 3 месяца (не одна последняя).
+FUNNEL_TEXT = """
 WITH gmap AS (""" + _GMAP + """)
-SELECT f.inn, f.company_name, f.gosb_id, g.new_gosb_id, g.gosb_name, f.segment_name, f.role_code, f.task_type,
-       f.last_active_type, f.task_text_status, f.is_task_closed, f.is_task_closed_success,
-       f.task_create_dt, f.last_active_dttm, f.unrealized_deal_potential,
-       f.plan_staff_deal_qty, f.fact_staff_deal_qty, f.task_comment, f.task_questionnaire
+SELECT g.new_gosb_id, f.inn, f.task_type, f.task_text_status,
+       f.task_comment, f.task_questionnaire, f.last_active_dttm
 FROM {schema}.uzp_dwh_sale_funnel_task f
-LEFT JOIN gmap g ON g.old_gosb_id=f.gosb_id
-WHERE f.tb_id=:tb_id
-  AND f.task_create_dt >  (CAST(:ref_funnel AS date) - INTERVAL '3 months')
-  AND f.task_create_dt <= CAST(:ref_funnel AS date)
+LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
+WHERE f.tb_id = :tb_id
+  AND f.inn = ANY(:inns)
+  AND f.task_create_dt >= CAST(:funnel_from AS date)
+  AND f.task_create_dt <= CAST(:ref_funnel  AS date)
+  AND (COALESCE(btrim(f.task_comment), '') <> ''
+       OR COALESCE(btrim(f.task_questionnaire), '') <> '')
+ORDER BY f.inn, g.new_gosb_id, f.last_active_dttm DESC
 """

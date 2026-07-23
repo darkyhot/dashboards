@@ -18,11 +18,10 @@ SEG_ORDER = segments.ORDER   # короткие названия сегмент�
 @dashboard("tb_health")
 def build(ctx: Context) -> str:
     tb = ctx.params.get("tb", "ЮЗБ")
-    a = analyze.run(ctx, tb)
-    progress.step("LLM: анализ свободного текста активностей по организациям")
-    insights = prompts.text_insights(ctx, a.priority_text)   # LLM: свободный текст
+    a = analyze.run(ctx, tb)          # включает разбор текста (правила + LLM)
+    _log_llm_stats(a)
     progress.step("LLM: нарратив «что плохо и что делать»")
-    story = prompts.narrative(ctx, a)                        # LLM: нарратив
+    story = prompts.narrative(ctx, a)
     progress.step("Сборка HTML")
 
     body = (
@@ -30,7 +29,7 @@ def build(ctx: Context) -> str:
         + _kpis(a)
         + _matrix(a)
         + _problem_gosb(a)
-        + _orgs(a, insights)
+        + _orgs(a)
         + C.section("Что делать — резюме", C.card(C.narrative_html(story)), eyebrow="AI")
     )
     return page(
@@ -132,10 +131,11 @@ def _problem_gosb(a: analyze.Analysis) -> str:
     return C.section("Проблемные ГОСБ — что сделать по каждому", grid, eyebrow="Приоритет по ГОСБ")
 
 
-def _orgs(a: analyze.Analysis, insights: dict) -> str:
+def _orgs(a: analyze.Analysis) -> str:
+    """Список к отработке. Рекомендация — по конкретной паре (ГОСБ, ИНН)."""
     rows = []
     for r in a.to_work.itertuples():
-        ins = insights.get(int(r.inn), {})
+        ins = a.insights.get((int(r.new_gosb_id), int(r.inn)), {})
         rows.append({
             "inn": int(r.inn), "company": (getattr(r, "company_name", "") or "")[:48],
             "lever": r.lever,
@@ -146,10 +146,22 @@ def _orgs(a: analyze.Analysis, insights: dict) -> str:
     gosb_opts = sorted({row["gosb"] for row in rows})
     seg_opts = [s for s in SEG_ORDER if s in {row["seg"] for row in rows}]
     explorer = C.orgs_explorer("work", rows, gosb_opts, seg_options=seg_opts)
-    head = (f'<h3>С кем работать — {len(rows)} организаций</h3>'
+    head = (f'<h3>С кем работать — {len(rows)} пар (ГОСБ × организация)</h3>'
             f'<p class="sub" style="font-size:14px;margin:-4px 0 14px">'
-            f'поиск, фильтр по ГОСБ и рычагу, листание</p>')
+            f'работа ведётся отдельно в каждом ГОСБ · поиск, фильтры, листание</p>')
     return C.section("Организации к работе", C.card(head + explorer), eyebrow="Список к отработке")
+
+
+def _log_llm_stats(a: analyze.Analysis) -> None:
+    s = a.llm_stats or {}
+    if not s:
+        return
+    progress.done(
+        f"Разбор текста: кандидатов {s.get('cand',0)} (top-{s.get('top_n')} на ГОСБ) · "
+        f"чек-лист {s.get('checklist',0)} · ключевые слова {s.get('keyword',0)} · "
+        f"без текста {s.get('no_text',0)} · LLM {s.get('llm',0)} "
+        f"(батчей {s.get('batches',0)} по {s.get('batch')}) · фолбэк {s.get('fallback',0)}"
+    )
 
 
 def _col(exec_pct):

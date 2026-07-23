@@ -1,9 +1,11 @@
 """Бизнес-логика дэша tb_health.
 
-Собирает данные запросами, считает разрыв до плана, раскладывает провалы по
-ГОСБ×сегмент, классифицирует организации по рычагу (привлечь/вернуть) и по
-результату активностей (работать / нет смысла), строит симуляцию закрытия плана
-и готовит контекст для LLM.
+Грейн работы с клиентом — (ГОСБ, ИНН): одна организация может обслуживаться в
+нескольких ГОСБ, и в каждом своя история отработки. Все агрегаты воронки считаются
+по ВСЕМ активностям за 3 месяца (не по последней задаче).
+
+Рекомендации разрешаются в порядке: чек-лист (причина оттока) -> ключевые слова ->
+LLM (только там, где есть содержательный текст и правила не сработали) -> правило.
 """
 from __future__ import annotations
 
@@ -11,12 +13,15 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from ...db import read_sql
 from ... import progress
-from . import queries as Q
-from . import segments
+from ...db import read_sql
+from . import prompts, queries as Q, segments, text_rules
 
 RUB_TO_MLN = 1e6
+LLM_TOP_N_DEFAULT = 20      # топ-N «успешных кейсов» НА КАЖДЫЙ ГОСБ
+LLM_BATCH_DEFAULT = 30      # организаций в одном запросе к LLM
+POOL_OVERSHOOT = 2          # берём с запасом: часть отсеется как «нет смысла»
+MAX_WAVES = 3               # сколько раз добираем, если не набрали N
 
 
 @dataclass
@@ -25,55 +30,61 @@ class Analysis:
     tb_id: int
     tb_full: str
     ref_date: str
-    verdict: dict                      # {'rcp': {...}, 'fot': {...}} — ФОТ в РУБЛЯХ
-    gap_rcp: float                     # недобор получателей (чел)
-    gap_fot: float                     # недобор ФОТ (рубли)
-    gap_fot_mln: float                 # недобор ФОТ (млн ₽ — для вывода)
-    matrix: pd.DataFrame               # ГОСБ×сегмент (получатели)
-    gosb_gap: pd.DataFrame             # разрыв по ГОСБ (все сегменты)
-    top_cells: pd.DataFrame            # топ провальных ячеек
-    attract: pd.DataFrame              # организации к привлечению
-    retention: pd.DataFrame            # организации к возврату
-    activity: dict                     # агрегаты активностей за 3 мес
-    to_work: pd.DataFrame              # приоритет «работать»
-    no_point: pd.DataFrame             # «нет смысла» + причина
-    sim: dict                          # симуляция закрытия плана
-    priority_text: list = field(default_factory=list)  # тексты для LLM по орг
-    gosb_cards: list = field(default_factory=list)     # разрез по проблемным ГОСБ
+    verdict: dict
+    gap_rcp: float
+    gap_fot: float
+    gap_fot_mln: float
+    matrix: pd.DataFrame
+    gosb_gap: pd.DataFrame
+    top_cells: pd.DataFrame
+    attract: pd.DataFrame
+    retention: pd.DataFrame
+    activity: dict
+    to_work: pd.DataFrame
+    no_point: pd.DataFrame
+    sim: dict
+    insights: dict = field(default_factory=dict)   # (gosb_id, inn) -> reason/action/…
+    themes: str = "—"
+    llm_stats: dict = field(default_factory=dict)
 
 
 def run(ctx, tb_short: str) -> Analysis:
     e = ctx.engine
+    top_n = int(ctx.params.get("llm_top_n", LLM_TOP_N_DEFAULT))
+    batch = int(ctx.params.get("llm_batch", LLM_BATCH_DEFAULT))
+
     progress.step(f"Резолв ТБ «{tb_short}»")
     tb = read_sql(e, Q.TB_RESOLVE, {"tb": tb_short})
     if tb.empty:
         raise ValueError(f"ТБ '{tb_short}' не найден в справочнике")
     tb_id = int(tb.tb_id.iloc[0]); tb_full = str(tb.tb_full_name.iloc[0])
 
-    # --- Опорный месяц. Если дата задана параметром (params["date"]) — она
-    # отправная (нормализуем к последнему дню месяца, как в report_dt). Иначе —
-    # текущий месяц = макс. report_dt. От :ref считаются и активности (−3 мес). ---
+    # --- Опорный месяц (метрики/витрина) и месяц задач (ref + 1) ---
     date_param = ctx.params.get("date")
     if date_param:
         ref = (pd.to_datetime(date_param) + pd.offsets.MonthEnd(0)).date()
-        progress.done(f"Опорный месяц (задан): {ref} — все таблицы строятся от него")
+        progress.done(f"Опорный месяц (задан): {ref}")
     else:
         ref = pd.to_datetime(read_sql(e, Q.REF_DATE).iloc[0, 0]).date()
         progress.done(f"Опорный месяц (авто, макс. report_dt): {ref}")
-    # задачи по метрикам идут месяцем позже -> воронка от ref + 1 месяц
+    # Задачи по метрикам идут месяцем позже -> воронка за месяц T = ref + 1.
+    # Окно — 3 календарных месяца: с первого дня месяца T-2 по конец месяца T.
     ref_funnel = (pd.Timestamp(ref) + pd.offsets.MonthEnd(1)).date()
-    progress.done(f"Месяц задач воронки: {ref_funnel} (ref + 1 мес)")
+    funnel_from = (pd.Timestamp(ref_funnel).to_period("M") - 2).to_timestamp().date()
+    months = ", ".join(
+        (pd.Timestamp(ref_funnel).to_period("M") - k).strftime("%m.%Y") for k in (2, 1, 0))
+    progress.done(f"Окно задач воронки: {funnel_from} … {ref_funnel} ({months})")
     p = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref}
+    pf = {"tb_id": tb_id, "ref_funnel": ref_funnel, "funnel_from": funnel_from}
 
     # --- Вердикт + ранги ---
     progress.step("Вердикт по ТБ + ранги (ФОТ, получатели)")
     v = read_sql(e, Q.TB_VERDICT, p)
     verdict, ref_date = _verdict(v, tb_id)
     gap_rcp = max(0.0, verdict["rcp"]["plan"] - verdict["rcp"]["fact"])
-    gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])  # рубли
-    gap_fot_mln = gap_fot / RUB_TO_MLN
+    gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
 
-    # --- ГОСБ×сегмент (короткие имена сегментов, хардкод) ---
+    # --- ГОСБ×сегмент ---
     progress.step("Матрица ГОСБ × сегмент + разрыв по ГОСБ")
     matrix = read_sql(e, Q.GOSB_SEG, {**p, "tb_id": tb_id})
     matrix["seg_name"] = matrix["seg_id"].map(segments.short)
@@ -83,32 +94,31 @@ def run(ctx, tb_short: str) -> Analysis:
                  .assign(share=lambda d: d.nedobor / max(gap_rcp, 1))
                  .head(8))
 
-    # --- Организации + активности ---
+    # --- Организации ---
     progress.step("Витрина организаций (потенциал/отток)")
     orgs = read_sql(e, Q.ORGS, {"tb_id": tb_id, "ref": ref})
-    progress.step("Активности воронки за 3 месяца")
-    funnel = read_sql(e, Q.FUNNEL_TB, {"tb_id": tb_id, "ref_funnel": ref_funnel})
-    fagg = _funnel_by_inn(funnel)
-    activity = _activity_totals(funnel)
 
-    orgs = orgs.merge(fagg, on="inn", how="left")
-    orgs["worked"] = orgs["n_tasks"].notna()
-    orgs["n_tasks"] = orgs["n_tasks"].fillna(0).astype(int)
+    # --- Активности: агрегат по (ГОСБ, ИНН) по ВСЕМ задачам за 3 мес ---
+    progress.step("Активности воронки за 3 мес: агрегат по (ГОСБ, ИНН)")
+    fagg = read_sql(e, Q.FUNNEL_AGG, pf)
+    activity = _activity(read_sql(e, Q.ACTIVITY_TOTALS, pf),
+                         read_sql(e, Q.ACTIVITY_BREAKDOWN, pf))
+    progress.done(f"задач {activity.get('n', 0)} → пар (ГОСБ,ИНН) {len(fagg)}"
+                  f" · из них с текстом {int(fagg['any_text'].sum()) if len(fagg) else 0}")
+
+    orgs = _merge_funnel(orgs, fagg)
     orgs["fot_potential_mln"] = orgs["fot_potential_amt"] / RUB_TO_MLN
     orgs["fot_outflow_mln"] = orgs["fot_outflow_amt"] / RUB_TO_MLN
-    # большое имя сегмента организации -> короткое (для отчёта)
     orgs["seg_name"] = orgs["segment_big"].map(segments.short_of_big).fillna("—")
     orgs["company_name"] = orgs["company_name"].fillna("")
 
-    # рычаг: привлечь vs вернуть (по доминирующему потенциалу в людях)
     attract = (orgs[orgs.emp_potential_qty >= 1]
-               .sort_values("emp_potential_qty", ascending=False)
-               .head(15).copy())
+               .sort_values("emp_potential_qty", ascending=False).head(15).copy())
     retention = (orgs[orgs.fl_outflow_qty >= 1]
-                 .sort_values("fl_outflow_qty", ascending=False)
-                 .head(15).copy())
+                 .sort_values("fl_outflow_qty", ascending=False).head(15).copy())
 
-    # --- Классификация работать / нет смысла (кандидаты с рычагом) ---
+    # --- Классификация по агрегатам (все активности) ---
+    progress.step("Классификация (ГОСБ,ИНН): работать / нет смысла")
     cand = orgs[(orgs.emp_potential_qty >= 1) | (orgs.fl_outflow_qty >= 1)].copy()
     cand["impact_fl"] = cand[["emp_potential_qty", "fl_outflow_qty"]].max(axis=1)
     cand["lever"] = ["Привлечь" if a >= b else "Вернуть"
@@ -117,165 +127,95 @@ def run(ctx, tb_short: str) -> Analysis:
         (pot if lev == "Привлечь" else out) / RUB_TO_MLN
         for lev, pot, out in zip(cand.lever, cand.fot_potential_amt, cand.fot_outflow_amt)
     ]
-    progress.step("Классификация организаций (работать / нет смысла)")
     to_work, no_point = _classify(cand)
 
-    # --- Симуляция закрытия плана (получатели — главная) ---
+    # --- Рекомендации: чек-лист -> ключевые слова -> LLM (top-N на КАЖДЫЙ ГОСБ) ---
+    insights, to_work, no_point, themes, llm_stats = _resolve(
+        ctx, e, pf, to_work, no_point, top_n, batch)
+
     sim = _simulate(to_work, gap_rcp, verdict["rcp"]["fact"], verdict["rcp"]["plan"])
-
-    # --- Разрез по проблемным ГОСБ (что сделать в каждом) ---
     progress.step("Разрез по проблемным ГОСБ")
-    gosb_cards = _gosb_cards(gosb_gap, matrix, to_work, funnel)
+    gosb_cards = _gosb_cards(gosb_gap, matrix, to_work, fagg)
 
-    # --- Тексты для LLM: только по ОТРАБОТАННЫМ организациям (у них есть текст),
-    # которые реально показываются в таблицах to_work / no_point ---
-    tw_worked = to_work[to_work["worked"] == True] if "worked" in to_work else to_work.iloc[:0]
-    priority_inns = (
-        list(tw_worked.sort_values("impact_fl", ascending=False).head(8)["inn"])
-        + list(no_point.head(4)["inn"] if not no_point.empty else [])
-    )
-    priority_inns = list(dict.fromkeys(int(x) for x in priority_inns))  # dedup, порядок
-    priority_text = _collect_text(funnel, priority_inns)
-
-    return Analysis(
+    a = Analysis(
         tb_short=tb_short, tb_id=tb_id, tb_full=tb_full, ref_date=ref_date,
-        verdict=verdict, gap_rcp=gap_rcp, gap_fot=gap_fot, gap_fot_mln=gap_fot_mln,
+        verdict=verdict, gap_rcp=gap_rcp, gap_fot=gap_fot, gap_fot_mln=gap_fot / RUB_TO_MLN,
         matrix=matrix, gosb_gap=gosb_gap, top_cells=top_cells,
         attract=attract, retention=retention, activity=activity,
-        to_work=to_work, no_point=no_point, sim=sim, priority_text=priority_text,
-        gosb_cards=gosb_cards,
+        to_work=to_work, no_point=no_point, sim=sim,
+        insights=insights, themes=themes, llm_stats=llm_stats,
     )
-
-
-def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame,
-                to_work: pd.DataFrame, funnel: pd.DataFrame) -> list:
-    """По каждому проблемному ГОСБ — что конкретно сделать."""
-    # активности за 3 мес по ГОСБ (грейн — new_gosb_id)
-    fg = {}
-    if not funnel.empty and "new_gosb_id" in funnel:
-        for nid, g in funnel.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
-            fg[int(nid)] = {
-                "act_n": int(len(g)),
-                "success": float(g.is_task_closed_success.mean()),
-                "worked_orgs": int(g.inn.nunique()),
-            }
-    cards = []
-    prob = gosb_gap[gosb_gap.nedobor > 0].sort_values("nedobor", ascending=False)
-    for r in prob.itertuples():
-        nid = int(r.new_gosb_id); name = r.gosb_name
-        sub = to_work[to_work.new_gosb_id == nid]
-        att = sub[sub.lever == "Привлечь"]; ret = sub[sub.lever == "Вернуть"]
-        seg_bad = (matrix[(matrix.new_gosb_id == nid) & (matrix.nedobor > 0)]
-                   .sort_values("nedobor", ascending=False))
-        # разбивка по сегментам: что западает и сколько организаций к работе
-        segs = []
-        for s in seg_bad.itertuples():
-            ss = sub[sub.seg_name == s.seg_name]
-            segs.append({
-                "seg": s.seg_name, "exec": float(s.execution_percent),
-                "nedobor": float(s.nedobor), "n_work": int(len(ss)),
-                "n_attract": int((ss.lever == "Привлечь").sum()),
-                "n_return": int((ss.lever == "Вернуть").sum()),
-                "pot_fl": float(ss.impact_fl.sum()),
-            })
-        cards.append({
-            "gosb_name": name,
-            "exec": float(r.execution_percent), "gap": float(r.nedobor),
-            "worst": [(s.seg_name, float(s.execution_percent), float(s.nedobor))
-                      for s in seg_bad.head(3).itertuples()],
-            "segs": segs,
-            "n_work": int(len(sub)), "n_attract": int(len(att)), "n_return": int(len(ret)),
-            "pot_fl": float(sub.impact_fl.sum()),
-            "pot_fl_att": float(att.impact_fl.sum()), "pot_fl_ret": float(ret.impact_fl.sum()),
-            "pot_fot": float(sub.impact_fot_mln.sum()),
-            "not_worked": int((~sub.worked).sum()) if "worked" in sub else 0,
-            "act": fg.get(nid, {"act_n": 0, "success": 0.0, "worked_orgs": 0}),
-            "top": [(int(o.inn), o.lever, float(o.impact_fl)) for o in sub.head(3).itertuples()],
-        })
-    return cards
+    a.gosb_cards = gosb_cards
+    return a
 
 
 # --------------------------------------------------------------------------- #
+def _merge_funnel(orgs: pd.DataFrame, fagg: pd.DataFrame) -> pd.DataFrame:
+    """Приклеить агрегат воронки на грейне (ГОСБ, ИНН)."""
+    cols = ["n_tasks", "n_calls", "n_meetings", "n_success", "any_success", "n_overdue",
+            "n_outflow", "plan_deal", "fact_deal", "unrealized", "any_text"]
+    if fagg.empty:
+        for c in cols:
+            orgs[c] = 0
+        orgs["any_success"] = False; orgs["any_text"] = False
+        orgs["worked"] = False
+        return orgs
+    fagg = fagg.copy()
+    fagg["new_gosb_id"] = fagg["new_gosb_id"].astype("Int64")
+    orgs["new_gosb_id"] = orgs["new_gosb_id"].astype("Int64")
+    orgs = orgs.merge(fagg, on=["new_gosb_id", "inn"], how="left")
+    orgs["worked"] = orgs["n_tasks"].notna() & (orgs["n_tasks"].fillna(0) > 0)
+    for c in ["n_tasks", "n_calls", "n_meetings", "n_success", "n_overdue",
+              "n_outflow", "plan_deal", "fact_deal", "unrealized"]:
+        orgs[c] = orgs[c].fillna(0).astype(int)
+    for c in ["any_success", "any_text"]:
+        orgs[c] = orgs[c].fillna(False).astype(bool)
+    return orgs
+
+
+def _activity(totals: pd.DataFrame, breakdown: pd.DataFrame) -> dict:
+    if totals.empty or not int(totals.n.iloc[0] or 0):
+        return {"n": 0}
+    t = totals.iloc[0]
+    def _dim(name):
+        d = breakdown[breakdown.dim == name]
+        return {str(r.k): int(r.n) for r in d.itertuples()}
+    return {
+        "n": int(t.n), "orgs": int(t.orgs),
+        "calls": int(t.calls or 0), "meetings": int(t.meetings or 0),
+        "success_rate": float(t.success_rate or 0), "overdue": int(t.overdue or 0),
+        "plan_deal": int(t.plan_deal or 0), "fact_deal": int(t.fact_deal or 0),
+        "unrealized": int(t.unrealized or 0),
+        "by_role": _dim("role"), "by_type": _dim("type"), "by_status": _dim("status"),
+    }
+
+
 def _verdict(v: pd.DataFrame, tb_id: int) -> tuple[dict, str]:
-    out = {}
-    ref = ""
+    out = {}; ref = ""
     for key, mid in (("rcp", Q.METRIC_RECIPIENTS), ("fot", Q.METRIC_FOT)):
         row = v[(v.metric_id == mid) & (v.tb_id == tb_id)]
         if row.empty:
             out[key] = {"plan": 0, "fact": 0, "exec": None, "rank": None, "n_tb": None}
             continue
-        r = row.iloc[0]
-        ref = str(r.end_dt)
-        out[key] = {
-            "plan": float(r.plan_amt), "fact": float(r.fact_amt),
-            "exec": float(r.execution_percent), "rank": int(r.rnk), "n_tb": int(r.n_tb),
-        }
+        r = row.iloc[0]; ref = str(r.end_dt)
+        out[key] = {"plan": float(r.plan_amt), "fact": float(r.fact_amt),
+                    "exec": float(r.execution_percent), "rank": int(r.rnk),
+                    "n_tb": int(r.n_tb)}
     return out, ref
 
 
-def _funnel_by_inn(f: pd.DataFrame) -> pd.DataFrame:
-    if f.empty:
-        return pd.DataFrame(columns=["inn"])
-    f = f.sort_values("last_active_dttm")
-    g = f.groupby("inn")
-    agg = g.agg(
-        n_tasks=("task_type", "size"),
-        n_calls=("last_active_type", lambda s: (s == "Звонок").sum()),
-        n_meetings=("last_active_type", lambda s: (s == "Встреча").sum()),
-        any_success=("is_task_closed_success", "max"),
-        plan_deal=("plan_staff_deal_qty", "sum"),
-        fact_deal=("fact_staff_deal_qty", "sum"),
-        unrealized=("unrealized_deal_potential", "sum"),
-        last_status=("task_text_status", "last"),
-        last_type=("task_type", "last"),
-        last_comment=("task_comment", "last"),
-        last_active=("last_active_dttm", "last"),
-    ).reset_index()
-    return agg
-
-
-def _activity_totals(f: pd.DataFrame) -> dict:
-    if f.empty:
-        return {"n": 0}
-    by_role = f.groupby("role_code").size().to_dict()
-    by_type = f.groupby("task_type").size().to_dict()
-    by_status = f.groupby("task_text_status").size().to_dict()
-    return {
-        "n": int(len(f)),
-        "orgs": int(f.inn.nunique()),
-        "calls": int((f.last_active_type == "Звонок").sum()),
-        "meetings": int((f.last_active_type == "Встреча").sum()),
-        "success_rate": float(f.is_task_closed_success.mean()),
-        "overdue": int((f.task_text_status == "Не закрыта: Просрочена").sum()),
-        "by_role": by_role, "by_type": by_type, "by_status": by_status,
-        "plan_deal": int(f.plan_staff_deal_qty.sum()),
-        "fact_deal": int(f.fact_staff_deal_qty.sum()),
-        "unrealized": int(f.unrealized_deal_potential.sum()),
-    }
-
-
 def _classify(cand: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Разделить кандидатов на «работать» и «нет смысла» с причиной."""
+    """Работать / нет смысла — по агрегатам ВСЕХ активностей за 3 мес."""
     work_rows, skip_rows = [], []
     for _, o in cand.iterrows():
-        worked = bool(o.get("worked", False))
-        status = o.get("last_status")
-        comment = str(o.get("last_comment") or "")
-        success = bool(o.get("any_success", False))
-        plan_deal = o.get("plan_deal") or 0
-        fact_deal = o.get("fact_deal") or 0
-        deadend = ("ликвидац" in comment.lower())
-
-        if deadend:
-            skip_rows.append((o, "Организация ликвидируется — работа нецелесообразна"))
-        elif not worked:
+        if not bool(o.get("worked", False)):
             work_rows.append((o, "Не работали за 3 мес — начать отработку"))
-        elif status == "Не закрыта: Просрочена":
-            work_rows.append((o, "Задача просрочена и не закрыта — вернуть в работу"))
-        elif fact_deal < plan_deal:
-            work_rows.append((o, f"Недоработка по сделке: привлечено {int(fact_deal)} из {int(plan_deal)}"))
-        elif success and status == "Закрыта: Своевременно":
-            skip_rows.append((o, "Недавно успешно отработана — потенциал реализуется"))
+        elif int(o.get("n_overdue", 0)) > 0:
+            work_rows.append((o, f"Просроченных задач: {int(o['n_overdue'])} — вернуть в работу"))
+        elif int(o.get("fact_deal", 0)) < int(o.get("plan_deal", 0)):
+            work_rows.append((o, f"Недоработка по сделкам: {int(o['fact_deal'])} из {int(o['plan_deal'])}"))
+        elif bool(o.get("any_success", False)):
+            skip_rows.append((o, "Отработана успешно — потенциал реализуется"))
         else:
             work_rows.append((o, "Отработана без результата — повторная активность"))
 
@@ -285,15 +225,198 @@ def _classify(cand: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         recs = []
         for o, reason in rows:
             d = o.to_dict(); d["reason"] = reason; recs.append(d)
-        return pd.DataFrame(recs)
+        return pd.DataFrame(recs).sort_values("impact_fl", ascending=False)
+    return _mk(work_rows), _mk(skip_rows)
 
-    to_work = _mk(work_rows).sort_values("impact_fl", ascending=False) if work_rows else _mk(work_rows)
-    no_point = _mk(skip_rows).sort_values("impact_fl", ascending=False) if skip_rows else _mk(skip_rows)
+
+# --------------------------------------------------------------------------- #
+def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFrame,
+             top_n: int, batch: int):
+    """Рекомендации по (ГОСБ, ИНН): детерминированно, затем LLM для остатка.
+
+    top_n — сколько «успешных кейсов» нужно набрать В КАЖДОМ ГОСБ, поэтому
+    кандидатов берём с запасом и добираем волнами.
+    """
+    stats = {"top_n": top_n, "batch": batch, "cand": 0, "checklist": 0,
+             "keyword": 0, "llm": 0, "no_text": 0, "fallback": 0, "batches": 0}
+    if to_work.empty:
+        return {}, to_work, no_point, "—", stats
+
+    insights: dict = {}
+    resolved_keys: set = set()
+    all_texts: list[str] = []
+    processed_keys: set = set()
+
+    for wave in range(MAX_WAVES):
+        pool = _pool_per_gosb(to_work, insights, top_n, wave, processed_keys)
+        if pool.empty:
+            break
+        processed_keys |= {(int(r.new_gosb_id), int(r.inn)) for r in pool.itertuples()}
+        stats["cand"] += len(pool)
+        progress.step(f"Рекомендации, волна {wave + 1}: кандидатов {len(pool)}"
+                      f" (top-{top_n} на каждый ГОСБ)")
+
+        # текст только по кандидатам этой волны
+        inns = sorted({int(x) for x in pool["inn"]})
+        text_df = read_sql(engine, Q.FUNNEL_TEXT, {**pf, "inns": inns})
+        notes = _collect_notes(text_df, pool, all_texts)
+
+        need_llm = []
+        for r in pool.itertuples():
+            key = (int(r.new_gosb_id), int(r.inn))
+            item_notes = notes.get(key, [])
+            det = _deterministic(item_notes)
+            if det:
+                insights[key] = det
+                stats["checklist" if det["source"].startswith("чек-лист") else "keyword"] += 1
+            elif item_notes:
+                need_llm.append({
+                    "gosb_id": key[0], "inn": key[1],
+                    "gosb": str(getattr(r, "gosb_name", "") or ""),
+                    "company": str(getattr(r, "company_name", "") or ""),
+                    "segment": str(getattr(r, "seg_name", "") or ""),
+                    "notes": item_notes,
+                })
+            else:
+                # нет содержательного текста -> остаётся причина из правил (_classify)
+                insights[key] = {"reason": "", "action": "", "verdict": "work",
+                                 "source": "правило"}
+                stats["no_text"] += 1
+
+        if need_llm:
+            got, nb = prompts.text_insights(ctx, need_llm, batch=batch)
+            stats["batches"] += nb
+            for it in need_llm:
+                key = (it["gosb_id"], it["inn"])
+                if key in got:
+                    insights[key] = got[key]; stats["llm"] += 1
+                else:   # LLM не вернул -> детерминированный фолбэк по тексту
+                    fb = text_rules.match_keyword(" ".join(it["notes"]))
+                    insights[key] = fb or {"reason": "", "action": "",
+                                           "verdict": "work", "source": "правило"}
+                    stats["fallback"] += 1
+
+        resolved_keys |= processed_keys
+        if _enough(to_work, insights, top_n):
+            break
+
+    to_work, no_point = _reclassify(to_work, no_point, insights)
+    return insights, to_work, no_point, text_rules.themes(all_texts), stats
+
+
+def _pool_per_gosb(to_work: pd.DataFrame, insights: dict, top_n: int,
+                   wave: int, processed: set) -> pd.DataFrame:
+    """Кандидаты волны: топ по потенциалу привлечения ФЛ в КАЖДОМ ГОСБ."""
+    take = top_n * POOL_OVERSHOOT
+    parts = []
+    for _, g in to_work.groupby("new_gosb_id"):
+        g = g.sort_values("emp_potential_qty", ascending=False)
+        g = g[[(int(r.new_gosb_id), int(r.inn)) not in processed for r in g.itertuples()]]
+        if not g.empty:
+            parts.append(g.head(take))
+    return pd.concat(parts, ignore_index=True) if parts else to_work.iloc[:0]
+
+
+def _enough(to_work: pd.DataFrame, insights: dict, top_n: int) -> bool:
+    """Набрали ли top_n подтверждённых «работать» в каждом ГОСБ."""
+    for nid, g in to_work.groupby("new_gosb_id"):
+        ok = 0
+        for r in g.sort_values("emp_potential_qty", ascending=False).itertuples():
+            key = (int(r.new_gosb_id), int(r.inn))
+            v = insights.get(key)
+            if v is None:
+                break                      # ещё не разобрали — нужна следующая волна
+            if v.get("verdict", "work") == "work":
+                ok += 1
+            if ok >= top_n:
+                break
+        if ok < top_n and len(g) > ok:
+            return False
+    return True
+
+
+def _deterministic(notes: list[dict]) -> dict | None:
+    """Детерминированное разрешение. None — нужен LLM.
+
+    Порядок: 1) причина оттока из ЧЕК-ЛИСТА (структурный ответ);
+             2) ключевые слова в КОММЕНТАРИИ;
+             3) ключевые слова в ОТВЕТАХ чек-листа.
+    Важно: по сырому тексту анкеты не матчим — там формулировки ВОПРОСОВ
+    (напр. «Получено согласие» с ответом «Нет») дают ложные срабатывания.
+    """
+    for n in notes:
+        det = text_rules.outflow_reason(n.get("questionnaire"))
+        if det:
+            return det
+    for n in notes:
+        det = text_rules.match_keyword(n.get("comment"))
+        if det:
+            return det
+    for n in notes:
+        answers = " ".join(text_rules.parse_questionnaire(n.get("questionnaire")).values())
+        det = text_rules.match_keyword(answers)
+        if det:
+            return det
+    return None
+
+
+def _collect_notes(text_df: pd.DataFrame, pool: pd.DataFrame, sink: list) -> dict:
+    """Содержательные заметки по каждой паре (ГОСБ, ИНН): ВСЕ активности за 3 мес."""
+    out: dict = {}
+    if text_df.empty:
+        return out
+    keys = {(int(r.new_gosb_id), int(r.inn)) for r in pool.itertuples()}
+    skipped: dict[str, int] = {}
+    for r in text_df.itertuples():
+        if pd.isna(r.new_gosb_id):
+            continue
+        key = (int(r.new_gosb_id), int(r.inn))
+        if key not in keys:
+            continue
+        comment = (r.task_comment or "").strip()
+        quest = (r.task_questionnaire or "").strip()
+        ok_c, why_c = text_rules.is_meaningful(comment)
+        ok_q, why_q = text_rules.is_meaningful(quest)
+        if not (ok_c or ok_q):
+            why = why_c if comment else why_q
+            skipped[why] = skipped.get(why, 0) + 1
+            continue
+        text = f"[{r.task_type}/{r.task_text_status}] "
+        if ok_c:
+            text += comment
+        if ok_q:
+            text += " | анкета: " + quest.replace("\n", "; ")
+        out.setdefault(key, []).append({"text": text[:400], "comment": comment,
+                                        "questionnaire": quest})
+        sink.append(comment or text)
+    if skipped and progress.SHOW_LLM:
+        for why, n in sorted(skipped.items(), key=lambda x: -x[1])[:6]:
+            progress.done(f"отсеяно без LLM ×{n}: {why}")
+    # ограничим объём промпта: до 8 записей на организацию (самые свежие — сверху)
+    return {k: [x for x in v][:8] for k, v in out.items()}
+
+
+def _reclassify(to_work: pd.DataFrame, no_point: pd.DataFrame, insights: dict):
+    """Вердикт no_point (напр. ликвидация) переносит строку в «нет смысла»."""
+    if to_work.empty:
+        return to_work, no_point
+    move_mask = []
+    for r in to_work.itertuples():
+        v = insights.get((int(r.new_gosb_id), int(r.inn)))
+        move_mask.append(bool(v and v.get("verdict") == "no_point"))
+    move_mask = pd.Series(move_mask, index=to_work.index)
+    moved = to_work[move_mask].copy()
+    if not moved.empty:
+        moved["reason"] = [insights[(int(r.new_gosb_id), int(r.inn))]["reason"]
+                           for r in moved.itertuples()]
+        no_point = pd.concat([no_point, moved], ignore_index=True)
+        to_work = to_work[~move_mask].copy()
+        progress.done(f"перенесено в «нет смысла» по тексту: {len(moved)}")
     return to_work, no_point
 
 
+# --------------------------------------------------------------------------- #
 def _simulate(to_work: pd.DataFrame, gap: float, fact: float, plan: float) -> dict:
-    """Сколько верхних организаций «работать» закрывают разрыв (получатели)."""
     if to_work.empty or gap <= 0:
         return {"gap": gap, "fact": fact, "plan": plan, "k": 0, "closable": 0.0,
                 "attract": 0.0, "retention": 0.0, "fot_mln": 0.0, "coverage": 0.0,
@@ -304,34 +427,45 @@ def _simulate(to_work: pd.DataFrame, gap: float, fact: float, plan: float) -> di
     hit = d[d["cum"] >= gap]
     k = int(d.index.get_indexer([hit.index[0]])[0]) + 1 if not hit.empty else len(d)
     sel = d.head(k)
-    attract = float(sel[sel.lever == "Привлечь"]["impact_fl"].sum())
-    retention = float(sel[sel.lever == "Вернуть"]["impact_fl"].sum())
-    return {
-        "gap": gap, "fact": fact, "plan": plan, "k": k,
-        "closable": min(float(sel["impact_fl"].sum()), gap),
-        "attract": attract, "retention": retention,
-        "fot_mln": float(sel["impact_fot_mln"].sum()),
-        "coverage": total / gap if gap else 0.0,
-        "total_potential": total,
-    }
+    return {"gap": gap, "fact": fact, "plan": plan, "k": k,
+            "closable": min(float(sel["impact_fl"].sum()), gap),
+            "attract": float(sel[sel.lever == "Привлечь"]["impact_fl"].sum()),
+            "retention": float(sel[sel.lever == "Вернуть"]["impact_fl"].sum()),
+            "fot_mln": float(sel["impact_fot_mln"].sum()),
+            "coverage": total / gap if gap else 0.0, "total_potential": total}
 
 
-def _collect_text(f: pd.DataFrame, inns: list) -> list:
-    """Собрать свободный текст задач по приоритетным организациям для LLM."""
-    out = []
-    for inn in inns:
-        sub = f[f.inn == inn]
-        if sub.empty:
-            continue
-        notes = []
-        for _, t in sub.iterrows():
-            c = (t.task_comment or "").strip()
-            q = (t.task_questionnaire or "").replace("\n", "; ").strip()
-            notes.append(f"[{t.task_type}/{t.task_text_status}] {c} | анкета: {q}"[:180])
-        out.append({
-            "inn": int(inn),
-            "company": str(sub.company_name.iloc[0]),
-            "segment": str(sub.segment_name.iloc[0]),
-            "notes": notes[:3],
+def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame,
+                to_work: pd.DataFrame, fagg: pd.DataFrame) -> list:
+    """По каждому проблемному ГОСБ — что конкретно сделать."""
+    fg = {}
+    if not fagg.empty:
+        for nid, g in fagg.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
+            n_tasks = int(g.n_tasks.sum())
+            fg[int(nid)] = {"act_n": n_tasks,
+                            "success": float(g.n_success.sum() / n_tasks) if n_tasks else 0.0,
+                            "worked_orgs": int(g.inn.nunique())}
+    cards = []
+    prob = gosb_gap[gosb_gap.nedobor > 0].sort_values("nedobor", ascending=False)
+    for r in prob.itertuples():
+        nid = int(r.new_gosb_id); name = r.gosb_name
+        sub = to_work[to_work.new_gosb_id == nid] if not to_work.empty else to_work
+        att = sub[sub.lever == "Привлечь"] if not sub.empty else sub
+        ret = sub[sub.lever == "Вернуть"] if not sub.empty else sub
+        seg_bad = (matrix[(matrix.new_gosb_id == nid) & (matrix.nedobor > 0)]
+                   .sort_values("nedobor", ascending=False))
+        segs = [{"seg": s.seg_name, "exec": float(s.execution_percent),
+                 "nedobor": float(s.nedobor),
+                 "n_work": int(len(sub[sub.seg_name == s.seg_name])) if not sub.empty else 0}
+                for s in seg_bad.itertuples()]
+        cards.append({
+            "gosb_name": name, "exec": float(r.execution_percent), "gap": float(r.nedobor),
+            "segs": segs,
+            "n_work": int(len(sub)), "n_attract": int(len(att)), "n_return": int(len(ret)),
+            "pot_fl_att": float(att.impact_fl.sum()) if not att.empty else 0.0,
+            "pot_fl_ret": float(ret.impact_fl.sum()) if not ret.empty else 0.0,
+            "pot_fot": float(sub.impact_fot_mln.sum()) if not sub.empty else 0.0,
+            "not_worked": int((~sub.worked).sum()) if not sub.empty else 0,
+            "act": fg.get(nid, {"act_n": 0, "success": 0.0, "worked_orgs": 0}),
         })
-    return out
+    return cards

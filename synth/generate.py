@@ -225,6 +225,8 @@ def _orgs(gosb: pd.DataFrame, latest: pd.DataFrame) -> pd.DataFrame:
             })
 
     df = pd.DataFrame(rows)
+    df = _spread_multi_gosb(df, gosb)   # часть компаний работает в неск. ГОСБ
+
     # Масштабируем потенциал+возврат провальных ГОСБ до ~1.3× разрыва,
     # чтобы список организаций реально закрывал недобор до плана.
     for gid, g in df.groupby("gosb_id"):
@@ -240,6 +242,42 @@ def _orgs(gosb: pd.DataFrame, latest: pd.DataFrame) -> pd.DataFrame:
     df["fl_outflow_qty"] = df["_back"].round().astype(int)
     df["fot_outflow_amt"] = (df["_back"] * df["avg_salary"]).round(2)
     return df.drop(columns=["_pull", "_back"])
+
+
+def _spread_multi_gosb(df: pd.DataFrame, gosb: pd.DataFrame, frac: float = 0.12) -> pd.DataFrame:
+    """~frac компаний обслуживаются в НЕСКОЛЬКИХ ГОСБ одного ТБ.
+
+    Один и тот же ИНН получает строки в 2–4 ГОСБ со своими показателями — так
+    проявляется грейн (ГОСБ, ИНН): в одном городе с клиентом работали, в другом нет.
+    Сегмент компании (segment_name) одинаков во всех ГОСБ.
+    """
+    by_tb = {int(t): g for t, g in gosb.groupby("tb_id")}
+    multi = df.sample(frac=frac, random_state=7)
+    extra = []
+    for _, o in multi.iterrows():
+        pool = by_tb.get(int(o.tb_id))
+        if pool is None or len(pool) < 2:
+            continue
+        others = pool[pool.old_gosb_id != int(o.gosb_id)]
+        if others.empty:
+            continue
+        n_more = int(RNG.integers(1, 4))                       # ещё 1–3 ГОСБ
+        picks = others.sample(n=min(n_more, len(others)), random_state=int(o.inn) % 10000)
+        for _, g2 in picks.iterrows():
+            fl = int(max(1, RNG.gamma(2.0, 40)))
+            sal = float(g2.avg_salary * RNG.uniform(0.85, 1.2))
+            extra.append({
+                "inn": int(o.inn), "gosb_id": int(g2.old_gosb_id), "tb_id": int(g2.tb_id),
+                "tb_short": g2.tb_short_name, "seg_code": int(o.seg_code),
+                "segment_name": o.segment_name,
+                "current_fl_qty": fl, "avg_salary": round(sal, 0),
+                "current_fot_amt": round(fl * sal, 2),
+                "_pull": max(0.0, RNG.normal(0.14, 0.07)) * fl,
+                "_back": max(0.0, RNG.normal(0.06, 0.04)) * fl,
+            })
+    if not extra:
+        return df
+    return pd.concat([df, pd.DataFrame(extra)], ignore_index=True)
 
 
 def _company_holding(orgs: pd.DataFrame) -> pd.DataFrame:
@@ -313,6 +351,18 @@ OUTFLOW_REASONS = [
 ]
 # причины, при которых работать бессмысленно
 DEADEND = {"Ликвидация организации"}
+
+# Свободные формулировки без явных ключевых слов — такие строки уходят в LLM
+FREEFORM_COMMENTS = [
+    "Клиент запросил расчёт экономии по обслуживанию перед принятием решения",
+    "Директор в командировке до конца месяца, вернуться в следующем периоде",
+    "Ожидаем протокол собрания учредителей по смене банка",
+    "Идёт закупочная процедура на банковское обслуживание, участвуем",
+    "Головной офис принимает решение централизованно, локально влиять не можем",
+    "Просят подготовить презентацию для собственника бизнеса",
+    "Часть сотрудников на аутсорсе, схема выплат уточняется",
+    "Клиент сравнивает тарифы, обещал дать ответ после квартального отчёта",
+]
 
 ROLE_BY_SEGMENT = {  # какая роль ведёт сегмент (по большому имени)
     "Крупнейшие": "МКК", "Крупные": "МКК", "Средние": "МЗП",
@@ -398,6 +448,11 @@ def _text_attract(o, success: bool):
         ]))
         quest = f"1. Получено согласие\nДа\n2. Планируемое привлечение\n{n} чел\n3. Комментарий\n{comment}"
         unreal = int(RNG.integers(0, 3))
+    elif RNG.random() < 0.35:
+        # свободные формулировки, НЕ попадающие под ключевые слова -> уходят в LLM
+        comment = str(RNG.choice(FREEFORM_COMMENTS))
+        quest = f"1. Получено согласие\nНет\n2. Комментарий\n{comment}\n3. Планируемое привлечение\n{n} чел"
+        unreal = n
     else:
         comment = str(RNG.choice([
             "ЛПР не заинтересован, работают с другим банком",
