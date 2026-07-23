@@ -1,0 +1,78 @@
+"""Реестр дэшбордов. Дэш регистрируется декоратором @dashboard("имя").
+
+generate_dashboard() — единственная точка входа для управляющего ноутбука.
+"""
+from __future__ import annotations
+
+import importlib
+import pkgutil
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable
+
+from . import config, llm
+from .db import get_engine
+from .llm import complete
+
+# Контекст, который прокидывается в генератор дэша.
+@dataclass
+class Context:
+    engine: object          # SQLAlchemy Engine
+    llm: Callable[..., str] # llm.complete
+    params: dict
+    output_dir: Path
+
+
+_REGISTRY: dict[str, Callable[[Context], str]] = {}
+_LOADED = False
+
+
+def dashboard(name: str):
+    """Декоратор регистрации. Функция принимает Context, возвращает HTML-строку."""
+    def deco(fn: Callable[[Context], str]):
+        _REGISTRY[name] = fn
+        fn._dashboard_name = name  # type: ignore[attr-defined]
+        return fn
+    return deco
+
+
+def _ensure_loaded() -> None:
+    """Импортировать все модули пакета dashboards, чтобы сработали декораторы."""
+    global _LOADED
+    if _LOADED:
+        return
+    from . import dashboards as pkg
+    for mod in pkgutil.iter_modules(pkg.__path__):
+        importlib.import_module(f"{pkg.__name__}.{mod.name}")
+    _LOADED = True
+
+
+def list_dashboards() -> list[str]:
+    _ensure_loaded()
+    return sorted(_REGISTRY)
+
+
+def generate_dashboard(name: str, conn: str | None = None, params: dict | None = None,
+                       contour: str | None = None) -> str:
+    """Сгенерировать дэш по имени. Возвращает путь к .html.
+
+    conn    — SQLAlchemy URL (если не задан, берётся из .env UZP_DB_URL).
+    params  — параметры конкретного дэша (напр. {"tb": "ЮЗБ"}).
+    contour — 'open' (DeepSeek) | 'closed' (GLM/Qwen). Управляется из тетрадки.
+    """
+    _ensure_loaded()
+    if name not in _REGISTRY:
+        raise KeyError(f"Дэш '{name}' не найден. Доступные: {list_dashboards()}")
+
+    config.set_contour(contour)
+    engine = get_engine(config.db_url(conn))
+    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ctx = Context(engine=engine, llm=complete, params=params or {}, output_dir=config.OUTPUT_DIR)
+
+    html = _REGISTRY[name](ctx)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = config.OUTPUT_DIR / f"{name}_{ts}.html"
+    out.write_text(html, encoding="utf-8")
+    return str(out)
