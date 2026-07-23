@@ -55,7 +55,7 @@ def list_dashboards() -> list[str]:
 
 def generate_dashboard(name: str, conn: str | None = None, params: dict | None = None,
                        contour: str | None = None, verbose: bool = True,
-                       show_sql: bool = False) -> str:
+                       show_sql: bool = False, show_llm: bool = False) -> str:
     """Сгенерировать дэш по имени. Возвращает путь к .html.
 
     conn     — SQLAlchemy URL (если не задан, берётся из .env UZP_DB_URL).
@@ -63,12 +63,13 @@ def generate_dashboard(name: str, conn: str | None = None, params: dict | None =
     contour  — 'open' (DeepSeek) | 'closed' (GLM/Qwen). Управляется из тетрадки.
     verbose  — печатать прогресс генерации (для тетрадки). По умолчанию True.
     show_sql — дополнительно печатать SQL-запросы.
+    show_llm — дополнительно печатать текст запросов/ответов LLM.
     """
     _ensure_loaded()
     if name not in _REGISTRY:
         raise KeyError(f"Дэш '{name}' не найден. Доступные: {list_dashboards()}")
 
-    progress.enable(verbose=verbose, show_sql=show_sql)
+    progress.enable(verbose=verbose, show_sql=show_sql, show_llm=show_llm)
     config.set_contour(contour)
     progress.step(f"Дэш «{name}» · контур {config.CONTOUR} · подключение к БД")
     engine = get_engine(config.db_url(conn))

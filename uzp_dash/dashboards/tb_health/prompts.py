@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import re
 
+from ... import progress
+
 
 def _parse_json(text: str):
     """Достать JSON из ответа LLM (снять ```-обёртки, найти объект)."""
@@ -41,10 +43,16 @@ def text_insights(ctx, priority_text: list) -> dict:
         '"worth" ("да"|"нет" — стоит ли работать), "action" (рекомендация ≤12 слов).\n'
         "Только JSON, без пояснений.\n\n" + listing
     )
+    progress.llm_request("анализ текста", prompt)
     try:
         raw = ctx.llm(prompt, temperature=0.1)
-        data = _parse_json(raw) or []
-    except Exception:
+        progress.llm_response("анализ текста", raw)
+        data = _parse_json(raw)
+        if data is None:
+            progress.llm_error("анализ текста", "невалидный JSON в ответе — инсайты пропущены")
+            data = []
+    except Exception as ex:
+        progress.llm_error("анализ текста", ex)
         data = []
     result = {}
     for r in data if isinstance(data, list) else []:
@@ -77,7 +85,7 @@ def narrative(ctx, a) -> str:
         f"Получатели: факт {v['rcp']['fact']:.0f} из плана {v['rcp']['plan']:.0f} "
         f"({v['rcp']['exec']*100:.0f}%, ранг {v['rcp']['rank']}/{v['rcp']['n_tb']}), "
         f"недобор {a.gap_rcp:.0f} чел.\n"
-        f"ФОТ: {v['fot']['exec']*100:.0f}% плана, недобор {a.gap_fot:.0f} млн ₽.\n"
+        f"ФОТ: {v['fot']['exec']*100:.0f}% плана, недобор {a.gap_fot_mln:.0f} млн ₽.\n"
         f"Провальные ГОСБ×сегмент: {cells}.\n"
         f"Активности за 3 мес: {a.activity.get('n',0)} задач по "
         f"{a.activity.get('orgs',0)} орг, успех {a.activity.get('success_rate',0)*100:.0f}%, "
@@ -98,10 +106,17 @@ def narrative(ctx, a) -> str:
         "**Ожидаемый эффект** — 1–2 предложения с числами.\n\n"
         + ctx_txt
     )
+    progress.llm_request("нарратив", prompt)
     try:
-        return ctx.llm(prompt, temperature=0.2)
+        resp = ctx.llm(prompt, temperature=0.2)
+        progress.llm_response("нарратив", resp)
+        if not resp or not resp.strip():
+            progress.llm_error("нарратив", "пустой ответ LLM — использую фолбэк")
+            return _fallback(a, themes) + "\n\n_(LLM вернул пустой ответ)_"
+        return resp
     except Exception as ex:
-        return _fallback(a, themes) + f"\n\n_(LLM недоступен: {type(ex).__name__})_"
+        progress.llm_error("нарратив", ex)
+        return _fallback(a, themes) + f"\n\n_(LLM недоступен: {type(ex).__name__}: {ex})_"
 
 
 def _themes(a) -> str:

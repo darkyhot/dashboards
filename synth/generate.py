@@ -120,7 +120,7 @@ def _metrics(gosb: pd.DataFrame):
     for _, gr in gosb.iterrows():
         gid = int(gr.old_gosb_id)
         seg_recips = gr.base_recipients * SEG_WEIGHTS
-        sal_musd = gr.avg_salary / 1e6            # средняя ЗП, млн руб
+        salary = gr.avg_salary                    # средняя ЗП, РУБЛИ (ФОТ-метрика в рублях)
         for si, seg_id in enumerate(SEG_CODES):
             texec = _target_exec(gr.tb_short_name, gid, seg_id)
             base = seg_recips[si]
@@ -132,7 +132,7 @@ def _metrics(gosb: pd.DataFrame):
                     "tb_id": int(gr.tb_id), "gosb_id": gid, "seg_id": int(seg_id),
                     "start_dt": mend.replace(day=1).date(), "end_dt": mend.date(),
                     "plan_r": plan_r, "fact_r": fact_r,
-                    "fot_plan": plan_r * sal_musd, "fot_fact": fact_r * sal_musd,
+                    "fot_plan": plan_r * salary, "fot_fact": fact_r * salary,
                 })
                 if mi == MONTHS - 1:
                     latest.append((gid, int(gr.tb_id), gr.tb_short_name, int(seg_id),
@@ -267,7 +267,19 @@ def _company_holding(orgs: pd.DataFrame) -> pd.DataFrame:
     df["zp_fl_perc"] = (df["current_fl_qty"] / total_emp).round(4)
     df["new_fl_cnt"] = RNG.integers(0, 20, len(orgs))
     df["np_cnt"] = RNG.integers(0, 10, len(orgs))
-    return df
+
+    # Строки уровня holding / head_holding (в отчёте фильтруются: org_type='inn').
+    # org_id у них — id холдинга, а не ИНН; значения крупнее (агрегаты).
+    n_h = max(50, len(df) // 12)
+    samp = df.sample(n=n_h, random_state=7).copy()
+    samp["org_type"] = RNG.choice(["holding", "head_holding"], size=n_h, p=[0.7, 0.3])
+    samp["org_id"] = (9_000_000_000_000 + np.arange(n_h)).astype("int64")
+    mult = RNG.integers(2, 6, n_h)
+    for c in ("current_fl_qty", "fl_outflow_qty"):
+        samp[c] = (samp[c].to_numpy() * mult)
+    samp["current_fot_amt"] = samp["current_fot_amt"].to_numpy() * mult
+    samp["fot_potential_amt"] = samp["fot_potential_amt"].to_numpy() * mult
+    return pd.concat([df, samp], ignore_index=True)
 
 
 def _dim_company(orgs: pd.DataFrame) -> pd.DataFrame:

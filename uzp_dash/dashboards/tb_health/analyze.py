@@ -25,9 +25,10 @@ class Analysis:
     tb_id: int
     tb_full: str
     ref_date: str
-    verdict: dict                      # {'rcp': {...}, 'fot': {...}}
+    verdict: dict                      # {'rcp': {...}, 'fot': {...}} — ФОТ в РУБЛЯХ
     gap_rcp: float                     # недобор получателей (чел)
-    gap_fot: float                     # недобор ФОТ (млн ₽)
+    gap_fot: float                     # недобор ФОТ (рубли)
+    gap_fot_mln: float                 # недобор ФОТ (млн ₽ — для вывода)
     matrix: pd.DataFrame               # ГОСБ×сегмент (получатели)
     gosb_gap: pd.DataFrame             # разрыв по ГОСБ (все сегменты)
     top_cells: pd.DataFrame            # топ провальных ячеек
@@ -69,7 +70,8 @@ def run(ctx, tb_short: str) -> Analysis:
     v = read_sql(e, Q.TB_VERDICT, p)
     verdict, ref_date = _verdict(v, tb_id)
     gap_rcp = max(0.0, verdict["rcp"]["plan"] - verdict["rcp"]["fact"])
-    gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
+    gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])  # рубли
+    gap_fot_mln = gap_fot / RUB_TO_MLN
 
     # --- ГОСБ×сегмент (короткие имена сегментов, хардкод) ---
     progress.step("Матрица ГОСБ × сегмент + разрыв по ГОСБ")
@@ -137,7 +139,7 @@ def run(ctx, tb_short: str) -> Analysis:
 
     return Analysis(
         tb_short=tb_short, tb_id=tb_id, tb_full=tb_full, ref_date=ref_date,
-        verdict=verdict, gap_rcp=gap_rcp, gap_fot=gap_fot,
+        verdict=verdict, gap_rcp=gap_rcp, gap_fot=gap_fot, gap_fot_mln=gap_fot_mln,
         matrix=matrix, gosb_gap=gosb_gap, top_cells=top_cells,
         attract=attract, retention=retention, activity=activity,
         to_work=to_work, no_point=no_point, sim=sim, priority_text=priority_text,

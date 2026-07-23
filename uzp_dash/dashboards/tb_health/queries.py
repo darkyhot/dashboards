@@ -81,6 +81,7 @@ FROM {schema}.uzp_dwh_company_holding_metric c
 JOIN gmap g ON g.old_gosb_id=c.level_id
 LEFT JOIN {schema}.uzp_dim_company dc ON dc.inn=c.org_id
 WHERE g.tb_id=:tb_id AND c.report_dt = :ref
+  AND c.org_type = 'inn'   -- только организации по ИНН (не holding/head_holding)
 """
 
 # Активности воронки за 3 месяца до :ref_funnel. Задачи по метрикам идут

@@ -54,22 +54,24 @@ def _hero(a: analyze.Analysis) -> str:
         f'{C.badge("ранг ТБ " + rank, "warn" if r["rank"] and r["rank"] > r["n_tb"]/2 else "good")}</div>'
         + C.meter(r["exec"])
         + f'<div class="row2">ФОТ: {(a.verdict["fot"]["exec"] or 0)*100:.0f}% плана · '
-          f'недобор {C.fmt_num(a.gap_fot)} млн ₽</div>'
+          f'недобор {C.fmt_num(a.gap_fot_mln)} млн ₽</div>'
     )
     return C.card(inner, cls="hero")
 
 
 def _kpis(a: analyze.Analysis) -> str:
-    def kpi(title, d, unit):
+    def kpi(title, d, unit, scale=1.0):
         return C.card(
             f'<div class="label">{C.esc(title)}</div>'
-            f'<div class="value">{C.fmt_num(d["fact"], unit)}</div>'
-            f'<div class="delta">план {C.fmt_num(d["plan"], unit)} · '
+            f'<div class="value">{C.fmt_num(d["fact"] / scale, unit)}</div>'
+            f'<div class="delta">план {C.fmt_num(d["plan"] / scale, unit)} · '
             f'<b style="color:{_col(d["exec"])}">{(d["exec"] or 0)*100:.0f}%</b></div>'
             + C.meter(d["exec"]),
             cls="kpi",
         )
-    cards = kpi("Получатели, чел", a.verdict["rcp"], "") + kpi("Общий ФОТ, млн ₽", a.verdict["fot"], "")
+    # ФОТ в БД — рубли, выводим в млн ₽ (÷ 1e6)
+    cards = (kpi("Получатели, чел", a.verdict["rcp"], "")
+             + kpi("Общий ФОТ, млн ₽", a.verdict["fot"], "", scale=1e6))
     return f'<div class="grid cols-2">{cards}</div>'
 
 
