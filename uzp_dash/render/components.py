@@ -225,7 +225,7 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
       if(g&&r.gosb!==g)return false;
       if(s&&r.seg!==s)return false;
       if(l&&r.lever!==l)return false;
-      if(q){{const hay=(r.inn+' '+r.gosb+' '+r.seg+' '+r.reason).toLowerCase();
+      if(q){{const hay=(r.inn+' '+(r.company||'')+' '+r.gosb+' '+r.seg+' '+r.reason).toLowerCase();
         if(!hay.includes(q))return false;}}
       return true;
     }});
@@ -239,7 +239,8 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     tb.innerHTML=slice.map(r=>{{
       const cls=r.lever==='Привлечь'?'good':'bad';
       const act=r.action?' · <span style="color:var(--text-2)">'+esc(r.action)+'</span>':'';
-      return '<tr><td>ИНН '+r.inn+'</td>'
+      return '<tr><td><div>'+esc(r.company||('ИНН '+r.inn))+'</div>'
+        +'<div style="font-size:12px;color:var(--text-2)">ИНН '+r.inn+'</div></td>'
         +'<td><span class="badge '+cls+'">'+r.lever+'</span></td>'
         +'<td>'+esc(r.gosb)+'</td><td>'+esc(r.seg)+'</td>'
         +'<td class="num">'+fmt(r.fl)+'</td><td class="num">'+fmt(r.fot)+'</td>'

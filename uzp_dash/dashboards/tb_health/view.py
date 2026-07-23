@@ -9,9 +9,9 @@ from __future__ import annotations
 from ...registry import Context, dashboard
 from ...render import components as C
 from ...render import page
-from . import analyze, prompts
+from . import analyze, prompts, segments
 
-SEG_ORDER = ["Крупнейшие", "Крупные", "Средние", "Малые", "Микро", "Рег. госсектор"]
+SEG_ORDER = segments.ORDER   # короткие названия сегментов (КСБ, РГС, …)
 
 
 @dashboard("tb_health")
@@ -21,16 +21,12 @@ def build(ctx: Context) -> str:
     insights = prompts.text_insights(ctx, a.priority_text)   # LLM: свободный текст
     story = prompts.narrative(ctx, a)                        # LLM: нарратив
 
-    proj = _projection_card(a)
-    nop = _no_point_card(a, insights)
-    итог = f'<div class="grid cols-2">{proj}{nop}</div>' if nop else proj
     body = (
         _hero(a)
         + _kpis(a)
         + _matrix(a)
         + _problem_gosb(a)
         + _orgs(a, insights)
-        + C.section("Динамика до плана и исключения", итог, eyebrow="Итог")
         + C.section("Что делать — резюме", C.card(C.narrative_html(story)), eyebrow="AI")
     )
     return page(
@@ -135,7 +131,8 @@ def _orgs(a: analyze.Analysis, insights: dict) -> str:
     for r in a.to_work.itertuples():
         ins = insights.get(int(r.inn), {})
         rows.append({
-            "inn": int(r.inn), "lever": r.lever,
+            "inn": int(r.inn), "company": (getattr(r, "company_name", "") or "")[:48],
+            "lever": r.lever,
             "gosb": (r.gosb_name or "")[:28], "seg": r.seg_name or "—",
             "fl": round(float(r.impact_fl)), "fot": round(float(r.impact_fot_mln), 1),
             "reason": ins.get("reason") or r.reason, "action": ins.get("action", ""),
@@ -147,41 +144,6 @@ def _orgs(a: analyze.Analysis, insights: dict) -> str:
             f'<p class="sub" style="font-size:14px;margin:-4px 0 14px">'
             f'поиск, фильтр по ГОСБ и рычагу, листание</p>')
     return C.section("Организации к работе", C.card(head + explorer), eyebrow="Список к отработке")
-
-
-def _no_point_card(a: analyze.Analysis, insights: dict) -> str:
-    if a.no_point.empty:
-        return ""
-    rows = []
-    for r in a.no_point.head(10).itertuples():
-        ins = insights.get(int(r.inn), {})
-        rows.append((f"ИНН {int(r.inn)}", C.esc((r.gosb_name or "")[:20]),
-                     C.esc(ins.get("reason") or r.reason)))
-    tbl = C.table(["Организация", "ГОСБ", "Причина"], rows)
-    return C.card(f'<h3>Нет смысла работать — {len(a.no_point)}</h3>'
-                  '<p class="sub" style="font-size:13px;margin:-4px 0 10px">исключить из отработки</p>'
-                  + tbl)
-
-
-def _projection_card(a: analyze.Analysis) -> str:
-    s = a.sim
-    bar = C.projection_bar(s["attract"], s["retention"], s["gap"])
-    if s["k"] and s["closable"] >= s["gap"] * 0.999:
-        verdict = (f'Топ-<b>{s["k"]}</b> организаций «в работу» полностью закрывают недобор '
-                   f'<b>{C.fmt_num(s["gap"])}</b> получателей.')
-    else:
-        verdict = (f'Все организации «в работу» дают <b>{C.fmt_num(s["total_potential"])}</b> получателей '
-                   f'(покрытие {s["coverage"]*100:.0f}% недобора <b>{C.fmt_num(s["gap"])}</b>).')
-    inner = (
-        '<h3>Динамика до плана</h3>'
-        f'<p class="sub" style="font-size:14px;margin:-4px 0 8px">Не хватает: '
-        f'<b>{C.fmt_num(a.gap_rcp)}</b> получателей (~{C.fmt_num(a.gap_fot)} млн ₽ ФОТ)</p>'
-        + bar
-        + f'<p style="margin:6px 0 0;font-size:15px">{verdict} '
-          f'Привлечение <b>+{C.fmt_num(s["attract"])}</b>, возврат <b>+{C.fmt_num(s["retention"])}</b>, '
-          f'эффект ФОТ <b>~{C.fmt_num(s["fot_mln"])}</b> млн ₽.</p>'
-    )
-    return C.card(inner)
 
 
 def _col(exec_pct):

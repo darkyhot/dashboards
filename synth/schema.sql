@@ -10,8 +10,7 @@ DROP TABLE IF EXISTS uzp_dim_metric CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_metrics CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_company_holding_metric CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_sale_funnel_task CASCADE;
-DROP TABLE IF EXISTS uzp_dim_extended_metrics CASCADE;
-DROP TABLE IF EXISTS dim_company CASCADE;
+DROP TABLE IF EXISTS uzp_dim_company CASCADE;
 
 -- ============ Справочники (грузятся из CSV как есть) ============
 
@@ -73,7 +72,7 @@ CREATE TABLE uzp_dwh_metrics (
   prediction_amt     numeric,
   prediction_percent numeric,
   modified_dttm      timestamp,
-  extended_dim_1     bigint,      -- сегмент; 1 = все сегменты (см. uzp_dim_extended_metrics)
+  extended_dim_1     bigint,      -- сегмент (короткий код); 1 = все. Маппинг зашит в отчёте
   extended_dim_2     bigint,
   extended_dim_3     bigint,
   extended_dim_4     bigint,
@@ -141,18 +140,30 @@ CREATE TABLE uzp_dwh_sale_funnel_task (
   task_questionnaire     varchar      -- чек-лист/анкета по задаче
 );
 
--- ============ Выдуманные справочник/связка (в проде будут добавлены) ============
+-- ============ Справочник компаний: сегмент по ИНН ============
+-- Маппинг сегментов (extended_dim_1) на короткие названия зашит в коде отчёта.
 
--- Справочник сегментов: extended_dim_1 = extended_dim_id
-CREATE TABLE uzp_dim_extended_metrics (
-  extended_dim_id   integer PRIMARY KEY,
-  extended_dim_name text
-);
-
--- Связка организации с сегментом (для company_holding_metric, где сегмента нет)
-CREATE TABLE dim_company (
-  inn             bigint PRIMARY KEY,
-  extended_dim_id integer REFERENCES uzp_dim_extended_metrics(extended_dim_id)
+CREATE TABLE uzp_dim_company (
+  epk_id                   bigint,
+  company_name             text,
+  inn                      bigint PRIMARY KEY,   -- ИНН — ключ поиска сегмента
+  kpp                      text,
+  segment_name             text,                 -- большое имя сегмента
+  holding_name             text,
+  mzp_last_action_dt       date,
+  km_last_action_dt        date,
+  crm_client_id            text,
+  agrmnt_flag              smallint,
+  rko_flag                 smallint,
+  dbo_flag                 smallint,
+  credit_flag              smallint,
+  deposit_flag             smallint,
+  corporate_card_flag      smallint,
+  internet_acquiring_flag  smallint,
+  merchant_acquiring_flag  smallint,
+  significance_level_id    smallint,
+  info                     text,
+  modified_dttm            timestamp
 );
 
 -- Индексы под запросы дэшей

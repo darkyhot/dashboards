@@ -45,17 +45,16 @@ WITH gmap AS (""" + _GMAP + """),
 mx AS (SELECT max(end_dt) d FROM {schema}.uzp_dwh_metrics
        WHERE level_name='gosb' AND period_type='m' AND metric_id=:m_rcp)
 SELECT g.new_gosb_id, g.gosb_name,
-       m.extended_dim_1 AS seg_id, s.extended_dim_name AS seg_name,
+       m.extended_dim_1 AS seg_id,
        sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
        sum(m.fact_amt) / NULLIF(sum(m.plan_amt), 0) AS execution_percent,
        sum(m.plan_amt - m.fact_amt) AS nedobor
 FROM {schema}.uzp_dwh_metrics m
 JOIN gmap g ON g.old_gosb_id=m.level_id
-JOIN {schema}.uzp_dim_extended_metrics s ON s.extended_dim_id=m.extended_dim_1
 JOIN mx ON mx.d=m.end_dt
 WHERE m.level_name='gosb' AND m.period_type='m' AND m.metric_id=:m_rcp
   AND g.tb_id=:tb_id AND m.extended_dim_1 <> 1
-GROUP BY g.new_gosb_id, g.gosb_name, m.extended_dim_1, s.extended_dim_name
+GROUP BY g.new_gosb_id, g.gosb_name, m.extended_dim_1
 """
 
 # Итоги по ГОСБ (все сегменты, агрегат по new_gosb_id) — разрыв по ГОСБ
@@ -80,15 +79,14 @@ ORDER BY nedobor DESC
 ORGS = """
 WITH gmap AS (""" + _GMAP + """),
 mx AS (SELECT max(report_dt) d FROM {schema}.uzp_dwh_company_holding_metric)
-SELECT c.org_id AS inn, c.level_id AS gosb_id, g.new_gosb_id, g.gosb_name,
-       dc.extended_dim_id AS seg_id, s.extended_dim_name AS seg_name,
+SELECT c.org_id AS inn, dc.company_name, c.level_id AS gosb_id, g.new_gosb_id, g.gosb_name,
+       dc.segment_name AS segment_big,
        c.current_fl_qty, c.current_fot_amt, c.zp_fl_perc, c.total_emp_qty, c.fl_y_1_diff_qty,
        c.emp_potential_qty, c.fot_potential_amt, c.fl_outflow_qty, c.fot_outflow_amt,
        CASE WHEN c.current_fl_qty>0 THEN c.current_fot_amt/c.current_fl_qty END AS avg_salary
 FROM {schema}.uzp_dwh_company_holding_metric c
 JOIN gmap g ON g.old_gosb_id=c.level_id
-LEFT JOIN {schema}.dim_company dc ON dc.inn=c.org_id
-LEFT JOIN {schema}.uzp_dim_extended_metrics s ON s.extended_dim_id=dc.extended_dim_id
+LEFT JOIN {schema}.uzp_dim_company dc ON dc.inn=c.org_id
 JOIN mx ON mx.d=c.report_dt
 WHERE g.tb_id=:tb_id
 """

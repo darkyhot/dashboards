@@ -13,6 +13,7 @@ import pandas as pd
 
 from ...db import read_sql
 from . import queries as Q
+from . import segments
 
 RUB_TO_MLN = 1e6
 
@@ -54,8 +55,9 @@ def run(ctx, tb_short: str) -> Analysis:
     gap_rcp = max(0.0, verdict["rcp"]["plan"] - verdict["rcp"]["fact"])
     gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
 
-    # --- ГОСБ×сегмент ---
+    # --- ГОСБ×сегмент (короткие имена сегментов, хардкод) ---
     matrix = read_sql(e, Q.GOSB_SEG, {**p, "tb_id": tb_id})
+    matrix["seg_name"] = matrix["seg_id"].map(segments.short)
     gosb_gap = read_sql(e, Q.GOSB_TOTALS, {**p, "tb_id": tb_id})
     top_cells = (matrix[matrix.nedobor > 0]
                  .sort_values("nedobor", ascending=False)
@@ -73,6 +75,9 @@ def run(ctx, tb_short: str) -> Analysis:
     orgs["n_tasks"] = orgs["n_tasks"].fillna(0).astype(int)
     orgs["fot_potential_mln"] = orgs["fot_potential_amt"] / RUB_TO_MLN
     orgs["fot_outflow_mln"] = orgs["fot_outflow_amt"] / RUB_TO_MLN
+    # большое имя сегмента организации -> короткое (для отчёта)
+    orgs["seg_name"] = orgs["segment_big"].map(segments.short_of_big).fillna("—")
+    orgs["company_name"] = orgs["company_name"].fillna("")
 
     # рычаг: привлечь vs вернуть (по доминирующему потенциалу в людях)
     attract = (orgs[orgs.emp_potential_qty >= 1]

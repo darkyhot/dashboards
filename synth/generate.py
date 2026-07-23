@@ -11,59 +11,56 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from faker import Faker
 from sqlalchemy.engine import Engine
 
 from uzp_dash import config
 from uzp_dash.db import read_sql
 
 RNG = np.random.default_rng(42)
+FAKE = Faker("ru_RU")
+Faker.seed(42)
 
 METRIC_FOT = 1000164          # Общий ФОТ, млн руб
 METRIC_RECIPIENTS = 12400196  # Количество уникальных получателей до ИНН
 
-# Сегменты: extended_dim_1 = extended_dim_id (1 = все сегменты)
-SEGMENTS = {
-    20: "Крупнейшие",
-    21: "Крупные",
-    22: "Средние",
-    23: "Малые",
-    24: "Микро",
-    25: "Рег. госсектор",
+# Сегменты УЗП: extended_dim_1 (короткие коды). 1 = Все. Некоторые коды
+# объединяют несколько «больших» сегментов (см. BIG_BY_CODE).
+SEG_CODES = [21, 22, 23, 24, 25, 1092]
+SEG_SHORT = {21: "КСБ", 22: "РГС", 23: "СКМ", 24: "КФИ", 25: "БМО", 1092: "ММБ"}
+# большие сегменты (uzp_dim_company.segment_name) по коду
+BIG_BY_CODE = {
+    21: ["Средние", "Крупные", "Крупнейшие"],   # КСБ
+    22: ["Рег. госсектор"],                       # РГС
+    23: ["Клиенты машиностроения"],               # СКМ
+    24: ["Фин.институты"],                         # КФИ
+    25: ["SBI"],                                   # БМО
+    1092: ["Микро", "Малые"],                     # ММБ
 }
-SEG_IDS = list(SEGMENTS)
-SEG_WEIGHTS = np.array([0.10, 0.18, 0.22, 0.25, 0.15, 0.10])  # доля получателей по сегментам
+SEG_WEIGHTS = np.array([0.22, 0.10, 0.08, 0.05, 0.03, 0.52])  # КСБ,РГС,СКМ,КФИ,БМО,ММБ
+PROBLEM_CODES = (1092,)         # ММБ (Микро+Малые) западает сильнее всего
 
 PROBLEM_TB_SHORT = "ЮЗБ"        # этот ТБ явно не выполняет план
 MONTHS = 24
 MAX_MONTH_END = pd.Timestamp("2026-06-30")
-GOSB_PER_TB = 8                 # представительная выборка ГОСБ на ТБ
 ORGS_TOTAL = 4000
 
 
 # --------------------------------------------------------------------------- #
 def generate_all(engine: Engine) -> dict[str, int]:
-    seg_df = _segments()
     gosb = _pick_gosb(engine)
     metrics, latest = _metrics(gosb)
     orgs = _orgs(gosb, latest)
     company = _company_holding(orgs)
-    dim_company = orgs[["inn", "extended_dim_id"]].drop_duplicates("inn")
+    dim_company = _dim_company(orgs)
     funnel = _funnel(orgs, gosb)
 
     counts = {}
-    counts["uzp_dim_extended_metrics"] = _bulk(engine, seg_df, "uzp_dim_extended_metrics")
-    counts["dim_company"] = _bulk(engine, dim_company, "dim_company")
+    counts["uzp_dim_company"] = _bulk(engine, dim_company, "uzp_dim_company")
     counts["uzp_dwh_metrics"] = _bulk(engine, metrics, "uzp_dwh_metrics")
     counts["uzp_dwh_company_holding_metric"] = _bulk(engine, company, "uzp_dwh_company_holding_metric")
     counts["uzp_dwh_sale_funnel_task"] = _bulk(engine, funnel, "uzp_dwh_sale_funnel_task")
     return counts
-
-
-# --------------------------------------------------------------------------- #
-def _segments() -> pd.DataFrame:
-    rows = [{"extended_dim_id": 1, "extended_dim_name": "Все сегменты"}]
-    rows += [{"extended_dim_id": k, "extended_dim_name": v} for k, v in SEGMENTS.items()]
-    return pd.DataFrame(rows)
 
 
 def _pick_gosb(engine: Engine) -> pd.DataFrame:
@@ -95,7 +92,7 @@ def _target_exec(tb_short: str, gosb_id: int, seg_id: int) -> float:
     r = RNG.normal(1.03, 0.03)
     if tb_short == PROBLEM_TB_SHORT:
         r = RNG.normal(0.93, 0.03)                       # весь ТБ слабее
-        if seg_id in (23, 24):                           # Малые/Микро — хуже всего
+        if seg_id in PROBLEM_CODES:                      # ММБ (Микро+Малые) хуже всего
             r = RNG.normal(0.82, 0.03)
     return float(np.clip(r, 0.6, 1.25))
 
@@ -122,7 +119,7 @@ def _metrics(gosb: pd.DataFrame):
         gid = int(gr.old_gosb_id)
         seg_recips = gr.base_recipients * SEG_WEIGHTS
         sal_musd = gr.avg_salary / 1e6            # средняя ЗП, млн руб
-        for si, seg_id in enumerate(SEG_IDS):
+        for si, seg_id in enumerate(SEG_CODES):
             texec = _target_exec(gr.tb_short_name, gid, seg_id)
             base = seg_recips[si]
             for mi, mend in enumerate(month_ends):
@@ -205,18 +202,19 @@ def _orgs(gosb: pd.DataFrame, latest: pd.DataFrame) -> pd.DataFrame:
         n = int(org_alloc.get(gid, 5))
         sub = latest[latest.gosb_id == gid]
         seg_fact = sub.set_index("seg_id")["fact_r"]
-        p = (seg_fact / seg_fact.sum()).reindex(SEG_IDS).fillna(0).to_numpy()
+        p = (seg_fact / seg_fact.sum()).reindex(SEG_CODES).fillna(0).to_numpy()
         if p.sum() == 0:
             p = SEG_WEIGHTS / SEG_WEIGHTS.sum()
-        assign = RNG.choice(SEG_IDS, size=n, p=p / p.sum())
+        assign = RNG.choice(SEG_CODES, size=n, p=p / p.sum())
         for seg_id in assign:
             inn_seq += int(RNG.integers(1, 900))
             fl = int(max(1, RNG.gamma(2.0, 60)))            # получателей в организации
             sal = float(gr.avg_salary * RNG.uniform(0.85, 1.2))
+            big = str(RNG.choice(BIG_BY_CODE[int(seg_id)]))  # большое имя сегмента
             rows.append({
                 "inn": inn_seq, "gosb_id": gid, "tb_id": int(gr.tb_id),
-                "tb_short": gr.tb_short_name, "extended_dim_id": int(seg_id),
-                "segment_name": SEGMENTS[int(seg_id)],
+                "tb_short": gr.tb_short_name, "seg_code": int(seg_id),
+                "segment_name": big,
                 "current_fl_qty": fl, "avg_salary": round(sal, 0),
                 "current_fot_amt": round(fl * sal, 2),
                 # «сырой» потенциал/возврат — отмасштабируем ниже под разрыв ГОСБ
@@ -270,6 +268,28 @@ def _company_holding(orgs: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _dim_company(orgs: pd.DataFrame) -> pd.DataFrame:
+    """Справочник компаний: сегмент и наименование по ИНН."""
+    o = orgs.drop_duplicates("inn")
+    n = len(o)
+    df = pd.DataFrame({
+        "epk_id": o["inn"].astype("int64").to_numpy(),
+        "company_name": [FAKE.company() for _ in range(n)],
+        "inn": o["inn"].astype("int64").to_numpy(),
+        "kpp": None,
+        "segment_name": o["segment_name"].to_numpy(),   # большое имя сегмента
+        "holding_name": None,
+        "mzp_last_action_dt": None, "km_last_action_dt": None, "crm_client_id": None,
+    })
+    for flag in ("agrmnt_flag", "rko_flag", "dbo_flag", "credit_flag", "deposit_flag",
+                 "corporate_card_flag", "internet_acquiring_flag", "merchant_acquiring_flag"):
+        df[flag] = RNG.choice([-1, 0, 1], size=n)
+    df["significance_level_id"] = RNG.choice([-1, 1, 2], size=n)
+    df["info"] = None
+    df["modified_dttm"] = pd.Timestamp.now()
+    return df
+
+
 # --- Банки фраз для свободного текста воронки (детерминированно, без API) --- #
 BANKS = ["ВТБ", "Альфа-Банк", "Т-Банк", "Газпромбанк", "Райффайзен"]
 OUTFLOW_REASONS = [
@@ -280,9 +300,10 @@ OUTFLOW_REASONS = [
 # причины, при которых работать бессмысленно
 DEADEND = {"Ликвидация организации"}
 
-ROLE_BY_SEGMENT = {  # какая роль ведёт сегмент
+ROLE_BY_SEGMENT = {  # какая роль ведёт сегмент (по большому имени)
     "Крупнейшие": "МКК", "Крупные": "МКК", "Средние": "МЗП",
     "Малые": "МЗП", "Микро": "СЗП", "Рег. госсектор": "МЗП",
+    "Клиенты машиностроения": "МКК", "Фин.институты": "МКК", "SBI": "МКК",
 }
 
 
