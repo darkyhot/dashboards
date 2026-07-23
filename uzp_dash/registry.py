@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import config, llm
+from . import config, llm, progress
 from .db import get_engine
 from .llm import complete
 
@@ -54,18 +54,23 @@ def list_dashboards() -> list[str]:
 
 
 def generate_dashboard(name: str, conn: str | None = None, params: dict | None = None,
-                       contour: str | None = None) -> str:
+                       contour: str | None = None, verbose: bool = True,
+                       show_sql: bool = False) -> str:
     """Сгенерировать дэш по имени. Возвращает путь к .html.
 
-    conn    — SQLAlchemy URL (если не задан, берётся из .env UZP_DB_URL).
-    params  — параметры конкретного дэша (напр. {"tb": "ЮЗБ"}).
-    contour — 'open' (DeepSeek) | 'closed' (GLM/Qwen). Управляется из тетрадки.
+    conn     — SQLAlchemy URL (если не задан, берётся из .env UZP_DB_URL).
+    params   — параметры конкретного дэша (напр. {"tb": "ЮЗБ"}).
+    contour  — 'open' (DeepSeek) | 'closed' (GLM/Qwen). Управляется из тетрадки.
+    verbose  — печатать прогресс генерации (для тетрадки). По умолчанию True.
+    show_sql — дополнительно печатать SQL-запросы.
     """
     _ensure_loaded()
     if name not in _REGISTRY:
         raise KeyError(f"Дэш '{name}' не найден. Доступные: {list_dashboards()}")
 
+    progress.enable(verbose=verbose, show_sql=show_sql)
     config.set_contour(contour)
+    progress.step(f"Дэш «{name}» · контур {config.CONTOUR} · подключение к БД")
     engine = get_engine(config.db_url(conn))
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ctx = Context(engine=engine, llm=complete, params=params or {}, output_dir=config.OUTPUT_DIR)
@@ -75,4 +80,5 @@ def generate_dashboard(name: str, conn: str | None = None, params: dict | None =
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out = config.OUTPUT_DIR / f"{name}_{ts}.html"
     out.write_text(html, encoding="utf-8")
+    progress.done(f"Готово: {out}")
     return str(out)

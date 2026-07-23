@@ -11,7 +11,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from . import config
+from . import config, progress
 
 
 @lru_cache(maxsize=8)
@@ -27,6 +27,7 @@ def read_sql(engine: Engine, sql: str, params: dict | None = None) -> pd.DataFra
     и именованные параметры :name (безопасная подстановка значений).
     """
     sql = sql.format(schema=config.SCHEMA)
+    progress.sql(sql, params)
     with engine.connect() as conn:
         return pd.read_sql(text(sql), conn, params=params or {})
 

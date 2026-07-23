@@ -9,6 +9,7 @@ from __future__ import annotations
 from ...registry import Context, dashboard
 from ...render import components as C
 from ...render import page
+from ... import progress
 from . import analyze, prompts, segments
 
 SEG_ORDER = segments.ORDER   # короткие названия сегментов (КСБ, РГС, …)
@@ -18,8 +19,11 @@ SEG_ORDER = segments.ORDER   # короткие названия сегмент�
 def build(ctx: Context) -> str:
     tb = ctx.params.get("tb", "ЮЗБ")
     a = analyze.run(ctx, tb)
+    progress.step("LLM: анализ свободного текста активностей по организациям")
     insights = prompts.text_insights(ctx, a.priority_text)   # LLM: свободный текст
+    progress.step("LLM: нарратив «что плохо и что делать»")
     story = prompts.narrative(ctx, a)                        # LLM: нарратив
+    progress.step("Сборка HTML")
 
     body = (
         _hero(a)

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from ...db import read_sql
+from ... import progress
 from . import queries as Q
 from . import segments
 
@@ -42,20 +43,36 @@ class Analysis:
 
 def run(ctx, tb_short: str) -> Analysis:
     e = ctx.engine
-    p = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS}
-
+    progress.step(f"Резолв ТБ «{tb_short}»")
     tb = read_sql(e, Q.TB_RESOLVE, {"tb": tb_short})
     if tb.empty:
         raise ValueError(f"ТБ '{tb_short}' не найден в справочнике")
     tb_id = int(tb.tb_id.iloc[0]); tb_full = str(tb.tb_full_name.iloc[0])
 
+    # --- Опорный месяц. Если дата задана параметром (params["date"]) — она
+    # отправная (нормализуем к последнему дню месяца, как в report_dt). Иначе —
+    # текущий месяц = макс. report_dt. От :ref считаются и активности (−3 мес). ---
+    date_param = ctx.params.get("date")
+    if date_param:
+        ref = (pd.to_datetime(date_param) + pd.offsets.MonthEnd(0)).date()
+        progress.done(f"Опорный месяц (задан): {ref} — все таблицы строятся от него")
+    else:
+        ref = pd.to_datetime(read_sql(e, Q.REF_DATE).iloc[0, 0]).date()
+        progress.done(f"Опорный месяц (авто, макс. report_dt): {ref}")
+    # задачи по метрикам идут месяцем позже -> воронка от ref + 1 месяц
+    ref_funnel = (pd.Timestamp(ref) + pd.offsets.MonthEnd(1)).date()
+    progress.done(f"Месяц задач воронки: {ref_funnel} (ref + 1 мес)")
+    p = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref}
+
     # --- Вердикт + ранги ---
+    progress.step("Вердикт по ТБ + ранги (ФОТ, получатели)")
     v = read_sql(e, Q.TB_VERDICT, p)
     verdict, ref_date = _verdict(v, tb_id)
     gap_rcp = max(0.0, verdict["rcp"]["plan"] - verdict["rcp"]["fact"])
     gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
 
     # --- ГОСБ×сегмент (короткие имена сегментов, хардкод) ---
+    progress.step("Матрица ГОСБ × сегмент + разрыв по ГОСБ")
     matrix = read_sql(e, Q.GOSB_SEG, {**p, "tb_id": tb_id})
     matrix["seg_name"] = matrix["seg_id"].map(segments.short)
     gosb_gap = read_sql(e, Q.GOSB_TOTALS, {**p, "tb_id": tb_id})
@@ -65,8 +82,10 @@ def run(ctx, tb_short: str) -> Analysis:
                  .head(8))
 
     # --- Организации + активности ---
-    orgs = read_sql(e, Q.ORGS, {"tb_id": tb_id})
-    funnel = read_sql(e, Q.FUNNEL_TB, {"tb_id": tb_id})
+    progress.step("Витрина организаций (потенциал/отток)")
+    orgs = read_sql(e, Q.ORGS, {"tb_id": tb_id, "ref": ref})
+    progress.step("Активности воронки за 3 месяца")
+    funnel = read_sql(e, Q.FUNNEL_TB, {"tb_id": tb_id, "ref_funnel": ref_funnel})
     fagg = _funnel_by_inn(funnel)
     activity = _activity_totals(funnel)
 
@@ -96,12 +115,14 @@ def run(ctx, tb_short: str) -> Analysis:
         (pot if lev == "Привлечь" else out) / RUB_TO_MLN
         for lev, pot, out in zip(cand.lever, cand.fot_potential_amt, cand.fot_outflow_amt)
     ]
+    progress.step("Классификация организаций (работать / нет смысла)")
     to_work, no_point = _classify(cand)
 
     # --- Симуляция закрытия плана (получатели — главная) ---
     sim = _simulate(to_work, gap_rcp, verdict["rcp"]["fact"], verdict["rcp"]["plan"])
 
     # --- Разрез по проблемным ГОСБ (что сделать в каждом) ---
+    progress.step("Разрез по проблемным ГОСБ")
     gosb_cards = _gosb_cards(gosb_gap, matrix, to_work, funnel)
 
     # --- Тексты для LLM: только по ОТРАБОТАННЫМ организациям (у них есть текст),

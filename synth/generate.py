@@ -43,6 +43,8 @@ PROBLEM_CODES = (1092,)         # ММБ (Микро+Малые) западае�
 PROBLEM_TB_SHORT = "ЮЗБ"        # этот ТБ явно не выполняет план
 MONTHS = 24
 MAX_MONTH_END = pd.Timestamp("2026-06-30")
+# Задачи по метрикам идут месяцем позже метрик -> воронка в следующем месяце
+FUNNEL_END = MAX_MONTH_END + pd.offsets.MonthEnd(1)   # 2026-07-31
 ORGS_TOTAL = 4000
 
 
@@ -319,7 +321,7 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
     # работаем примерно с 55% организаций (у остальных задач нет = «не работали»)
     worked = orgs.sample(frac=0.55, random_state=1)
     rows = []
-    last3_start = MAX_MONTH_END - pd.Timedelta(days=90)
+    last3_start = FUNNEL_END - pd.Timedelta(days=90)
 
     for _, o in worked.iterrows():
         # доминирующий рычаг организации
@@ -327,7 +329,7 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
         role = ROLE_BY_SEGMENT.get(o.segment_name, "МЗП")
         n_tasks = int(RNG.integers(1, 4))
         for _ in range(n_tasks):
-            created = MAX_MONTH_END - pd.Timedelta(days=int(RNG.integers(5, 90)))
+            created = FUNNEL_END - pd.Timedelta(days=int(RNG.integers(5, 90)))
             active = created + pd.Timedelta(days=int(RNG.integers(0, 6)),
                                             hours=int(RNG.integers(8, 19)))
             closed = bool(RNG.random() < 0.8)
@@ -343,7 +345,7 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
             plan_deal = int(max(0, round(o.emp_potential_qty * RNG.uniform(0.5, 1.2)))) if not is_outflow else 0
             fact_deal = int(round(plan_deal * (RNG.uniform(0.6, 1.0) if success else RNG.uniform(0.0, 0.4))))
             rows.append({
-                "report_dt": MAX_MONTH_END.date(),
+                "report_dt": FUNNEL_END.date(),
                 "tb_id": int(o.tb_id), "tb_name": tb_full.get(int(o.tb_id)),
                 "gosb_id": int(o.gosb_id), "gosb_name": gosb_name.get(int(o.gosb_id)),
                 "inn": int(o.inn), "company_name": f"Организация {o.inn}",
