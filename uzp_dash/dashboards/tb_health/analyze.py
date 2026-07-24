@@ -23,6 +23,15 @@ LLM_BATCH_DEFAULT = 30      # организаций в одном запрос�
 PLAN_OVERSHOOT = 1.5        # разбираем с запасом на перевыполнение плана до +50%
 MAX_WAVES = 3               # сколько раз добираем, если запаса не хватило
 PLAN_TARGETS = (1.0, 1.2, 1.5)   # цели в дэше: выполнить план / +20% / +50%
+# Сегмент считаем западающим, только если недобор осмысленный: минимум один
+# получатель и выполнение ниже 99.5% (иначе −2 чел при 100% попадали бы в отбор).
+MIN_SEG_GAP = 1.0
+SEG_FAIL_EXEC = 0.995
+
+
+def _failing_seg(nedobor, execution_percent) -> bool:
+    return (float(nedobor or 0) >= MIN_SEG_GAP
+            and float(execution_percent or 0) < SEG_FAIL_EXEC)
 
 
 @dataclass
@@ -137,18 +146,26 @@ def run(ctx, tb_short: str) -> Analysis:
     ]
     to_work, no_point = _classify(cand)
 
-    # --- Рекомендации: чек-лист -> ключевые слова -> LLM (кто нужен под план) ---
-    gaps = {int(r.new_gosb_id): max(float(r.nedobor), 0.0) for r in gosb_gap.itertuples()}
-    insights, to_work, no_point, themes, llm_stats = _resolve(
-        ctx, e, pf, to_work, no_point, top_n, batch, gaps)
+    # --- Разрывы на грейне (ГОСБ, сегмент): работаем именно с западающими ---
+    matrix["is_failing"] = [_failing_seg(r.nedobor, r.execution_percent)
+                            for r in matrix.itertuples()]
+    seg_gaps = {(int(r.new_gosb_id), r.seg_name): float(r.nedobor)
+                for r in matrix.itertuples() if r.is_failing}
+    n_gosb_seg = len({nid for nid, _ in seg_gaps})
+    progress.done(f"Западающих (ГОСБ, сегмент): {len(seg_gaps)} в {n_gosb_seg} ГОСБ")
 
-    # --- Отбор «ровно под план»: сколько организаций закрывает разрыв ГОСБ ---
-    progress.step("Отбор организаций под план по каждому ГОСБ")
-    to_work, gosb_plan = _select(to_work, gaps)
+    # --- Рекомендации: чек-лист -> ключевые слова -> LLM (кто нужен под план) ---
+    insights, to_work, no_point, themes, llm_stats = _resolve(
+        ctx, e, pf, to_work, no_point, top_n, batch, seg_gaps)
+
+    # --- Отбор «ровно под план»: закрываем разрыв КАЖДОГО западающего сегмента ---
+    progress.step("Отбор организаций под план по (ГОСБ, сегмент)")
+    to_work, gosb_plan = _select(to_work, seg_gaps)
     sim = _plan_summary(to_work, gosb_plan, gap_rcp,
                         verdict["rcp"]["fact"], verdict["rcp"]["plan"])
     progress.done(f"Под план нужно {sim['k']} организаций (+{sim['closable']:.0f} чел); "
-                  f"потенциал покрывает разрыв на {sim['coverage']*100:.0f}%")
+                  f"потенциал западающих сегментов покрывает разрыв на "
+                  f"{sim['coverage']*100:.0f}% · добор из других сегментов: {sim['filler_n']}")
     progress.step("Разрез по проблемным ГОСБ")
     gosb_cards = _gosb_cards(gosb_gap, matrix, to_work, fagg, gosb_plan)
 
@@ -258,12 +275,13 @@ def _classify(cand: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 # --------------------------------------------------------------------------- #
 def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFrame,
-             top_n: int, batch: int, gaps: dict):
+             top_n: int, batch: int, seg_gaps: dict):
     """Рекомендации по (ГОСБ, ИНН): детерминированно, затем LLM для остатка.
 
-    Разбираем не «фиксированный топ», а тех, кто реально нужен под план: в каждом
-    ГОСБ идём по убыванию эффекта, пока не наберём разрыв × PLAN_OVERSHOOT
-    (запас на перевыполнение до +50%). top_n — потолок стоимости на ГОСБ.
+    Разбираем не «фиксированный топ», а тех, кто реально нужен под план западающих
+    сегментов (тот же `_mark_needed` с запасом ×PLAN_OVERSHOOT). Строки, уже
+    получившие вердикт «не работать», из расчёта выбывают — их место занимают
+    следующие, поэтому нужна следующая волна. top_n — потолок стоимости на ГОСБ.
     """
     stats = {"top_n": top_n, "batch": batch, "cand": 0, "checklist": 0,
              "keyword": 0, "llm": 0, "no_text": 0, "fallback": 0, "batches": 0}
@@ -276,13 +294,14 @@ def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFram
     processed_keys: set = set()
 
     for wave in range(MAX_WAVES):
-        pool = _pool_per_gosb(to_work, top_n, processed_keys, gaps)
+        pool = _pool_needed(to_work, seg_gaps, insights, top_n, processed_keys)
         if pool.empty:
             break
         processed_keys |= {(int(r.new_gosb_id), int(r.inn)) for r in pool.itertuples()}
         stats["cand"] += len(pool)
         progress.step(f"Рекомендации, волна {wave + 1}: кандидатов {len(pool)}"
-                      f" (нужны под план ×{PLAN_OVERSHOOT}, потолок {top_n} на ГОСБ)")
+                      f" (нужны под план западающих сегментов ×{PLAN_OVERSHOOT},"
+                      f" потолок {top_n} на ГОСБ)")
 
         # текст только по кандидатам этой волны
         inns = sorted({int(x) for x in pool["inn"]})
@@ -323,58 +342,30 @@ def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFram
                     stats["fallback"] += 1
 
         resolved_keys |= processed_keys
-        if _enough(to_work, insights, top_n, gaps):
-            break
 
     to_work, no_point = _reclassify(to_work, no_point, insights)
     return insights, to_work, no_point, text_rules.themes(all_texts), stats
 
 
-def _rows_for_target(g: pd.DataFrame, target: float) -> int:
-    """Сколько верхних строк (по убыванию эффекта) закрывают target получателей."""
-    if target <= 0:
-        return 0
-    cum = g["impact_fl"].cumsum().to_numpy()
-    for i, c in enumerate(cum, start=1):
-        if c >= target:
-            return i
-    return len(g)
+def _pool_needed(to_work: pd.DataFrame, seg_gaps: dict, insights: dict,
+                 top_n: int, processed: set) -> pd.DataFrame:
+    """Кандидаты волны: кто нужен под план западающих сегментов и ещё не разобран.
 
-
-def _pool_per_gosb(to_work: pd.DataFrame, top_n: int, processed: set,
-                   gaps: dict) -> pd.DataFrame:
-    """Кандидаты волны: сверху вниз по эффекту, пока не наберётся план ×1.5."""
-    parts = []
-    for nid, g in to_work.groupby("new_gosb_id"):
-        g = g.sort_values("impact_fl", ascending=False)
-        target = gaps.get(int(nid), 0.0) * PLAN_OVERSHOOT
-        need = min(max(_rows_for_target(g, target), 1), top_n)
-        done_here = sum(1 for r in g.itertuples()
-                        if (int(r.new_gosb_id), int(r.inn)) in processed)
-        take = need - done_here
-        if take <= 0:
-            continue
-        rest = g[[(int(r.new_gosb_id), int(r.inn)) not in processed for r in g.itertuples()]]
-        if not rest.empty:
-            parts.append(rest.head(take))
-    return pd.concat(parts, ignore_index=True) if parts else to_work.iloc[:0]
-
-
-def _enough(to_work: pd.DataFrame, insights: dict, top_n: int, gaps: dict) -> bool:
-    """Хватает ли подтверждённых «работать», чтобы закрыть план ×1.5 в каждом ГОСБ."""
-    for nid, g in to_work.groupby("new_gosb_id"):
-        target = gaps.get(int(nid), 0.0) * PLAN_OVERSHOOT
-        acc = 0.0; n = 0
-        for r in g.sort_values("impact_fl", ascending=False).itertuples():
-            if acc >= target or n >= top_n:
-                break
-            v = insights.get((int(r.new_gosb_id), int(r.inn)))
-            if v is None:
-                return False               # ещё не разобрали — нужна следующая волна
-            n += 1
-            if v.get("verdict", "work") == "work":
-                acc += float(r.impact_fl)
-    return True
+    Строки, уже признанные «не работать», из расчёта исключаем — тогда следующая
+    волна автоматически подтягивает тех, кто занял их место.
+    """
+    alive = to_work[[
+        (insights.get((int(r.new_gosb_id), int(r.inn))) or {}).get("verdict", "work") != "no_point"
+        for r in to_work.itertuples()]]
+    if alive.empty:
+        return to_work.iloc[:0]
+    chosen, _, _ = _mark_needed(alive, seg_gaps, PLAN_OVERSHOOT)
+    if not chosen:
+        return to_work.iloc[:0]
+    pool = alive.loc[sorted(chosen)].sort_values("impact_fl", ascending=False)
+    pool = pool.groupby("new_gosb_id", group_keys=False).head(top_n)   # потолок стоимости
+    pool = pool[[(int(r.new_gosb_id), int(r.inn)) not in processed for r in pool.itertuples()]]
+    return pool
 
 
 def _deterministic(notes: list[dict]) -> dict | None:
@@ -472,48 +463,114 @@ def _reclassify(to_work: pd.DataFrame, no_point: pd.DataFrame, insights: dict):
 
 
 # --------------------------------------------------------------------------- #
-def _select(to_work: pd.DataFrame, gaps: dict) -> tuple[pd.DataFrame, dict]:
-    """Отбор «ровно под план» внутри каждого ГОСБ.
+def _mark_needed(rows: pd.DataFrame, seg_gaps: dict, k: float) -> tuple[set, set, dict]:
+    """Кто нужен, чтобы закрыть разрыв каждого ЗАПАДАЮЩЕГО сегмента при цели k.
 
-    Рычаг не важен: привлечение и возврат в одном списке, сортировка по эффекту в
-    получателях. Идём сверху вниз и набираем, пока разрыв ГОСБ не закрыт. Строка
-    попадает в цель k, если накопленное ДО неё меньше разрыва × k — так последняя
-    организация закрывает остаток, а перебор не превышает одну организацию.
+    Фаза 1 — внутри сегмента: организации ЭТОГО сегмента в ЭТОМ ГОСБ по убыванию
+    эффекта, пока не набрано gap × k. Фаза 2 — добор: если своих не хватило,
+    остаток закрываем организациями других сегментов того же ГОСБ (в т.ч. без
+    сегмента в справочнике), помечая строки как доборные.
+
+    Возврат: (индексы отобранных, индексы доборных, инфо по (ГОСБ, сегмент)).
     """
-    if to_work.empty:
-        for c in ["cum", "cum_prev", "gosb_gap", "rank_in_gosb"]:
-            to_work[c] = 0.0
-        to_work["need_100"] = False
-        return to_work, {}
+    chosen: set = set()
+    filler: set = set()
+    info: dict = {}
+    if rows.empty:
+        return chosen, filler, info
 
-    parts = []
-    for nid, g in to_work.groupby("new_gosb_id"):
-        g = g.sort_values("impact_fl", ascending=False).copy()
-        g["cum"] = g["impact_fl"].cumsum()
-        g["cum_prev"] = g["cum"] - g["impact_fl"]
-        g["gosb_gap"] = gaps.get(int(nid), 0.0)
-        g["rank_in_gosb"] = range(1, len(g) + 1)
-        parts.append(g)
-    out = pd.concat(parts, ignore_index=True)
-    out["need_100"] = out["cum_prev"] < out["gosb_gap"]
-    out = out.sort_values(["gosb_gap", "rank_in_gosb"], ascending=[False, True],
-                          ignore_index=True)
+    by_gosb = {}
+    for (nid, seg), gap in seg_gaps.items():
+        by_gosb.setdefault(nid, []).append((seg, gap))
+
+    for nid, g in rows.groupby("new_gosb_id"):
+        bad_segs = by_gosb.get(int(nid), [])
+        if not bad_segs:
+            continue
+        shortfall = 0.0
+        for seg, gap in sorted(bad_segs, key=lambda x: -x[1]):
+            target = gap * k
+            sub = g[g.seg_name == seg].sort_values("impact_fl", ascending=False)
+            acc = 0.0; n_own = 0
+            for idx, fl in zip(sub.index, sub["impact_fl"]):
+                if acc >= target:
+                    break
+                chosen.add(idx); acc += float(fl); n_own += 1
+            lack = max(0.0, target - acc)
+            shortfall += lack
+            info[(int(nid), seg)] = {
+                "gap": gap, "own_n": n_own, "own_fl": acc, "lack": lack,
+                "coverage": (acc / target) if target > 0 else None,
+                "n_avail": int(len(sub)),
+            }
+        if shortfall <= 0:
+            continue
+        # добор из других сегментов ГОСБ — только на недостающий объём
+        rest = (g[~g.index.isin(chosen)].sort_values("impact_fl", ascending=False))
+        acc = 0.0
+        for idx, fl in zip(rest.index, rest["impact_fl"]):
+            if acc >= shortfall:
+                break
+            chosen.add(idx); filler.add(idx); acc += float(fl)
+    return chosen, filler, info
+
+
+def _select(to_work: pd.DataFrame, seg_gaps: dict) -> tuple[pd.DataFrame, dict]:
+    """Пометить строки минимальной целью, при которой они нужны (need_k).
+
+    need_k = 1.0 / 1.2 / 1.5 — цель «выполнить план / +20% / +50%»; 0 — организация
+    не нужна ни при какой цели (здоровый сегмент или хвост списка), её видно только
+    при выборе «Все организации».
+    """
+    out = to_work.copy().reset_index(drop=True)
+    if out.empty:
+        out["need_k"] = 0.0
+        out["filler"] = False
+        return out, {}
+
+    out["need_k"] = 0.0
+    out["filler"] = False
+    seg_info: dict = {}
+    # от большей цели к меньшей: меньшая перезаписывает — остаётся минимальная
+    for k in sorted(PLAN_TARGETS, reverse=True):
+        chosen, filler, info = _mark_needed(out, seg_gaps, k)
+        if chosen:
+            idx = sorted(chosen)
+            out.loc[idx, "need_k"] = k
+            out.loc[idx, "filler"] = [i in filler for i in idx]
+        if k == 1.0:
+            seg_info = info
+
+    # сначала нужные под план (need_k>0), внутри — по убыванию эффекта
+    out["_ord"] = out["need_k"].replace(0.0, 99.0)
+    out = out.sort_values(["_ord", "impact_fl"], ascending=[True, False],
+                          ignore_index=True).drop(columns="_ord")
 
     plan: dict = {}
     for nid, g in out.groupby("new_gosb_id"):
-        gap = float(g["gosb_gap"].iloc[0])
-        sel = g[g.need_100]
+        sel = g[(g.need_k > 0) & (g.need_k <= 1.0)]
         att = sel[sel.lever == "Привлечь"]; ret = sel[sel.lever == "Вернуть"]
-        total = float(g["impact_fl"].sum())
+        fill = sel[sel.filler]
+        segs = []
+        for (gid, seg), d in seg_info.items():
+            if gid != int(nid):
+                continue
+            s_sel = sel[sel.seg_name == seg]
+            segs.append({"seg": seg, "gap": d["gap"], "n_need": int(len(s_sel)),
+                         "fl_need": float(s_sel["impact_fl"].sum()),
+                         "coverage": d["coverage"], "lack": d["lack"],
+                         "n_avail": d["n_avail"]})
+        segs.sort(key=lambda s: -s["gap"])
         plan[int(nid)] = {
-            "gap": gap, "n_need": int(len(sel)),
-            "fl_need": float(sel["impact_fl"].sum()),
+            "segs": segs,
+            "gap_seg": sum(s["gap"] for s in segs),
+            "n_need": int(len(sel)), "fl_need": float(sel["impact_fl"].sum()),
             "fot_need": float(sel["impact_fot_mln"].sum()),
             "n_attract": int(len(att)), "fl_attract": float(att["impact_fl"].sum()),
             "n_return": int(len(ret)), "fl_return": float(ret["impact_fl"].sum()),
-            "n_total": int(len(g)), "fl_total": total,
-            "coverage": (total / gap) if gap > 0 else None,
-            "not_worked": int((~g["worked"]).sum()) if "worked" in g else 0,
+            "filler_n": int(len(fill)), "filler_fl": float(fill["impact_fl"].sum()),
+            "n_total": int(len(g)), "fl_total": float(g["impact_fl"].sum()),
+            "not_worked": int((~sel["worked"]).sum()) if "worked" in sel else 0,
         }
     return out, plan
 
@@ -521,17 +578,23 @@ def _select(to_work: pd.DataFrame, gaps: dict) -> tuple[pd.DataFrame, dict]:
 def _plan_summary(to_work: pd.DataFrame, gosb_plan: dict, gap: float,
                   fact: float, plan_amt: float) -> dict:
     """Итог по ТБ: сколько организаций нужно суммарно и что это даёт."""
-    gap_sum = sum(p["gap"] for p in gosb_plan.values()) or gap
-    total = float(to_work["impact_fl"].sum()) if not to_work.empty else 0.0
-    sel = to_work[to_work.need_100] if not to_work.empty else to_work
+    gap_sum = sum(p["gap_seg"] for p in gosb_plan.values()) or gap
+    sel = to_work[(to_work.need_k > 0) & (to_work.need_k <= 1.0)] if not to_work.empty \
+        else to_work
+    # потенциал, который реально считается «в тему»: западающие сегменты
+    own = 0.0
+    for p in gosb_plan.values():
+        own += sum(s["fl_need"] for s in p["segs"])
     return {
-        "gap": gap, "gap_gosb": gap_sum, "fact": fact, "plan": plan_amt,
+        "gap": gap, "gap_seg": gap_sum, "fact": fact, "plan": plan_amt,
         "k": int(len(sel)),
         "closable": float(sel["impact_fl"].sum()) if len(sel) else 0.0,
         "attract": float(sel[sel.lever == "Привлечь"]["impact_fl"].sum()) if len(sel) else 0.0,
         "retention": float(sel[sel.lever == "Вернуть"]["impact_fl"].sum()) if len(sel) else 0.0,
         "fot_mln": float(sel["impact_fot_mln"].sum()) if len(sel) else 0.0,
-        "coverage": (total / gap_sum) if gap_sum else 0.0, "total_potential": total,
+        "filler_n": int(sel["filler"].sum()) if len(sel) else 0,
+        "coverage": (own / gap_sum) if gap_sum else 0.0,
+        "total_potential": float(to_work["impact_fl"].sum()) if not to_work.empty else 0.0,
     }
 
 
@@ -545,28 +608,43 @@ def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame, to_work: pd.DataFr
             fg[int(nid)] = {"act_n": n_tasks,
                             "success": float(g.n_success.sum() / n_tasks) if n_tasks else 0.0,
                             "worked_orgs": int(g.inn.nunique())}
+    # Карточку строим и для ГОСБ, ВЫПОЛНЯЮЩЕГО общий план: если внутри есть
+    # западающий сегмент, это тоже проблема — просто её вытягивают другие сегменты.
+    failing = matrix[matrix["is_failing"]] if "is_failing" in matrix else \
+        matrix[matrix.nedobor > 0]
+    seg_bad_ids = set(failing["new_gosb_id"].astype(int))
+    prob = gosb_gap[(gosb_gap.nedobor > 0)
+                    | (gosb_gap.new_gosb_id.astype(int).isin(seg_bad_ids))]
+    prob = prob.sort_values("nedobor", ascending=False)
+
     cards = []
-    prob = gosb_gap[gosb_gap.nedobor > 0].sort_values("nedobor", ascending=False)
     for r in prob.itertuples():
         nid = int(r.new_gosb_id); name = r.gosb_name
         sub = to_work[to_work.new_gosb_id == nid] if not to_work.empty else to_work
-        sel = sub[sub.need_100] if not sub.empty else sub
-        seg_bad = (matrix[(matrix.new_gosb_id == nid) & (matrix.nedobor > 0)]
+        sel = sub[(sub.need_k > 0) & (sub.need_k <= 1.0)] if not sub.empty else sub
+        seg_bad = (failing[failing.new_gosb_id == nid]
                    .sort_values("nedobor", ascending=False))
-        segs = [{"seg": s.seg_name, "exec": float(s.execution_percent),
-                 "nedobor": float(s.nedobor),
-                 "n_work": int(len(sel[sel.seg_name == s.seg_name])) if not sel.empty else 0}
-                for s in seg_bad.itertuples()]
         p = gosb_plan.get(nid, {})
+        plan_by_seg = {s["seg"]: s for s in p.get("segs", [])}
+        segs = []
+        for s in seg_bad.itertuples():
+            ps = plan_by_seg.get(s.seg_name, {})
+            segs.append({
+                "seg": s.seg_name, "exec": float(s.execution_percent),
+                "nedobor": float(s.nedobor),
+                "n_need": int(ps.get("n_need", 0)), "fl_need": float(ps.get("fl_need", 0.0)),
+                "coverage": ps.get("coverage"), "n_avail": int(ps.get("n_avail", 0)),
+            })
         cards.append({
             "gosb_name": name, "exec": float(r.execution_percent), "gap": float(r.nedobor),
-            "segs": segs,
+            "seg_only": float(r.nedobor) <= 0,     # план в целом выполняется
+            "segs": segs, "gap_seg": float(p.get("gap_seg", sum(s["nedobor"] for s in segs))),
             "n_need": int(p.get("n_need", 0)), "fl_need": float(p.get("fl_need", 0.0)),
             "fot_need": float(p.get("fot_need", 0.0)),
             "n_attract": int(p.get("n_attract", 0)), "fl_attract": float(p.get("fl_attract", 0.0)),
             "n_return": int(p.get("n_return", 0)), "fl_return": float(p.get("fl_return", 0.0)),
+            "filler_n": int(p.get("filler_n", 0)), "filler_fl": float(p.get("filler_fl", 0.0)),
             "n_total": int(p.get("n_total", 0)), "fl_total": float(p.get("fl_total", 0.0)),
-            "coverage": p.get("coverage"),
             "not_worked": int((~sel.worked).sum()) if not sel.empty else 0,
             "act": fg.get(nid, {"act_n": 0, "success": 0.0, "worked_orgs": 0}),
         })

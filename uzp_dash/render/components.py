@@ -187,9 +187,10 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     """Интерактивная таблица организаций: цель по плану + поиск + фильтры (ГОСБ,
     сегмент, рычаг) + пагинация. Самодостаточный инлайн-JS (работает офлайн).
 
-    rows: [{inn, lever, gosb, seg, fl, fot, reason, action, cumprev, gapg}, ...]
-    Фильтр «Цель»: строка показывается, если накопленный эффект ДО неё внутри её ГОСБ
-    (cumprev) меньше разрыва этого ГОСБ (gapg), умноженного на коэффициент цели.
+    rows: [{inn, lever, gosb, seg, fl, fot, reason, action, needk}, ...]
+    Фильтр «Цель»: needk — минимальная цель (1.0/1.2/1.5), при которой организация
+    нужна для закрытия разрыва её сегмента; 0 — не нужна ни при какой (видна только
+    при выборе «Все организации»).
     """
     import json
     data = json.dumps(rows, ensure_ascii=False).replace("</", "<\\/")
@@ -231,8 +232,8 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     const q=($('q').value||'').toLowerCase(), g=$('g').value, s=$('s').value, l=$('l').value;
     const k=parseFloat($('k').value);
     return DATA.filter(r=>{{
-      // цель по плану: набираем сверху вниз внутри ГОСБ, пока разрыв не закрыт
-      if(k>0&&!(Number(r.cumprev)<Number(r.gapg)*k))return false;
+      // цель по плану: организация нужна, если её needk не больше выбранной цели
+      if(k>0&&!(Number(r.needk)>0&&Number(r.needk)<=k))return false;
       if(g&&r.gosb!==g)return false;
       if(s&&r.seg!==s)return false;
       if(l&&r.lever!==l)return false;

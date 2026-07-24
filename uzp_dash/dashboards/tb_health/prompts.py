@@ -250,7 +250,12 @@ def narrative(ctx, a) -> str:
         f"{r.gosb_name}/{r.seg_name} ({r.execution_percent*100:.0f}%, −{r.nedobor:.0f})"
         for r in a.top_cells.head(5).itertuples()
     )
-    sel = a.to_work[a.to_work.need_100] if "need_100" in a.to_work else a.to_work
+    sel = (a.to_work[(a.to_work.need_k > 0) & (a.to_work.need_k <= 1.0)]
+           if "need_k" in a.to_work else a.to_work)
+    bad_segs = "; ".join(
+        f'{c["gosb_name"]}: ' + ", ".join(
+            f'{s["seg"]} ({s["exec"]*100:.0f}%, −{s["nedobor"]:.0f})' for s in c["segs"][:3])
+        for c in getattr(a, "gosb_cards", [])[:6] if c["segs"])
     top_orgs = "; ".join(
         f'{(getattr(r, "company_name", "") or r.inn)} [{r.gosb_name}] '
         f'({r.lever}, +{r.impact_fl:.0f} чел)'
@@ -267,6 +272,10 @@ def narrative(ctx, a) -> str:
         f"{a.activity.get('orgs',0)} орг, успех {a.activity.get('success_rate',0)*100:.0f}%, "
         f"привлечено по сделкам {a.activity.get('fact_deal',0)} из {a.activity.get('plan_deal',0)}.\n"
         f"Частые причины из комментариев: {a.themes}.\n"
+        f"Западающие сегменты по ГОСБ: {bad_segs or '—'}.\n"
+        f"Организации к отработке подбираются ВНУТРИ западающих сегментов; там, где "
+        f"своих организаций не хватает, добираем из других сегментов ГОСБ "
+        f"(таких добров: {a.sim.get('filler_n', 0)}).\n"
         f"Для выполнения плана нужно отработать {a.sim['k']} организаций (ГОСБ×ИНН) "
         f"с суммарным эффектом +{a.sim['closable']:.0f} чел и ФОТ ~{a.sim['fot_mln']:.0f} млн ₽ "
         f"(привлечение {a.sim['attract']:.0f}, возврат {a.sim['retention']:.0f}); "
