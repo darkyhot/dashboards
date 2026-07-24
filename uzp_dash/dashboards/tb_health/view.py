@@ -201,11 +201,14 @@ def _log_llm_stats(a: analyze.Analysis) -> None:
     s = a.llm_stats or {}
     if not s:
         return
+    capped = s.get("capped", 0)
+    tail = (f" · не влезло в бюджет ({s.get('max_calls')} выз.) → правила: {capped}"
+            if capped else "")
     progress.done(
-        f"Разбор текста: кандидатов {s.get('cand',0)} (top-{s.get('top_n')} на ГОСБ) · "
+        f"Аудит отработки: пул {s.get('pool',0)} пар (эффект ≥ {s.get('min_impact',0):g}) · "
         f"чек-лист {s.get('checklist',0)} · ключевые слова {s.get('keyword',0)} · "
         f"без текста {s.get('no_text',0)} · LLM {s.get('llm',0)} "
-        f"(батчей {s.get('batches',0)} по {s.get('batch')}) · фолбэк {s.get('fallback',0)}"
+        f"(батчей {s.get('batches',0)} по {s.get('batch')}) · фолбэк {s.get('fallback',0)}{tail}"
     )
 
 

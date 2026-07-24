@@ -475,8 +475,12 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
         # доминирующий рычаг организации
         outflow_heavy = o.fl_outflow_qty >= max(1, 0.6 * o.emp_potential_qty)
         role = ROLE_BY_SEGMENT.get(o.segment_name, "МЗП")
+        # пул авторов организации (1–2 сотрудника) — чтобы возникали расхождения между ними
+        author_pool = [35_000_000 + (int(o.inn) % 900_000) + k
+                       for k in range(int(RNG.integers(1, 3)))]
         n_tasks = int(RNG.integers(1, 4))
         for _ in range(n_tasks):
+            author_id = int(RNG.choice(author_pool))
             created = FUNNEL_END - pd.Timedelta(days=int(RNG.integers(5, 90)))
             active = created + pd.Timedelta(days=int(RNG.integers(0, 6)),
                                             hours=int(RNG.integers(8, 19)))
@@ -510,10 +514,12 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
                 "task_type": tt, "task_subtype": None, "task_category": "Задача",
                 "task_code": f"T{int(o.inn)}-{int(RNG.integers(1000,9999))}",
                 "task_create_dt": created.date(),
+                "fact_close_task_dttm": (active if closed else None),
                 "is_task_closed": closed,
                 "is_task_closed_success": success,
                 "is_task_in_progress": not closed,
                 "task_text_status": status,
+                "isu_struct_saphr_id": author_id,
                 "role_code": role,
                 "last_active_type": str(RNG.choice(["Звонок", "Встреча"], p=[0.65, 0.35])),
                 "last_active_status": "Исполнена" if closed else "В работе",

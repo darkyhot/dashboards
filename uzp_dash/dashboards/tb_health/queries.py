@@ -186,10 +186,18 @@ SELECT 'status', COALESCE(task_text_status,'—'), count(*) FROM base GROUP BY 2
 
 # Свободный текст ТОЛЬКО по приоритетным ИНН — все содержательные активности
 # каждой пары (ГОСБ, ИНН) за 3 месяца (не одна последняя).
+#
+# Для хронологии и поиска противоречий тянем АВТОРА (табельный isu_struct_saphr_id —
+# ФИО НЕ тянем: для «противоречий между сотрудниками» достаточно РАЗЛИЧАТЬ авторов),
+# роль, дату создания задачи, факт закрытия и признак успеха. Числа по сделкам/
+# потенциалу/оттоку здесь не нужны — они берутся из FUNNEL_AGG/ORGS (уже с *_old).
+# NULLS LAST: задачи без активности не должны всплывать первыми и занимать лимит.
 FUNNEL_TEXT = """
 WITH gmap AS (""" + _GMAP + """)
 SELECT g.new_gosb_id, f.inn, f.task_type, f.task_text_status,
-       f.task_comment, f.task_questionnaire, f.last_active_dttm
+       f.task_comment, f.task_questionnaire, f.last_active_dttm,
+       f.isu_struct_saphr_id AS author_id, f.role_code,
+       f.task_create_dt, f.fact_close_task_dttm, f.is_task_closed_success
 FROM {schema}.uzp_dwh_sale_funnel_task f
 LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
 WHERE f.tb_id = :tb_id
@@ -198,5 +206,5 @@ WHERE f.tb_id = :tb_id
   AND f.task_create_dt <= CAST(:ref_funnel  AS date)
   AND (COALESCE(btrim(f.task_comment), '') <> ''
        OR COALESCE(btrim(f.task_questionnaire), '') <> '')
-ORDER BY f.inn, g.new_gosb_id, f.last_active_dttm DESC
+ORDER BY f.inn, g.new_gosb_id, f.last_active_dttm DESC NULLS LAST
 """

@@ -125,10 +125,12 @@ CREATE TABLE uzp_dwh_sale_funnel_task (
   task_category          varchar,
   task_code              varchar,
   task_create_dt         date,
+  fact_close_task_dttm   timestamp,   -- факт. закрытие задачи (для «закрыто в день создания»)
   is_task_closed         boolean,
   is_task_closed_success boolean,
   is_task_in_progress    boolean,
   task_text_status       varchar,
+  isu_struct_saphr_id    bigint,      -- табельный автора (для различения сотрудников)
   role_code              varchar,     -- МЗП / СЗП / МКК
   last_active_type       varchar,     -- Звонок / Встреча
   last_active_status     varchar,

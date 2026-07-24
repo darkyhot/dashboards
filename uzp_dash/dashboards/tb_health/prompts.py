@@ -93,29 +93,80 @@ def _parse_items(raw: str) -> list[dict]:
     return out
 
 
+def _facts_line(f: dict) -> str:
+    """Строка ФАКТОВ из витрины. По сделкам — ТОЛЬКО «старый» месяц: свежие сделки
+    (последние 2 мес) ещё могут не реализоваться, их факт=0 — это норма."""
+    if not f:
+        return "—"
+    parts: list[str] = []
+    if f.get("potential"):
+        parts.append(f"потенциал привлечения {int(f['potential'])} чел")
+    if f.get("outflow_fl"):
+        parts.append(f"отток {int(f['outflow_fl'])} чел "
+                     f"(ФОТ {float(f.get('outflow_fot_mln', 0)):.1f} млн ₽)")
+    if f.get("avg_salary"):
+        parts.append(f"средняя ЗП ~{float(f['avg_salary']) / 1000:.0f} тыс ₽")
+    if f.get("plan_deal_old") or f.get("fact_deal_old"):
+        parts.append(f"сделка (старый месяц) план {int(f.get('plan_deal_old', 0))} / "
+                     f"факт {int(f.get('fact_deal_old', 0))}")
+    parts.append("есть свежая сделка — по ней рано судить" if f.get("has_fresh_deal")
+                 else "свежих сделок нет")
+    if f.get("n_overdue"):
+        parts.append(f"просрочено задач {int(f['n_overdue'])}")
+    parts.append("есть успешно закрытые задачи" if f.get("any_success")
+                 else "успешно закрытых нет")
+    return "; ".join(parts)
+
+
+def _note_line(n) -> str:
+    if not isinstance(n, dict):
+        return f" - {n}"
+    meta = " · ".join(x for x in (n.get("date", ""), n.get("author", ""),
+                                  n.get("role", "")) if x)
+    ts = f'[{n.get("type", "")}/{n.get("status", "")}]'
+    same = " (закрыта в день создания)" if n.get("closed_same_day") else ""
+    return f' - {meta} · {ts}{same} {n.get("text", "")}'.rstrip()
+
+
 def _prompt(chunk: list[dict]) -> str:
-    # Названия ГОСБ и компаний в LLM НЕ отправляем (шлюз блокирует запросы с
-    # чувствительной географией). Для ответа они не нужны: ключ — числовые id.
-    lines = []
+    # Названия ГОСБ/компаний и ФИО в LLM НЕ отправляем (шлюз блокирует чувствительное;
+    # автор — обезличенный токен «Сотрудник-NN»). Ключ ответа — числовые id.
+    blocks = []
     for o in chunk:
-        notes = " ⏵ ".join(n["text"] if isinstance(n, dict) else str(n) for n in o["notes"])
-        lines.append(
-            f'gosb_id={o["gosb_id"]} inn={o["inn"]} '
-            f'| сегмент: {o.get("segment", "")} | активности: {notes}'
+        notes = "\n".join(_note_line(n) for n in o["notes"])
+        blocks.append(
+            f'## gosb_id={o["gosb_id"]} inn={o["inn"]} | сегмент: {o.get("segment", "")}'
+            f' | рычаг: {o.get("lever", "")}\n'
+            f'ФАКТЫ: {_facts_line(o.get("facts", {}))}\n'
+            f'ХРОНОЛОГИЯ:\n{notes}'
         )
     return (
-        "Ты — аналитик зарплатных проектов банка. Ниже по каждой паре "
-        "(ГОСБ, организация) даны ВСЕ содержательные комментарии сотрудников и "
-        "анкеты по задачам за 3 месяца. Работа ведётся отдельно в каждом ГОСБ.\n"
-        "Ответь БЕЗ рассуждений и пояснений: на каждую входную строку — ровно один "
-        "JSON-объект на отдельной строке (формат JSONL, без общего массива, без ```):\n"
-        '{"gosb_id": <число как во входе>, "inn": <число как во входе>, '
-        '"reason": "<причина текущего положения, ≤8 слов>", '
-        '"worth": "да|нет — есть ли смысл вести работу в ЭТОМ ГОСБ", '
-        '"action": "<что конкретно сделать, ≤12 слов>"}\n'
-        "В текстах reason и action НЕ употребляй слово «ИНН» — пиши «организация».\n"
-        f"Строк на входе: {len(chunk)} — верни столько же строк ответа.\n\n"
-        + "\n".join(lines)
+        "Ты — старший аналитик зарплатных проектов банка. По каждой паре "
+        "(ГОСБ, организация) даны ФАКТЫ из витрины и ХРОНОЛОГИЯ активностей "
+        "сотрудников за 3 месяца. Работа ведётся отдельно в каждом ГОСБ. Сравни ТЕКСТ "
+        "комментариев с ЧИСЛАМИ и оцени, качественно ли отработана организация.\n"
+        "Ответь БЕЗ рассуждений: на каждую пару — ровно один JSON-объект на отдельной "
+        "строке (JSONL, без общего массива, без ```):\n"
+        '{"gosb_id": <как во входе>, "inn": <как во входе>, '
+        '"verdict": "work|no_point|in_progress", '
+        '"quality": "качественно|формально|не отработана|—", '
+        '"contradiction": "да|нет", '
+        '"outflow_worked": "да|нет|—", "attract_real": "да|нет|—", '
+        '"reason": "<причина/суть, ≤10 слов>", "action": "<что сделать, ≤12 слов>"}\n'
+        "Правила оценки:\n"
+        "• verdict=no_point ТОЛЬКО при явной ликвидации/банкротстве в тексте; во всех "
+        "остальных случаях work (или in_progress, если сделка уже заведена и идут "
+        "зачисления).\n"
+        "• quality=формально — текст заявляет успех, но факт по сделке 0 при плане>0, "
+        "или задача закрыта в день создания, или комментарий дежурный.\n"
+        "• contradiction=да — разные сотрудники противоречат друг другу (напр. один "
+        "«клиент согласился», другой «отказался»).\n"
+        "• outflow_worked — реально ли отработан отток (сверь с числом оттока/возврата); "
+        "attract_real — реально ли привлечение/расширение (сверь с потенциалом и сделкой). "
+        "«—», если к этой организации неприменимо.\n"
+        "В reason и action НЕ употребляй слово «ИНН» — пиши «организация».\n"
+        f"Пар на входе: {len(chunk)} — верни столько же строк ответа.\n\n"
+        + "\n\n".join(blocks)
     )
 
 
@@ -154,15 +205,54 @@ def _ask(ctx, chunk: list[dict], label: str) -> dict:
             key = (int(r["gosb_id"]), int(r["inn"]))
         except (KeyError, ValueError, TypeError):
             continue
-        worth = str(r.get("worth", "")).strip().lower()
         result[key] = {
             "reason": str(r.get("reason", ""))[:80],
             "action": str(r.get("action", ""))[:100],
-            "worth": worth,
-            "verdict": "no_point" if worth.startswith("нет") else "work",
+            "verdict": _norm_verdict(r.get("verdict")),
+            "quality": _norm_quality(r.get("quality")),
+            "contradiction": _yn(r.get("contradiction")),
+            "outflow_worked": _yn(r.get("outflow_worked")),
+            "attract_real": _yn(r.get("attract_real")),
             "source": "LLM",
         }
     return result
+
+
+# Явные словари вместо startswith("нет"): «нет данных» не должно давать no_point.
+_VERDICT_MAP = (
+    ("no_point", "no_point"), ("нет смысл", "no_point"), ("бесперспектив", "no_point"),
+    ("ликвидац", "no_point"),
+    ("in_progress", "in_progress"), ("в процесс", "in_progress"), ("в работе", "in_progress"),
+    ("work", "work"), ("работать", "work"), ("да", "work"),
+)
+
+
+def _norm_verdict(raw) -> str:
+    r = str(raw or "").strip().lower()
+    for pref, val in _VERDICT_MAP:
+        if r.startswith(pref):
+            return val
+    return "work"      # безопасный дефолт: не «прибиваем» потенциал из-за неясности
+
+
+def _norm_quality(raw) -> str:
+    r = str(raw or "").strip().lower()
+    if r.startswith("формал"):
+        return "формально"
+    if r.startswith("не отраб"):
+        return "не отработана"
+    if r.startswith("качеств"):
+        return "качественно"
+    return "—"
+
+
+def _yn(raw) -> str:
+    r = str(raw or "").strip().lower()
+    if r.startswith("да"):
+        return "да"
+    if r.startswith("нет"):
+        return "нет"
+    return "—"
 
 
 def _split(chunk: list[dict], size: int) -> list[list[dict]]:
@@ -186,8 +276,9 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
                   max_calls: int | None = None) -> tuple[dict, int]:
     """Анализ свободного текста по парам (ГОСБ, ИНН).
 
-    items: [{gosb_id, inn, gosb, company, segment, notes:[{text,...}]}, ...]
-    Возврат: ({(gosb_id, inn): {reason, action, worth, verdict, source}}, n_вызовов)
+    items: [{gosb_id, inn, segment, lever, facts:{...}, notes:[{text,date,author,…}]}, …]
+    Возврат: ({(gosb_id, inn): {reason, action, verdict, quality, contradiction,
+              outflow_worked, attract_real, source}}, n_вызовов)
     """
     result: dict = {}
     if not items:

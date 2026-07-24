@@ -18,10 +18,9 @@ from ...db import read_sql
 from . import prompts, queries as Q, segments, text_rules
 
 RUB_TO_MLN = 1e6
-LLM_TOP_N_DEFAULT = 20      # потолок: сколько организаций разбирать LLM в одном ГОСБ
-LLM_BATCH_DEFAULT = 30      # организаций в одном запросе к LLM
-PLAN_OVERSHOOT = 1.5        # разбираем с запасом на перевыполнение плана до +50%
-MAX_WAVES = 3               # сколько раз добираем, если запаса не хватило
+LLM_BATCH_DEFAULT = 12      # пар (ГОСБ, ИНН) в одном запросе к LLM (один глубокий проход)
+LLM_MIN_IMPACT_DEFAULT = 1  # ниже этого эффекта (чел) в LLM не отправляем — только правила
+LLM_MAX_CALLS_DEFAULT = 80  # жёсткий потолок вызовов на весь ТБ; хвост уходит на правила
 PLAN_TARGETS = (1.0, 1.2, 1.5)   # цели в дэше: выполнить план / +20% / +50%
 # Сегмент западает, если план не выполнен (exec < 1) — тот же признак, что даёт
 # красную ячейку в тепловой карте (render.components.heat_bg). Порог в одного
@@ -29,7 +28,7 @@ PLAN_TARGETS = (1.0, 1.2, 1.5)   # цели в дэше: выполнить пл
 MIN_SEG_GAP = 1.0
 
 
-def _failing_seg(nedobor, execution_percent=None) -> bool:
+def _failing_seg(nedobor) -> bool:
     return float(nedobor or 0) >= MIN_SEG_GAP
 
 
@@ -60,8 +59,9 @@ class Analysis:
 
 def run(ctx, tb_short: str) -> Analysis:
     e = ctx.engine
-    top_n = int(ctx.params.get("llm_top_n", LLM_TOP_N_DEFAULT))
     batch = int(ctx.params.get("llm_batch", LLM_BATCH_DEFAULT))
+    min_impact = float(ctx.params.get("llm_min_impact", LLM_MIN_IMPACT_DEFAULT))
+    max_calls = int(ctx.params.get("llm_max_calls", LLM_MAX_CALLS_DEFAULT))
 
     progress.step(f"Резолв ТБ «{tb_short}»")
     tb = read_sql(e, Q.TB_RESOLVE, {"tb": tb_short})
@@ -151,16 +151,15 @@ def run(ctx, tb_short: str) -> Analysis:
     to_work, no_point = _classify(cand)
 
     # --- Разрывы на грейне (ГОСБ, сегмент): работаем именно с западающими ---
-    matrix["is_failing"] = [_failing_seg(r.nedobor, r.execution_percent)
-                            for r in matrix.itertuples()]
+    matrix["is_failing"] = [_failing_seg(r.nedobor) for r in matrix.itertuples()]
     seg_gaps = {(int(r.new_gosb_id), r.seg_name): float(r.nedobor)
                 for r in matrix.itertuples() if r.is_failing}
     n_gosb_seg = len({nid for nid, _ in seg_gaps})
     progress.done(f"Западающих (ГОСБ, сегмент): {len(seg_gaps)} в {n_gosb_seg} ГОСБ")
 
-    # --- Рекомендации: чек-лист -> ключевые слова -> LLM (кто нужен под план) ---
+    # --- Рекомендации: чек-лист -> ключевые слова -> LLM (аудит отработки) ---
     insights, to_work, no_point, themes, llm_stats = _resolve(
-        ctx, e, pf, to_work, no_point, top_n, batch, seg_gaps)
+        ctx, e, pf, to_work, no_point, seg_gaps, batch, min_impact, max_calls)
 
     # --- Отбор «ровно под план»: закрываем разрыв КАЖДОГО западающего сегмента ---
     progress.step("Отбор организаций под план по (ГОСБ, сегмент)")
@@ -277,145 +276,209 @@ def _classify(cand: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return _mk(work_rows), _mk(skip_rows)
 
 
+# Правила, заявляющие УСПЕХ: при факте по старой сделке 0 их вердикт подозрителен —
+# такой кейс проверяет модель на «формальное закрытие» (см. suspect_formal в _resolve).
+_POSITIVE_REASONS = {"Получено согласие", "Планируется расширение"}
+
+
 # --------------------------------------------------------------------------- #
 def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFrame,
-             top_n: int, batch: int, seg_gaps: dict):
-    """Рекомендации по (ГОСБ, ИНН): детерминированно, затем LLM для остатка.
+             seg_gaps: dict, batch: int, min_impact: float, max_calls: int):
+    """Аудит отработки по (ГОСБ, ИНН): один проход по всему пулу западающих сегментов.
 
-    Разбираем не «фиксированный топ», а тех, кто реально нужен под план западающих
-    сегментов (тот же `_mark_needed` с запасом ×PLAN_OVERSHOOT). Строки, уже
-    получившие вердикт «не работать», из расчёта выбывают — их место занимают
-    следующие, поэтому нужна следующая волна. top_n — потолок стоимости на ГОСБ.
+    Пул — `_audit_pool`: ВСЕ организации западающих сегментов их ГОСБ + доборные из
+    других сегментов ГОСБ (не «топ» и не «минимум под план»). Разрешение: чек-лист ->
+    ключевые слова (кроме needs_llm и пар с ≥2 авторами) -> LLM с фактами и хронологией
+    -> фолбэк на правила для того, что не влезло в бюджет вызовов.
     """
-    stats = {"top_n": top_n, "batch": batch, "cand": 0, "checklist": 0,
-             "keyword": 0, "llm": 0, "no_text": 0, "fallback": 0, "batches": 0}
+    stats = {"batch": batch, "min_impact": min_impact, "max_calls": max_calls,
+             "pool": 0, "checklist": 0, "keyword": 0, "llm": 0, "no_text": 0,
+             "fallback": 0, "batches": 0, "capped": 0}
     if to_work.empty:
         return {}, to_work, no_point, "—", stats
 
+    pool = _audit_pool(to_work, seg_gaps, min_impact)
+    stats["pool"] = len(pool)
+    if pool.empty:
+        return {}, to_work, no_point, "—", stats
+    progress.step(f"Аудит отработки: пул {len(pool)} пар (ГОСБ,ИНН) — все организации "
+                  f"западающих сегментов + добор, эффект ≥ {min_impact:g} чел")
+
     insights: dict = {}
-    resolved_keys: set = set()
     all_texts: list[str] = []
-    processed_keys: set = set()
+    inns = sorted({int(x) for x in pool["inn"]})
+    text_df = read_sql(engine, Q.FUNNEL_TEXT, {**pf, "inns": inns})
+    notes = _collect_notes(text_df, pool, all_texts)
 
-    for wave in range(MAX_WAVES):
-        pool = _pool_needed(to_work, seg_gaps, insights, top_n, processed_keys)
-        if pool.empty:
-            break
-        processed_keys |= {(int(r.new_gosb_id), int(r.inn)) for r in pool.itertuples()}
-        stats["cand"] += len(pool)
-        progress.step(f"Рекомендации, волна {wave + 1}: кандидатов {len(pool)}"
-                      f" (нужны под план западающих сегментов ×{PLAN_OVERSHOOT},"
-                      f" потолок {top_n} на ГОСБ)")
+    need_llm = []
+    for r in pool.itertuples():
+        key = (int(r.new_gosb_id), int(r.inn))
+        item_notes = notes.get(key, [])
+        facts = _facts(r)
+        multi_author = len({n["author"] for n in item_notes}) >= 2
+        det = _deterministic(item_notes, multi_author)
+        # «лишь бы закрыть»: правило заявляет успех (согласие/расширение), но по СТАРОЙ
+        # сделке план>0, факт=0 — не закрываем правилом, отдаём модели на проверку
+        # формальности (это и есть вопрос «качественно или просто закрыли»).
+        suspect_formal = facts["plan_deal_old"] > 0 and facts["fact_deal_old"] == 0
+        if det and not (suspect_formal and det.get("reason") in _POSITIVE_REASONS):
+            insights[key] = det
+            stats["checklist" if det["source"].startswith("чек-лист") else "keyword"] += 1
+        elif any(n.get("for_llm") for n in item_notes):
+            # в LLM: id + сегмент + рычаг + ФАКТЫ (числа витрины) + хронология заметок
+            llm_notes = [n for n in item_notes if n.get("for_llm")]
+            llm_notes.sort(key=lambda n: n.get("_sort") or pd.Timestamp.min)
+            need_llm.append({
+                "gosb_id": key[0], "inn": key[1],
+                "segment": str(getattr(r, "seg_name", "") or ""),
+                "lever": str(getattr(r, "lever", "") or ""),
+                "facts": facts,
+                "notes": llm_notes,
+            })
+        else:
+            # нет содержательного текста -> остаётся причина из правил (_classify)
+            insights[key] = {"reason": "", "action": "", "verdict": "work",
+                             "source": "правило"}
+            stats["no_text"] += 1
 
-        # текст только по кандидатам этой волны
-        inns = sorted({int(x) for x in pool["inn"]})
-        text_df = read_sql(engine, Q.FUNNEL_TEXT, {**pf, "inns": inns})
-        notes = _collect_notes(text_df, pool, all_texts)
-
-        need_llm = []
-        for r in pool.itertuples():
-            key = (int(r.new_gosb_id), int(r.inn))
-            item_notes = notes.get(key, [])
-            det = _deterministic(item_notes)
-            if det:
-                insights[key] = det
-                stats["checklist" if det["source"].startswith("чек-лист") else "keyword"] += 1
-            elif item_notes:
-                # названия ГОСБ и компаний в LLM не передаём — только id и сегмент
-                need_llm.append({
-                    "gosb_id": key[0], "inn": key[1],
-                    "segment": str(getattr(r, "seg_name", "") or ""),
-                    "notes": item_notes,
-                })
-            else:
-                # нет содержательного текста -> остаётся причина из правил (_classify)
-                insights[key] = {"reason": "", "action": "", "verdict": "work",
-                                 "source": "правило"}
-                stats["no_text"] += 1
-
-        if need_llm:
-            got, nb = prompts.text_insights(ctx, need_llm, batch=batch)
-            stats["batches"] += nb
-            for it in need_llm:
-                key = (it["gosb_id"], it["inn"])
-                if key in got:
-                    insights[key] = got[key]; stats["llm"] += 1
-                else:   # LLM не вернул -> детерминированный фолбэк по тексту
-                    insights[key] = _fallback_insight(it["notes"])
-                    stats["fallback"] += 1
-
-        resolved_keys |= processed_keys
+    if need_llm:
+        # пул отсортирован по убыванию эффекта -> бюджет тратится на крупные первыми
+        got, nb = prompts.text_insights(ctx, need_llm, batch=batch, max_calls=max_calls)
+        stats["batches"] += nb
+        for it in need_llm:
+            key = (it["gosb_id"], it["inn"])
+            if key in got:
+                has_outflow = int(it["facts"].get("outflow_fl", 0)) > 0
+                insights[key] = _decorate_reason(got[key], has_outflow); stats["llm"] += 1
+            else:   # не влез в бюджет вызовов / LLM не вернул -> фолбэк на правила
+                insights[key] = _fallback_insight(it["notes"]); stats["fallback"] += 1
+        stats["capped"] = sum(1 for it in need_llm if (it["gosb_id"], it["inn"]) not in got)
 
     to_work, no_point = _reclassify(to_work, no_point, insights)
     return insights, to_work, no_point, text_rules.themes(all_texts), stats
 
 
-def _pool_needed(to_work: pd.DataFrame, seg_gaps: dict, insights: dict,
-                 top_n: int, processed: set) -> pd.DataFrame:
-    """Кандидаты волны: кто нужен под план западающих сегментов и ещё не разобран.
-
-    Строки, уже признанные «не работать», из расчёта исключаем — тогда следующая
-    волна автоматически подтягивает тех, кто занял их место.
-    """
-    alive = to_work[[
-        (insights.get((int(r.new_gosb_id), int(r.inn))) or {}).get("verdict", "work") != "no_point"
-        for r in to_work.itertuples()]]
-    if alive.empty:
+def _audit_pool(to_work: pd.DataFrame, seg_gaps: dict, min_impact: float) -> pd.DataFrame:
+    """Пул на аудит: ВСЕ организации западающих сегментов + доборные из других
+    сегментов ГОСБ (когда своих не хватает). Порог по эффекту отсекает мелочь;
+    сортировка по убыванию эффекта — чтобы бюджет вызовов шёл на крупные первыми."""
+    if to_work.empty:
         return to_work.iloc[:0]
-    chosen, _, _ = _mark_needed(alive, seg_gaps, PLAN_OVERSHOOT)
-    if not chosen:
-        return to_work.iloc[:0]
-    pool = alive.loc[sorted(chosen)].sort_values("impact_fl", ascending=False)
-    pool = pool.groupby("new_gosb_id", group_keys=False).head(top_n)   # потолок стоимости
-    pool = pool[[(int(r.new_gosb_id), int(r.inn)) not in processed for r in pool.itertuples()]]
-    return pool
+    own_mask = [(int(r.new_gosb_id), r.seg_name) in seg_gaps for r in to_work.itertuples()]
+    own = to_work[own_mask]
+    # доборные под цель +50%: организации других сегментов ГОСБ, если своих мало
+    _, filler_idx, _ = _mark_needed(to_work, seg_gaps, max(PLAN_TARGETS))
+    filler = to_work.loc[sorted(filler_idx)] if filler_idx else to_work.iloc[:0]
+    pool = pd.concat([own, filler]).drop_duplicates(subset=["new_gosb_id", "inn"])
+    pool = pool[pool["impact_fl"] >= float(min_impact)]
+    return pool.sort_values("impact_fl", ascending=False)
 
 
-def _deterministic(notes: list[dict]) -> dict | None:
+def _facts(r) -> dict:
+    """Числовые ФАКТЫ витрины для LLM. Сделки — только «старый» месяц (*_old)."""
+    return {
+        "potential": int(getattr(r, "emp_potential_qty", 0) or 0),
+        "outflow_fl": int(getattr(r, "fl_outflow_qty", 0) or 0),
+        "outflow_fot_mln": float(getattr(r, "fot_outflow_mln", 0) or 0),
+        "avg_salary": float(getattr(r, "avg_salary", 0) or 0),
+        "plan_deal_old": int(getattr(r, "plan_deal_old", 0) or 0),
+        "fact_deal_old": int(getattr(r, "fact_deal_old", 0) or 0),
+        "has_fresh_deal": bool(getattr(r, "has_fresh_deal", False)),
+        "n_overdue": int(getattr(r, "n_overdue", 0) or 0),
+        "any_success": bool(getattr(r, "any_success", False)),
+    }
+
+
+def _decorate_reason(ins: dict, has_outflow: bool = True) -> dict:
+    """Дописать в reason префикс качества, чтобы вывод лёг в поле «Причина / действие»
+    без правок вёрстки и индексировался поиском таблицы. «отток не отработан» ставим
+    только при реальном оттоке — иначе модель иногда лепит его на чистое привлечение."""
+    prefixes = []
+    if ins.get("quality") == "формально":
+        prefixes.append("формально закрыто")
+    elif ins.get("quality") == "не отработана":
+        prefixes.append("не отработана")
+    if ins.get("contradiction") == "да":
+        prefixes.append("противоречие в комментариях")
+    if ins.get("outflow_worked") == "нет" and has_outflow:
+        prefixes.append("отток не отработан")
+    if prefixes:
+        base = ins.get("reason", "")
+        ins["reason"] = " · ".join(prefixes) + (f" · {base}" if base else "")
+    return ins
+
+
+def _deterministic(notes: list[dict], multi_author: bool = False) -> dict | None:
     """Детерминированное разрешение. None — нужен LLM.
 
     Порядок: 1) причина оттока из ЧЕК-ЛИСТА (структурный ответ);
              2) ключевые слова в КОММЕНТАРИИ;
              3) ключевые слова в ОТВЕТАХ чек-листа.
-    Важно: по сырому тексту анкеты не матчим — там формулировки ВОПРОСОВ
-    (напр. «Получено согласие» с ответом «Нет») дают ложные срабатывания.
+    Ужесточения:
+      * подтверждённая ликвидация из чек-листа (no_point) короткозамыкает всегда;
+      * при ≥2 авторах правила НЕ закрывают кейс (кроме того no_point) — противоречия
+        между сотрудниками может оценить только LLM;
+      * правила с флагом needs_llm (ликвидация/банкротство по ключевым словам) — лишь
+        подсказка, вердикт подтверждает модель, поэтому здесь их не применяем.
+    По сырому тексту анкеты не матчим — там формулировки ВОПРОСОВ дают ложные
+    срабатывания (матчим отдельно по РАЗОБРАННЫМ ответам).
     """
+    for n in notes:
+        det = text_rules.outflow_reason(n.get("questionnaire"))
+        if det and det.get("verdict") == "no_point":
+            return det                    # ликвидация из чек-листа — доверяем, всегда
+    if multi_author:
+        return None                       # ≥2 авторов -> в LLM (кроме no_point выше)
     for n in notes:
         det = text_rules.outflow_reason(n.get("questionnaire"))
         if det:
             return det
     for n in notes:
         det = text_rules.match_keyword(n.get("comment"))
-        if det:
+        if det and not det.get("needs_llm"):
             return det
     for n in notes:
         answers = " ".join(text_rules.parse_questionnaire(n.get("questionnaire")).values())
         det = text_rules.match_keyword(answers)
-        if det:
+        if det and not det.get("needs_llm"):
             return det
     return None
 
 
 def _fallback_insight(notes: list[dict]) -> dict:
-    """Если LLM не ответил — разрешаем теми же детерминированными правилами.
+    """Если LLM не ответил / не влез в бюджет — разрешаем детерминированными правилами.
 
-    Порядок тот же, что и до LLM (чек-лист -> ключевые слова), плюс последняя
-    попытка по склейке всех заметок. notes — список СЛОВАРЕЙ, поэтому текст
-    собираем через prompts.notes_text (иначе " ".join падает на dict).
+    Текст для повторного матчинга собираем из КОММЕНТАРИЯ и РАЗОБРАННЫХ ОТВЕТОВ анкеты,
+    а НЕ из сырого n['text'] (там формулировки вопросов чек-листа дают ложные
+    срабатывания). needs_llm-правила здесь не применяем — подтвердить их некому.
     """
     det = _deterministic(notes)
     if det:
         return det
-    fb = text_rules.match_keyword(prompts.notes_text(notes))
-    return fb or {"reason": "", "action": "", "verdict": "work", "source": "правило"}
+    safe_parts = []
+    for n in notes:
+        if n.get("comment"):
+            safe_parts.append(n["comment"])
+        safe_parts.extend(text_rules.parse_questionnaire(n.get("questionnaire")).values())
+    fb = text_rules.match_keyword(" ".join(safe_parts))
+    if fb and not fb.get("needs_llm"):
+        return fb
+    return {"reason": "", "action": "", "verdict": "work", "source": "правило"}
 
 
 def _collect_notes(text_df: pd.DataFrame, pool: pd.DataFrame, sink: list) -> dict:
-    """Содержательные заметки по каждой паре (ГОСБ, ИНН): ВСЕ активности за 3 мес."""
+    """Заметки по каждой паре (ГОСБ, ИНН): ВСЕ активности за 3 мес, с автором и датой.
+
+    Автор обезличивается ПО ПАРЕ (`Сотрудник-1..N` по табельному isu_struct_saphr_id) —
+    ФИО не тянем; этого достаточно, чтобы модель различала сотрудников для поиска
+    противоречий. Неинформативные заметки НЕ выбрасываем (чтобы короткие «ушли в ВТБ»
+    видели правила), а помечаем for_llm=False — в LLM уходит только содержательный текст.
+    """
     out: dict = {}
     if text_df.empty:
         return out
     keys = {(int(r.new_gosb_id), int(r.inn)) for r in pool.itertuples()}
+    authors: dict = {}     # key -> {author_id: "Сотрудник-NN"}
     skipped: dict[str, int] = {}
     for r in text_df.itertuples():
         if pd.isna(r.new_gosb_id):
@@ -427,23 +490,43 @@ def _collect_notes(text_df: pd.DataFrame, pool: pd.DataFrame, sink: list) -> dic
         quest = (r.task_questionnaire or "").strip()
         ok_c, why_c = text_rules.is_meaningful(comment)
         ok_q, why_q = text_rules.is_meaningful(quest)
-        if not (ok_c or ok_q):
+        for_llm = ok_c or ok_q
+        if not for_llm:
             why = why_c if comment else why_q
             skipped[why] = skipped.get(why, 0) + 1
-            continue
-        text = f"[{r.task_type}/{r.task_text_status}] "
+        # содержательный текст для промпта (без [тип/статус] — они идут отдельным мета)
+        parts = []
         if ok_c:
-            text += comment
+            parts.append(comment)
         if ok_q:
-            text += " | анкета: " + quest.replace("\n", "; ")
-        out.setdefault(key, []).append({"text": text[:400], "comment": comment,
-                                        "questionnaire": quest})
-        sink.append(comment or text)
+            parts.append("анкета: " + quest.replace("\n", "; "))
+        text = " | ".join(parts)[:400]
+        # автор -> обезличенный токен в рамках этой пары
+        amap = authors.setdefault(key, {})
+        aid = getattr(r, "author_id", None)
+        aid = int(aid) if pd.notna(aid) else -1
+        if aid not in amap:
+            amap[aid] = f"Сотрудник-{len(amap) + 1:02d}"
+        created = getattr(r, "task_create_dt", None)
+        closed = getattr(r, "fact_close_task_dttm", None)
+        closed_same_day = bool(pd.notna(created) and pd.notna(closed)
+                               and pd.Timestamp(created).date() == pd.Timestamp(closed).date())
+        out.setdefault(key, []).append({
+            "text": text, "comment": comment, "questionnaire": quest, "for_llm": for_llm,
+            "date": (pd.Timestamp(created).strftime("%d.%m") if pd.notna(created) else ""),
+            "_sort": (pd.Timestamp(created) if pd.notna(created) else None),
+            "author": amap[aid], "role": str(getattr(r, "role_code", "") or ""),
+            "type": str(getattr(r, "task_type", "") or ""),
+            "status": str(getattr(r, "task_text_status", "") or ""),
+            "closed_same_day": closed_same_day,
+        })
+        if comment:
+            sink.append(comment)
     if skipped and progress.SHOW_LLM:
         for why, n in sorted(skipped.items(), key=lambda x: -x[1])[:6]:
-            progress.done(f"отсеяно без LLM ×{n}: {why}")
-    # ограничим объём промпта: до 8 записей на организацию (самые свежие — сверху)
-    return {k: [x for x in v][:8] for k, v in out.items()}
+            progress.done(f"неинформативных заметок ×{n}: {why}")
+    # до 8 записей на организацию (самые свежие — сверху, text_df уже DESC)
+    return {k: v[:8] for k, v in out.items()}
 
 
 def _reclassify(to_work: pd.DataFrame, no_point: pd.DataFrame, insights: dict):
