@@ -55,15 +55,18 @@ def list_dashboards() -> list[str]:
 
 def generate_dashboard(name: str, conn: str | None = None, params: dict | None = None,
                        contour: str | None = None, verbose: bool = True,
-                       show_sql: bool = False, show_llm: bool = False) -> str:
+                       show_sql: bool = False, show_llm: bool = False,
+                       llm_opts: dict | None = None) -> str:
     """Сгенерировать дэш по имени. Возвращает путь к .html.
 
     conn     — SQLAlchemy URL (если не задан, берётся из .env UZP_DB_URL).
-    params   — параметры конкретного дэша (напр. {"tb": "ЮЗБ"}).
+    params   — параметры конкретного дэша (напр. {"tb": "ЮЗБ", "llm_top_n": 20}).
     contour  — 'open' (DeepSeek) | 'closed' (GLM/Qwen). Управляется из тетрадки.
     verbose  — печатать прогресс генерации (для тетрадки). По умолчанию True.
     show_sql — дополнительно печатать SQL-запросы.
     show_llm — дополнительно печатать текст запросов/ответов LLM.
+    llm_opts — настройки вызова LLM: {"max_tokens": 4000, "extra": {...},
+               "timeout": (10, 120)}. Полные логи всегда пишутся в output/llm_logs/.
     """
     _ensure_loaded()
     if name not in _REGISTRY:
@@ -71,6 +74,9 @@ def generate_dashboard(name: str, conn: str | None = None, params: dict | None =
 
     progress.enable(verbose=verbose, show_sql=show_sql, show_llm=show_llm)
     config.set_contour(contour)
+    opts = llm.configure(**(llm_opts or {}))
+    progress.done(f"LLM: max_tokens={opts['max_tokens']} · extra={opts['extra']} · "
+                  f"timeout={opts['timeout']} · логи → {progress.LOG_DIR}")
     progress.step(f"Дэш «{name}» · контур {config.CONTOUR} · подключение к БД")
     engine = get_engine(config.db_url(conn))
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

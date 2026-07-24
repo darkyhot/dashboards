@@ -291,9 +291,7 @@ def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFram
                 if key in got:
                     insights[key] = got[key]; stats["llm"] += 1
                 else:   # LLM не вернул -> детерминированный фолбэк по тексту
-                    fb = text_rules.match_keyword(" ".join(it["notes"]))
-                    insights[key] = fb or {"reason": "", "action": "",
-                                           "verdict": "work", "source": "правило"}
+                    insights[key] = _fallback_insight(it["notes"])
                     stats["fallback"] += 1
 
         resolved_keys |= processed_keys
@@ -358,6 +356,20 @@ def _deterministic(notes: list[dict]) -> dict | None:
         if det:
             return det
     return None
+
+
+def _fallback_insight(notes: list[dict]) -> dict:
+    """Если LLM не ответил — разрешаем теми же детерминированными правилами.
+
+    Порядок тот же, что и до LLM (чек-лист -> ключевые слова), плюс последняя
+    попытка по склейке всех заметок. notes — список СЛОВАРЕЙ, поэтому текст
+    собираем через prompts.notes_text (иначе " ".join падает на dict).
+    """
+    det = _deterministic(notes)
+    if det:
+        return det
+    fb = text_rules.match_keyword(prompts.notes_text(notes))
+    return fb or {"reason": "", "action": "", "verdict": "work", "source": "правило"}
 
 
 def _collect_notes(text_df: pd.DataFrame, pool: pd.DataFrame, sink: list) -> dict:
