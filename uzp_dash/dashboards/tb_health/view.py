@@ -36,7 +36,6 @@ def build(ctx: Context) -> str:
         title=f"Здоровье ТБ — {C.esc(a.tb_full)}",
         subtitle=f"Текущая ситуация на {C.esc(a.ref_date)} · получатели и ФОТ",
         body=body,
-        footer="УЗП · дэш tb_health. Данные — синтетические (открытый контур).",
     )
 
 
@@ -83,7 +82,11 @@ def _matrix(a: analyze.Analysis) -> str:
     rows_id_label = [(int(r.new_gosb_id), (r.gosb_name or "")[:26])
                      for r in gg.itertuples() if int(r.new_gosb_id) in present]
     segs = [s for s in SEG_ORDER if s in set(m.seg_name)]
-    cells = {(int(row.new_gosb_id), row.seg_name): (row.execution_percent, row.nedobor)
+    # Красная ячейка = западающий сегмент из карточек ГОСБ: тот же порог в одного
+    # получателя (недобор меньше человека — округление, показываем как выполнено).
+    cells = {(int(row.new_gosb_id), row.seg_name):
+             (row.execution_percent if analyze._failing_seg(row.nedobor) else
+              max(float(row.execution_percent or 0), 1.0), row.nedobor)
              for row in m.itertuples()}
     heat = C.card(
         '<h3>Выполнение плана по получателям, %</h3>'
@@ -105,50 +108,92 @@ def _problem_gosb(a: analyze.Analysis) -> str:
         return ""
     cards = []
     for c in a.gosb_cards:
-        st = "bad" if c["exec"] < 0.9 else "warn"
-        # компактные чипы западающих сегментов (детали — в тепловой карте выше)
-        fails = [s for s in sorted(c["segs"], key=lambda x: x["exec"]) if s["exec"] < 0.95][:4]
-        chips = "".join(C.badge(f'{s["seg"]} {s["exec"]*100:.0f}%', C.status_of(s["exec"]))
-                        for s in fails) or '<span class="clab">в норме по сегментам</span>'
+        st = "warn" if c["seg_only"] else ("bad" if c["exec"] < 0.9 else "warn")
+        # строки по ВСЕМ западающим сегментам (те же, что красные в тепловой карте)
+        lines = []
+        for s in c["segs"]:
+            cov = s["coverage"]
+            if not s["n_avail"]:
+                tail = " · своих организаций к работе нет — добор из других сегментов"
+            elif cov is not None and cov < 0.999:
+                tail = (f' · в сегменте хватает на {cov*100:.0f}% ({s["n_avail"]} орг), '
+                        f'добор из других')
+            else:
+                tail = ""
+            # при 99.5–99.9% показываем десятую долю, иначе «100%» рядом с недобором
+            fmt = "%s %.1f%%" if s["exec"] >= 0.995 else "%s %.0f%%"
+            chip = C.badge(fmt % (s["seg"], s["exec"] * 100), C.status_of(s["exec"]))
+            lines.append(
+                f'<div class="g-seg">{chip}'
+                f' −{C.fmt_num(s["nedobor"])} чел → <b>{s["n_need"]}</b> орг '
+                f'(+{C.fmt_num(s["fl_need"])}){C.esc(tail)}</div>')
+        seg_html = "".join(lines) or '<div class="g-seg">в норме по сегментам</div>'
         act = c["act"]
+        if c["seg_only"]:
+            head_badge = C.badge(f'план выполняется, но западает '
+                                 f'{", ".join(s["seg"] for s in c["segs"][:3])}', "warn")
+        else:
+            head_badge = C.badge("−" + C.fmt_num(c["gap"]) + " чел до плана", st)
+        filler = (f' · добор из других сегментов: <b>{c["filler_n"]}</b> орг '
+                  f'(+{C.fmt_num(c["filler_fl"])})' if c["filler_n"] else "")
+        cover = (c["fl_need"] / c["gap_seg"]) if c["gap_seg"] > 0 else None
+        short = (f' · этого хватает лишь на <b>{cover*100:.0f}%</b> разрыва — '
+                 f'потенциала в ГОСБ больше нет' if cover is not None and cover < 0.999 else "")
         do = (
-            f'<div class="g-do">Привлечь <b>{c["n_attract"]}</b> орг '
-            f'(+{C.fmt_num(c["pot_fl_att"])} чел) · вернуть <b>{c["n_return"]}</b> '
-            f'(+{C.fmt_num(c["pot_fl_ret"])}) · ФОТ <b>~{C.fmt_num(c["pot_fot"])}</b> млн ₽</div>'
+            f'<div class="g-do">Итого под план: <b>{c["n_need"]}</b> организаций '
+            f'(+{C.fmt_num(c["fl_need"])} чел, привлечь {c["n_attract"]} / '
+            f'вернуть {c["n_return"]}) · ФОТ <b>~{C.fmt_num(c["fot_need"])}</b> млн ₽'
+            f'{filler}{short}</div>'
             f'<div class="g-act">Активности 3 мес: {act["act_n"]} по {act["worked_orgs"]} орг, '
-            f'успех {act["success"]*100:.0f}% · не работали с '
-            f'<b>{c["not_worked"]}</b> приоритетными</div>'
+            f'успех {act["success"]*100:.0f}% · из нужных под план не работали с '
+            f'<b>{c["not_worked"]}</b></div>'
         )
         inner = (
             f'<div class="g-head"><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
             f'<span class="g-ex" style="color:{_col(c["exec"])}">{c["exec"]*100:.0f}%</span></div>'
-            f'<div style="margin:2px 0 4px">{C.badge("−" + C.fmt_num(c["gap"]) + " чел до плана", st)}</div>'
-            f'<div class="chips"><span class="clab">западают:</span>{chips}</div>'
-            f'{do}'
+            f'<div style="margin:2px 0 6px">{head_badge}</div>'
+            f'{seg_html}{do}'
         )
         cards.append(C.card(inner, cls=f"gcard {st}"))
     grid = f'<div class="gcards">{"".join(cards)}</div>'
-    return C.section("Проблемные ГОСБ — что сделать по каждому", grid, eyebrow="Приоритет по ГОСБ")
+    return C.section("Проблемные ГОСБ — что сделать по каждому", grid,
+                     eyebrow="Приоритет по ГОСБ и сегменту")
 
 
 def _orgs(a: analyze.Analysis) -> str:
-    """Список к отработке. Рекомендация — по конкретной паре (ГОСБ, ИНН)."""
+    """Список к отработке: по умолчанию — ровно те, кем закрывается план.
+
+    Отбор считается в Python внутри западающих сегментов каждого ГОСБ, а строке
+    проставляется need_k — минимальная цель, при которой организация нужна. Поэтому
+    фильтр «Цель» в HTML просто сравнивает need_k с коэффициентом и работает поверх
+    остальных фильтров.
+    """
     rows = []
     for r in a.to_work.itertuples():
         ins = a.insights.get((int(r.new_gosb_id), int(r.inn)), {})
+        reason = ins.get("reason") or r.reason
+        if bool(getattr(r, "filler", False)):
+            reason = "добор из другого сегмента · " + reason
         rows.append({
             "inn": int(r.inn), "company": (getattr(r, "company_name", "") or "")[:48],
             "lever": r.lever,
             "gosb": (r.gosb_name or "")[:28], "seg": r.seg_name or "—",
             "fl": round(float(r.impact_fl)), "fot": round(float(r.impact_fot_mln), 1),
-            "reason": ins.get("reason") or r.reason, "action": ins.get("action", ""),
+            "reason": reason, "action": ins.get("action", ""),
+            "needk": float(getattr(r, "need_k", 0.0)),
         })
     gosb_opts = sorted({row["gosb"] for row in rows})
     seg_opts = [s for s in SEG_ORDER if s in {row["seg"] for row in rows}]
     explorer = C.orgs_explorer("work", rows, gosb_opts, seg_options=seg_opts)
-    head = (f'<h3>С кем работать — {len(rows)} пар (ГОСБ × организация)</h3>'
+    sim = a.sim
+    bad_segs = sorted({s["seg"] for c in a.gosb_cards for s in c["segs"]},
+                      key=lambda x: SEG_ORDER.index(x) if x in SEG_ORDER else 99)
+    head = (f'<h3>С кем работать — {sim["k"]} организаций закрывают план</h3>'
             f'<p class="sub" style="font-size:14px;margin:-4px 0 14px">'
-            f'работа ведётся отдельно в каждом ГОСБ · поиск, фильтры, листание</p>')
+            f'отбор идёт внутри ЗАПАДАЮЩИХ сегментов каждого ГОСБ '
+            f'({C.esc(", ".join(bad_segs)) or "—"}), по величине эффекта, пока разрыв '
+            f'сегмента не закрыт · переключатель «Цель» задаёт перевыполнение · '
+            f'всего кандидатов {len(rows)}</p>')
     return C.section("Организации к работе", C.card(head + explorer), eyebrow="Список к отработке")
 
 

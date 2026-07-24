@@ -108,9 +108,12 @@ def heat_matrix(rows_id_label: list[tuple], seg_names: list[str], cells: dict) -
             else:
                 ex, ned = cell
                 bg = heat_bg(ex)
+                # 99.5–99.9% печатаем с десятой долей: иначе ячейка «100%» выглядит
+                # выполненной, хотя план недобран (и в карточке ГОСБ она красная)
+                pct = f"{ex*100:.1f}%" if 0.995 <= ex < 1 else f"{ex*100:.0f}%"
                 tds.append(
                     f'<td class="num heat" style="background:{bg}" title="недобор {ned:.0f}">'
-                    f'{ex*100:.0f}%</td>'
+                    f'{pct}</td>'
                 )
         rows.append(f'<tr>{"".join(tds)}</tr>')
     return (f'<div style="overflow-x:auto"><table class="matrix">'
@@ -184,10 +187,13 @@ def _bold(t: str) -> str:
 
 def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
                   seg_options: list[str] | None = None, page_size: int = 15) -> str:
-    """Интерактивная таблица организаций: поиск + фильтры (ГОСБ, сегмент, рычаг) +
-    пагинация. Самодостаточный инлайн-JS (работает офлайн, в т.ч. в закрытом контуре).
+    """Интерактивная таблица организаций: цель по плану + поиск + фильтры (ГОСБ,
+    сегмент, рычаг) + пагинация. Самодостаточный инлайн-JS (работает офлайн).
 
-    rows: [{inn, lever, gosb, seg, fl, fot, reason}, ...]
+    rows: [{inn, lever, gosb, seg, fl, fot, reason, action, needk}, ...]
+    Фильтр «Цель»: needk — минимальная цель (1.0/1.2/1.5), при которой организация
+    нужна для закрытия разрыва её сегмента; 0 — не нужна ни при какой (видна только
+    при выборе «Все организации»).
     """
     import json
     data = json.dumps(rows, ensure_ascii=False).replace("</", "<\\/")
@@ -196,7 +202,13 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     tid = esc(table_id)
     return f"""
 <div class="filters">
-  <input id="{tid}-q" placeholder="Поиск: ИНН, ГОСБ, сегмент, причина…">
+  <select id="{tid}-k">
+    <option value="1">Выполнить план</option>
+    <option value="1.2">Перевыполнить на 20%</option>
+    <option value="1.5">Перевыполнить на 50%</option>
+    <option value="0">Все организации</option>
+  </select>
+  <input id="{tid}-q" placeholder="Поиск: номер, название, ГОСБ, сегмент, причина…">
   <select id="{tid}-g"><option value="">Все ГОСБ</option>{gopts}</select>
   <select id="{tid}-s"><option value="">Все сегменты</option>{sopts}</select>
   <select id="{tid}-l"><option value="">Все рычаги</option>
@@ -221,7 +233,10 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
   const fmt=n=>Number(n).toLocaleString('ru-RU',{{maximumFractionDigits:0}});
   function filtered(){{
     const q=($('q').value||'').toLowerCase(), g=$('g').value, s=$('s').value, l=$('l').value;
+    const k=parseFloat($('k').value);
     return DATA.filter(r=>{{
+      // цель по плану: организация нужна, если её needk не больше выбранной цели
+      if(k>0&&!(Number(r.needk)>0&&Number(r.needk)<=k))return false;
       if(g&&r.gosb!==g)return false;
       if(s&&r.seg!==s)return false;
       if(l&&r.lever!==l)return false;
@@ -239,18 +254,20 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     tb.innerHTML=slice.map(r=>{{
       const cls=r.lever==='Привлечь'?'good':'bad';
       const act=r.action?' · <span style="color:var(--text-2)">'+esc(r.action)+'</span>':'';
-      return '<tr><td><div>'+esc(r.company||('ИНН '+r.inn))+'</div>'
-        +'<div style="font-size:12px;color:var(--text-2)">ИНН '+r.inn+'</div></td>'
+      return '<tr><td><div>'+esc(r.company||('Орг. '+r.inn))+'</div>'
+        +'<div style="font-size:12px;color:var(--text-2)">Орг. '+r.inn+'</div></td>'
         +'<td><span class="badge '+cls+'">'+r.lever+'</span></td>'
         +'<td>'+esc(r.gosb)+'</td><td>'+esc(r.seg)+'</td>'
         +'<td class="num">'+fmt(r.fl)+'</td><td class="num">'+fmt(r.fot)+'</td>'
         +'<td>'+esc(r.reason)+act+'</td></tr>';
     }}).join('')||'<tr><td colspan="7" style="color:var(--text-2)">Ничего не найдено</td></tr>';
-    $('i').textContent='Показано '+slice.length+' из '+rows.length+' · стр. '+(page+1)+'/'+pages;
+    const sumFl=rows.reduce((a,r)=>a+Number(r.fl||0),0);
+    $('i').textContent='Показано '+slice.length+' из '+rows.length+' орг · суммарный эффект +'
+      +fmt(sumFl)+' чел · стр. '+(page+1)+'/'+pages;
     $('p').disabled=page<=0; $('n').disabled=page>=pages-1;
   }}
   function esc(s){{return String(s==null?'':s).replace(/[&<>"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));}}
-  ['q','g','s','l'].forEach(k=>$(k).addEventListener('input',()=>{{page=0;render();}}));
+  ['k','q','g','s','l'].forEach(k=>$(k).addEventListener('input',()=>{{page=0;render();}}));
   $('p').addEventListener('click',()=>{{page--;render();}});
   $('n').addEventListener('click',()=>{{page++;render();}});
   render();

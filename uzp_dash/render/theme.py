@@ -157,7 +157,9 @@ td.heat { font-weight: 600; font-variant-numeric: tabular-nums; border-radius: 6
 .gcard .g-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .gcard .g-head h3 { font-size: 17px; }
 .gcard .g-ex { font-variant-numeric: tabular-nums; font-weight: 680; font-size: 20px; letter-spacing: -0.02em; }
-.gcard .g-do { font-size: 14px; line-height: 1.4; letter-spacing: -0.004em; margin: 10px 0 0; }
+.gcard .g-seg { font-size: 13.5px; line-height: 1.5; letter-spacing: -0.004em; margin: 5px 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
+.gcard .g-seg b { font-variant-numeric: tabular-nums; }
+.gcard .g-do { font-size: 14px; line-height: 1.4; letter-spacing: -0.004em; margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--separator); }
 .gcard .g-do b { font-variant-numeric: tabular-nums; }
 .gcard .g-act { font-size: 12.5px; color: var(--text-2); margin-top: 8px; line-height: 1.35; }
 

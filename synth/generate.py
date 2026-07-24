@@ -89,13 +89,39 @@ def _pick_gosb(engine: Engine) -> pd.DataFrame:
     return picked
 
 
+# Профили ГОСБ проблемного ТБ: дэш должен показывать все три ситуации —
+# план вытянут за счёт сильных сегментов, но один сегмент провален; провалены
+# два сегмента; провал по всему ГОСБ.
+GOSB_PROFILES = ("one_bad_seg", "two_bad_segs", "all_bad")
+
+
+def _gosb_profile(gosb_id: int) -> tuple[str, tuple[int, ...]]:
+    """Детерминированный профиль ГОСБ и его западающие сегменты."""
+    prof = GOSB_PROFILES[gosb_id % len(GOSB_PROFILES)]
+    if prof == "one_bad_seg":
+        bad = (SEG_CODES[(gosb_id // 3) % len(SEG_CODES)],)
+    elif prof == "two_bad_segs":
+        i = (gosb_id // 3) % len(SEG_CODES)
+        bad = (SEG_CODES[i], SEG_CODES[(i + 3) % len(SEG_CODES)])
+    else:
+        bad = tuple(SEG_CODES)
+    return prof, bad
+
+
 def _target_exec(tb_short: str, gosb_id: int, seg_id: int) -> float:
     """Целевое выполнение плана по (ТБ, ГОСБ, сегмент). <1 — провал."""
-    r = RNG.normal(1.03, 0.03)
-    if tb_short == PROBLEM_TB_SHORT:
-        r = RNG.normal(0.93, 0.03)                       # весь ТБ слабее
-        if seg_id in PROBLEM_CODES:                      # ММБ (Микро+Малые) хуже всего
-            r = RNG.normal(0.82, 0.03)
+    if tb_short != PROBLEM_TB_SHORT:
+        return float(np.clip(RNG.normal(1.03, 0.03), 0.6, 1.25))
+    prof, bad = _gosb_profile(gosb_id)
+    if seg_id in bad:
+        # ММБ (самый крупный сегмент) проваливается сильнее прочих
+        r = RNG.normal(0.80 if seg_id in PROBLEM_CODES else 0.85, 0.03)
+    elif prof == "one_bad_seg":
+        r = RNG.normal(1.08, 0.02)      # сильные сегменты вытягивают ГОСБ выше 100%
+    elif prof == "two_bad_segs":
+        r = RNG.normal(1.03, 0.02)      # вытягивают частично
+    else:
+        r = RNG.normal(0.93, 0.03)
     return float(np.clip(r, 0.6, 1.25))
 
 
@@ -195,8 +221,6 @@ def _orgs(gosb: pd.DataFrame, latest: pd.DataFrame) -> pd.DataFrame:
     total_recip = latest.groupby("gosb_id")["fact_r"].sum()
     org_alloc = (total_recip / total_recip.sum() * ORGS_TOTAL).round().astype(int).clip(lower=3)
 
-    gosb_gap = latest.groupby("gosb_id")["gap"].sum()   # разрыв получателей по ГОСБ
-
     rows = []
     inn_seq = 1_000_000_000
     for _, gr in gosb.iterrows():
@@ -227,21 +251,38 @@ def _orgs(gosb: pd.DataFrame, latest: pd.DataFrame) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df = _spread_multi_gosb(df, gosb)   # часть компаний работает в неск. ГОСБ
 
-    # Масштабируем потенциал+возврат провальных ГОСБ до ~1.3× разрыва,
-    # чтобы список организаций реально закрывал недобор до плана.
-    for gid, g in df.groupby("gosb_id"):
-        gap = float(gosb_gap.get(gid, 0.0))
+    # Масштабируем потенциал+возврат под разрыв КОНКРЕТНОГО (ГОСБ, сегмент): отбор
+    # ведётся внутри западающего сегмента, поэтому запас нужен именно там. Запас
+    # большой, потому что из отбора выпадает заметная часть организаций: со свежей
+    # сделкой (уже в работе) и успешно отработанные.
+    seg_gap = latest.set_index(["gosb_id", "seg_id"])["gap"].to_dict()
+    scarce = _scarce_segments(seg_gap)      # где намеренно не хватает своих организаций
+    for (gid, seg), g in df.groupby(["gosb_id", "seg_code"]):
+        gap = float(seg_gap.get((gid, int(seg)), 0.0))
         cur = g["_pull"].sum() + g["_back"].sum()
-        if gap > 0 and cur > 0:
-            factor = (1.8 * gap) / cur   # с запасом: список «работать» закрывает план
-            df.loc[g.index, "_pull"] *= factor
-            df.loc[g.index, "_back"] *= factor
+        if cur <= 0:
+            continue
+        if gap > 0:
+            factor = (3.6 * gap) / cur
+            if (gid, int(seg)) in scarce:
+                factor *= 0.15              # своих не хватит -> сработает добор
+        else:
+            factor = 0.6                    # сегмент выполняет план: потенциал скромный
+        df.loc[g.index, "_pull"] *= factor
+        df.loc[g.index, "_back"] *= factor
 
     df["emp_potential_qty"] = df["_pull"].round(3)
     df["fot_potential_amt"] = (df["_pull"] * df["avg_salary"]).round(2)
     df["fl_outflow_qty"] = df["_back"].round().astype(int)
     df["fot_outflow_amt"] = (df["_back"] * df["avg_salary"]).round(2)
     return df.drop(columns=["_pull", "_back"])
+
+
+def _scarce_segments(seg_gap: dict, every: int = 5) -> set:
+    """Каждый N-й западающий (ГОСБ, сегмент) делаем дефицитным по потенциалу —
+    чтобы в дэше воспроизводился сценарий «своих не хватает, добор из других»."""
+    bad = sorted(k for k, v in seg_gap.items() if v > 0)
+    return set(bad[::every])
 
 
 def _spread_multi_gosb(df: pd.DataFrame, gosb: pd.DataFrame, frac: float = 0.12) -> pd.DataFrame:
@@ -406,6 +447,15 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
                 tt, text, comment, quest, unreal = _text_attract(o, success)
             plan_deal = int(max(0, round(o.emp_potential_qty * RNG.uniform(0.5, 1.2)))) if not is_outflow else 0
             fact_deal = int(round(plan_deal * (RNG.uniform(0.6, 1.0) if success else RNG.uniform(0.0, 0.4))))
+            # Сделка заводится через 0–10 дней после задачи; часть сделок оказывается
+            # в последних месяцах окна («свежие» — по ним рано судить о зачислениях).
+            if plan_deal > 0:
+                deal_dt = created + pd.Timedelta(days=int(RNG.integers(0, 11)),
+                                                 hours=int(RNG.integers(9, 19)))
+                deal_dt = min(deal_dt, FUNNEL_END)
+                deal_code = f"D{int(o.inn)}-{int(RNG.integers(1000, 9999))}"
+            else:
+                deal_dt, deal_code = None, None
             rows.append({
                 "report_dt": FUNNEL_END.date(),
                 "tb_id": int(o.tb_id), "tb_name": tb_full.get(int(o.tb_id)),
@@ -424,6 +474,8 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
                 "last_active_status": "Исполнена" if closed else "В работе",
                 "last_active_dttm": active,
                 "unrealized_deal_potential": unreal,
+                "deal_code": deal_code,
+                "deal_create_dttm": deal_dt,
                 "plan_staff_deal_qty": plan_deal,
                 "fact_staff_deal_qty": fact_deal,
                 "task_text": text, "task_comment": comment, "task_questionnaire": quest,
