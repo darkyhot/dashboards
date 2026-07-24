@@ -11,6 +11,7 @@ DROP TABLE IF EXISTS uzp_dwh_metrics CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_company_holding_metric CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_sale_funnel_task CASCADE;
 DROP TABLE IF EXISTS uzp_dim_company CASCADE;
+DROP TABLE IF EXISTS uzp_dim_mzp_reference_base CASCADE;
 
 -- ============ Справочники (грузятся из CSV как есть) ============
 
@@ -168,8 +169,25 @@ CREATE TABLE uzp_dim_company (
   modified_dttm            timestamp
 );
 
+-- ============ Эталонная база закрепления ИУП (СПОД) ============
+-- Перечень организаций, с которыми можно работать: грейн (ГОСБ, ИНН).
+-- gosb_id здесь — НОВЫЙ идентификатор ГОСБ (uzp_dim_gosb.new_gosb_id).
+-- Организации вне этой базы в рекомендации дэша не попадают вообще.
+
+CREATE TABLE uzp_dim_mzp_reference_base (
+  gosb_id        integer,     -- new_gosb_id
+  inn            bigint,      -- ИНН компании
+  main_pos_id    bigint,      -- основная штатная единица сотрудника
+  reserve_pos_id bigint,      -- резервная штатная единица
+  actual_dt      date,        -- дата актуальности эталонной базы (срезов несколько)
+  is_q_ref_base  boolean,     -- признак эталонной базы квартала
+  inserted_dttm  timestamp,
+  author_login   text
+);
+
 -- Индексы под запросы дэшей
 CREATE INDEX ix_metrics_lookup ON uzp_dwh_metrics (metric_id, level_name, period_type, end_dt);
 CREATE INDEX ix_chm_gosb ON uzp_dwh_company_holding_metric (level_id, report_dt);
 CREATE INDEX ix_funnel_inn ON uzp_dwh_sale_funnel_task (inn);
 CREATE INDEX ix_gosb_tb ON uzp_dim_gosb (tb_id);
+CREATE INDEX ix_ref_base ON uzp_dim_mzp_reference_base (gosb_id, inn);
