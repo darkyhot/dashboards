@@ -133,6 +133,8 @@ CREATE TABLE uzp_dwh_sale_funnel_task (
   last_active_status     varchar,
   last_active_dttm       timestamp,
   unrealized_deal_potential integer,
+  deal_code              varchar,     -- код сделки (есть, если сделка заведена)
+  deal_create_dttm       timestamp,   -- дата создания СДЕЛКИ (не задачи!)
   plan_staff_deal_qty    integer,
   fact_staff_deal_qty    integer,
   task_text              varchar,     -- текст задачи

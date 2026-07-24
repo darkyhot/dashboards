@@ -87,6 +87,10 @@ WHERE g.tb_id=:tb_id AND c.report_dt = :ref
 # Окно активностей: три КАЛЕНДАРНЫХ месяца — от первого дня месяца T-2 до конца
 # месяца T (:ref_funnel). Задачи по метрикам идут месяцем позже метрик, поэтому
 # :ref_funnel = :ref + 1 месяц. Пример: ref_funnel = 31.07 -> май, июнь, июль.
+#
+# Сделки оцениваются по ДАТЕ СОЗДАНИЯ СДЕЛКИ (deal_create_dttm), а не задачи:
+# сделка, заведённая в последние два месяца (>= :fresh_from), считается свежей —
+# получатели ещё не успели прийти, судить о недоработке рано.
 _FUNNEL_BASE = """
 base AS (
   SELECT g.new_gosb_id, f.inn, f.role_code, f.task_type, f.last_active_type,
@@ -94,6 +98,9 @@ base AS (
          COALESCE(f.plan_staff_deal_qty, 0)      AS plan_staff_deal_qty,
          COALESCE(f.fact_staff_deal_qty, 0)      AS fact_staff_deal_qty,
          COALESCE(f.unrealized_deal_potential,0) AS unrealized_deal_potential,
+         f.deal_create_dttm,
+         (COALESCE(f.plan_staff_deal_qty, 0) > 0
+          AND f.deal_create_dttm >= CAST(:fresh_from AS date)) AS is_fresh_deal,
          (COALESCE(btrim(f.task_comment), '') <> ''
           OR COALESCE(btrim(f.task_questionnaire), '') <> '') AS has_text
   FROM {schema}.uzp_dwh_sale_funnel_task f
@@ -118,6 +125,11 @@ SELECT new_gosb_id, inn,
        sum(CASE WHEN task_type='Отток' THEN 1 ELSE 0 END)               AS n_outflow,
        sum(plan_staff_deal_qty)                                         AS plan_deal,
        sum(fact_staff_deal_qty)                                         AS fact_deal,
+       -- недоработку считаем ТОЛЬКО по сделкам, созданным до :fresh_from
+       sum(CASE WHEN NOT is_fresh_deal THEN plan_staff_deal_qty ELSE 0 END) AS plan_deal_old,
+       sum(CASE WHEN NOT is_fresh_deal THEN fact_staff_deal_qty ELSE 0 END) AS fact_deal_old,
+       bool_or(is_fresh_deal)                                           AS has_fresh_deal,
+       max(CASE WHEN is_fresh_deal THEN deal_create_dttm END)           AS fresh_deal_dt,
        sum(unrealized_deal_potential)                                   AS unrealized,
        bool_or(has_text)                                                AS any_text,
        max(last_active_dttm)                                            AS last_active

@@ -184,10 +184,12 @@ def _bold(t: str) -> str:
 
 def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
                   seg_options: list[str] | None = None, page_size: int = 15) -> str:
-    """Интерактивная таблица организаций: поиск + фильтры (ГОСБ, сегмент, рычаг) +
-    пагинация. Самодостаточный инлайн-JS (работает офлайн, в т.ч. в закрытом контуре).
+    """Интерактивная таблица организаций: цель по плану + поиск + фильтры (ГОСБ,
+    сегмент, рычаг) + пагинация. Самодостаточный инлайн-JS (работает офлайн).
 
-    rows: [{inn, lever, gosb, seg, fl, fot, reason}, ...]
+    rows: [{inn, lever, gosb, seg, fl, fot, reason, action, cumprev, gapg}, ...]
+    Фильтр «Цель»: строка показывается, если накопленный эффект ДО неё внутри её ГОСБ
+    (cumprev) меньше разрыва этого ГОСБ (gapg), умноженного на коэффициент цели.
     """
     import json
     data = json.dumps(rows, ensure_ascii=False).replace("</", "<\\/")
@@ -196,6 +198,12 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     tid = esc(table_id)
     return f"""
 <div class="filters">
+  <select id="{tid}-k">
+    <option value="1">Выполнить план</option>
+    <option value="1.2">Перевыполнить на 20%</option>
+    <option value="1.5">Перевыполнить на 50%</option>
+    <option value="0">Все организации</option>
+  </select>
   <input id="{tid}-q" placeholder="Поиск: ИНН, ГОСБ, сегмент, причина…">
   <select id="{tid}-g"><option value="">Все ГОСБ</option>{gopts}</select>
   <select id="{tid}-s"><option value="">Все сегменты</option>{sopts}</select>
@@ -221,7 +229,10 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
   const fmt=n=>Number(n).toLocaleString('ru-RU',{{maximumFractionDigits:0}});
   function filtered(){{
     const q=($('q').value||'').toLowerCase(), g=$('g').value, s=$('s').value, l=$('l').value;
+    const k=parseFloat($('k').value);
     return DATA.filter(r=>{{
+      // цель по плану: набираем сверху вниз внутри ГОСБ, пока разрыв не закрыт
+      if(k>0&&!(Number(r.cumprev)<Number(r.gapg)*k))return false;
       if(g&&r.gosb!==g)return false;
       if(s&&r.seg!==s)return false;
       if(l&&r.lever!==l)return false;
@@ -246,11 +257,13 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
         +'<td class="num">'+fmt(r.fl)+'</td><td class="num">'+fmt(r.fot)+'</td>'
         +'<td>'+esc(r.reason)+act+'</td></tr>';
     }}).join('')||'<tr><td colspan="7" style="color:var(--text-2)">Ничего не найдено</td></tr>';
-    $('i').textContent='Показано '+slice.length+' из '+rows.length+' · стр. '+(page+1)+'/'+pages;
+    const sumFl=rows.reduce((a,r)=>a+Number(r.fl||0),0);
+    $('i').textContent='Показано '+slice.length+' из '+rows.length+' орг · суммарный эффект +'
+      +fmt(sumFl)+' чел · стр. '+(page+1)+'/'+pages;
     $('p').disabled=page<=0; $('n').disabled=page>=pages-1;
   }}
   function esc(s){{return String(s==null?'':s).replace(/[&<>"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));}}
-  ['q','g','s','l'].forEach(k=>$(k).addEventListener('input',()=>{{page=0;render();}}));
+  ['k','q','g','s','l'].forEach(k=>$(k).addEventListener('input',()=>{{page=0;render();}}));
   $('p').addEventListener('click',()=>{{page--;render();}});
   $('n').addEventListener('click',()=>{{page++;render();}});
   render();

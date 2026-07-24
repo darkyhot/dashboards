@@ -111,13 +111,20 @@ def _problem_gosb(a: analyze.Analysis) -> str:
         chips = "".join(C.badge(f'{s["seg"]} {s["exec"]*100:.0f}%', C.status_of(s["exec"]))
                         for s in fails) or '<span class="clab">в норме по сегментам</span>'
         act = c["act"]
+        cov = c["coverage"]
+        if cov is not None and cov < 1:
+            do_head = (f'<div class="g-do">Потенциала хватает на <b>{cov*100:.0f}%</b> разрыва: '
+                       f'даже все <b>{c["n_total"]}</b> организаций дают '
+                       f'+{C.fmt_num(c["fl_total"])} чел</div>')
+        else:
+            do_head = (f'<div class="g-do">Под план нужно <b>{c["n_need"]}</b> организаций: '
+                       f'+{C.fmt_num(c["fl_need"])} чел (привлечь {c["n_attract"]} / '
+                       f'вернуть {c["n_return"]}) · ФОТ <b>~{C.fmt_num(c["fot_need"])}</b> млн ₽</div>')
         do = (
-            f'<div class="g-do">Привлечь <b>{c["n_attract"]}</b> орг '
-            f'(+{C.fmt_num(c["pot_fl_att"])} чел) · вернуть <b>{c["n_return"]}</b> '
-            f'(+{C.fmt_num(c["pot_fl_ret"])}) · ФОТ <b>~{C.fmt_num(c["pot_fot"])}</b> млн ₽</div>'
-            f'<div class="g-act">Активности 3 мес: {act["act_n"]} по {act["worked_orgs"]} орг, '
-            f'успех {act["success"]*100:.0f}% · не работали с '
-            f'<b>{c["not_worked"]}</b> приоритетными</div>'
+            do_head
+            + f'<div class="g-act">Активности 3 мес: {act["act_n"]} по {act["worked_orgs"]} орг, '
+              f'успех {act["success"]*100:.0f}% · из нужных под план не работали с '
+              f'<b>{c["not_worked"]}</b></div>'
         )
         inner = (
             f'<div class="g-head"><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
@@ -132,7 +139,11 @@ def _problem_gosb(a: analyze.Analysis) -> str:
 
 
 def _orgs(a: analyze.Analysis) -> str:
-    """Список к отработке. Рекомендация — по конкретной паре (ГОСБ, ИНН)."""
+    """Список к отработке: по умолчанию — ровно те, кем закрывается план.
+
+    Отбор посчитан внутри каждого ГОСБ (cum_prev < разрыв × цель), поэтому фильтр
+    «Цель» в HTML просто меняет коэффициент и работает поверх остальных фильтров.
+    """
     rows = []
     for r in a.to_work.itertuples():
         ins = a.insights.get((int(r.new_gosb_id), int(r.inn)), {})
@@ -142,13 +153,17 @@ def _orgs(a: analyze.Analysis) -> str:
             "gosb": (r.gosb_name or "")[:28], "seg": r.seg_name or "—",
             "fl": round(float(r.impact_fl)), "fot": round(float(r.impact_fot_mln), 1),
             "reason": ins.get("reason") or r.reason, "action": ins.get("action", ""),
+            "cumprev": round(float(getattr(r, "cum_prev", 0.0))),
+            "gapg": round(float(getattr(r, "gosb_gap", 0.0))),
         })
     gosb_opts = sorted({row["gosb"] for row in rows})
     seg_opts = [s for s in SEG_ORDER if s in {row["seg"] for row in rows}]
     explorer = C.orgs_explorer("work", rows, gosb_opts, seg_options=seg_opts)
-    head = (f'<h3>С кем работать — {len(rows)} пар (ГОСБ × организация)</h3>'
+    sim = a.sim
+    head = (f'<h3>С кем работать — {sim["k"]} организаций закрывают план</h3>'
             f'<p class="sub" style="font-size:14px;margin:-4px 0 14px">'
-            f'работа ведётся отдельно в каждом ГОСБ · поиск, фильтры, листание</p>')
+            f'отбор внутри каждого ГОСБ по величине эффекта, пока не закрыт его разрыв · '
+            f'переключатель «Цель» задаёт перевыполнение · всего кандидатов {len(rows)}</p>')
     return C.section("Организации к работе", C.card(head + explorer), eyebrow="Список к отработке")
 
 

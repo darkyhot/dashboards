@@ -227,13 +227,15 @@ def _orgs(gosb: pd.DataFrame, latest: pd.DataFrame) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df = _spread_multi_gosb(df, gosb)   # часть компаний работает в неск. ГОСБ
 
-    # Масштабируем потенциал+возврат провальных ГОСБ до ~1.3× разрыва,
-    # чтобы список организаций реально закрывал недобор до плана.
+    # Масштабируем потенциал+возврат провальных ГОСБ с запасом к разрыву. Запас
+    # большой, потому что из отбора выпадает заметная часть организаций: со свежей
+    # сделкой (уже в работе) и успешно отработанные. После отсева должно остаться
+    # ~1.3× разрыва, иначе фильтр «Выполнить план / +20% / +50%» нечего резать.
     for gid, g in df.groupby("gosb_id"):
         gap = float(gosb_gap.get(gid, 0.0))
         cur = g["_pull"].sum() + g["_back"].sum()
         if gap > 0 and cur > 0:
-            factor = (1.8 * gap) / cur   # с запасом: список «работать» закрывает план
+            factor = (3.6 * gap) / cur
             df.loc[g.index, "_pull"] *= factor
             df.loc[g.index, "_back"] *= factor
 
@@ -406,6 +408,15 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
                 tt, text, comment, quest, unreal = _text_attract(o, success)
             plan_deal = int(max(0, round(o.emp_potential_qty * RNG.uniform(0.5, 1.2)))) if not is_outflow else 0
             fact_deal = int(round(plan_deal * (RNG.uniform(0.6, 1.0) if success else RNG.uniform(0.0, 0.4))))
+            # Сделка заводится через 0–10 дней после задачи; часть сделок оказывается
+            # в последних месяцах окна («свежие» — по ним рано судить о зачислениях).
+            if plan_deal > 0:
+                deal_dt = created + pd.Timedelta(days=int(RNG.integers(0, 11)),
+                                                 hours=int(RNG.integers(9, 19)))
+                deal_dt = min(deal_dt, FUNNEL_END)
+                deal_code = f"D{int(o.inn)}-{int(RNG.integers(1000, 9999))}"
+            else:
+                deal_dt, deal_code = None, None
             rows.append({
                 "report_dt": FUNNEL_END.date(),
                 "tb_id": int(o.tb_id), "tb_name": tb_full.get(int(o.tb_id)),
@@ -424,6 +435,8 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
                 "last_active_status": "Исполнена" if closed else "В работе",
                 "last_active_dttm": active,
                 "unrealized_deal_potential": unreal,
+                "deal_code": deal_code,
+                "deal_create_dttm": deal_dt,
                 "plan_staff_deal_qty": plan_deal,
                 "fact_staff_deal_qty": fact_deal,
                 "task_text": text, "task_comment": comment, "task_questionnaire": quest,

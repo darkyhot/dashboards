@@ -250,10 +250,11 @@ def narrative(ctx, a) -> str:
         f"{r.gosb_name}/{r.seg_name} ({r.execution_percent*100:.0f}%, −{r.nedobor:.0f})"
         for r in a.top_cells.head(5).itertuples()
     )
+    sel = a.to_work[a.to_work.need_100] if "need_100" in a.to_work else a.to_work
     top_orgs = "; ".join(
         f'{(getattr(r, "company_name", "") or r.inn)} [{r.gosb_name}] '
         f'({r.lever}, +{r.impact_fl:.0f} чел)'
-        for r in a.to_work.head(6).itertuples()
+        for r in sel.head(6).itertuples()
     )
     ctx_txt = (
         f"ТБ: {a.tb_full}. Опорный месяц: {a.ref_date}.\n"
@@ -266,8 +267,11 @@ def narrative(ctx, a) -> str:
         f"{a.activity.get('orgs',0)} орг, успех {a.activity.get('success_rate',0)*100:.0f}%, "
         f"привлечено по сделкам {a.activity.get('fact_deal',0)} из {a.activity.get('plan_deal',0)}.\n"
         f"Частые причины из комментариев: {a.themes}.\n"
-        f"К отработке отобрано организаций (ГОСБ×ИНН): {len(a.to_work)}; "
-        f"исключено как бесперспективные: {len(a.no_point)}.\n"
+        f"Для выполнения плана нужно отработать {a.sim['k']} организаций (ГОСБ×ИНН) "
+        f"с суммарным эффектом +{a.sim['closable']:.0f} чел и ФОТ ~{a.sim['fot_mln']:.0f} млн ₽ "
+        f"(привлечение {a.sim['attract']:.0f}, возврат {a.sim['retention']:.0f}); "
+        f"весь доступный потенциал покрывает разрыв на {a.sim['coverage']*100:.0f}%; "
+        f"исключено как бесперспективные или уже в работе: {len(a.no_point)}.\n"
         f"Приоритетные: {top_orgs}."
     )
     prompt = (
@@ -304,9 +308,9 @@ def _fallback(a) -> str:
         f"**Диагноз.** {a.tb_full}: получатели {v['rcp']['exec']*100:.0f}% плана "
         f"(недобор {a.gap_rcp:.0f} чел, ранг {v['rcp']['rank']}/{v['rcp']['n_tb']}). "
         f"Основной провал — в сегментах с наибольшим недобором.\n\n"
-        f"**Что сделать.** Отработать {len(a.to_work)} организаций из списка "
-        f"(приоритет — максимальный потенциал привлечения); частые причины: {a.themes}; "
-        f"закрыть недоработки по сделкам.\n\n"
-        f"**Ожидаемый эффект.** Закрытие недобора {a.gap_rcp:.0f} получателей, "
-        f"эффект ФОТ ~{a.sim.get('fot_mln', 0):.0f} млн ₽."
+        f"**Что сделать.** Отработать {a.sim.get('k', 0)} организаций из списка — именно "
+        f"столько закрывает план (отбор по величине эффекта внутри каждого ГОСБ); "
+        f"частые причины: {a.themes}; закрыть недоработки по сделкам.\n\n"
+        f"**Ожидаемый эффект.** +{a.sim.get('closable', 0):.0f} получателей при недоборе "
+        f"{a.gap_rcp:.0f}, эффект ФОТ ~{a.sim.get('fot_mln', 0):.0f} млн ₽."
     )
