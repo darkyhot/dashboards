@@ -56,9 +56,11 @@ def generate_all(engine: Engine) -> dict[str, int]:
     company = _company_holding(orgs)
     dim_company = _dim_company(orgs)
     funnel = _funnel(orgs, gosb)
+    ref_base = _reference_base(orgs, gosb)
 
     counts = {}
     counts["uzp_dim_company"] = _bulk(engine, dim_company, "uzp_dim_company")
+    counts["uzp_dim_mzp_reference_base"] = _bulk(engine, ref_base, "uzp_dim_mzp_reference_base")
     counts["uzp_dwh_metrics"] = _bulk(engine, metrics, "uzp_dwh_metrics")
     counts["uzp_dwh_company_holding_metric"] = _bulk(engine, company, "uzp_dwh_company_holding_metric")
     counts["uzp_dwh_sale_funnel_task"] = _bulk(engine, funnel, "uzp_dwh_sale_funnel_task")
@@ -381,6 +383,49 @@ def _dim_company(orgs: pd.DataFrame) -> pd.DataFrame:
     df["info"] = None
     df["modified_dttm"] = pd.Timestamp.now()
     return df
+
+
+REF_COVERAGE = 0.85     # доля пар (ГОСБ, ИНН) витрины, закреплённых в эталонной базе
+REF_EXTRA = 0.10        # доля «лишних» пар: есть в базе, но нет в витрине
+
+
+def _reference_base(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
+    """Эталонная база закрепления ИУП: с кем вообще можно работать.
+
+    Грейн — (new_gosb_id, ИНН). Закрепляем не все пары витрины: незакреплённые
+    дэш обязан отбрасывать, даже если у них есть потенциал или отток.
+    """
+    new_by_old = gosb.drop_duplicates("old_gosb_id").set_index("old_gosb_id")["new_gosb_id"]
+    pairs = (orgs[["gosb_id", "inn"]].copy()
+             .assign(gosb_id=lambda d: d["gosb_id"].map(new_by_old))
+             .dropna().drop_duplicates())
+    pairs["gosb_id"] = pairs["gosb_id"].astype(int)
+
+    keep = pairs.sample(frac=REF_COVERAGE, random_state=11)
+    # «лишние» пары: организации, которых нет в витрине этого ГОСБ
+    n_extra = int(len(pairs) * REF_EXTRA)
+    extra = pd.DataFrame({
+        "gosb_id": RNG.choice(pairs["gosb_id"].unique(), size=n_extra),
+        "inn": 2_000_000_000 + RNG.integers(1, 900_000, n_extra),
+    })
+    base = pd.concat([keep, extra], ignore_index=True)
+
+    # несколько срезов актуальности: часть пар присутствует в двух-трёх
+    snapshots = [d.date() for d in
+                 pd.to_datetime(["2026-04-30", "2026-06-17", FUNNEL_END.date()])]
+    rows = []
+    for i, dt in enumerate(snapshots):
+        part = base if i == len(snapshots) - 1 else base.sample(frac=0.7, random_state=20 + i)
+        rows.append(part.assign(actual_dt=dt))
+    df = pd.concat(rows, ignore_index=True)
+    n = len(df)
+    df["main_pos_id"] = 35_000_000 + RNG.integers(0, 900_000, n)
+    df["reserve_pos_id"] = 35_000_000 + RNG.integers(0, 900_000, n)
+    df["is_q_ref_base"] = False
+    df["inserted_dttm"] = pd.Timestamp.now()
+    df["author_login"] = "synthetic_loader"
+    return df[["gosb_id", "inn", "main_pos_id", "reserve_pos_id", "actual_dt",
+               "is_q_ref_base", "inserted_dttm", "author_login"]]
 
 
 # --- Банки фраз для свободного текста воронки (детерминированно, без API) --- #

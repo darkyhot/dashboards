@@ -110,9 +110,14 @@ def run(ctx, tb_short: str) -> Analysis:
                  .assign(share=lambda d: d.nedobor / max(gap_rcp, 1))
                  .head(8))
 
-    # --- Организации ---
+    # --- Организации (только закреплённые в эталонной базе ИУП) ---
     progress.step("Витрина организаций (потенциал/отток)")
     orgs = read_sql(e, Q.ORGS, {"tb_id": tb_id, "ref": ref})
+    rs = read_sql(e, Q.ORGS_REF_STATS, {"tb_id": tb_id, "ref": ref})
+    if not rs.empty:
+        n_all = int(rs.n_all.iloc[0] or 0); n_ref = int(rs.n_ref.iloc[0] or 0)
+        progress.done(f"Эталонная база: закреплено {n_ref} из {n_all} пар (ГОСБ, ИНН) — "
+                      f"остальные {n_all - n_ref} исключены из отбора")
 
     # --- Активности: агрегат по (ГОСБ, ИНН) по ВСЕМ задачам за 3 мес ---
     progress.step("Активности воронки за 3 мес: агрегат по (ГОСБ, ИНН)")

@@ -82,6 +82,27 @@ JOIN gmap g ON g.old_gosb_id=c.level_id
 LEFT JOIN {schema}.uzp_dim_company dc ON dc.inn=c.org_id
 WHERE g.tb_id=:tb_id AND c.report_dt = :ref
   AND c.org_type = 'inn'   -- только организации по ИНН (не holding/head_holding)
+  -- работать можно только с закреплёнными в эталонной базе (грейн ГОСБ+ИНН).
+  -- EXISTS, а не JOIN: в базе несколько срезов actual_dt на одну пару.
+  AND EXISTS (SELECT 1 FROM {schema}.uzp_dim_mzp_reference_base rb
+              WHERE rb.inn = c.org_id AND rb.gosb_id = g.new_gosb_id)
+"""
+
+# Сколько пар (ГОСБ, ИНН) закреплено в эталонной базе — для прогресса в тетрадке
+ORGS_REF_STATS = """
+WITH gmap AS (""" + _GMAP + """),
+pairs AS (
+  SELECT DISTINCT g.new_gosb_id, c.org_id AS inn
+  FROM {schema}.uzp_dwh_company_holding_metric c
+  JOIN gmap g ON g.old_gosb_id=c.level_id
+  WHERE g.tb_id=:tb_id AND c.report_dt = :ref AND c.org_type = 'inn'
+)
+SELECT count(*) AS n_all,
+       count(*) FILTER (
+         WHERE EXISTS (SELECT 1 FROM {schema}.uzp_dim_mzp_reference_base rb
+                       WHERE rb.inn = pairs.inn AND rb.gosb_id = pairs.new_gosb_id)
+       ) AS n_ref
+FROM pairs
 """
 
 # Окно активностей: три КАЛЕНДАРНЫХ месяца — от первого дня месяца T-2 до конца
