@@ -23,15 +23,14 @@ LLM_BATCH_DEFAULT = 30      # организаций в одном запрос�
 PLAN_OVERSHOOT = 1.5        # разбираем с запасом на перевыполнение плана до +50%
 MAX_WAVES = 3               # сколько раз добираем, если запаса не хватило
 PLAN_TARGETS = (1.0, 1.2, 1.5)   # цели в дэше: выполнить план / +20% / +50%
-# Сегмент считаем западающим, только если недобор осмысленный: минимум один
-# получатель и выполнение ниже 99.5% (иначе −2 чел при 100% попадали бы в отбор).
+# Сегмент западает, если план не выполнен (exec < 1) — тот же признак, что даёт
+# красную ячейку в тепловой карте (render.components.heat_bg). Порог в одного
+# получателя отсекает только шум округления.
 MIN_SEG_GAP = 1.0
-SEG_FAIL_EXEC = 0.995
 
 
-def _failing_seg(nedobor, execution_percent) -> bool:
-    return (float(nedobor or 0) >= MIN_SEG_GAP
-            and float(execution_percent or 0) < SEG_FAIL_EXEC)
+def _failing_seg(nedobor, execution_percent=None) -> bool:
+    return float(nedobor or 0) >= MIN_SEG_GAP
 
 
 @dataclass

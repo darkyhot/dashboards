@@ -36,7 +36,6 @@ def build(ctx: Context) -> str:
         title=f"Здоровье ТБ — {C.esc(a.tb_full)}",
         subtitle=f"Текущая ситуация на {C.esc(a.ref_date)} · получатели и ФОТ",
         body=body,
-        footer="УЗП · дэш tb_health. Данные — синтетические (открытый контур).",
     )
 
 
@@ -83,7 +82,11 @@ def _matrix(a: analyze.Analysis) -> str:
     rows_id_label = [(int(r.new_gosb_id), (r.gosb_name or "")[:26])
                      for r in gg.itertuples() if int(r.new_gosb_id) in present]
     segs = [s for s in SEG_ORDER if s in set(m.seg_name)]
-    cells = {(int(row.new_gosb_id), row.seg_name): (row.execution_percent, row.nedobor)
+    # Красная ячейка = западающий сегмент из карточек ГОСБ: тот же порог в одного
+    # получателя (недобор меньше человека — округление, показываем как выполнено).
+    cells = {(int(row.new_gosb_id), row.seg_name):
+             (row.execution_percent if analyze._failing_seg(row.nedobor) else
+              max(float(row.execution_percent or 0), 1.0), row.nedobor)
              for row in m.itertuples()}
     heat = C.card(
         '<h3>Выполнение плана по получателям, %</h3>'
@@ -106,9 +109,9 @@ def _problem_gosb(a: analyze.Analysis) -> str:
     cards = []
     for c in a.gosb_cards:
         st = "warn" if c["seg_only"] else ("bad" if c["exec"] < 0.9 else "warn")
-        # строки по западающим сегментам: разрыв -> сколько организаций нужно
+        # строки по ВСЕМ западающим сегментам (те же, что красные в тепловой карте)
         lines = []
-        for s in c["segs"][:5]:
+        for s in c["segs"]:
             cov = s["coverage"]
             if not s["n_avail"]:
                 tail = " · своих организаций к работе нет — добор из других сегментов"
@@ -117,7 +120,9 @@ def _problem_gosb(a: analyze.Analysis) -> str:
                         f'добор из других')
             else:
                 tail = ""
-            chip = C.badge("%s %.0f%%" % (s["seg"], s["exec"] * 100), C.status_of(s["exec"]))
+            # при 99.5–99.9% показываем десятую долю, иначе «100%» рядом с недобором
+            fmt = "%s %.1f%%" if s["exec"] >= 0.995 else "%s %.0f%%"
+            chip = C.badge(fmt % (s["seg"], s["exec"] * 100), C.status_of(s["exec"]))
             lines.append(
                 f'<div class="g-seg">{chip}'
                 f' −{C.fmt_num(s["nedobor"])} чел → <b>{s["n_need"]}</b> орг '

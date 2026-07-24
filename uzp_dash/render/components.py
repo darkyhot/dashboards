@@ -108,9 +108,12 @@ def heat_matrix(rows_id_label: list[tuple], seg_names: list[str], cells: dict) -
             else:
                 ex, ned = cell
                 bg = heat_bg(ex)
+                # 99.5–99.9% печатаем с десятой долей: иначе ячейка «100%» выглядит
+                # выполненной, хотя план недобран (и в карточке ГОСБ она красная)
+                pct = f"{ex*100:.1f}%" if 0.995 <= ex < 1 else f"{ex*100:.0f}%"
                 tds.append(
                     f'<td class="num heat" style="background:{bg}" title="недобор {ned:.0f}">'
-                    f'{ex*100:.0f}%</td>'
+                    f'{pct}</td>'
                 )
         rows.append(f'<tr>{"".join(tds)}</tr>')
     return (f'<div style="overflow-x:auto"><table class="matrix">'
@@ -205,7 +208,7 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     <option value="1.5">Перевыполнить на 50%</option>
     <option value="0">Все организации</option>
   </select>
-  <input id="{tid}-q" placeholder="Поиск: ИНН, ГОСБ, сегмент, причина…">
+  <input id="{tid}-q" placeholder="Поиск: номер, название, ГОСБ, сегмент, причина…">
   <select id="{tid}-g"><option value="">Все ГОСБ</option>{gopts}</select>
   <select id="{tid}-s"><option value="">Все сегменты</option>{sopts}</select>
   <select id="{tid}-l"><option value="">Все рычаги</option>
@@ -251,8 +254,8 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     tb.innerHTML=slice.map(r=>{{
       const cls=r.lever==='Привлечь'?'good':'bad';
       const act=r.action?' · <span style="color:var(--text-2)">'+esc(r.action)+'</span>':'';
-      return '<tr><td><div>'+esc(r.company||('ИНН '+r.inn))+'</div>'
-        +'<div style="font-size:12px;color:var(--text-2)">ИНН '+r.inn+'</div></td>'
+      return '<tr><td><div>'+esc(r.company||('Орг. '+r.inn))+'</div>'
+        +'<div style="font-size:12px;color:var(--text-2)">Орг. '+r.inn+'</div></td>'
         +'<td><span class="badge '+cls+'">'+r.lever+'</span></td>'
         +'<td>'+esc(r.gosb)+'</td><td>'+esc(r.seg)+'</td>'
         +'<td class="num">'+fmt(r.fl)+'</td><td class="num">'+fmt(r.fot)+'</td>'
