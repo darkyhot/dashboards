@@ -316,10 +316,9 @@ def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFram
                 insights[key] = det
                 stats["checklist" if det["source"].startswith("чек-лист") else "keyword"] += 1
             elif item_notes:
+                # названия ГОСБ и компаний в LLM не передаём — только id и сегмент
                 need_llm.append({
                     "gosb_id": key[0], "inn": key[1],
-                    "gosb": str(getattr(r, "gosb_name", "") or ""),
-                    "company": str(getattr(r, "company_name", "") or ""),
                     "segment": str(getattr(r, "seg_name", "") or ""),
                     "notes": item_notes,
                 })

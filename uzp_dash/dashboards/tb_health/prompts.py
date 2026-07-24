@@ -17,6 +17,7 @@ import math
 
 from ... import llm as llm_mod
 from ... import progress
+from ...anonymize import Aliases
 
 BATCH_STEPS = (30, 10, 3, 1)   # шаги деградации размера батча
 PROMPT_CHAR_LIMIT = 40_000     # больше в один запрос не отправляем — делим заранее
@@ -93,12 +94,14 @@ def _parse_items(raw: str) -> list[dict]:
 
 
 def _prompt(chunk: list[dict]) -> str:
+    # Названия ГОСБ и компаний в LLM НЕ отправляем (шлюз блокирует запросы с
+    # чувствительной географией). Для ответа они не нужны: ключ — числовые id.
     lines = []
     for o in chunk:
         notes = " ⏵ ".join(n["text"] if isinstance(n, dict) else str(n) for n in o["notes"])
         lines.append(
-            f'gosb_id={o["gosb_id"]} inn={o["inn"]} | {o["company"]} '
-            f'| ГОСБ: {o["gosb"]} | сегмент: {o["segment"]} | активности: {notes}'
+            f'gosb_id={o["gosb_id"]} inn={o["inn"]} '
+            f'| сегмент: {o.get("segment", "")} | активности: {notes}'
         )
     return (
         "Ты — аналитик зарплатных проектов банка. Ниже по каждой паре "
@@ -245,21 +248,27 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
 
 # --------------------------------------------------------------------------- #
 def narrative(ctx, a) -> str:
-    """Исполнительный нарратив «что плохо и что делать» для управляющего ТБ."""
+    """Исполнительный нарратив «что плохо и что делать» для управляющего ТБ.
+
+    Названия ГОСБ и компаний уходят в LLM только как псевдонимы («ГОСБ-01»);
+    настоящие имена подставляются обратно в ответ модели (Aliases.restore).
+    """
     v = a.verdict
+    al = Aliases()
     cells = "; ".join(
-        f"{r.gosb_name}/{r.seg_name} ({r.execution_percent*100:.0f}%, −{r.nedobor:.0f})"
+        f"{al.alias('ГОСБ', r.gosb_name)}/{r.seg_name} "
+        f"({r.execution_percent*100:.0f}%, −{r.nedobor:.0f})"
         for r in a.top_cells.head(5).itertuples()
     )
     sel = (a.to_work[(a.to_work.need_k > 0) & (a.to_work.need_k <= 1.0)]
            if "need_k" in a.to_work else a.to_work)
     bad_segs = "; ".join(
-        f'{c["gosb_name"]}: ' + ", ".join(
+        f'{al.alias("ГОСБ", c["gosb_name"])}: ' + ", ".join(
             f'{s["seg"]} ({s["exec"]*100:.0f}%, −{s["nedobor"]:.0f})' for s in c["segs"][:3])
         for c in getattr(a, "gosb_cards", [])[:6] if c["segs"])
     top_orgs = "; ".join(
-        f'{(getattr(r, "company_name", "") or r.inn)} [{r.gosb_name}] '
-        f'({r.lever}, +{r.impact_fl:.0f} чел)'
+        f'{al.alias("Организация", getattr(r, "company_name", "") or r.inn)} '
+        f'[{al.alias("ГОСБ", r.gosb_name)}] ({r.lever}, +{r.impact_fl:.0f} чел)'
         for r in sel.head(6).itertuples()
     )
     ctx_txt = (
@@ -292,10 +301,12 @@ def narrative(ctx, a) -> str:
         "**Что сделать** — 3–5 конкретных действий (какие ГОСБ, сегменты, организации, "
         "привлечение vs возврат).\n"
         "**Ожидаемый эффект** — 1–2 предложения с числами.\n"
-        "Не употребляй слово «ИНН» — пиши «организация».\n\n"
+        "Не употребляй слово «ИНН» — пиши «организация».\n"
+        "Обозначения вида ГОСБ-01 пиши ПОЛНОСТЬЮ при каждом упоминании "
+        "(«ГОСБ-01, ГОСБ-02»), не сокращай перечисления до «ГОСБ-01, 02».\n\n"
         + ctx_txt
     )
-    progress.llm_request("нарратив", prompt)
+    progress.llm_request("нарратив", prompt, note=f"псевдонимов {len(al)}")
     llm_mod.LAST_META = {}
     try:
         resp = ctx.llm(prompt, temperature=0.2)
@@ -305,7 +316,7 @@ def narrative(ctx, a) -> str:
         if not resp or not resp.strip():
             progress.llm_error("нарратив", "пустой ответ LLM — использую фолбэк")
             return _fallback(a) + "\n\n_(LLM вернул пустой ответ)_"
-        return resp
+        return al.restore(resp)      # вернуть настоящие названия ГОСБ/организаций
     except Exception as ex:
         meta = dict(llm_mod.LAST_META)
         progress.llm_error("нарратив", f"{type(ex).__name__}: {ex}")
