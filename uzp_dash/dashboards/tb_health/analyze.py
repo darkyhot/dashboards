@@ -158,8 +158,11 @@ def run(ctx, tb_short: str) -> Analysis:
     progress.done(f"Западающих (ГОСБ, сегмент): {len(seg_gaps)} в {n_gosb_seg} ГОСБ")
 
     # --- Рекомендации: чек-лист -> ключевые слова -> LLM (аудит отработки) ---
+    # Опорный месяц задач = конец окна воронки: относительно него решаем, назван ли
+    # в тексте срок В БУДУЩЕМ (тогда спрашивать результат ещё рано).
+    ref_ym = (pd.Timestamp(ref_funnel).year, pd.Timestamp(ref_funnel).month)
     insights, to_work, no_point, themes, llm_stats = _resolve(
-        ctx, e, pf, to_work, no_point, seg_gaps, batch, min_impact, max_calls)
+        ctx, e, pf, to_work, no_point, seg_gaps, batch, min_impact, max_calls, ref_ym)
 
     # --- Отбор «ровно под план»: закрываем разрыв КАЖДОГО западающего сегмента ---
     progress.step("Отбор организаций под план по (ГОСБ, сегмент)")
@@ -188,8 +191,9 @@ def run(ctx, tb_short: str) -> Analysis:
 def _merge_funnel(orgs: pd.DataFrame, fagg: pd.DataFrame) -> pd.DataFrame:
     """Приклеить агрегат воронки на грейне (ГОСБ, ИНН)."""
     num_cols = ["n_tasks", "n_calls", "n_meetings", "n_success", "n_overdue", "n_outflow",
+                "n_in_progress", "n_closed",
                 "plan_deal", "fact_deal", "plan_deal_old", "fact_deal_old", "unrealized"]
-    bool_cols = ["any_success", "any_text", "has_fresh_deal"]
+    bool_cols = ["any_success", "any_text", "has_fresh_deal", "deal_expected"]
     if fagg.empty:
         for c in num_cols:
             orgs[c] = 0
@@ -246,17 +250,25 @@ def _classify(cand: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     Сделки оцениваются по дате создания сделки: свежая сделка означает, что
     организация уже в работе и зачисления просто не успели пройти — такие в список
-    к отработке не берём. Недоработку считаем только по «старым» сделкам.
+    к отработке не берём. Недоработку считаем только по «старым» сделкам, и только
+    если сделка по задачам вообще ожидалась (deal_expected).
+
+    Отдельная ветка — задачи, которые ЕЩЁ В РАБОТЕ и не просрочены: ни одна не
+    закрыта, спрашивать результат рано, это не недоработка.
     """
     work_rows, skip_rows = [], []
     for _, o in cand.iterrows():
         fresh_dt = o.get("fresh_deal_dt")
         when = f" с {pd.Timestamp(fresh_dt):%m.%Y}" if pd.notna(fresh_dt) else ""
+        n_ip = int(o.get("n_in_progress", 0))
         if bool(o.get("has_fresh_deal", False)):
             skip_rows.append((o, f"Сделка в работе{when} — ждём зачислений"))
         elif not bool(o.get("worked", False)):
             work_rows.append((o, "Не работали за 3 мес — начать отработку"))
-        elif int(o.get("fact_deal_old", 0)) < int(o.get("plan_deal_old", 0)):
+        elif n_ip > 0 and int(o.get("n_closed", 0)) == 0 and int(o.get("n_overdue", 0)) == 0:
+            skip_rows.append((o, f"Задач в работе: {n_ip} — срок не вышел, ждём результата"))
+        elif (bool(o.get("deal_expected", False))
+                and int(o.get("fact_deal_old", 0)) < int(o.get("plan_deal_old", 0))):
             work_rows.append((o, f"Недоработка по сделке: {int(o['fact_deal_old'])} "
                                  f"из {int(o['plan_deal_old'])} получателей"))
         elif int(o.get("n_overdue", 0)) > 0:
@@ -283,17 +295,19 @@ _POSITIVE_REASONS = {"Получено согласие", "Планируетс�
 
 # --------------------------------------------------------------------------- #
 def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFrame,
-             seg_gaps: dict, batch: int, min_impact: float, max_calls: int):
+             seg_gaps: dict, batch: int, min_impact: float, max_calls: int,
+             ref_ym: tuple[int, int]):
     """Аудит отработки по (ГОСБ, ИНН): один проход по всему пулу западающих сегментов.
 
     Пул — `_audit_pool`: ВСЕ организации западающих сегментов их ГОСБ + доборные из
     других сегментов ГОСБ (не «топ» и не «минимум под план»). Разрешение: чек-лист ->
-    ключевые слова (кроме needs_llm и пар с ≥2 авторами) -> LLM с фактами и хронологией
-    -> фолбэк на правила для того, что не влезло в бюджет вызовов.
+    названный в тексте будущий срок -> ключевые слова (кроме needs_llm и пар с ≥2
+    авторами) -> LLM с фактами и хронологией -> фолбэк на правила для того, что не
+    влезло в бюджет вызовов.
     """
     stats = {"batch": batch, "min_impact": min_impact, "max_calls": max_calls,
              "pool": 0, "checklist": 0, "keyword": 0, "llm": 0, "no_text": 0,
-             "fallback": 0, "batches": 0, "capped": 0}
+             "fallback": 0, "batches": 0, "capped": 0, "deadline": 0, "no_influence": 0}
     if to_work.empty:
         return {}, to_work, no_point, "—", stats
 
@@ -315,12 +329,16 @@ def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFram
         key = (int(r.new_gosb_id), int(r.inn))
         item_notes = notes.get(key, [])
         facts = _facts(r)
+        # назван ли в тексте срок ПОЗЖЕ опорного месяца («зачисления пройдут 08.2026»)
+        facts["deadline"] = text_rules.deadline(
+            " ".join(n.get("comment") or "" for n in item_notes), ref_ym)
         multi_author = len({n["author"] for n in item_notes}) >= 2
-        det = _deterministic(item_notes, multi_author)
+        det = _deterministic(item_notes, multi_author, facts)
         # «лишь бы закрыть»: правило заявляет успех (согласие/расширение), но по СТАРОЙ
         # сделке план>0, факт=0 — не закрываем правилом, отдаём модели на проверку
         # формальности (это и есть вопрос «качественно или просто закрыли»).
-        suspect_formal = facts["plan_deal_old"] > 0 and facts["fact_deal_old"] == 0
+        suspect_formal = (facts["deal_expected"] and facts["plan_deal_old"] > 0
+                          and facts["fact_deal_old"] == 0)
         if det and not (suspect_formal and det.get("reason") in _POSITIVE_REASONS):
             insights[key] = det
             stats["checklist" if det["source"].startswith("чек-лист") else "keyword"] += 1
@@ -343,17 +361,24 @@ def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFram
 
     if need_llm:
         # пул отсортирован по убыванию эффекта -> бюджет тратится на крупные первыми
-        got, nb = prompts.text_insights(ctx, need_llm, batch=batch, max_calls=max_calls)
+        ref_label = f"{ref_ym[1]:02d}.{ref_ym[0]}"
+        got, nb = prompts.text_insights(ctx, need_llm, batch=batch, max_calls=max_calls,
+                                       ref_label=ref_label)
         stats["batches"] += nb
         for it in need_llm:
             key = (it["gosb_id"], it["inn"])
             if key in got:
-                has_outflow = int(it["facts"].get("outflow_fl", 0)) > 0
-                insights[key] = _decorate_reason(got[key], has_outflow); stats["llm"] += 1
+                insights[key] = _finalize(got[key], it["facts"]); stats["llm"] += 1
             else:   # не влез в бюджет вызовов / LLM не вернул -> фолбэк на правила
-                insights[key] = _fallback_insight(it["notes"]); stats["fallback"] += 1
+                insights[key] = _fallback_insight(it["notes"], it["facts"])
+                stats["fallback"] += 1
         stats["capped"] = sum(1 for it in need_llm if (it["gosb_id"], it["inn"]) not in got)
 
+    stats["deadline"] = sum(1 for v in insights.values()
+                            if v.get("source") == "срок в тексте")
+    stats["no_influence"] = sum(1 for v in insights.values()
+                                if v.get("can_influence") == "нет"
+                                or v.get("action") == text_rules.NO_INFLUENCE_ACTION)
     to_work, no_point = _reclassify(to_work, no_point, insights)
     return insights, to_work, no_point, text_rules.themes(all_texts), stats
 
@@ -375,32 +400,57 @@ def _audit_pool(to_work: pd.DataFrame, seg_gaps: dict, min_impact: float) -> pd.
 
 
 def _facts(r) -> dict:
-    """Числовые ФАКТЫ витрины для LLM. Сделки — только «старый» месяц (*_old)."""
+    """Числовые ФАКТЫ витрины для LLM. Сделки — только «старый» месяц (*_old).
+
+    deal_expected: ожидается ли по задачам сделка вообще (план>0 либо заведён deal_code).
+    Если нет — отсутствие сделки НЕ дефект, и спрашивать по ней факт зачислений нельзя.
+    n_in_progress / n_closed: сколько задач ещё в работе (не просрочены) и сколько
+    закрыто — без этого открытая задача выглядит как «не отработана».
+    """
     return {
         "potential": int(getattr(r, "emp_potential_qty", 0) or 0),
         "outflow_fl": int(getattr(r, "fl_outflow_qty", 0) or 0),
         "outflow_fot_mln": float(getattr(r, "fot_outflow_mln", 0) or 0),
         "avg_salary": float(getattr(r, "avg_salary", 0) or 0),
+        "deal_expected": bool(getattr(r, "deal_expected", False)),
         "plan_deal_old": int(getattr(r, "plan_deal_old", 0) or 0),
         "fact_deal_old": int(getattr(r, "fact_deal_old", 0) or 0),
         "has_fresh_deal": bool(getattr(r, "has_fresh_deal", False)),
         "n_overdue": int(getattr(r, "n_overdue", 0) or 0),
+        "n_in_progress": int(getattr(r, "n_in_progress", 0) or 0),
+        "n_closed": int(getattr(r, "n_closed", 0) or 0),
         "any_success": bool(getattr(r, "any_success", False)),
     }
 
 
-def _decorate_reason(ins: dict, has_outflow: bool = True) -> dict:
-    """Дописать в reason префикс качества, чтобы вывод лёг в поле «Причина / действие»
-    без правок вёрстки и индексировался поиском таблицы. «отток не отработан» ставим
-    только при реальном оттоке — иначе модель иногда лепит его на чистое привлечение."""
+def _finalize(ins: dict, facts: dict) -> dict:
+    """Привести ответ модели в вид, который ложится в поле «Причина / действие».
+
+    Метки качества дописываются ПРЕФИКСОМ в reason (без правок вёрстки, индексируются
+    поиском таблицы). Каждая метка гасится там, где она заведомо не имеет смысла:
+      * «формально закрыто» / «не отработана» — только если задачи вообще ЗАКРЫТЫ:
+        по открытой и не просроченной задаче спрашивать результат рано;
+      * «отток не отработан» — только при реальном оттоке И когда банк мог на него
+        повлиять (объективный отток вроде отпусков отрабатывать нечем);
+      * «влиять нечем» переводит вердикт в no_point — такая пара уходит из списка,
+        а действие заменяется на мониторинг, чтобы не требовать выдуманных шагов.
+    """
+    has_closed = facts.get("n_closed", 0) > 0 or facts.get("n_overdue", 0) > 0
+    has_outflow = int(facts.get("outflow_fl", 0)) > 0
+    no_influence = ins.get("can_influence") == "нет"
     prefixes = []
-    if ins.get("quality") == "формально":
-        prefixes.append("формально закрыто")
-    elif ins.get("quality") == "не отработана":
-        prefixes.append("не отработана")
+    if no_influence:
+        prefixes.append("влиять нечем")
+        ins["verdict"] = "no_point"
+        ins["action"] = text_rules.NO_INFLUENCE_ACTION
+    if has_closed and not no_influence:
+        if ins.get("quality") == "формально":
+            prefixes.append("формально закрыто")
+        elif ins.get("quality") == "не отработана":
+            prefixes.append("не отработана")
     if ins.get("contradiction") == "да":
         prefixes.append("противоречие в комментариях")
-    if ins.get("outflow_worked") == "нет" and has_outflow:
+    if ins.get("outflow_worked") == "нет" and has_outflow and not no_influence:
         prefixes.append("отток не отработан")
     if prefixes:
         base = ins.get("reason", "")
@@ -408,30 +458,43 @@ def _decorate_reason(ins: dict, has_outflow: bool = True) -> dict:
     return ins
 
 
-def _deterministic(notes: list[dict], multi_author: bool = False) -> dict | None:
+def _deterministic(notes: list[dict], multi_author: bool = False,
+                   facts: dict | None = None) -> dict | None:
     """Детерминированное разрешение. None — нужен LLM.
 
     Порядок: 1) причина оттока из ЧЕК-ЛИСТА (структурный ответ);
-             2) ключевые слова в КОММЕНТАРИИ;
-             3) ключевые слова в ОТВЕТАХ чек-листа.
+             2) названный в тексте СРОК позже опорного месяца;
+             3) ключевые слова в КОММЕНТАРИИ;
+             4) ключевые слова в ОТВЕТАХ чек-листа.
     Ужесточения:
-      * подтверждённая ликвидация из чек-листа (no_point) короткозамыкает всегда;
+      * структурный no_point из чек-листа (ликвидация, отпуска/сезонность, сокращение
+        штата) короткозамыкает всегда — это поле формы, а не догадка по тексту;
+      * названный будущий срок при отсутствии просрочки закрывает кейс как in_progress:
+        сотрудник назвал дату, она не наступила — требовать результата сейчас не за что;
       * при ≥2 авторах правила НЕ закрывают кейс (кроме того no_point) — противоречия
         между сотрудниками может оценить только LLM;
-      * правила с флагом needs_llm (ликвидация/банкротство по ключевым словам) — лишь
-        подсказка, вердикт подтверждает модель, поэтому здесь их не применяем.
+      * правила с флагом needs_llm (ликвидация по ключевым словам, «влиять нечем» по
+        свободному тексту, незнакомая причина оттока) — лишь подсказка, вердикт
+        подтверждает модель, поэтому здесь их не применяем.
     По сырому тексту анкеты не матчим — там формулировки ВОПРОСОВ дают ложные
     срабатывания (матчим отдельно по РАЗОБРАННЫМ ответам).
     """
+    facts = facts or {}
     for n in notes:
         det = text_rules.outflow_reason(n.get("questionnaire"))
         if det and det.get("verdict") == "no_point":
-            return det                    # ликвидация из чек-листа — доверяем, всегда
+            return det                    # структурный ответ чек-листа — доверяем всегда
+    # срок назван и ещё не наступил, просрочки нет -> работа идёт, ждём
+    due = facts.get("deadline")
+    if due and not facts.get("n_overdue"):
+        return {"reason": f"назван срок {due} — ещё не наступил",
+                "action": f"Проконтролировать в {due}",
+                "verdict": "in_progress", "source": "срок в тексте", "needs_llm": False}
     if multi_author:
         return None                       # ≥2 авторов -> в LLM (кроме no_point выше)
     for n in notes:
         det = text_rules.outflow_reason(n.get("questionnaire"))
-        if det:
+        if det and not det.get("needs_llm"):
             return det
     for n in notes:
         det = text_rules.match_keyword(n.get("comment"))
@@ -445,14 +508,19 @@ def _deterministic(notes: list[dict], multi_author: bool = False) -> dict | None
     return None
 
 
-def _fallback_insight(notes: list[dict]) -> dict:
+def _fallback_insight(notes: list[dict], facts: dict | None = None) -> dict:
     """Если LLM не ответил / не влез в бюджет — разрешаем детерминированными правилами.
 
     Текст для повторного матчинга собираем из КОММЕНТАРИЯ и РАЗОБРАННЫХ ОТВЕТОВ анкеты,
     а НЕ из сырого n['text'] (там формулировки вопросов чек-листа дают ложные
-    срабатывания). needs_llm-правила здесь не применяем — подтвердить их некому.
+    срабатывания).
+
+    В отличие от `_deterministic`, здесь needs_llm-правила ПРИМЕНЯЮТСЯ как есть:
+    подтвердить их некому, а догадка по ключевым словам («сезонный фактор»,
+    «признаки ликвидации») честнее слепого «работать». Ложный no_point по ликвидации
+    так не возникает: у этого правила вердикт и так work, модель лишь могла его усилить.
     """
-    det = _deterministic(notes)
+    det = _deterministic(notes, facts=facts)
     if det:
         return det
     safe_parts = []
@@ -461,7 +529,7 @@ def _fallback_insight(notes: list[dict]) -> dict:
             safe_parts.append(n["comment"])
         safe_parts.extend(text_rules.parse_questionnaire(n.get("questionnaire")).values())
     fb = text_rules.match_keyword(" ".join(safe_parts))
-    if fb and not fb.get("needs_llm"):
+    if fb:
         return fb
     return {"reason": "", "action": "", "verdict": "work", "source": "правило"}
 
@@ -516,9 +584,13 @@ def _collect_notes(text_df: pd.DataFrame, pool: pd.DataFrame, sink: list) -> dic
             "date": (pd.Timestamp(created).strftime("%d.%m") if pd.notna(created) else ""),
             "_sort": (pd.Timestamp(created) if pd.notna(created) else None),
             "author": amap[aid], "role": str(getattr(r, "role_code", "") or ""),
-            "type": str(getattr(r, "task_type", "") or ""),
+            "type": " / ".join(x for x in (str(getattr(r, "task_type", "") or ""),
+                                           str(getattr(r, "task_subtype", "") or "")) if x),
             "status": str(getattr(r, "task_text_status", "") or ""),
             "closed_same_day": closed_same_day,
+            # чтобы модель не спрашивала результат с ещё открытой задачи
+            "in_progress": bool(getattr(r, "is_in_progress", False)),
+            "overdue": bool(getattr(r, "is_overdue", False)),
         })
         if comment:
             sink.append(comment)
@@ -529,22 +601,34 @@ def _collect_notes(text_df: pd.DataFrame, pool: pd.DataFrame, sink: list) -> dic
     return {k: v[:8] for k, v in out.items()}
 
 
+# Вердикты, при которых организации в списке «к работе» делать нечего ПРЯМО СЕЙЧАС:
+#   no_point    — влиять нечем (ликвидация, отпуска/сезонность, сокращение штата);
+#   in_progress — работа идёт: задача не закрыта и не просрочена, либо назван срок,
+#                 который ещё не наступил, либо только что заведена сделка.
+# И то и другое уходит из списка: список должен отвечать на вопрос «что мы РЕАЛЬНО
+# можем сделать сейчас», а не перечислять всё, к чему можно придраться.
+_MOVE_VERDICTS = ("no_point", "in_progress")
+
+
 def _reclassify(to_work: pd.DataFrame, no_point: pd.DataFrame, insights: dict):
-    """Вердикт no_point (напр. ликвидация) переносит строку в «нет смысла»."""
+    """Перенести из «к работе» строки, где действовать сейчас не за что."""
     if to_work.empty:
         return to_work, no_point
     move_mask = []
     for r in to_work.itertuples():
         v = insights.get((int(r.new_gosb_id), int(r.inn)))
-        move_mask.append(bool(v and v.get("verdict") == "no_point"))
+        move_mask.append(bool(v and v.get("verdict") in _MOVE_VERDICTS))
     move_mask = pd.Series(move_mask, index=to_work.index)
     moved = to_work[move_mask].copy()
     if not moved.empty:
         moved["reason"] = [insights[(int(r.new_gosb_id), int(r.inn))]["reason"]
                            for r in moved.itertuples()]
+        n_wait = sum(1 for r in moved.itertuples()
+                     if insights[(int(r.new_gosb_id), int(r.inn))]["verdict"] == "in_progress")
         no_point = pd.concat([no_point, moved], ignore_index=True)
         to_work = to_work[~move_mask].copy()
-        progress.done(f"перенесено в «нет смысла» по тексту: {len(moved)}")
+        progress.done(f"убрано из списка по тексту: {len(moved)} "
+                      f"(влиять нечем {len(moved) - n_wait}, работа идёт {n_wait})")
     return to_work, no_point
 
 

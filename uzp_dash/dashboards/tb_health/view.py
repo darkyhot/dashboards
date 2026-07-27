@@ -210,6 +210,10 @@ def _log_llm_stats(a: analyze.Analysis) -> None:
         f"без текста {s.get('no_text',0)} · LLM {s.get('llm',0)} "
         f"(батчей {s.get('batches',0)} по {s.get('batch')}) · фолбэк {s.get('fallback',0)}{tail}"
     )
+    progress.done(
+        f"Из них не требуют действий сейчас: влиять нечем {s.get('no_influence',0)} · "
+        f"назван будущий срок {s.get('deadline',0)}"
+    )
 
 
 def _col(exec_pct):

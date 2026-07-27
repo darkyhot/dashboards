@@ -112,6 +112,14 @@ FROM pairs
 # Сделки оцениваются по ДАТЕ СОЗДАНИЯ СДЕЛКИ (deal_create_dttm), а не задачи:
 # сделка, заведённая в последние два месяца (>= :fresh_from), считается свежей —
 # получатели ещё не успели прийти, судить о недоработке рано.
+# Ещё два признака, без которых задача выглядит недоработанной, хотя это не так:
+#   is_in_progress — задача ЕЩЁ НЕ ЗАКРЫТА (статус «Новая»/«В работе»). Если она при
+#     этом не просрочена, требовать результата рано: это нормальный ход работы.
+#   deal_expected  — по задаче В ПРИНЦИПЕ ожидается сделка. Определяем ПО ДАННЫМ
+#     (план сделки > 0 либо заведён deal_code), а не по вокабуляру task_type: у задач
+#     типа «Задача» сделки нет и не будет, спрашивать по ним факт зачислений нельзя.
+# Просрочку ловим по вхождению «просроч» (ILIKE), а не точным литералом статуса —
+# формулировки статусов в АС различаются.
 _FUNNEL_BASE = """
 base AS (
   SELECT g.new_gosb_id, f.inn, f.role_code, f.task_type, f.last_active_type,
@@ -122,6 +130,11 @@ base AS (
          f.deal_create_dttm,
          (COALESCE(f.plan_staff_deal_qty, 0) > 0
           AND f.deal_create_dttm >= CAST(:fresh_from AS date)) AS is_fresh_deal,
+         COALESCE(f.is_task_in_progress, NOT COALESCE(f.is_task_closed, false))
+                                                              AS is_in_progress,
+         COALESCE(f.task_text_status ILIKE '%просроч%', false) AS is_overdue,
+         (COALESCE(f.plan_staff_deal_qty, 0) > 0
+          OR f.deal_code IS NOT NULL)                         AS deal_expected,
          (COALESCE(btrim(f.task_comment), '') <> ''
           OR COALESCE(btrim(f.task_questionnaire), '') <> '') AS has_text
   FROM {schema}.uzp_dwh_sale_funnel_task f
@@ -142,7 +155,11 @@ SELECT new_gosb_id, inn,
        sum(CASE WHEN last_active_type='Встреча' THEN 1 ELSE 0 END)      AS n_meetings,
        sum(CASE WHEN is_task_closed_success THEN 1 ELSE 0 END)          AS n_success,
        bool_or(is_task_closed_success)                                  AS any_success,
-       sum(CASE WHEN task_text_status='Не закрыта: Просрочена' THEN 1 ELSE 0 END) AS n_overdue,
+       sum(CASE WHEN is_overdue THEN 1 ELSE 0 END)                      AS n_overdue,
+       -- ещё в работе и НЕ просрочены: по таким требовать результата рано
+       sum(CASE WHEN is_in_progress AND NOT is_overdue THEN 1 ELSE 0 END) AS n_in_progress,
+       sum(CASE WHEN NOT is_in_progress THEN 1 ELSE 0 END)              AS n_closed,
+       bool_or(deal_expected)                                           AS deal_expected,
        sum(CASE WHEN task_type='Отток' THEN 1 ELSE 0 END)               AS n_outflow,
        sum(plan_staff_deal_qty)                                         AS plan_deal,
        sum(fact_staff_deal_qty)                                         AS fact_deal,
@@ -166,7 +183,7 @@ SELECT count(*) AS n, count(DISTINCT inn) AS orgs,
        sum(CASE WHEN last_active_type='Звонок'  THEN 1 ELSE 0 END) AS calls,
        sum(CASE WHEN last_active_type='Встреча' THEN 1 ELSE 0 END) AS meetings,
        avg(CASE WHEN is_task_closed_success THEN 1.0 ELSE 0.0 END) AS success_rate,
-       sum(CASE WHEN task_text_status='Не закрыта: Просрочена' THEN 1 ELSE 0 END) AS overdue,
+       sum(CASE WHEN is_overdue THEN 1 ELSE 0 END) AS overdue,
        sum(plan_staff_deal_qty) AS plan_deal,
        sum(fact_staff_deal_qty) AS fact_deal,
        sum(unrealized_deal_potential) AS unrealized
@@ -191,13 +208,20 @@ SELECT 'status', COALESCE(task_text_status,'—'), count(*) FROM base GROUP BY 2
 # ФИО НЕ тянем: для «противоречий между сотрудниками» достаточно РАЗЛИЧАТЬ авторов),
 # роль, дату создания задачи, факт закрытия и признак успеха. Числа по сделкам/
 # потенциалу/оттоку здесь не нужны — они берутся из FUNNEL_AGG/ORGS (уже с *_old).
+# Плюс признак «задача ещё в работе» и «по задаче есть/ожидается сделка» — чтобы в
+# хронологии было видно, с какой задачи вообще правомерно спрашивать результат.
 # NULLS LAST: задачи без активности не должны всплывать первыми и занимать лимит.
 FUNNEL_TEXT = """
 WITH gmap AS (""" + _GMAP + """)
-SELECT g.new_gosb_id, f.inn, f.task_type, f.task_text_status,
+SELECT g.new_gosb_id, f.inn, f.task_type, f.task_subtype, f.task_text_status,
        f.task_comment, f.task_questionnaire, f.last_active_dttm,
        f.isu_struct_saphr_id AS author_id, f.role_code,
-       f.task_create_dt, f.fact_close_task_dttm, f.is_task_closed_success
+       f.task_create_dt, f.fact_close_task_dttm, f.is_task_closed_success,
+       COALESCE(f.is_task_in_progress, NOT COALESCE(f.is_task_closed, false))
+                                                             AS is_in_progress,
+       COALESCE(f.task_text_status ILIKE '%просроч%', false)  AS is_overdue,
+       (COALESCE(f.plan_staff_deal_qty, 0) > 0
+        OR f.deal_code IS NOT NULL)                           AS deal_expected
 FROM {schema}.uzp_dwh_sale_funnel_task f
 LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
 WHERE f.tb_id = :tb_id

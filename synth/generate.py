@@ -45,6 +45,12 @@ MONTHS = 24
 MAX_MONTH_END = pd.Timestamp("2026-06-30")
 # Задачи по метрикам идут месяцем позже метрик -> воронка в следующем месяце
 FUNNEL_END = MAX_MONTH_END + pd.offsets.MonthEnd(1)   # 2026-07-31
+# Месяц ПОСЛЕ опорного — для комментариев с ещё не наступившим сроком
+# («зачисления пройдут 08.2026»): такой срок не является недоработкой.
+_NEXT_MONTH = FUNNEL_END + pd.offsets.MonthEnd(1)
+FUTURE_MONTH = _NEXT_MONTH.strftime("%m.%Y")
+FUTURE_MONTH_NAME = ("январе феврале марте апреле мае июне июле августе сентябре "
+                     "октябре ноябре декабре").split()[_NEXT_MONTH.month - 1]
 ORGS_TOTAL = 4000
 
 
@@ -433,10 +439,14 @@ BANKS = ["ВТБ", "Альфа-Банк", "Т-Банк", "Газпромбанк
 OUTFLOW_REASONS = [
     "Смена зарплатного банка", "Текучка персонала", "Сокращение штата",
     "Недовольство условиями обслуживания", "Переход сотрудников на самозанятость",
-    "Сезонные отпуска", "Ликвидация организации",
+    "Сезонные отпуска", "Отпуска сотрудников", "Ликвидация организации",
 ]
 # причины, при которых работать бессмысленно
 DEADEND = {"Ликвидация организации"}
+# причины ВНЕ зоны влияния банка: организация не оттекла, а временно просела
+# (клиент остался с нами) либо решение принято клиентом. Требовать по ним действий
+# нельзя — на этих кейсах проверяем, что аудит не возвращает задачу на доработку.
+NO_INFLUENCE = {"Сезонные отпуска", "Отпуска сотрудников", "Сокращение штата"}
 
 # Свободные формулировки без явных ключевых слов — такие строки уходят в LLM
 FREEFORM_COMMENTS = [
@@ -486,15 +496,24 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
                                             hours=int(RNG.integers(8, 19)))
             closed = bool(RNG.random() < 0.8)
             success = closed and bool(RNG.random() < 0.5)
+            # Незакрытая задача бывает двух РАЗНЫХ видов, и путать их нельзя:
+            #   «Новая»/«В работе» — срок не вышел, спрашивать результат рано;
+            #   «Просрочена»       — реальная недоработка.
+            overdue = (not closed) and bool(RNG.random() < 0.5)
             status = ("Закрыта: Своевременно" if success
                       else "Закрыта: С просрочкой" if closed
-                      else "Не закрыта: Просрочена")
+                      else "Не закрыта: Просрочена" if overdue
+                      else str(RNG.choice(["Новая", "В работе"])))
             is_outflow = outflow_heavy and RNG.random() < 0.8
             if is_outflow:
                 tt, text, comment, quest, unreal = _text_outflow(o, success)
             else:
                 tt, text, comment, quest, unreal = _text_attract(o, success)
-            plan_deal = int(max(0, round(o.emp_potential_qty * RNG.uniform(0.5, 1.2)))) if not is_outflow else 0
+            # Часть активностей — «Задача» без сделки: сделка по ним не заводится
+            # никогда, поэтому её отсутствие не должно считаться недоработкой.
+            is_offer = (not is_outflow) and bool(RNG.random() < 0.7)
+            plan_deal = (int(max(0, round(o.emp_potential_qty * RNG.uniform(0.5, 1.2))))
+                         if is_offer else 0)
             fact_deal = int(round(plan_deal * (RNG.uniform(0.6, 1.0) if success else RNG.uniform(0.0, 0.4))))
             # Сделка заводится через 0–10 дней после задачи; часть сделок оказывается
             # в последних месяцах окна («свежие» — по ним рано судить о зачислениях).
@@ -511,7 +530,10 @@ def _funnel(orgs: pd.DataFrame, gosb: pd.DataFrame) -> pd.DataFrame:
                 "gosb_id": int(o.gosb_id), "gosb_name": gosb_name.get(int(o.gosb_id)),
                 "inn": int(o.inn), "company_name": f"Организация {o.inn}",
                 "segment_name": o.segment_name,
-                "task_type": tt, "task_subtype": None, "task_category": "Задача",
+                # task_category различает «Предложение» (по нему бывает сделка) и
+                # «Задачу» (сделки не будет) — как в проме
+                "task_type": tt, "task_subtype": None,
+                "task_category": "Предложение" if is_offer else "Задача",
                 "task_code": f"T{int(o.inn)}-{int(RNG.integers(1000,9999))}",
                 "task_create_dt": created.date(),
                 "fact_close_task_dttm": (active if closed else None),
@@ -548,6 +570,9 @@ def _text_attract(o, success: bool):
             f"Клиент согласился на перевод, ожидаем {n} получателей",
             "Оформили согласие на зарплатный проект, готовим реестр",
             f"Расширение подтверждено, {n} новых получателей до конца месяца",
+            # срок В БУДУЩЕМ: спрашивать результат в опорном месяце не за что
+            f"Договорились о расширении, зачисления пройдут {FUTURE_MONTH}",
+            f"Согласовано расширение, первые выплаты ожидаем в {FUTURE_MONTH_NAME}",
         ]))
         quest = f"1. Получено согласие\nДа\n2. Планируемое привлечение\n{n} чел\n3. Комментарий\n{comment}"
         unreal = int(RNG.integers(0, 3))
@@ -580,6 +605,13 @@ def _text_outflow(o, success: bool):
         comment = f"Причина оттока: {reason.lower()} на {bank}. {'Удалось удержать часть получателей' if success else 'Клиент подтвердил уход'}"
     elif reason in DEADEND:
         comment = "Организация в процессе ликвидации, работа нецелесообразна"
+    elif reason in NO_INFLUENCE:
+        # временное снижение: клиент остался с нами, влиять банку нечем.
+        # Часть таких комментариев называет будущий срок возврата получателей.
+        comment = (f"Причина оттока: {reason.lower()}, сотрудники вернутся, "
+                   f"зачисления пройдут {FUTURE_MONTH}" if RNG.random() < 0.5
+                   else f"Причина оттока: {reason.lower()}, снижение временное, "
+                        f"клиент обслуживание не менял")
     else:
         comment = f"Причина оттока: {reason.lower()}. {'Отток остановлен' if success else 'Отток продолжается'}"
     ret = 0 if reason in DEADEND else int(round(n * (RNG.uniform(0.4, 0.9) if success else RNG.uniform(0, 0.3))))

@@ -94,8 +94,15 @@ def _parse_items(raw: str) -> list[dict]:
 
 
 def _facts_line(f: dict) -> str:
-    """Строка ФАКТОВ из витрины. По сделкам — ТОЛЬКО «старый» месяц: свежие сделки
-    (последние 2 мес) ещё могут не реализоваться, их факт=0 — это норма."""
+    """Строка ФАКТОВ из витрины — формулировки без внутреннего жаргона.
+
+    Раньше здесь стояло «свежих сделок нет», и модель читала это как «сделки нет»
+    даже когда рядом шли план/факт по сделке. Теперь про сделку говорится ровно одно
+    утверждение, и отдельно проговаривается случай, когда сделка НЕ предполагается.
+
+    По сделкам берём ТОЛЬКО «старый» месяц: свежие (последние 2 мес) ещё могут
+    реализоваться, их факт=0 — норма, а не недоработка.
+    """
     if not f:
         return "—"
     parts: list[str] = []
@@ -106,15 +113,29 @@ def _facts_line(f: dict) -> str:
                      f"(ФОТ {float(f.get('outflow_fot_mln', 0)):.1f} млн ₽)")
     if f.get("avg_salary"):
         parts.append(f"средняя ЗП ~{float(f['avg_salary']) / 1000:.0f} тыс ₽")
-    if f.get("plan_deal_old") or f.get("fact_deal_old"):
-        parts.append(f"сделка (старый месяц) план {int(f.get('plan_deal_old', 0))} / "
-                     f"факт {int(f.get('fact_deal_old', 0))}")
-    parts.append("есть свежая сделка — по ней рано судить" if f.get("has_fresh_deal")
-                 else "свежих сделок нет")
+    # состояние задач: открытая и не просроченная задача — это НЕ недоработка
+    n_ip, n_cl = int(f.get("n_in_progress", 0)), int(f.get("n_closed", 0))
+    if n_ip:
+        parts.append(f"задач ещё В РАБОТЕ {n_ip} (не закрыты и НЕ просрочены)")
+    if n_cl:
+        parts.append(f"закрытых задач {n_cl}"
+                     + (", среди них есть успешные" if f.get("any_success")
+                        else ", успешных среди них нет"))
+    elif not n_ip:
+        parts.append("закрытых задач нет")
     if f.get("n_overdue"):
-        parts.append(f"просрочено задач {int(f['n_overdue'])}")
-    parts.append("есть успешно закрытые задачи" if f.get("any_success")
-                 else "успешно закрытых нет")
+        parts.append(f"ПРОСРОЧЕНО задач {int(f['n_overdue'])}")
+    # сделка: одно утверждение вместо двух противоречивых
+    if not f.get("deal_expected"):
+        parts.append("сделка по этим задачам НЕ предполагается — её отсутствие НЕ дефект")
+    elif int(f.get("plan_deal_old", 0)) > 0:
+        parts.append(f"по заведённой сделке срок уже прошёл: план "
+                     f"{int(f['plan_deal_old'])} / факт {int(f.get('fact_deal_old', 0))} "
+                     f"получателей")
+    else:
+        parts.append("сделка заведена недавно — о зачислениях судить рано")
+    if f.get("deadline"):
+        parts.append(f"в тексте назван срок {f['deadline']} — он ЕЩЁ НЕ НАСТУПИЛ")
     return "; ".join(parts)
 
 
@@ -124,11 +145,18 @@ def _note_line(n) -> str:
     meta = " · ".join(x for x in (n.get("date", ""), n.get("author", ""),
                                   n.get("role", "")) if x)
     ts = f'[{n.get("type", "")}/{n.get("status", "")}]'
-    same = " (закрыта в день создания)" if n.get("closed_same_day") else ""
-    return f' - {meta} · {ts}{same} {n.get("text", "")}'.rstrip()
+    if n.get("overdue"):
+        state = " (ПРОСРОЧЕНА)"
+    elif n.get("in_progress"):
+        state = " (ещё в работе — результата ждать рано)"
+    elif n.get("closed_same_day"):
+        state = " (закрыта в день создания)"
+    else:
+        state = ""
+    return f' - {meta} · {ts}{state} {n.get("text", "")}'.rstrip()
 
 
-def _prompt(chunk: list[dict]) -> str:
+def _prompt(chunk: list[dict], ref_label: str = "") -> str:
     # Названия ГОСБ/компаний и ФИО в LLM НЕ отправляем (шлюз блокирует чувствительное;
     # автор — обезличенный токен «Сотрудник-NN»). Ключ ответа — числовые id.
     blocks = []
@@ -140,39 +168,58 @@ def _prompt(chunk: list[dict]) -> str:
             f'ФАКТЫ: {_facts_line(o.get("facts", {}))}\n'
             f'ХРОНОЛОГИЯ:\n{notes}'
         )
+    now = (f"Сейчас {ref_label}. Всё, что назначено на месяц ПОЗЖЕ {ref_label}, ещё не "
+           f"наступило и недоработкой НЕ является.\n" if ref_label else "")
     return (
         "Ты — старший аналитик зарплатных проектов банка. По каждой паре "
         "(ГОСБ, организация) даны ФАКТЫ из витрины и ХРОНОЛОГИЯ активностей "
-        "сотрудников за 3 месяца. Работа ведётся отдельно в каждом ГОСБ. Сравни ТЕКСТ "
-        "комментариев с ЧИСЛАМИ и оцени, качественно ли отработана организация.\n"
+        "сотрудников за 3 месяца. Работа ведётся отдельно в каждом ГОСБ.\n"
+        + now +
+        "ГЛАВНЫЙ ВОПРОС: есть ли ПРЯМО СЕЙЧАС действие, которое зависит ОТ БАНКА и "
+        "может дать получателей. Если такого действия нет — так и скажи, не придумывай "
+        "поручений. Придирки к формулировкам никому не нужны.\n"
         "Ответь БЕЗ рассуждений: на каждую пару — ровно один JSON-объект на отдельной "
         "строке (JSONL, без общего массива, без ```):\n"
         '{"gosb_id": <как во входе>, "inn": <как во входе>, '
         '"verdict": "work|no_point|in_progress", '
+        '"can_influence": "да|нет", '
         '"quality": "качественно|формально|не отработана|—", '
         '"contradiction": "да|нет", '
         '"outflow_worked": "да|нет|—", "attract_real": "да|нет|—", '
         '"reason": "<причина/суть, ≤10 слов>", "action": "<что сделать, ≤12 слов>"}\n'
         "Правила оценки:\n"
-        "• verdict=no_point ТОЛЬКО при явной ликвидации/банкротстве в тексте; во всех "
-        "остальных случаях work (или in_progress, если сделка уже заведена и идут "
-        "зачисления).\n"
-        "• quality=формально — текст заявляет успех, но факт по сделке 0 при плане>0, "
-        "или задача закрыта в день создания, или комментарий дежурный.\n"
+        "• can_influence=нет — причина ВНЕ зоны влияния банка: отпуска или сезонность, "
+        "сокращение штата либо ликвидация у клиента, перевод людей в другой регион, "
+        "решение принимает головной офис вне этого ГОСБ. Тогда verdict=no_point, "
+        "action=«Мониторинг, действий не требуется». Сезонный отток или отпуска значат, "
+        "что клиент ОСТАЛСЯ с нами — это не потеря.\n"
+        "• verdict=in_progress — работа идёт и ждать нормально: задача не закрыта и НЕ "
+        "просрочена, или назван срок позже текущего месяца, или сделка заведена недавно. "
+        "Это НЕ недоработка; action — «Проконтролировать в <срок>».\n"
+        "• verdict=work — только если банк может сделать конкретный следующий шаг СЕЙЧАС "
+        "(перезвонить, встретиться с ЛПР, пересмотреть условия, закрыть просрочку).\n"
+        "• verdict=no_point — влиять нечем (см. can_influence) либо ликвидация/банкротство.\n"
+        "• quality=«не отработана» — ТОЛЬКО когда задачи закрыты или просрочены, а "
+        "содержательной работы в них нет. Если задача ещё в работе и не просрочена — "
+        "ставь «—»: спрашивать результат рано.\n"
+        "• quality=формально — заявлен успех, но по заведённой сделке факт 0 при плане>0, "
+        "либо задача закрыта в день создания, либо комментарий дежурный. Если сделка по "
+        "задачам НЕ предполагается, её отсутствие формальностью НЕ считается.\n"
         "• contradiction=да — разные сотрудники противоречат друг другу (напр. один "
         "«клиент согласился», другой «отказался»).\n"
-        "• outflow_worked — реально ли отработан отток (сверь с числом оттока/возврата); "
-        "attract_real — реально ли привлечение/расширение (сверь с потенциалом и сделкой). "
-        "«—», если к этой организации неприменимо.\n"
+        "• outflow_worked=нет — только при РЕАЛЬНОМ оттоке, который банк мог удержать и "
+        "не удержал. Если отток объективный (отпуска, сезон, сокращение штата) — ставь «—».\n"
+        "• attract_real — реально ли привлечение/расширение по смыслу текста и потенциалу. "
+        "Отсутствие сделки само по себе НЕ делает привлечение нереальным.\n"
         "В reason и action НЕ употребляй слово «ИНН» — пиши «организация».\n"
         f"Пар на входе: {len(chunk)} — верни столько же строк ответа.\n\n"
         + "\n\n".join(blocks)
     )
 
 
-def _ask(ctx, chunk: list[dict], label: str) -> dict:
+def _ask(ctx, chunk: list[dict], label: str, ref_label: str = "") -> dict:
     """Один вызов LLM по чанку. Возвращает {(gosb_id, inn): insight}."""
-    prompt = _prompt(chunk)
+    prompt = _prompt(chunk, ref_label)
     progress.llm_request(label, prompt, note=f"орг {len(chunk)}")
     llm_mod.LAST_META = {}
     raw, meta = "", {}
@@ -209,6 +256,7 @@ def _ask(ctx, chunk: list[dict], label: str) -> dict:
             "reason": str(r.get("reason", ""))[:80],
             "action": str(r.get("action", ""))[:100],
             "verdict": _norm_verdict(r.get("verdict")),
+            "can_influence": _yn(r.get("can_influence")),
             "quality": _norm_quality(r.get("quality")),
             "contradiction": _yn(r.get("contradiction")),
             "outflow_worked": _yn(r.get("outflow_worked")),
@@ -221,8 +269,10 @@ def _ask(ctx, chunk: list[dict], label: str) -> dict:
 # Явные словари вместо startswith("нет"): «нет данных» не должно давать no_point.
 _VERDICT_MAP = (
     ("no_point", "no_point"), ("нет смысл", "no_point"), ("бесперспектив", "no_point"),
-    ("ликвидац", "no_point"),
+    ("ликвидац", "no_point"), ("monitor", "no_point"), ("мониторинг", "no_point"),
+    ("влиять неч", "no_point"),
     ("in_progress", "in_progress"), ("в процесс", "in_progress"), ("в работе", "in_progress"),
+    ("ждать", "in_progress"), ("wait", "in_progress"),
     ("work", "work"), ("работать", "work"), ("да", "work"),
 )
 
@@ -267,18 +317,21 @@ def _next_size(n: int) -> int:
     return max(1, n // 2)
 
 
-def _fits(chunk: list[dict]) -> bool:
-    return len(_prompt(chunk)) <= PROMPT_CHAR_LIMIT
+def _fits(chunk: list[dict], ref_label: str = "") -> bool:
+    return len(_prompt(chunk, ref_label)) <= PROMPT_CHAR_LIMIT
 
 
 # --------------------------------------------------------------------------- #
 def text_insights(ctx, items: list[dict], batch: int = 30,
-                  max_calls: int | None = None) -> tuple[dict, int]:
+                  max_calls: int | None = None,
+                  ref_label: str = "") -> tuple[dict, int]:
     """Анализ свободного текста по парам (ГОСБ, ИНН).
 
     items: [{gosb_id, inn, segment, lever, facts:{...}, notes:[{text,date,author,…}]}, …]
-    Возврат: ({(gosb_id, inn): {reason, action, verdict, quality, contradiction,
-              outflow_worked, attract_real, source}}, n_вызовов)
+    ref_label: опорный месяц «MM.YYYY» — без него модель не может отличить «срок ещё
+    не наступил» от «просрочено» и требует результата по будущим датам.
+    Возврат: ({(gosb_id, inn): {reason, action, verdict, can_influence, quality,
+              contradiction, outflow_worked, attract_real, source}}, n_вызовов)
     """
     result: dict = {}
     if not items:
@@ -294,10 +347,10 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
     while queue:
         chunk = queue.pop(0)
         # слишком объёмный промпт делим, не тратя вызов
-        while len(chunk) > 1 and not _fits(chunk):
+        while len(chunk) > 1 and not _fits(chunk, ref_label):
             size = _next_size(len(chunk))
             parts = _split(chunk, size)
-            progress.done(f"промпт великоват ({len(_prompt(chunk))} симв.) → "
+            progress.done(f"промпт великоват ({len(_prompt(chunk, ref_label))} симв.) → "
                           f"дроблю на {len(parts)} по {size}")
             chunk = parts[0]
             queue = parts[1:] + queue
@@ -308,7 +361,7 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
             break
 
         label = f"батч {calls + 1} · {len(chunk)} орг из {total}"
-        got = _ask(ctx, chunk, label)
+        got = _ask(ctx, chunk, label, ref_label)
         calls += 1
         result.update(got)
 
