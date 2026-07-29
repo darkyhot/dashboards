@@ -52,15 +52,13 @@ def _hero(a: analyze.Analysis) -> str:
     word = {"good": "План выполняется", "warn": "План под угрозой",
             "bad": "План не выполняется"}[st]
     rank = f'{r["rank"]}/{r["n_tb"]}' if r["rank"] else "—"
-    left = int(d.get("days_left", 0))
     closed_txt = (f'{C.esc(d.get("closed_label", ""))} закрыт: '
                   f'{(cl.get("exec") or 0) * 100:.0f}% плана · ранг ТБ {rank} за закрытый месяц')
     inner = (
         f'<div class="eyebrow">Прогноз по получателям на {C.esc(d.get("label", ""))}</div>'
         f'<div class="verdict">{C.esc(word)} · '
         f'<span class="big">{(r["exec"] or 0)*100:.0f}%</span> плана по прогнозу</div>'
-        f'<div>{C.badge("−" + C.fmt_num(a.gap_rcp) + " получателей до плана", st)} '
-        f'{C.badge("до конца месяца " + str(left) + " дн.", "warn")}</div>'
+        f'<div>{C.badge("−" + C.fmt_num(a.gap_rcp) + " получателей до плана", st)}</div>'
         + C.meter(r["exec"])
         + f'<div class="row2">ФОТ: {(a.verdict["fot"]["exec"] or 0)*100:.0f}% плана · '
           f'недобор {C.fmt_num(a.gap_fot_mln)} млн ₽</div>'
@@ -282,8 +280,7 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
         f'<dialog class="gd" id="gd-{gid}"><div class="gd-sheet">'
         f'<div class="gd-head"><div><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
         f'<div class="gd-note">прогноз {C.fmt_num(wf["forecast"])} из плана '
-        f'{C.fmt_num(wf["plan"])} · {ex*100:.0f}% · до конца месяца '
-        f'{d.get("days_left", 0)} дн.</div></div>'
+        f'{C.fmt_num(wf["plan"])} · {ex*100:.0f}%</div></div>'
         f'<button class="gd-close" onclick="gdClose({gid})" '
         f'aria-label="Закрыть">×</button></div>'
 
@@ -420,12 +417,12 @@ def _orgs(a: analyze.Analysis) -> str:
     seg_opts = [s for s in SEG_ORDER if s in {row["seg"] for row in rows}]
     explorer = C.orgs_explorer("work", rows, gosb_opts, seg_options=seg_opts)
     sim = a.sim
-    bad_segs = sorted({s["seg"] for c in a.gosb_cards for s in c["segs"]},
+    # именно segs_bad: в segs теперь лежат ВСЕ сегменты ГОСБ, включая выполняющие
+    bad_segs = sorted({s["seg"] for c in a.gosb_cards for s in c["segs_bad"]},
                       key=lambda x: SEG_ORDER.index(x) if x in SEG_ORDER else 99)
-    d = a.dates or {}
     n_hold = sum(1 for r in rows if r["lever"] == "Удержать")
-    hold = (f' · из них «Удержать» — <b>{n_hold}</b>: оттекают прямо сейчас, '
-            f'до конца месяца {d.get("days_left", 0)} дн.' if n_hold else "")
+    hold = (f' · из них «Удержать» — <b>{n_hold}</b>: оттекают прямо сейчас'
+            if n_hold else "")
     head = (f'<h3>С кем работать — {sim["k"]} организаций закрывают план</h3>'
             f'<p class="sub" style="font-size:14px;margin:-4px 0 14px">'
             f'отбор идёт внутри ЗАПАДАЮЩИХ сегментов каждого ГОСБ '
