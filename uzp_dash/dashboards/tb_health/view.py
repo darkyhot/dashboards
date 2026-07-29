@@ -163,31 +163,58 @@ def _matrix(a: analyze.Analysis) -> str:
                      eyebrow="Диагностика по прогнозу")
 
 
+def _gap_cell(v: float) -> str:
+    """Ячейка недобора. План выполнен (недобор ≤ 0) — ставим «—», а не «−0»."""
+    return "—" if v <= 0.5 else "−" + C.fmt_num(v)
+
+
+def _gosb_table(c: dict) -> str:
+    """Таблица карточки: строка «Всего» по ГОСБ + строки западающих сегментов.
+
+    Одни и те же колонки на обоих уровнях — итог и сегменты сравниваются по вертикали.
+    Первая ячейка сегмента — статусный бейдж: состояние не кодируется одним лишь цветом.
+    У строки «Всего» бейджа нет — процент уже стоит крупно в шапке карточки.
+    """
+    def row(label, d, cls=""):
+        return (f'<div class="g-row {cls}"><span>{label}</span>'
+                f'<span>{C.fmt_num(d["forecast"])}</span>'
+                f'<span>{C.fmt_num(d["plan"])}</span>'
+                f'<span>{_gap_cell(d["nedobor"])}</span>'
+                f'<span>{d["n_need"] or "—"}</span></div>')
+
+    head = ('<div class="g-row head"><span>сегмент</span><span>прогноз</span>'
+            '<span>план</span><span>недобор</span><span>орг</span></div>')
+    total = row("Всего", {"forecast": c["forecast"], "plan": c["plan"],
+                          "nedobor": c["gap"], "n_need": c["n_need"]}, "total")
+    rows = []
+    for s in c["segs"]:
+        # при 99.5–99.9% показываем десятую долю, иначе «100%» рядом с недобором
+        fmt = "%s %.1f%%" if s["exec"] >= 0.995 else "%s %.0f%%"
+        rows.append(row(C.badge(fmt % (s["seg"], s["exec"] * 100), C.status_of(s["exec"])), s))
+    if not rows:
+        rows.append('<div class="g-row"><span>в норме по сегментам</span>'
+                    '<span></span><span></span><span></span><span></span></div>')
+    rest = row("прочие", c["rest"], "rest") if c.get("rest") else ""
+    return f'<div class="g-tbl">{head}{total}{"".join(rows)}{rest}</div>'
+
+
 def _problem_gosb(a: analyze.Analysis) -> str:
     if not a.gosb_cards:
         return ""
     cards = []
     for c in a.gosb_cards:
         st = "warn" if c["seg_only"] else ("bad" if c["exec"] < 0.9 else "warn")
-        # строки по ВСЕМ западающим сегментам (те же, что красные в тепловой карте)
-        lines = []
+        seg_html = _gosb_table(c)
+        # пояснения по сегментам в строку таблицы не влезают — собираем их отдельно
+        notes = []
         for s in c["segs"]:
             cov = s["coverage"]
             if not s["n_avail"]:
-                tail = " · своих организаций к работе нет — добор из других сегментов"
+                notes.append(f'в {s["seg"]} своих организаций нет — добор из других')
             elif cov is not None and cov < 0.999:
-                tail = (f' · в сегменте хватает на {cov*100:.0f}% ({s["n_avail"]} орг), '
-                        f'добор из других')
-            else:
-                tail = ""
-            # при 99.5–99.9% показываем десятую долю, иначе «100%» рядом с недобором
-            fmt = "%s %.1f%%" if s["exec"] >= 0.995 else "%s %.0f%%"
-            chip = C.badge(fmt % (s["seg"], s["exec"] * 100), C.status_of(s["exec"]))
-            lines.append(
-                f'<div class="g-seg">{chip}'
-                f' −{C.fmt_num(s["nedobor"])} чел → <b>{s["n_need"]}</b> орг '
-                f'(+{C.fmt_num(s["fl_need"])}){C.esc(tail)}</div>')
-        seg_html = "".join(lines) or '<div class="g-seg">в норме по сегментам</div>'
+                notes.append(f'в {s["seg"]} хватает на {cov*100:.0f}% ({s["n_avail"]} орг)')
+        note_html = (f'<div class="g-act">{C.esc(" · ".join(notes[:3]))}</div>'
+                     if notes else "")
         act = c["act"]
         if c["seg_only"]:
             head_badge = C.badge(f'план выполняется, но западает '
@@ -204,6 +231,7 @@ def _problem_gosb(a: analyze.Analysis) -> str:
             f'(+{C.fmt_num(c["fl_need"])} чел, привлечь {c["n_attract"]} / '
             f'вернуть {c["n_return"]}) · ФОТ <b>~{C.fmt_num(c["fot_need"])}</b> млн ₽'
             f'{filler}{short}</div>'
+            f'{note_html}'
             f'<div class="g-act">Активности 3 мес: {act["act_n"]} по {act["worked_orgs"]} орг, '
             f'успех {act["success"]*100:.0f}% · из нужных под план не работали с '
             f'<b>{c["not_worked"]}</b></div>'
@@ -211,8 +239,9 @@ def _problem_gosb(a: analyze.Analysis) -> str:
         inner = (
             f'<div class="g-head"><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
             f'<span class="g-ex" style="color:{_col(c["exec"])}">{c["exec"]*100:.0f}%</span></div>'
-            f'<div style="margin:2px 0 6px">{head_badge}</div>'
-            f'{seg_html}{do}'
+            + C.meter(c["exec"])
+            + f'<div style="margin:2px 0 6px">{head_badge}</div>'
+            + f'{seg_html}{do}'
         )
         cards.append(C.card(inner, cls=f"gcard {st}"))
     grid = f'<div class="gcards">{"".join(cards)}</div>'

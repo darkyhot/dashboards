@@ -1040,6 +1040,27 @@ def _plan_summary(to_work: pd.DataFrame, gosb_plan: dict, gap: float,
     }
 
 
+# Остаток меньше этой доли плана ГОСБ в таблицу не выносим — это шум округления.
+REST_MIN_SHARE = 0.005
+
+
+def _rest_row(gosb_row, segs: list, n_need_total: int) -> dict | None:
+    """Строка «прочие» для таблицы карточки: ГОСБ минус показанные сегменты.
+
+    В карточке перечисляются ТОЛЬКО западающие сегменты, поэтому их сумма не обязана
+    равняться итогу ГОСБ, а таблица, которая не сходится, выглядит сломанной. Остаток
+    закрывает разницу; он же поглощает известное расхождение уровней `tb`/`gosb`
+    в витрине метрик (строка «все сегменты» — не сумма строк по сегментам).
+    """
+    plan = float(gosb_row.plan_amt) - sum(s["plan"] for s in segs)
+    forecast = float(gosb_row.fact_amt) - sum(s["forecast"] for s in segs)
+    n_need = max(0, n_need_total - sum(s["n_need"] for s in segs))
+    if abs(plan) < REST_MIN_SHARE * max(float(gosb_row.plan_amt), 1) and abs(forecast) < 1:
+        return None
+    return {"plan": plan, "forecast": forecast, "nedobor": plan - forecast,
+            "n_need": n_need}
+
+
 def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame, to_work: pd.DataFrame,
                 fagg: pd.DataFrame, gosb_plan: dict) -> list:
     """По каждому проблемному ГОСБ — что конкретно сделать, чтобы закрыть разрыв."""
@@ -1074,11 +1095,14 @@ def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame, to_work: pd.DataFr
             segs.append({
                 "seg": s.seg_name, "exec": float(s.execution_percent),
                 "nedobor": float(s.nedobor),
+                "plan": float(s.plan_amt), "forecast": float(s.fact_amt),
                 "n_need": int(ps.get("n_need", 0)), "fl_need": float(ps.get("fl_need", 0.0)),
                 "coverage": ps.get("coverage"), "n_avail": int(ps.get("n_avail", 0)),
             })
         cards.append({
             "gosb_name": name, "exec": float(r.execution_percent), "gap": float(r.nedobor),
+            "plan": float(r.plan_amt), "forecast": float(r.fact_amt),
+            "rest": _rest_row(r, segs, int(p.get("n_need", 0))),
             "seg_only": float(r.nedobor) <= 0,     # план в целом выполняется
             "segs": segs, "gap_seg": float(p.get("gap_seg", sum(s["nedobor"] for s in segs))),
             "n_need": int(p.get("n_need", 0)), "fl_need": float(p.get("fl_need", 0.0)),

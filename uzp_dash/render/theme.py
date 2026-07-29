@@ -150,7 +150,10 @@ td.heat { font-weight: 600; font-variant-numeric: tabular-nums; border-radius: 6
 @media (max-width: 620px) { .hbar { grid-template-columns: 100px 1fr 52px; } }
 
 /* Карточки проблемных ГОСБ */
-.gcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+/* 360px, а не 300: в карточке четыре числовые колонки с пятизначными числами.
+   min(360px, 100%) — чтобы на узком экране колонка не вылезала за контейнер
+   и страница не ехала горизонтально. */
+.gcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); gap: 14px; }
 .gcard { position: relative; overflow: hidden; padding: 16px 18px; }
 .gcard::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--bad); }
 .gcard.warn::before { background: var(--warn); }
@@ -159,6 +162,16 @@ td.heat { font-weight: 600; font-variant-numeric: tabular-nums; border-radius: 6
 .gcard .g-ex { font-variant-numeric: tabular-nums; font-weight: 680; font-size: 20px; letter-spacing: -0.02em; }
 .gcard .g-seg { font-size: 13.5px; line-height: 1.5; letter-spacing: -0.004em; margin: 5px 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
 .gcard .g-seg b { font-variant-numeric: tabular-nums; }
+/* Таблица «прогноз / план / недобор / орг»: строка «Всего» по ГОСБ и строки сегментов
+   в одних колонках — выравнивание делает сравнение за читателя. */
+.gcard .g-tbl { margin: 12px 0 0; overflow-x: auto; }
+.gcard .g-row { display: grid; grid-template-columns: minmax(88px, 1.15fr) repeat(4, minmax(0, 1fr));
+                gap: 6px; align-items: baseline; font-size: 13px; line-height: 1.5;
+                letter-spacing: -0.004em; padding: 3px 0; }
+.gcard .g-row > span:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+.gcard .g-row.head { color: var(--text-2); font-size: 11.5px; letter-spacing: 0; padding-bottom: 1px; }
+.gcard .g-row.total { font-weight: 620; border-bottom: 1px solid var(--separator); padding-bottom: 6px; margin-bottom: 2px; }
+.gcard .g-row.rest { color: var(--text-2); }
 .gcard .g-do { font-size: 14px; line-height: 1.4; letter-spacing: -0.004em; margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--separator); }
 .gcard .g-do b { font-variant-numeric: tabular-nums; }
 .gcard .g-act { font-size: 12.5px; color: var(--text-2); margin-top: 8px; line-height: 1.35; }
