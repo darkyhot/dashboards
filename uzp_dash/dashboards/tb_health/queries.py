@@ -251,6 +251,25 @@ WHERE f.tb_id = :tb_id
 ORDER BY f.inn, g.new_gosb_id, f.last_active_dttm DESC NULLS LAST
 """
 
+# Справка по организациям ТБ для детализации прогноза: название, тренд год к году
+# и признак «закреплена в эталонной базе».
+#
+# Это ORGS БЕЗ фильтра эталонной базы — намеренно: в ожидаемый отток входят и
+# организации вне базы (на тестовом ТБ это ~12% оттока), и без них детализация
+# не сойдётся с водопадом. Флаг in_ref показывает, можно ли с парой работать.
+ORG_DETAIL = """
+WITH gmap AS (""" + _GMAP + """)
+SELECT g.new_gosb_id, c.org_id AS inn, dc.company_name,
+       COALESCE(c.fl_y_1_diff_qty, 0) AS fl_yoy,
+       COALESCE(c.current_fl_qty, 0)  AS current_fl_qty,
+       EXISTS (SELECT 1 FROM {schema}.uzp_dim_mzp_reference_base rb
+               WHERE rb.inn = c.org_id AND rb.gosb_id = g.new_gosb_id) AS in_ref
+FROM {schema}.uzp_dwh_company_holding_metric c
+JOIN gmap g ON g.old_gosb_id = c.level_id
+LEFT JOIN {schema}.uzp_dim_company dc ON dc.inn = c.org_id
+WHERE g.tb_id = :tb_id AND c.report_dt = :ref_closed AND c.org_type = 'inn'
+"""
+
 # ==================== Прогноз на текущий месяц ============================== #
 
 # Ежедневный отток: сколько получателей прошлого месяца ещё НЕ зачислились, хотя

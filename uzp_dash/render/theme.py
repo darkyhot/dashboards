@@ -157,24 +157,67 @@ td.heat { font-weight: 600; font-variant-numeric: tabular-nums; border-radius: 6
 .gcard { position: relative; overflow: hidden; padding: 16px 18px; }
 .gcard::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--bad); }
 .gcard.warn::before { background: var(--warn); }
+.gcard.good::before { background: var(--good); }
+/* Карточка кликабельна целиком — открывает разбор прогноза */
+.gcard { cursor: pointer; transition: box-shadow var(--spring), transform var(--spring); }
+.gcard:hover { transform: translateY(-1px); }
+.gcard:focus-visible { outline: 2px solid var(--good); outline-offset: 2px; }
+.g-more { margin-top: 10px; font-size: 12.5px; font-weight: 600; color: var(--good);
+          letter-spacing: -0.004em; }
 .gcard .g-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .gcard .g-head h3 { font-size: 17px; }
 .gcard .g-ex { font-variant-numeric: tabular-nums; font-weight: 680; font-size: 20px; letter-spacing: -0.02em; }
-.gcard .g-seg { font-size: 13.5px; line-height: 1.5; letter-spacing: -0.004em; margin: 5px 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
-.gcard .g-seg b { font-variant-numeric: tabular-nums; }
+/* Строки водопада и таблицы НЕ привязаны к .gcard: те же блоки рендерятся
+   в разделе «Из чего складывается прогноз» по ТБ и в оверлее по ГОСБ. */
+.g-seg { font-size: 13.5px; line-height: 1.5; letter-spacing: -0.004em; margin: 5px 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
+.g-seg b { font-variant-numeric: tabular-nums; }
+.g-hint { color: var(--text-2); font-size: 12.5px; letter-spacing: -0.003em; }
 /* Таблица «прогноз / план / недобор / орг»: строка «Всего» по ГОСБ и строки сегментов
    в одних колонках — выравнивание делает сравнение за читателя. */
-.gcard .g-tbl { margin: 12px 0 0; overflow-x: auto; }
-.gcard .g-row { display: grid; grid-template-columns: minmax(88px, 1.15fr) repeat(4, minmax(0, 1fr));
+.g-tbl { margin: 12px 0 0; overflow-x: auto; }
+/* первая колонка вмещает бейдж целиком («КСБ 99.9%»), числовые — своё значение;
+   minmax(0,...) для чисел не годится: ячейка сжалась бы уже содержимого */
+.g-tbl .g-row { display: grid; grid-template-columns: minmax(104px, 1.25fr) repeat(4, minmax(46px, 1fr));
                 gap: 6px; align-items: baseline; font-size: 13px; line-height: 1.5;
                 letter-spacing: -0.004em; padding: 3px 0; }
-.gcard .g-row > span:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
-.gcard .g-row.head { color: var(--text-2); font-size: 11.5px; letter-spacing: 0; padding-bottom: 1px; }
-.gcard .g-row.total { font-weight: 620; border-bottom: 1px solid var(--separator); padding-bottom: 6px; margin-bottom: 2px; }
-.gcard .g-row.rest { color: var(--text-2); }
-.gcard .g-do { font-size: 14px; line-height: 1.4; letter-spacing: -0.004em; margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--separator); }
-.gcard .g-do b { font-variant-numeric: tabular-nums; }
-.gcard .g-act { font-size: 12.5px; color: var(--text-2); margin-top: 8px; line-height: 1.35; }
+.g-tbl .g-row > span:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+/* nowrap ТОЛЬКО у бейджей таблицы: «КСБ» и «104%» всегда в одной строке.
+   Глобально нельзя — длинные бейджи («план выполняется, но западает …») должны переноситься. */
+.g-tbl .badge { white-space: nowrap; }
+/* в оверлее к таблице добавляются отток и пайплайн — разбор на грейне (ГОСБ, сегмент) */
+.g-tbl.wide .g-row { grid-template-columns: minmax(104px, 1.25fr) repeat(6, minmax(46px, 1fr)); }
+.g-tbl .g-row.head { color: var(--text-2); font-size: 11.5px; letter-spacing: 0; padding-bottom: 1px; }
+.g-tbl .g-row.total { font-weight: 620; border-bottom: 1px solid var(--separator); padding-bottom: 6px; margin-bottom: 2px; }
+.g-tbl .g-row.rest, .g-tbl .g-row.ok { color: var(--text-2); }
+
+/* Оверлей с разбором прогноза по ГОСБ */
+dialog.gd { border: 0; padding: 0; background: transparent; max-width: 760px; width: 92vw;
+            max-height: 88vh; color: var(--text); }
+dialog.gd::backdrop { background: rgba(0, 0, 0, 0.45); backdrop-filter: blur(6px); }
+dialog.gd[open] { animation: gd-in 0.22s cubic-bezier(0.22, 1, 0.36, 1); }
+@keyframes gd-in { from { opacity: 0; transform: scale(0.97) translateY(6px); } }
+/* лист непрозрачный (--surface полупрозрачна и на размытой подложке «плывёт») */
+.gd-sheet { background: var(--surface-solid); border-radius: 20px; padding: 22px 24px;
+            max-height: 88vh; overflow-y: auto; box-shadow: 0 24px 60px rgba(0,0,0,0.28); }
+.gd-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+           position: sticky; top: -22px; background: var(--surface-solid); padding: 4px 0 8px;
+           margin: -4px 0 4px; }
+.gd-close { border: 0; background: var(--separator); color: var(--text); cursor: pointer;
+            border-radius: 980px; width: 30px; height: 30px; font-size: 16px; line-height: 1; }
+.gd-block { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--separator); }
+.gd-block h4 { margin: 0 0 8px; font-size: 14px; letter-spacing: -0.01em; }
+.gd-note { font-size: 13px; color: var(--text-2); line-height: 1.45; margin: 6px 0 0; }
+.gd-lead { font-size: 15px; font-weight: 600; letter-spacing: -0.006em; margin: 10px 0 0; }
+.gd-row { display: grid; grid-template-columns: 1fr 72px 1.35fr; gap: 10px;
+          align-items: baseline; font-size: 13px; line-height: 1.45; padding: 4px 0;
+          border-top: 1px solid var(--separator); }
+.gd-row:first-of-type { border-top: 0; }
+.gd-row > span:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums;
+                              font-weight: 620; }
+.gd-row .gd-why { color: var(--text-2); font-size: 12.5px; }
+.g-do { font-size: 14px; line-height: 1.4; letter-spacing: -0.004em; margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--separator); }
+.g-do b { font-variant-numeric: tabular-nums; }
+.g-act { font-size: 12.5px; color: var(--text-2); margin-top: 8px; line-height: 1.35; }
 
 /* Чипы западающих сегментов */
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 2px; }
@@ -206,5 +249,8 @@ td.heat { font-weight: 600; font-variant-numeric: tabular-nums; border-radius: 6
 @media (prefers-reduced-motion: reduce) {
   .meter > span, .proj-seg, .hbar-track > span { transition: none; }
   .pager button { transition: none; }
+  .gcard { transition: none; }
+  .gcard:hover { transform: none; }
+  dialog.gd[open] { animation: none; }
 }
 """

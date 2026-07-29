@@ -69,6 +69,7 @@ class Analysis:
     wf: dict = field(default_factory=dict)         # водопад прогноза по ТБ
     closed: dict = field(default_factory=dict)     # вердикт ЗАКРЫТОГО месяца + ранг
     fc_stats: dict = field(default_factory=dict)   # диагностика прогноза
+    gosb_detail: dict = field(default_factory=dict)  # new_gosb_id -> разбор прогноза
 
 
 def run(ctx, tb_short: str) -> Analysis:
@@ -95,7 +96,7 @@ def run(ctx, tb_short: str) -> Analysis:
     # --- Закрытый месяц: база прогноза и ранг ТБ ---
     # Ранг берём именно отсюда: в текущем месяце факт витрины частичный, ранжировать
     # по нему нельзя, а прогноз по всем 12 ТБ здесь не считается.
-    progress.step(f"База прогноза: закрытый месяц {ref_closed}")
+    progress.step(f"Портфель-база прогноза: закрытый месяц {ref_closed}")
     v_cls = read_sql(e, Q.TB_VERDICT, p_cls)
     closed_verdict, _ = _verdict(v_cls, tb_id)
     v_cur = read_sql(e, Q.TB_VERDICT, p_cur)
@@ -169,7 +170,7 @@ def run(ctx, tb_short: str) -> Analysis:
     gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
     progress.done(
         f"Прогноз на {ref_cur}: {wf['forecast']:.0f} из плана {wf['plan']:.0f} "
-        f"({(wf['exec'] or 0) * 100:.1f}%) = база {wf['base']:.0f} "
+        f"({(wf['exec'] or 0) * 100:.1f}%) = портфель {wf['base']:.0f} "
         f"− отток {wf['out_exp']:.0f} (факт {wf['observed']:.0f} + риск {wf['risk']:.0f}) "
         f"+ приток {wf['in_exp']:.0f} + пайплайн {wf['pipe']:.0f}")
     _check_waterfall(wf, matrix, fc_stats)
@@ -206,8 +207,15 @@ def run(ctx, tb_short: str) -> Analysis:
     progress.done(f"Под план нужно {sim['k']} организаций (+{sim['closable']:.0f} чел); "
                   f"потенциал западающих сегментов покрывает разрыв на "
                   f"{sim['coverage']*100:.0f}% · добор из других сегментов: {sim['filler_n']}")
-    progress.step("Разрез по проблемным ГОСБ")
+    progress.step("Разрез по ГОСБ + детализация прогноза")
     gosb_cards = _gosb_cards(gosb_gap, matrix, to_work, fagg, gosb_plan)
+    org_detail = read_sql(e, Q.ORG_DETAIL, {"tb_id": tb_id, "ref_closed": ref_closed})
+    gosb_detail = _gosb_detail(orgs_fc, org_detail, insights, to_work, no_point,
+                               gosb_gap, fc_stats.get("conv_tb", 1.0))
+    n_named = sum(len(v["top_out"]) + len(v["top_pipe"]) for v in gosb_detail.values())
+    progress.done(f"Карточек ГОСБ: {len(gosb_cards)} (все, включая выполняющие план) · "
+                  f"детализация по {len(gosb_detail)} ГОСБ, названо {n_named} организаций "
+                  f"(порог {DETAIL_MIN_SHARE*100:.0f}% блока и {DETAIL_MIN_FL} чел)")
 
     a = Analysis(
         tb_short=tb_short, tb_id=tb_id, tb_full=tb_full, ref_date=ref_date,
@@ -217,6 +225,7 @@ def run(ctx, tb_short: str) -> Analysis:
         to_work=to_work, no_point=no_point, sim=sim, gosb_plan=gosb_plan,
         insights=insights, themes=themes, llm_stats=llm_stats,
         dates=d, wf=wf, closed=closed_verdict, fc_stats=fc_stats,
+        gosb_detail=gosb_detail,
     )
     a.gosb_cards = gosb_cards
     return a
@@ -267,7 +276,7 @@ def _dates(engine, params: dict) -> dict:
 
     progress.done(f"Прогнозный месяц: {ref_cur} ({src}) · факт зачислений по {act_dt} "
                   f"(месяц пройден на {elapsed * 100:.0f}%, до конца {left} дн.)")
-    progress.done(f"База прогноза — закрытый месяц {ref_closed}; "
+    progress.done(f"Портфель-база прогноза — закрытый месяц {ref_closed}; "
                   f"история витрины с {hist_from} ({HIST_MONTHS} мес)")
     months = ", ".join((cur.to_period("M") - k).strftime("%m.%Y") for k in (2, 1, 0))
     progress.done(f"Окно задач воронки: {funnel_from} … {ref_funnel} ({months}) · "
@@ -1043,6 +1052,43 @@ def _plan_summary(to_work: pd.DataFrame, gosb_plan: dict, gap: float,
 # Остаток меньше этой доли плана ГОСБ в таблицу не выносим — это шум округления.
 REST_MIN_SHARE = 0.005
 
+# Пороги именной детализации. Именами число объяснить нельзя: на тестовом ГОСБ
+# ожидаемый отток 552 чел размазан по 67 организациям, топ-5 дают лишь 32%, топ-20 —
+# 80%. Поэтому называем только тех, кто реально двигает цифру, а хвост честно
+# сворачиваем в одну строку; структуру объясняют разборы по причине и зоне влияния.
+DETAIL_MIN_SHARE = 0.05   # доля блока
+DETAIL_MIN_FL = 3         # и не меньше стольких человек
+DETAIL_MAX_ROWS = 8       # потолок строк в блоке
+
+
+def _material(rows: list, key: str, cap: int = DETAIL_MAX_ROWS) -> tuple:
+    """Материальные строки блока + честный хвост (сколько организаций и человек)."""
+    total = float(sum(abs(r[key]) for r in rows))
+    if total <= 0:
+        return [], 0, 0.0
+    ordered = sorted(rows, key=lambda r: -abs(r[key]))
+    thr = max(DETAIL_MIN_SHARE * total, DETAIL_MIN_FL)
+    n = 0
+    for r in ordered:
+        if n >= cap or abs(r[key]) < thr:
+            break
+        n += 1
+    tail = ordered[n:]
+    return ordered[:n], len(tail), float(sum(abs(r[key]) for r in tail))
+
+
+def _bucket(rows: list, val: str, key: str) -> list:
+    """Свод блока по признаку: [(метка, сумма, число орг, доля)] по убыванию."""
+    agg: dict = {}
+    for r in rows:
+        if r[val] <= 0:
+            continue
+        a = agg.setdefault(r[key] or "—", [0.0, 0])
+        a[0] += r[val]; a[1] += 1
+    total = sum(v[0] for v in agg.values())
+    out = [(k, v[0], v[1], (v[0] / total) if total else 0.0) for k, v in agg.items()]
+    return sorted(out, key=lambda x: -x[1])
+
 
 def _rest_row(gosb_row, segs: list, n_need_total: int) -> dict | None:
     """Строка «прочие» для таблицы карточки: ГОСБ минус показанные сегменты.
@@ -1061,6 +1107,79 @@ def _rest_row(gosb_row, segs: list, n_need_total: int) -> dict | None:
             "n_need": n_need}
 
 
+def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
+                 to_work: pd.DataFrame, no_point: pd.DataFrame,
+                 gosb_gap: pd.DataFrame, conv_tb: float) -> dict:
+    """Разбор прогноза по каждому ГОСБ — то, что открывается по клику на карточку.
+
+    Отвечает на два вопроса. «Почему прогноз такой» — водопад этого ГОСБ. И главное,
+    «что из этого ваше»: отток раскладывается по ПРИЧИНЕ (устойчивый / сезонный /
+    разовый) и по ЗОНЕ ВЛИЯНИЯ (можно работать / влиять нечем / вне эталонной базы).
+    Именами объясняется только материальная часть — см. `_material`.
+    """
+    out: dict = {}
+    if orgs_fc is None or orgs_fc.empty:
+        return out
+    names, yoy, ref, cur = {}, {}, {}, {}
+    yoy_tot: dict = {}
+    if detail is not None and not detail.empty:
+        for r in detail.itertuples():
+            if pd.isna(r.new_gosb_id):
+                continue
+            k = (int(r.new_gosb_id), int(r.inn))
+            names[k] = str(r.company_name or "").strip() or f"Орг. {int(r.inn)}"
+            yoy[k] = float(r.fl_yoy or 0)
+            cur[k] = float(r.current_fl_qty or 0)
+            ref[k] = bool(r.in_ref)
+            yoy_tot[k[0]] = yoy_tot.get(k[0], 0.0) + float(r.fl_yoy or 0)
+
+    def _keys(df):
+        return ({(int(r.new_gosb_id), int(r.inn)) for r in df.itertuples()}
+                if df is not None and not df.empty else set())
+    work, nopt = _keys(to_work), _keys(no_point)
+    totals = {int(r.new_gosb_id): r for r in gosb_gap.itertuples()}
+
+    for nid, g in orgs_fc.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
+        nid = int(nid)
+        t = totals.get(nid)
+        wf = forecast.waterfall(float(t.base_amt) if t is not None else 0.0, g,
+                                float(t.plan_amt) if t is not None else 0.0)
+        rows = []
+        for r in g.itertuples():
+            k = (nid, int(r.inn))
+            ins = insights.get(k, {})
+            rows.append({
+                "inn": int(r.inn), "name": names.get(k, f"Орг. {int(r.inn)}"),
+                "out": float(r.out_exp), "seen": float(r.out_observed),
+                "pipe": float(r.pipe_np_raw), "pipe_adj": float(r.pipe_np),
+                "cls": str(r.out_class or "—"), "note": str(r.note or ""),
+                "action": ins.get("action", ""),
+                "yoy": yoy.get(k, 0.0), "cur": cur.get(k, 0.0),
+                "in_ref": ref.get(k, False),
+                "zone": ("можно работать" if k in work else
+                         "влиять нечем" if k in nopt else "вне эталонной базы"),
+            })
+        # порог > 0, а не >= 1: организации с долей человека тоже должны попасть
+        # в хвост, иначе «названные + хвост» не сойдутся с итогом блока
+        top_out, out_n, out_fl = _material([r for r in rows if r["out"] > 0], "out")
+        top_pipe, pipe_n, pipe_fl = _material([r for r in rows if r["pipe"] > 0], "pipe")
+        up, _, _ = _material([r for r in rows if r["yoy"] >= 1], "yoy", cap=5)
+        down, _, _ = _material([r for r in rows if r["yoy"] <= -1], "yoy", cap=5)
+        workable = [r for r in rows if r["zone"] == "можно работать" and r["out"] >= 1]
+        out[nid] = {
+            "wf": wf, "conv": conv_tb,
+            "out_tot": float(sum(r["out"] for r in rows)),
+            "by_class": _bucket(rows, "out", "cls"),
+            "by_zone": _bucket(rows, "out", "zone"),
+            "workable_fl": float(sum(r["out"] for r in workable)),
+            "workable_n": len(workable),
+            "top_out": top_out, "out_tail_n": out_n, "out_tail_fl": out_fl,
+            "top_pipe": top_pipe, "pipe_tail_n": pipe_n, "pipe_tail_fl": pipe_fl,
+            "yoy_total": float(yoy_tot.get(nid, 0.0)), "yoy_up": up, "yoy_down": down,
+        }
+    return out
+
+
 def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame, to_work: pd.DataFrame,
                 fagg: pd.DataFrame, gosb_plan: dict) -> list:
     """По каждому проблемному ГОСБ — что конкретно сделать, чтобы закрыть разрыв."""
@@ -1071,40 +1190,48 @@ def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame, to_work: pd.DataFr
             fg[int(nid)] = {"act_n": n_tasks,
                             "success": float(g.n_success.sum() / n_tasks) if n_tasks else 0.0,
                             "worked_orgs": int(g.inn.nunique())}
-    # Карточку строим и для ГОСБ, ВЫПОЛНЯЮЩЕГО общий план: если внутри есть
-    # западающий сегмент, это тоже проблема — просто её вытягивают другие сегменты.
-    failing = matrix[matrix["is_failing"]] if "is_failing" in matrix else \
-        matrix[matrix.nedobor > 0]
-    seg_bad_ids = set(failing["new_gosb_id"].astype(int))
-    prob = gosb_gap[(gosb_gap.nedobor > 0)
-                    | (gosb_gap.new_gosb_id.astype(int).isin(seg_bad_ids))]
-    prob = prob.sort_values("nedobor", ascending=False)
+    # Карточки строим по ВСЕМ ГОСБ, включая выполняющие план: управляющему нужно
+    # видеть и за счёт чего план вытягивается, а не только где провал. Сортировка по
+    # недобору оставляет проблемные сверху.
+    is_fail = (matrix["is_failing"] if "is_failing" in matrix
+               else matrix["nedobor"] > 0)
+    order = gosb_gap.sort_values("nedobor", ascending=False)
 
     cards = []
-    for r in prob.itertuples():
+    for r in order.itertuples():
         nid = int(r.new_gosb_id); name = r.gosb_name
         sub = to_work[to_work.new_gosb_id == nid] if not to_work.empty else to_work
         sel = sub[(sub.need_k > 0) & (sub.need_k <= 1.0)] if not sub.empty else sub
-        seg_bad = (failing[failing.new_gosb_id == nid]
-                   .sort_values("nedobor", ascending=False))
+        # ВСЕ сегменты ГОСБ: западающие первыми (по недобору), затем выполняющие
+        # без ведущего подчёркивания: itertuples переименовывает такие колонки
+        g_seg = matrix[matrix.new_gosb_id == nid].copy()
+        g_seg["fails"] = is_fail.reindex(g_seg.index).fillna(False)
+        g_seg = g_seg.sort_values(["fails", "nedobor"], ascending=[False, False])
         p = gosb_plan.get(nid, {})
         plan_by_seg = {s["seg"]: s for s in p.get("segs", [])}
         segs = []
-        for s in seg_bad.itertuples():
+        for s in g_seg.itertuples():
             ps = plan_by_seg.get(s.seg_name, {})
             segs.append({
-                "seg": s.seg_name, "exec": float(s.execution_percent),
-                "nedobor": float(s.nedobor),
+                "seg": s.seg_name, "exec": float(s.execution_percent or 0),
+                "nedobor": float(s.nedobor), "failing": bool(s.fails),
                 "plan": float(s.plan_amt), "forecast": float(s.fact_amt),
+                "out_exp": float(getattr(s, "out_exp", 0) or 0),
+                "pipe_np": float(getattr(s, "pipe_np", 0) or 0),
                 "n_need": int(ps.get("n_need", 0)), "fl_need": float(ps.get("fl_need", 0.0)),
                 "coverage": ps.get("coverage"), "n_avail": int(ps.get("n_avail", 0)),
             })
+        bad = [s for s in segs if s["failing"]]
         cards.append({
+            "gosb_id": nid,
             "gosb_name": name, "exec": float(r.execution_percent), "gap": float(r.nedobor),
             "plan": float(r.plan_amt), "forecast": float(r.fact_amt),
             "rest": _rest_row(r, segs, int(p.get("n_need", 0))),
-            "seg_only": float(r.nedobor) <= 0,     # план в целом выполняется
-            "segs": segs, "gap_seg": float(p.get("gap_seg", sum(s["nedobor"] for s in segs))),
+            # ГОСБ здоров, если и общий план выполняется, и западающих сегментов нет
+            "healthy": float(r.nedobor) <= 0 and not bad,
+            "seg_only": float(r.nedobor) <= 0 and bool(bad),   # план вытянут другими
+            "segs": segs, "segs_bad": bad,
+            "gap_seg": float(p.get("gap_seg", sum(s["nedobor"] for s in bad))),
             "n_need": int(p.get("n_need", 0)), "fl_need": float(p.get("fl_need", 0.0)),
             "fot_need": float(p.get("fot_need", 0.0)),
             "n_attract": int(p.get("n_attract", 0)), "fl_attract": float(p.get("fl_attract", 0.0)),

@@ -85,6 +85,27 @@ def _kpis(a: analyze.Analysis) -> str:
     return f'<div class="grid cols-2">{cards}</div>'
 
 
+def _wf_lines(wf: dict, d: dict, conv: float) -> str:
+    """Строки водопада. Общие для блока по ТБ и для оверлея по ГОСБ — слагаемые
+    и порядок одни и те же, меняется только срез данных."""
+    rows = [
+        (f'Портфель — {C.esc(d.get("closed_label", ""))} закрыт', wf["base"], 0, ""),
+        (f'Ежедневный отток на {C.esc(str(d.get("act_dt", "")))}', wf["observed"], -1, ""),
+        ("Риск оттока до конца месяца", wf["risk"], -1, "прогноз по истории"),
+        ("Сезонный приход", wf["in_exp"], 1, "клиенты, которые обычно возвращаются"),
+        ("Пайплайн на месяц", wf["pipe"], 1,
+         f'заявлено {C.fmt_num(wf["pipe_raw"])}, коэф. реализуемости {conv:.2f}'),
+    ]
+    # подсказка идёт классом g-hint, а НЕ .sub: .sub — это стиль подзаголовка
+    # страницы (19px), внутри строки водопада он выглядит крупнее самой строки
+    return "".join(
+        f'<div class="g-seg"><b>{lbl}</b> '
+        f'<span style="color:{"var(--bad)" if sign < 0 else "var(--good)"}">'
+        f'{"−" if sign < 0 else "+" if sign > 0 else ""}{C.fmt_num(val)}</span>'
+        + (f' <span class="g-hint">· {hint}</span>' if hint else "") + '</div>'
+        for lbl, val, sign, hint in rows)
+
+
 def _waterfall(a: analyze.Analysis) -> str:
     """Из чего складывается прогноз: база закрытого месяца → отток → пайплайн.
 
@@ -96,21 +117,7 @@ def _waterfall(a: analyze.Analysis) -> str:
         return ""
     d = a.dates or {}
     fc = a.fc_stats or {}
-    rows = [
-        (f'База — {C.esc(d.get("closed_label", ""))} закрыт', wf["base"], 0, ""),
-        (f'Ежедневный отток на {C.esc(str(d.get("act_dt", "")))}', wf["observed"], -1, ""),
-        ("Риск оттока до конца месяца", wf["risk"], -1, "прогноз по истории"),
-        ("Сезонный приход", wf["in_exp"], 1, "клиенты, которые обычно возвращаются"),
-        ("Пайплайн на месяц", wf["pipe"], 1,
-         f'заявлено {C.fmt_num(wf["pipe_raw"])}, коэф. реализуемости '
-         f'{fc.get("conv_tb", 1.0):.2f}'),
-    ]
-    body = "".join(
-        f'<div class="g-seg"><b>{lbl}</b> '
-        f'<span style="color:{"var(--bad)" if sign < 0 else "var(--good)"}">'
-        f'{"−" if sign < 0 else "+" if sign > 0 else ""}{C.fmt_num(val)}</span>'
-        + (f' <span class="sub">· {hint}</span>' if hint else "") + '</div>'
-        for lbl, val, sign, hint in rows)
+    body = _wf_lines(wf, d, fc.get("conv_tb", 1.0))
     ex = wf.get("exec") or 0
     st = C.status_of(wf.get("exec"))
     total = (
@@ -168,46 +175,159 @@ def _gap_cell(v: float) -> str:
     return "—" if v <= 0.5 else "−" + C.fmt_num(v)
 
 
-def _gosb_table(c: dict) -> str:
-    """Таблица карточки: строка «Всего» по ГОСБ + строки западающих сегментов.
+def _seg_badge(s: dict) -> str:
+    """Бейдж сегмента: имя + выполнение, цвет по статусу — состояние не кодируется
+    одним лишь цветом. При 99.5–99.9% показываем десятую долю, иначе рядом с
+    недобором стояло бы «100%»."""
+    fmt = "%s %.1f%%" if s["exec"] >= 0.995 else "%s %.0f%%"
+    return C.badge(fmt % (s["seg"], s["exec"] * 100), C.status_of(s["exec"]))
+
+
+def _gosb_table(c: dict, wide: bool = False) -> str:
+    """Таблица карточки: строка «Всего» по ГОСБ + строки ВСЕХ сегментов.
 
     Одни и те же колонки на обоих уровнях — итог и сегменты сравниваются по вертикали.
-    Первая ячейка сегмента — статусный бейдж: состояние не кодируется одним лишь цветом.
+    Выполняющие сегменты идут ниже западающих и приглушены: видно, за счёт чего ГОСБ
+    вытягивает план, но взгляд по-прежнему цепляется за проблемные.
     У строки «Всего» бейджа нет — процент уже стоит крупно в шапке карточки.
+
+    wide=True (в оверлее) добавляет колонки оттока и пайплайна — это детализация
+    прогноза на грейне (ГОСБ, сегмент).
     """
     def row(label, d, cls=""):
+        pipe = d.get("pipe_np", 0)
+        extra = (f'<span>{_gap_cell(d.get("out_exp", 0))}</span>'
+                 f'<span>{"+" + C.fmt_num(pipe) if pipe >= 1 else "—"}</span>'
+                 if wide else "")
         return (f'<div class="g-row {cls}"><span>{label}</span>'
                 f'<span>{C.fmt_num(d["forecast"])}</span>'
                 f'<span>{C.fmt_num(d["plan"])}</span>'
                 f'<span>{_gap_cell(d["nedobor"])}</span>'
-                f'<span>{d["n_need"] or "—"}</span></div>')
+                f'{extra}<span>{d.get("n_need") or "—"}</span></div>')
 
-    head = ('<div class="g-row head"><span>сегмент</span><span>прогноз</span>'
-            '<span>план</span><span>недобор</span><span>орг</span></div>')
-    total = row("Всего", {"forecast": c["forecast"], "plan": c["plan"],
-                          "nedobor": c["gap"], "n_need": c["n_need"]}, "total")
-    rows = []
-    for s in c["segs"]:
-        # при 99.5–99.9% показываем десятую долю, иначе «100%» рядом с недобором
-        fmt = "%s %.1f%%" if s["exec"] >= 0.995 else "%s %.0f%%"
-        rows.append(row(C.badge(fmt % (s["seg"], s["exec"] * 100), C.status_of(s["exec"])), s))
+    cols = ('<span>отток</span><span>пайплайн</span>' if wide else "")
+    head = (f'<div class="g-row head"><span>сегмент</span><span>прогноз</span>'
+            f'<span>план</span><span>недобор</span>{cols}<span>орг</span></div>')
+    tot = {"forecast": c["forecast"], "plan": c["plan"], "nedobor": c["gap"],
+           "n_need": c["n_need"],
+           "out_exp": sum(s.get("out_exp", 0) for s in c["segs"]),
+           "pipe_np": sum(s.get("pipe_np", 0) for s in c["segs"])}
+    rows = [row(_seg_badge(s), s, "" if s["failing"] else "ok") for s in c["segs"]]
     if not rows:
-        rows.append('<div class="g-row"><span>в норме по сегментам</span>'
-                    '<span></span><span></span><span></span><span></span></div>')
+        rows.append('<div class="g-row"><span>нет данных по сегментам</span></div>')
     rest = row("прочие", c["rest"], "rest") if c.get("rest") else ""
-    return f'<div class="g-tbl">{head}{total}{"".join(rows)}{rest}</div>'
+    cls_w = " wide" if wide else ""
+    return (f'<div class="g-tbl{cls_w}">{head}{row("Всего", tot, "total")}'
+            f'{"".join(rows)}{rest}</div>')
+
+
+def _org_rows(rows: list, key: str, tail_n: int, tail_fl: float,
+              tail_txt: str, sign: int = -1, why=None) -> str:
+    """Строки именной детализации: организация · вклад · причина и что сделать.
+
+    Названия компаний приходят из БД — обязательно через C.esc.
+    Хвост не прячем: сколько организаций и человек осталось за кадром, видно явно.
+    """
+    if not rows:
+        return '<div class="gd-note">нет организаций с заметным вкладом</div>'
+    # пояснение зависит от блока: причина оттока к пайплайну и к годовому тренду
+    # отношения не имеет, поэтому текст задаётся вызывающим
+    why_fn = why or (lambda r: " · ".join(x for x in (r.get("note"), r.get("action")) if x))
+    out = []
+    for r in rows:
+        mark = "−" if sign < 0 else "+"
+        out.append(
+            f'<div class="gd-row"><span>{C.esc(r["name"])}</span>'
+            f'<span>{mark}{C.fmt_num(abs(r[key]))}</span>'
+            f'<span class="gd-why">{C.esc(why_fn(r)) or "—"}</span></div>')
+    if tail_n:
+        out.append(f'<div class="gd-note">ещё {tail_n} орг. на {C.fmt_num(tail_fl)} чел '
+                   f'{C.esc(tail_txt)}</div>')
+    return "".join(out)
+
+
+def _why_pipe(r: dict) -> str:
+    """Пояснение к строке пайплайна: сколько из заявленного дошло до прогноза."""
+    return f'в прогнозе {C.fmt_num(r["pipe_adj"])} — с поправкой на реализуемость'
+
+
+def _why_size(r: dict) -> str:
+    """Пояснение к строке годового тренда: текущий размер организации."""
+    return f'сейчас {C.fmt_num(r["cur"])} чел'
+
+
+def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
+    """Оверлей «почему прогноз такой» по одному ГОСБ.
+
+    Порядок блоков — от числа к именам: водопад → из чего сложился отток и что из
+    него в зоне влияния → крупнейшие организации → пайплайн → тренд базы →
+    разбор по сегментам. Именами объяснить число нельзя (топ-5 дают ~треть),
+    поэтому сначала структура, а имена — только материальные.
+    """
+    if not det:
+        return ""
+    wf = det["wf"]
+    gid = c["gosb_id"]
+    ex = wf.get("exec") or 0
+    zone = C.hbars([(k, v) for k, v, _, _ in det["by_zone"]], " чел")
+    cls = C.hbars([(k, v) for k, v, _, _ in det["by_class"]], " чел")
+    lead = (f'<div class="gd-lead">Реально ваши: <b>{C.fmt_num(det["workable_fl"])}</b> чел '
+            f'по {det["workable_n"]} организациям — они в списке «Организации к работе». '
+            f'Остальное — вне зоны влияния или вне эталонной базы.</div>')
+    yoy = det["yoy_total"]
+    yoy_head = (f'<h4>Портфель год к году: '
+                f'<span style="color:{"var(--bad)" if yoy < 0 else "var(--good)"}">'
+                f'{"−" if yoy < 0 else "+"}{C.fmt_num(abs(yoy))} чел</span></h4>')
+    return (
+        f'<dialog class="gd" id="gd-{gid}"><div class="gd-sheet">'
+        f'<div class="gd-head"><div><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
+        f'<div class="gd-note">прогноз {C.fmt_num(wf["forecast"])} из плана '
+        f'{C.fmt_num(wf["plan"])} · {ex*100:.0f}% · до конца месяца '
+        f'{d.get("days_left", 0)} дн.</div></div>'
+        f'<button class="gd-close" onclick="gdClose({gid})" '
+        f'aria-label="Закрыть">×</button></div>'
+
+        f'<div class="gd-block"><h4>Из чего сложился прогноз</h4>'
+        f'{_wf_lines(wf, d, det["conv"])}</div>'
+
+        f'<div class="gd-block"><h4>Отток {C.fmt_num(det["out_tot"])} чел — '
+        f'что из этого ваше</h4>{zone}{lead}'
+        f'<div class="gd-note" style="margin-top:12px">по причине:</div>{cls}</div>'
+
+        f'<div class="gd-block"><h4>Крупнейшие в оттоке</h4>'
+        f'{_org_rows(det["top_out"], "out", det["out_tail_n"], det["out_tail_fl"], "— хвост")}'
+        f'</div>'
+
+        f'<div class="gd-block"><h4>Пайплайн на месяц: заявлено '
+        f'{C.fmt_num(wf["pipe_raw"])}, в прогнозе {C.fmt_num(wf["pipe"])}</h4>'
+        + _org_rows(det["top_pipe"], "pipe", det["pipe_tail_n"], det["pipe_tail_fl"],
+                    "— хвост", 1, _why_pipe)
+        + '</div>'
+
+        f'<div class="gd-block">{yoy_head}'
+        f'<div class="gd-note">просели за год:</div>'
+        f'{_org_rows(det["yoy_down"], "yoy", 0, 0, "", -1, _why_size)}'
+        f'<div class="gd-note" style="margin-top:10px">выросли за год:</div>'
+        f'{_org_rows(det["yoy_up"], "yoy", 0, 0, "", 1, _why_size)}</div>'
+
+        f'<div class="gd-block"><h4>Разбор по сегментам</h4>{_gosb_table(c, wide=True)}</div>'
+        f'</div></dialog>'
+    )
 
 
 def _problem_gosb(a: analyze.Analysis) -> str:
     if not a.gosb_cards:
         return ""
-    cards = []
+    cards, dialogs = [], []
+    d = a.dates or {}
     for c in a.gosb_cards:
-        st = "warn" if c["seg_only"] else ("bad" if c["exec"] < 0.9 else "warn")
+        st = ("good" if c["healthy"] else
+              "warn" if c["seg_only"] else
+              "bad" if c["exec"] < 0.9 else "warn")
         seg_html = _gosb_table(c)
-        # пояснения по сегментам в строку таблицы не влезают — собираем их отдельно
+        # пояснения по западающим сегментам в строку таблицы не влезают — отдельно
         notes = []
-        for s in c["segs"]:
+        for s in c["segs_bad"]:
             cov = s["coverage"]
             if not s["n_avail"]:
                 notes.append(f'в {s["seg"]} своих организаций нет — добор из других')
@@ -216,9 +336,11 @@ def _problem_gosb(a: analyze.Analysis) -> str:
         note_html = (f'<div class="g-act">{C.esc(" · ".join(notes[:3]))}</div>'
                      if notes else "")
         act = c["act"]
-        if c["seg_only"]:
+        if c["healthy"]:
+            head_badge = C.badge("план выполняется по всем сегментам", "good")
+        elif c["seg_only"]:
             head_badge = C.badge(f'план выполняется, но западает '
-                                 f'{", ".join(s["seg"] for s in c["segs"][:3])}', "warn")
+                                 f'{", ".join(s["seg"] for s in c["segs_bad"][:3])}', "warn")
         else:
             head_badge = C.badge("−" + C.fmt_num(c["gap"]) + " чел до плана", st)
         filler = (f' · добор из других сегментов: <b>{c["filler_n"]}</b> орг '
@@ -236,17 +358,40 @@ def _problem_gosb(a: analyze.Analysis) -> str:
             f'успех {act["success"]*100:.0f}% · из нужных под план не работали с '
             f'<b>{c["not_worked"]}</b></div>'
         )
+        gid = c["gosb_id"]
+        det = (a.gosb_detail or {}).get(gid)
+        more = ('<div class="g-more">Почему такой прогноз →</div>' if det else "")
         inner = (
             f'<div class="g-head"><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
             f'<span class="g-ex" style="color:{_col(c["exec"])}">{c["exec"]*100:.0f}%</span></div>'
             + C.meter(c["exec"])
             + f'<div style="margin:2px 0 6px">{head_badge}</div>'
-            + f'{seg_html}{do}'
+            + f'{seg_html}{do}{more}'
         )
-        cards.append(C.card(inner, cls=f"gcard {st}"))
-    grid = f'<div class="gcards">{"".join(cards)}</div>'
-    return C.section("Проблемные ГОСБ — что сделать по каждому", grid,
-                     eyebrow="Приоритет по ГОСБ и сегменту")
+        # карточка кликабельна целиком; role/tabindex — чтобы работала и с клавиатуры
+        attrs = (f' role="button" tabindex="0" onclick="gdOpen({gid})" '
+                 f'onkeydown="if(event.key===\'Enter\'||event.key===\' \')'
+                 f'{{event.preventDefault();gdOpen({gid});}}"' if det else "")
+        cards.append(f'<div class="card gcard {st}"{attrs}>{inner}</div>')
+        if det:
+            dialogs.append(_gosb_dialog(c, det, d))
+    grid = (f'<div class="gcards">{"".join(cards)}</div>{"".join(dialogs)}'
+            + _GD_JS)
+    return C.section("ГОСБ — что сделать по каждому", grid,
+                     eyebrow="Все ГОСБ · клик открывает разбор прогноза")
+
+
+# Открытие/закрытие оверлея. Нативный <dialog>: Esc работает сам, фокус
+# возвращается браузером. Клик по подложке закрываем вручную — по умолчанию не закрывает.
+_GD_JS = """
+<script>
+function gdOpen(id){var d=document.getElementById('gd-'+id); if(d) d.showModal();}
+function gdClose(id){var d=document.getElementById('gd-'+id); if(d) d.close();}
+document.querySelectorAll('dialog.gd').forEach(function(d){
+  d.addEventListener('click', function(e){ if(e.target===d) d.close(); });
+});
+</script>
+"""
 
 
 def _orgs(a: analyze.Analysis) -> str:
