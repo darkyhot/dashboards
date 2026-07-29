@@ -25,9 +25,11 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(ROOT / ".env")
 
-# --- Схема пром-БД. Локальная синтетика повторяет её ТОЧЬ-В-ТОЧЬ, ---
+# --- Схемы пром-БД. Локальная синтетика повторяет их ТОЧЬ-В-ТОЧЬ, ---
 # поэтому SQL дэшей идентичен в обоих контурах.
 SCHEMA = "s_grnplm_ld_salesntwrk_pcap_sn_uzp"
+# Схема пайплайна (yva_pl_task_deal_code) — в SQL это плейсхолдер {schema_t}
+SCHEMA_T = "s_grnplm_ld_salesntwrk_pcap_sn_t_uzp"
 
 # --- Контур --- (управляется из ноутбука; env — лишь фолбэк по умолчанию)
 CONTOUR = os.environ.get("UZP_CONTOUR", "open").strip().lower()

@@ -1,16 +1,34 @@
-"""SQL для дэша tb_health. {schema} подставляется в db.read_sql, значения — :params.
+"""SQL для дэша tb_health. {schema} / {schema_t} подставляются в db.read_sql,
+значения — :params.
 
-Опорная дата :ref — ТЕКУЩИЙ месяц (последний день) из report_dt, единая для всех
-таблиц. Метрики фильтруются по end_dt = :ref (а не по max(end_dt) — там бывают
-будущие плановые месяцы). Активности — окно 3 мес до :ref. Ранги — window-функция.
+Дэш строится на ТЕКУЩИЙ (незакрытый) месяц :ref_cur — по прогнозу, потому что
+окончательная ЗП-ведомость есть только за закрытый месяц. Опорные даты:
+  :ref_cur    — прогнозный месяц (конец месяца), из uzp_dwh_day_outflow;
+  :act_dt     — по какую дату в нём есть факт зачислений;
+  :ref_closed — предыдущий, ЗАКРЫТЫЙ месяц: база прогноза (факт метрик оттуда);
+  :ref_funnel — конец окна воронки, совпадает с :ref_cur.
+Метрики фильтруются по end_dt = <нужный месяц> (а не по max(end_dt) — там бывают
+будущие плановые месяцы). Активности — окно 3 мес до :ref_funnel.
 """
 
 METRIC_FOT = 1000164          # Общий ФОТ, млн ₽
 METRIC_RECIPIENTS = 12400196  # Количество уникальных получателей до ИНН
 
-# Опорный (текущий) месяц: последний день месяца из report_dt операционных витрин
+# Закрытый месяц: последний день месяца из report_dt операционных витрин.
+# Используется как ФОЛБЭК опорной даты, если ежедневная витрина пуста.
 REF_DATE = """
 SELECT max(report_dt) AS ref FROM {schema}.uzp_dwh_company_holding_metric
+"""
+
+# Опорные даты дэша. Ежедневная витрина живёт ТОЛЬКО за текущий месяц (один
+# report_dt и один act_dt), поэтому именно она задаёт «сегодня»: прогнозный месяц
+# и дату, по которую есть факт зачислений.
+REF_CUR = """
+SELECT r.ref_cur,
+       (SELECT max(d.act_dt) FROM {schema}.uzp_dwh_day_outflow d
+        WHERE d.report_dt = r.ref_cur) AS act_dt
+FROM (SELECT max(report_dt) AS ref_cur FROM {schema}.uzp_dwh_day_outflow) r
+WHERE r.ref_cur IS NOT NULL
 """
 
 # Резолв ТБ по короткому имени -> tb_id, полное имя
@@ -231,4 +249,106 @@ WHERE f.tb_id = :tb_id
   AND (COALESCE(btrim(f.task_comment), '') <> ''
        OR COALESCE(btrim(f.task_questionnaire), '') <> '')
 ORDER BY f.inn, g.new_gosb_id, f.last_active_dttm DESC NULLS LAST
+"""
+
+# ==================== Прогноз на текущий месяц ============================== #
+
+# Ежедневный отток: сколько получателей прошлого месяца ещё НЕ зачислились, хотя
+# их выплатная дата уже прошла. Грейн (ГОСБ, ИНН).
+#
+# min(outflow_unpaid_m_qty) — по требованию бизнеса: у организации в месяце
+# обычно две выплаты (аванс + основная), и отток надо брать ПО ИТОГУ обеих: если
+# сотрудник получил хотя бы на одну из дат, он не отток.
+#
+# paid_mtd / fl_prev_m нужны для стыковки с прогнозным оттоком: доля уже
+# зачислившихся показывает, сколько риска месяца уже отыграно (см. forecast.reconcile).
+# segment_name здесь КОРОТКИЙ (ММБ/КСБ/…) — это основной источник сегмента
+# организации, справочник uzp_dim_company идёт фолбэком.
+DAY_OUTFLOW = """
+WITH gmap AS (""" + _GMAP + """)
+SELECT g.new_gosb_id, d.org_inn AS inn,
+       max(d.segment_name)                        AS seg_day,
+       min(d.outflow_unpaid_m_qty)                AS out_observed,
+       max(d.fact_fl_qty)                         AS paid_mtd,
+       max(d.fl_prev_m_qty)                       AS fl_prev_m,
+       max(d.m_avg_salary_amt)                    AS avg_salary_m,
+       count(DISTINCT d.payment_order_num)        AS n_payments
+FROM {schema}.uzp_dwh_day_outflow d
+LEFT JOIN gmap g ON g.old_gosb_id = d.gosb_id
+WHERE d.report_dt = :ref_cur AND d.act_dt = :act_dt AND d.tb_id = :tb_id
+GROUP BY g.new_gosb_id, d.org_inn
+"""
+
+# История витрины по (ГОСБ, ИНН) за :hist_from … :ref_closed — под модель оттока
+# (устойчивый отток два закрытых месяца подряд + сезонность год к году).
+# Тянем только то, что нужно модели: сам отток и численность получателей.
+OUTFLOW_HISTORY = """
+WITH gmap AS (""" + _GMAP + """)
+SELECT g.new_gosb_id, c.org_id AS inn, c.report_dt,
+       COALESCE(c.fl_outflow_qty, 0) AS fl_outflow_qty,
+       COALESCE(c.current_fl_qty, 0) AS current_fl_qty
+FROM {schema}.uzp_dwh_company_holding_metric c
+JOIN gmap g ON g.old_gosb_id = c.level_id
+WHERE g.tb_id = :tb_id AND c.org_type = 'inn'
+  AND c.report_dt > CAST(:hist_from AS date)
+  AND c.report_dt <= CAST(:ref_closed AS date)
+"""
+
+# Пайплайн: сколько НП сотрудник запланировал ИМЕННО на текущий месяц.
+#
+# В uzp_dwh_sale_funnel_task.plan_staff_deal_qty план размазан на все 3 месяца
+# жизни сделки; помесячная разбивка есть только в yva_pl_task_deal_code, ключ —
+# coalesce(deal_code, task_code).
+#
+# CTE codes ОБЯЗАТЕЛЬНА: один и тот же deal_code встречается в нескольких строках
+# воронки (несколько задач по сделке), и join напрямую задвоил бы план.
+# Окно воронки то же, что у активностей: сделка живёт 3 месяца, поэтому запланировать
+# текущий месяц могли только сделки этого окна.
+PIPELINE = """
+WITH gmap AS (""" + _GMAP + """),
+codes AS (
+  SELECT COALESCE(f.deal_code, f.task_code) AS code,
+         f.inn,
+         min(g.new_gosb_id)                       AS new_gosb_id,
+         min(f.segment_name)                      AS seg_funnel,
+         sum(COALESCE(f.fact_staff_deal_qty, 0))  AS fact_deal
+  FROM {schema}.uzp_dwh_sale_funnel_task f
+  LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
+  WHERE f.tb_id = :tb_id
+    AND f.task_create_dt >= CAST(:funnel_from AS date)
+    AND f.task_create_dt <= CAST(:ref_funnel  AS date)
+    AND COALESCE(f.deal_code, f.task_code) IS NOT NULL
+  GROUP BY 1, 2
+)
+SELECT c.new_gosb_id, c.inn, min(c.seg_funnel) AS seg_funnel,
+       sum(COALESCE(p.pl_plan_np_amt, 0))  AS pipe_np_raw,
+       sum(COALESCE(p.pl_plan_fot_amt, 0)) AS pipe_fot_raw,
+       sum(c.fact_deal)                    AS fact_deal,
+       count(*)                            AS n_deals
+FROM codes c
+JOIN {schema_t}.yva_pl_task_deal_code p ON p.pl_task_deal_code = c.code
+WHERE p.pl_month_num = :cur_month
+GROUP BY c.new_gosb_id, c.inn
+"""
+
+# Историческая реализуемость пайплайна: какая доля запланированных по сделке
+# получателей реально доходит. Считаем ТОЛЬКО по сделкам, созданным раньше
+# :fresh_from — свежие ещё не успели реализоваться и занизили бы коэффициент.
+# Строка level='tb' (new_gosb_id IS NULL) — фолбэк для ГОСБ без своей истории.
+DEAL_CONVERSION = """
+WITH gmap AS (""" + _GMAP + """),
+base AS (
+  SELECT g.new_gosb_id,
+         COALESCE(f.plan_staff_deal_qty, 0) AS plan_q,
+         COALESCE(f.fact_staff_deal_qty, 0) AS fact_q
+  FROM {schema}.uzp_dwh_sale_funnel_task f
+  LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
+  WHERE f.tb_id = :tb_id
+    AND COALESCE(f.plan_staff_deal_qty, 0) > 0
+    AND f.deal_create_dttm IS NOT NULL
+    AND f.deal_create_dttm < CAST(:fresh_from AS date)
+)
+SELECT new_gosb_id, sum(plan_q) AS plan_q, sum(fact_q) AS fact_q FROM base GROUP BY 1
+UNION ALL
+SELECT NULL, sum(plan_q), sum(fact_q) FROM base
 """

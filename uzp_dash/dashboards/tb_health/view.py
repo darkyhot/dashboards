@@ -27,32 +27,44 @@ def build(ctx: Context) -> str:
     body = (
         _hero(a)
         + _kpis(a)
+        + _waterfall(a)
         + _matrix(a)
         + _problem_gosb(a)
         + _orgs(a)
         + C.section("Что делать — резюме", C.card(C.narrative_html(story)), eyebrow="AI")
     )
+    d = a.dates or {}
     return page(
         title=f"Здоровье ТБ — {C.esc(a.tb_full)}",
-        subtitle=f"Текущая ситуация на {C.esc(a.ref_date)} · получатели и ФОТ",
+        subtitle=f"Прогноз на {C.esc(d.get('label', a.ref_date))}",
         body=body,
     )
 
 
 # --------------------------------------------------------------------------- #
 def _hero(a: analyze.Analysis) -> str:
+    """Вердикт по ПРОГНОЗУ текущего месяца. Закрытый месяц — строкой ниже:
+    это единственная твёрдая цифра, и по ней же считается ранг ТБ."""
     r = a.verdict["rcp"]
+    d = a.dates or {}
+    cl = (a.closed or {}).get("rcp", {})
     st = C.status_of(r["exec"])
-    word = {"good": "План выполняется", "warn": "План под угрозой", "bad": "План не выполняется"}[st]
+    word = {"good": "План выполняется", "warn": "План под угрозой",
+            "bad": "План не выполняется"}[st]
     rank = f'{r["rank"]}/{r["n_tb"]}' if r["rank"] else "—"
+    left = int(d.get("days_left", 0))
+    closed_txt = (f'{C.esc(d.get("closed_label", ""))} закрыт: '
+                  f'{(cl.get("exec") or 0) * 100:.0f}% плана · ранг ТБ {rank} за закрытый месяц')
     inner = (
-        f'<div class="eyebrow">Вердикт по получателям</div>'
-        f'<div class="verdict">{C.esc(word)} · <span class="big">{(r["exec"] or 0)*100:.0f}%</span> плана</div>'
+        f'<div class="eyebrow">Прогноз по получателям на {C.esc(d.get("label", ""))}</div>'
+        f'<div class="verdict">{C.esc(word)} · '
+        f'<span class="big">{(r["exec"] or 0)*100:.0f}%</span> плана по прогнозу</div>'
         f'<div>{C.badge("−" + C.fmt_num(a.gap_rcp) + " получателей до плана", st)} '
-        f'{C.badge("ранг ТБ " + rank, "warn" if r["rank"] and r["rank"] > r["n_tb"]/2 else "good")}</div>'
+        f'{C.badge("до конца месяца " + str(left) + " дн.", "warn")}</div>'
         + C.meter(r["exec"])
         + f'<div class="row2">ФОТ: {(a.verdict["fot"]["exec"] or 0)*100:.0f}% плана · '
           f'недобор {C.fmt_num(a.gap_fot_mln)} млн ₽</div>'
+        + f'<div class="row2">{closed_txt}</div>'
     )
     return C.card(inner, cls="hero")
 
@@ -68,9 +80,56 @@ def _kpis(a: analyze.Analysis) -> str:
             cls="kpi",
         )
     # ФОТ в БД — рубли, выводим в млн ₽ (÷ 1e6)
-    cards = (kpi("Получатели, чел", a.verdict["rcp"], "")
-             + kpi("Общий ФОТ, млн ₽", a.verdict["fot"], "", scale=1e6))
+    cards = (kpi("Получатели (прогноз), чел", a.verdict["rcp"], "")
+             + kpi("Общий ФОТ (прогноз), млн ₽", a.verdict["fot"], "", scale=1e6))
     return f'<div class="grid cols-2">{cards}</div>'
+
+
+def _waterfall(a: analyze.Analysis) -> str:
+    """Из чего складывается прогноз: база закрытого месяца → отток → пайплайн.
+
+    Отток намеренно разбит на «уже не зачислились» и «риск»: первое уже случилось,
+    второе — то, на что ещё можно повлиять до конца месяца.
+    """
+    wf = a.wf or {}
+    if not wf:
+        return ""
+    d = a.dates or {}
+    fc = a.fc_stats or {}
+    rows = [
+        (f'База — {C.esc(d.get("closed_label", ""))} закрыт', wf["base"], 0, ""),
+        (f'Ежедневный отток на {C.esc(str(d.get("act_dt", "")))}', wf["observed"], -1, ""),
+        ("Риск оттока до конца месяца", wf["risk"], -1, "прогноз по истории"),
+        ("Сезонный приход", wf["in_exp"], 1, "клиенты, которые обычно возвращаются"),
+        ("Пайплайн на месяц", wf["pipe"], 1,
+         f'заявлено {C.fmt_num(wf["pipe_raw"])}, коэф. реализуемости '
+         f'{fc.get("conv_tb", 1.0):.2f}'),
+    ]
+    body = "".join(
+        f'<div class="g-seg"><b>{lbl}</b> '
+        f'<span style="color:{"var(--bad)" if sign < 0 else "var(--good)"}">'
+        f'{"−" if sign < 0 else "+" if sign > 0 else ""}{C.fmt_num(val)}</span>'
+        + (f' <span class="sub">· {hint}</span>' if hint else "") + '</div>'
+        for lbl, val, sign, hint in rows)
+    ex = wf.get("exec") or 0
+    st = C.status_of(wf.get("exec"))
+    total = (
+        f'<div class="g-do">Прогноз на {C.esc(d.get("label", ""))}: '
+        f'<b>{C.fmt_num(wf["forecast"])}</b> при плане {C.fmt_num(wf["plan"])} → '
+        + C.badge(f"{ex * 100:.0f}% плана", st) + '</div>'
+    )
+    upside = ""
+    if wf.get("pipe_upside", 0) >= 1:
+        upside = (f'<div class="g-act">Если пайплайн отработают на 100%, прогноз '
+                  f'вырастет до <b>{C.fmt_num(wf["ceiling"])}</b> '
+                  f'(+{C.fmt_num(wf["pipe_upside"])} чел) — это потолок месяца.</div>')
+    note = ('<p class="sub" style="font-size:14px;margin:-4px 0 12px">'
+            'прогноз — пассивный сценарий «если ничего не делать»: приход из пайплайна '
+            'в нём уже учтён, а потенциал привлечения и удержание — нет. '
+            'Список организаций ниже показывает, чем прогноз можно улучшить.</p>')
+    return C.section("Из чего складывается прогноз",
+                     C.card('<h3>Расчёт по получателям</h3>' + note + body + total + upside),
+                     eyebrow="Метод")
 
 
 def _matrix(a: analyze.Analysis) -> str:
@@ -89,8 +148,9 @@ def _matrix(a: analyze.Analysis) -> str:
               max(float(row.execution_percent or 0), 1.0), row.nedobor)
              for row in m.itertuples()}
     heat = C.card(
-        '<h3>Выполнение плана по получателям, %</h3>'
-        '<p class="sub" style="font-size:14px;margin:-4px 0 12px">красное — сильнее отстаёт от плана</p>'
+        '<h3>Прогноз выполнения плана по получателям, %</h3>'
+        '<p class="sub" style="font-size:14px;margin:-4px 0 12px">'
+        'красное — сильнее отстаёт от плана ТЕКУЩЕГО месяца по прогнозу</p>'
         + C.heat_matrix(rows_id_label, segs, cells))
     top = [(f'{r.gosb_name} · {r.seg_name}',
             C.badge(f'{r.execution_percent*100:.0f}%', C.status_of(r.execution_percent)),
@@ -100,7 +160,7 @@ def _matrix(a: analyze.Analysis) -> str:
                                top, num_cols=[2, 3]))
     return C.section("Где провал — ГОСБ × сегмент",
                      f'<div class="grid cols-2">{heat}{top_tbl}</div>',
-                     eyebrow="Диагностика")
+                     eyebrow="Диагностика по прогнозу")
 
 
 def _problem_gosb(a: analyze.Analysis) -> str:
@@ -188,12 +248,16 @@ def _orgs(a: analyze.Analysis) -> str:
     sim = a.sim
     bad_segs = sorted({s["seg"] for c in a.gosb_cards for s in c["segs"]},
                       key=lambda x: SEG_ORDER.index(x) if x in SEG_ORDER else 99)
+    d = a.dates or {}
+    n_hold = sum(1 for r in rows if r["lever"] == "Удержать")
+    hold = (f' · из них «Удержать» — <b>{n_hold}</b>: оттекают прямо сейчас, '
+            f'до конца месяца {d.get("days_left", 0)} дн.' if n_hold else "")
     head = (f'<h3>С кем работать — {sim["k"]} организаций закрывают план</h3>'
             f'<p class="sub" style="font-size:14px;margin:-4px 0 14px">'
             f'отбор идёт внутри ЗАПАДАЮЩИХ сегментов каждого ГОСБ '
             f'({C.esc(", ".join(bad_segs)) or "—"}), по величине эффекта, пока разрыв '
             f'сегмента не закрыт · переключатель «Цель» задаёт перевыполнение · '
-            f'всего кандидатов {len(rows)}</p>')
+            f'всего кандидатов {len(rows)}{hold}</p>')
     return C.section("Организации к работе", C.card(head + explorer), eyebrow="Список к отработке")
 
 

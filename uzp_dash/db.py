@@ -23,10 +23,11 @@ def get_engine(url: str) -> Engine:
 def read_sql(engine: Engine, sql: str, params: dict | None = None) -> pd.DataFrame:
     """Выполнить SELECT и вернуть DataFrame.
 
-    В SQL используйте плейсхолдер {schema} — он подставляется автоматически,
+    В SQL используйте плейсхолдеры {schema} (основная витринная схема) и
+    {schema_t} (схема пайплайна) — они подставляются автоматически,
     и именованные параметры :name (безопасная подстановка значений).
     """
-    sql = sql.format(schema=config.SCHEMA)
+    sql = sql.format(schema=config.SCHEMA, schema_t=config.SCHEMA_T)
     progress.sql(sql, params)
     with engine.connect() as conn:
         return pd.read_sql(text(sql), conn, params=params or {})

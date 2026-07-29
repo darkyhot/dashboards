@@ -1,5 +1,14 @@
 """Бизнес-логика дэша tb_health.
 
+Дэш строится на ТЕКУЩИЙ (незакрытый) месяц по ПРОГНОЗУ: окончательная ЗП-ведомость
+есть только за закрытый месяц, а управляющему нужно понимать, выполняется ли план
+СЕЙЧАС, пока на него ещё можно повлиять.
+
+    прогноз = факт закрытого месяца − ожидаемый отток + приход из пайплайна
+
+Математика прогноза вынесена в forecast.py; здесь она сшивается с планом текущего
+месяца, разрывом по (ГОСБ, сегмент) и списком организаций к работе.
+
 Грейн работы с клиентом — (ГОСБ, ИНН): одна организация может обслуживаться в
 нескольких ГОСБ, и в каждом своя история отработки. Все агрегаты воронки считаются
 по ВСЕМ активностям за 3 месяца (не по последней задаче).
@@ -15,13 +24,14 @@ import pandas as pd
 
 from ... import progress
 from ...db import read_sql
-from . import prompts, queries as Q, segments, text_rules
+from . import forecast, prompts, queries as Q, segments, text_rules
 
 RUB_TO_MLN = 1e6
 LLM_BATCH_DEFAULT = 12      # пар (ГОСБ, ИНН) в одном запросе к LLM (один глубокий проход)
 LLM_MIN_IMPACT_DEFAULT = 1  # ниже этого эффекта (чел) в LLM не отправляем — только правила
 LLM_MAX_CALLS_DEFAULT = 80  # жёсткий потолок вызовов на весь ТБ; хвост уходит на правила
 PLAN_TARGETS = (1.0, 1.2, 1.5)   # цели в дэше: выполнить план / +20% / +50%
+HIST_MONTHS = 24                 # глубина истории витрины под модель сезонности
 # Сегмент западает, если план не выполнен (exec < 1) — тот же признак, что даёт
 # красную ячейку в тепловой карте (render.components.heat_bg). Порог в одного
 # получателя отсекает только шум округления.
@@ -37,8 +47,8 @@ class Analysis:
     tb_short: str
     tb_id: int
     tb_full: str
-    ref_date: str
-    verdict: dict
+    ref_date: str            # прогнозный (текущий) месяц — им подписан весь дэш
+    verdict: dict            # план текущего месяца против ПРОГНОЗА
     gap_rcp: float
     gap_fot: float
     gap_fot_mln: float
@@ -55,6 +65,10 @@ class Analysis:
     insights: dict = field(default_factory=dict)   # (gosb_id, inn) -> reason/action/…
     themes: str = "—"
     llm_stats: dict = field(default_factory=dict)
+    dates: dict = field(default_factory=dict)      # ref_cur / ref_closed / act_dt / …
+    wf: dict = field(default_factory=dict)         # водопад прогноза по ТБ
+    closed: dict = field(default_factory=dict)     # вердикт ЗАКРЫТОГО месяца + ранг
+    fc_stats: dict = field(default_factory=dict)   # диагностика прогноза
 
 
 def run(ctx, tb_short: str) -> Analysis:
@@ -69,51 +83,32 @@ def run(ctx, tb_short: str) -> Analysis:
         raise ValueError(f"ТБ '{tb_short}' не найден в справочнике")
     tb_id = int(tb.tb_id.iloc[0]); tb_full = str(tb.tb_full_name.iloc[0])
 
-    # --- Опорный месяц (метрики/витрина) и месяц задач (ref + 1) ---
-    date_param = ctx.params.get("date")
-    if date_param:
-        ref = (pd.to_datetime(date_param) + pd.offsets.MonthEnd(0)).date()
-        progress.done(f"Опорный месяц (задан): {ref}")
-    else:
-        ref = pd.to_datetime(read_sql(e, Q.REF_DATE).iloc[0, 0]).date()
-        progress.done(f"Опорный месяц (авто, макс. report_dt): {ref}")
-    # Задачи по метрикам идут месяцем позже -> воронка за месяц T = ref + 1.
-    # Окно — 3 календарных месяца: с первого дня месяца T-2 по конец месяца T.
-    ref_funnel = (pd.Timestamp(ref) + pd.offsets.MonthEnd(1)).date()
-    funnel_from = (pd.Timestamp(ref_funnel).to_period("M") - 2).to_timestamp().date()
-    months = ", ".join(
-        (pd.Timestamp(ref_funnel).to_period("M") - k).strftime("%m.%Y") for k in (2, 1, 0))
-    progress.done(f"Окно задач воронки: {funnel_from} … {ref_funnel} ({months})")
-    # Сделки судим по дате СОЗДАНИЯ СДЕЛКИ: заведённые в двух последних месяцах окна
-    # ещё не могли дать зачисления, по ним недоработку не считаем.
-    fresh_from = (pd.Timestamp(ref_funnel).to_period("M") - 1).to_timestamp().date()
-    progress.done(f"Сделки: созданные с {fresh_from} — свежие (организация уже в работе); "
-                  f"недоработку считаем только по сделкам, созданным раньше")
-    p = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref}
+    # --- Опорные даты: прогнозный месяц, закрытый месяц-база, окно воронки ---
+    d = _dates(e, ctx.params)
+    ref_cur, ref_closed, act_dt = d["ref_cur"], d["ref_closed"], d["act_dt"]
+    ref_funnel, funnel_from, fresh_from = d["ref_funnel"], d["funnel_from"], d["fresh_from"]
+    p_cur = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref_cur}
+    p_cls = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref_closed}
     pf = {"tb_id": tb_id, "ref_funnel": ref_funnel, "funnel_from": funnel_from,
           "fresh_from": fresh_from}
 
-    # --- Вердикт + ранги ---
-    progress.step("Вердикт по ТБ + ранги (ФОТ, получатели)")
-    v = read_sql(e, Q.TB_VERDICT, p)
-    verdict, ref_date = _verdict(v, tb_id)
-    gap_rcp = max(0.0, verdict["rcp"]["plan"] - verdict["rcp"]["fact"])
-    gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
-
-    # --- ГОСБ×сегмент ---
-    progress.step("Матрица ГОСБ × сегмент + разрыв по ГОСБ")
-    matrix = read_sql(e, Q.GOSB_SEG, {**p, "tb_id": tb_id})
-    matrix["seg_name"] = matrix["seg_id"].map(segments.short)
-    gosb_gap = read_sql(e, Q.GOSB_TOTALS, {**p, "tb_id": tb_id})
-    top_cells = (matrix[matrix.nedobor > 0]
-                 .sort_values("nedobor", ascending=False)
-                 .assign(share=lambda d: d.nedobor / max(gap_rcp, 1))
-                 .head(8))
+    # --- Закрытый месяц: база прогноза и ранг ТБ ---
+    # Ранг берём именно отсюда: в текущем месяце факт витрины частичный, ранжировать
+    # по нему нельзя, а прогноз по всем 12 ТБ здесь не считается.
+    progress.step(f"База прогноза: закрытый месяц {ref_closed}")
+    v_cls = read_sql(e, Q.TB_VERDICT, p_cls)
+    closed_verdict, _ = _verdict(v_cls, tb_id)
+    v_cur = read_sql(e, Q.TB_VERDICT, p_cur)
+    plan_cur, ref_date = _verdict(v_cur, tb_id)
+    progress.done(f"{ref_closed} закрыт: получатели {closed_verdict['rcp']['fact']:.0f} "
+                  f"из {closed_verdict['rcp']['plan']:.0f} "
+                  f"({(closed_verdict['rcp']['exec'] or 0) * 100:.0f}%) · "
+                  f"план на {ref_cur}: {plan_cur['rcp']['plan']:.0f}")
 
     # --- Организации (только закреплённые в эталонной базе ИУП) ---
     progress.step("Витрина организаций (потенциал/отток)")
-    orgs = read_sql(e, Q.ORGS, {"tb_id": tb_id, "ref": ref})
-    rs = read_sql(e, Q.ORGS_REF_STATS, {"tb_id": tb_id, "ref": ref})
+    orgs = read_sql(e, Q.ORGS, {"tb_id": tb_id, "ref": ref_closed})
+    rs = read_sql(e, Q.ORGS_REF_STATS, {"tb_id": tb_id, "ref": ref_closed})
     if not rs.empty:
         n_all = int(rs.n_all.iloc[0] or 0); n_ref = int(rs.n_ref.iloc[0] or 0)
         progress.done(f"Эталонная база: закреплено {n_ref} из {n_all} пар (ГОСБ, ИНН) — "
@@ -133,21 +128,60 @@ def run(ctx, tb_short: str) -> Analysis:
     orgs["seg_name"] = orgs["segment_big"].map(segments.short_of_big).fillna("—")
     orgs["company_name"] = orgs["company_name"].fillna("")
 
+    # --- Прогноз на текущий месяц по (ГОСБ, ИНН) ---
+    orgs, orgs_fc, fc_stats = _forecast_orgs(e, orgs, d, tb_id)
+
     attract = (orgs[orgs.emp_potential_qty >= 1]
                .sort_values("emp_potential_qty", ascending=False).head(15).copy())
     retention = (orgs[orgs.fl_outflow_qty >= 1]
                  .sort_values("fl_outflow_qty", ascending=False).head(15).copy())
 
+    # --- Прогнозная матрица ГОСБ×сегмент и разрыв по ГОСБ ---
+    progress.step("Матрица ГОСБ × сегмент по ПРОГНОЗУ + разрыв по ГОСБ")
+    base_seg = read_sql(e, Q.GOSB_SEG, {**p_cls, "tb_id": tb_id})
+    plan_seg = read_sql(e, Q.GOSB_SEG, {**p_cur, "tb_id": tb_id})
+    for f in (base_seg, plan_seg):
+        f["seg_name"] = f["seg_id"].map(segments.short)
+    matrix, mstats = forecast.build_matrix(base_seg, plan_seg, orgs_fc)
+    matrix = matrix.merge(
+        base_seg[["new_gosb_id", "seg_name", "gosb_name"]].drop_duplicates(),
+        on=["new_gosb_id", "seg_name"], how="left")
+    gosb_gap = forecast.build_totals(read_sql(e, Q.GOSB_TOTALS, {**p_cls, "tb_id": tb_id}),
+                                     read_sql(e, Q.GOSB_TOTALS, {**p_cur, "tb_id": tb_id}),
+                                     orgs_fc)
+    fc_stats.update(mstats)
+    if mstats.get("unattributed", 0) > 0:
+        progress.done(f"Дельта без сегмента разнесена по сегментам ГОСБ "
+                      f"пропорционально базе: {mstats['unattributed']:.0f} чел")
+
+    # --- Вердикт ТБ: план текущего месяца против прогноза ---
+    wf = forecast.waterfall(
+        base=closed_verdict["rcp"]["fact"], orgs_fc=orgs_fc,
+        plan=plan_cur["rcp"]["plan"],
+        base_fot=closed_verdict["fot"]["fact"], plan_fot=plan_cur["fot"]["plan"])
+    verdict = {
+        "rcp": {"plan": wf["plan"], "fact": wf["forecast"], "exec": wf["exec"],
+                "rank": closed_verdict["rcp"]["rank"], "n_tb": closed_verdict["rcp"]["n_tb"]},
+        "fot": {"plan": wf["plan_fot"], "fact": wf["forecast_fot"], "exec": wf["exec_fot"],
+                "rank": closed_verdict["fot"]["rank"], "n_tb": closed_verdict["fot"]["n_tb"]},
+    }
+    gap_rcp = max(0.0, verdict["rcp"]["plan"] - verdict["rcp"]["fact"])
+    gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
+    progress.done(
+        f"Прогноз на {ref_cur}: {wf['forecast']:.0f} из плана {wf['plan']:.0f} "
+        f"({(wf['exec'] or 0) * 100:.1f}%) = база {wf['base']:.0f} "
+        f"− отток {wf['out_exp']:.0f} (факт {wf['observed']:.0f} + риск {wf['risk']:.0f}) "
+        f"+ приток {wf['in_exp']:.0f} + пайплайн {wf['pipe']:.0f}")
+    _check_waterfall(wf, matrix, fc_stats)
+
+    top_cells = (matrix[matrix.nedobor > 0]
+                 .sort_values("nedobor", ascending=False)
+                 .assign(share=lambda x: x.nedobor / max(gap_rcp, 1))
+                 .head(8))
+
     # --- Классификация по агрегатам (все активности) ---
     progress.step("Классификация (ГОСБ,ИНН): работать / нет смысла")
-    cand = orgs[(orgs.emp_potential_qty >= 1) | (orgs.fl_outflow_qty >= 1)].copy()
-    cand["impact_fl"] = cand[["emp_potential_qty", "fl_outflow_qty"]].max(axis=1)
-    cand["lever"] = ["Привлечь" if a >= b else "Вернуть"
-                     for a, b in zip(cand.emp_potential_qty, cand.fl_outflow_qty)]
-    cand["impact_fot_mln"] = [
-        (pot if lev == "Привлечь" else out) / RUB_TO_MLN
-        for lev, pot, out in zip(cand.lever, cand.fot_potential_amt, cand.fot_outflow_amt)
-    ]
+    cand = _candidates(orgs, d["days_left"])
     to_work, no_point = _classify(cand)
 
     # --- Разрывы на грейне (ГОСБ, сегмент): работаем именно с западающими ---
@@ -182,9 +216,225 @@ def run(ctx, tb_short: str) -> Analysis:
         attract=attract, retention=retention, activity=activity,
         to_work=to_work, no_point=no_point, sim=sim, gosb_plan=gosb_plan,
         insights=insights, themes=themes, llm_stats=llm_stats,
+        dates=d, wf=wf, closed=closed_verdict, fc_stats=fc_stats,
     )
     a.gosb_cards = gosb_cards
     return a
+
+
+# --------------------------------------------------------------------------- #
+def _dates(engine, params: dict) -> dict:
+    """Опорные даты дэша.
+
+    Ежедневная витрина оттока живёт ТОЛЬКО за текущий месяц (один report_dt и один
+    act_dt), поэтому именно она задаёт «сегодня»: прогнозный месяц и дату, по
+    которую есть факт зачислений. Параметр `date`, если задан, означает
+    ПРОГНОЗНЫЙ месяц. Если витрины нет — откатываемся на прежнюю логику
+    (закрытый месяц company_holding + 1 месяц) и говорим об этом явно.
+    """
+    ref_cur = act_dt = None
+    src = ""
+    if params.get("date"):
+        ref_cur = (pd.to_datetime(params["date"]) + pd.offsets.MonthEnd(0)).date()
+        src = "задан параметром date"
+    row = read_sql(engine, Q.REF_CUR)
+    if not row.empty and pd.notna(row.ref_cur.iloc[0]):
+        d_cur = pd.to_datetime(row.ref_cur.iloc[0]).date()
+        d_act = (pd.to_datetime(row.act_dt.iloc[0]).date()
+                 if pd.notna(row.act_dt.iloc[0]) else d_cur)
+        if ref_cur is None:
+            ref_cur, act_dt, src = d_cur, d_act, "ежедневная витрина оттока"
+        elif d_cur == ref_cur:
+            act_dt = d_act
+    if ref_cur is None:
+        closed = pd.to_datetime(read_sql(engine, Q.REF_DATE).iloc[0, 0]).date()
+        ref_cur = (pd.Timestamp(closed) + pd.offsets.MonthEnd(1)).date()
+        src = "ФОЛБЭК: ежедневной витрины нет — закрытый месяц витрины + 1"
+    if act_dt is None:
+        act_dt = ref_cur
+    cur = pd.Timestamp(ref_cur)
+    ref_closed = (cur.to_period("M") - 1).to_timestamp("M").date()
+    # Окно воронки — 3 календарных месяца, заканчивая ПРОГНОЗНЫМ: задачи по метрикам
+    # идут месяцем позже метрик, поэтому конец окна и есть текущий месяц.
+    ref_funnel = ref_cur
+    funnel_from = (cur.to_period("M") - 2).to_timestamp().date()
+    # Сделки судим по дате СОЗДАНИЯ СДЕЛКИ: заведённые в двух последних месяцах окна
+    # ещё не могли дать зачисления, по ним недоработку не считаем.
+    fresh_from = (cur.to_period("M") - 1).to_timestamp().date()
+    hist_from = (cur.to_period("M") - (HIST_MONTHS + 1)).to_timestamp("M").date()
+    elapsed = min(1.0, pd.Timestamp(act_dt).day / cur.day)
+    left = max(0, (cur.date() - act_dt).days)
+
+    progress.done(f"Прогнозный месяц: {ref_cur} ({src}) · факт зачислений по {act_dt} "
+                  f"(месяц пройден на {elapsed * 100:.0f}%, до конца {left} дн.)")
+    progress.done(f"База прогноза — закрытый месяц {ref_closed}; "
+                  f"история витрины с {hist_from} ({HIST_MONTHS} мес)")
+    months = ", ".join((cur.to_period("M") - k).strftime("%m.%Y") for k in (2, 1, 0))
+    progress.done(f"Окно задач воронки: {funnel_from} … {ref_funnel} ({months}) · "
+                  f"сделки с {fresh_from} — свежие")
+    return {"ref_cur": ref_cur, "ref_closed": ref_closed, "act_dt": act_dt,
+            "ref_funnel": ref_funnel, "funnel_from": funnel_from,
+            "fresh_from": fresh_from, "hist_from": hist_from,
+            "cur_month": int(cur.month), "month_elapsed": float(elapsed),
+            "days_left": int(left), "src": src,
+            "label": f"{cur.month:02d}.{cur.year}",
+            "closed_label": f"{pd.Timestamp(ref_closed).month:02d}."
+                            f"{pd.Timestamp(ref_closed).year}"}
+
+
+def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
+    """Прогноз по (ГОСБ, ИНН): ожидаемый отток + приход из пайплайна.
+
+    Возвращает (orgs с приклеенным прогнозом, кадр прогноза, диагностика).
+    Отдельно считается ФОТ-эффект: отток пересчитывается по средней ЗП
+    организации, а по пайплайну план ФОТа есть свой.
+    """
+    progress.step(f"Прогноз на {d['ref_cur']}: отток по истории + ежедневный + пайплайн")
+    day = read_sql(engine, Q.DAY_OUTFLOW,
+                   {"tb_id": tb_id, "ref_cur": d["ref_cur"], "act_dt": d["act_dt"]})
+    hist = read_sql(engine, Q.OUTFLOW_HISTORY,
+                    {"tb_id": tb_id, "hist_from": d["hist_from"],
+                     "ref_closed": d["ref_closed"]})
+    pipe = read_sql(engine, Q.PIPELINE, {"tb_id": tb_id, "funnel_from": d["funnel_from"],
+                                         "ref_funnel": d["ref_funnel"],
+                                         "cur_month": d["cur_month"]})
+    conv = read_sql(engine, Q.DEAL_CONVERSION,
+                    {"tb_id": tb_id, "fresh_from": d["fresh_from"]})
+
+    pred = forecast.outflow_model(hist, d["ref_cur"])
+    rec = forecast.reconcile(day, pred, d["month_elapsed"])
+    by_gosb, tb_k = forecast.conversion(conv)
+    pipe_fc = forecast.pipeline_np(pipe, by_gosb, tb_k)
+    # сегмент из воронки приходит БОЛЬШИМ именем — приводим к короткому,
+    # иначе он не совпадёт с сегментами матрицы
+    if not pipe_fc.empty:
+        short = pipe_fc["seg_funnel"].map(segments.short_of_big)
+        pipe_fc["seg_funnel"] = short.fillna(pipe_fc["seg_funnel"])
+    seg_of = {int(r.inn): r.seg_name for r in orgs.itertuples()
+              if r.seg_name and r.seg_name != "—"}
+    fc = forecast.org_forecast(rec, pipe_fc, seg_of)
+
+    # ФОТ-эффект: средняя ЗП из ежедневной витрины, фолбэк — из витрины организаций
+    sal_of = {(int(r.new_gosb_id), int(r.inn)): float(r.avg_salary or 0)
+              for r in orgs.itertuples() if pd.notna(r.new_gosb_id)}
+    sal = [float(s) if float(s or 0) > 0 else sal_of.get((int(g), int(i)), 0.0)
+           for s, g, i in zip(fc["avg_salary_m"], fc["new_gosb_id"], fc["inn"])]
+    fc["salary"] = sal
+    fc["out_fot"] = fc["out_exp"] * fc["salary"]
+    fc["in_fot"] = fc["in_exp"] * fc["salary"]
+
+    n_hist = int(pred["hist_months"].iloc[0]) if not pred.empty else 0
+    classes = fc["out_class"].value_counts().to_dict() if not fc.empty else {}
+    stats = {"n_day": len(day), "n_hist_orgs": len(pred), "hist_months": n_hist,
+             "n_pipe": len(pipe_fc), "conv_tb": tb_k, "classes": classes,
+             "pipe_np": float(fc["pipe_np"].sum()) if not fc.empty else 0.0,
+             "pipe_np_raw": float(fc["pipe_np_raw"].sum()) if not fc.empty else 0.0}
+    progress.done(f"История: {n_hist} мес по {len(pred)} парам · ежедневная витрина: "
+                  f"{len(day)} пар · пайплайн на {d['label']}: {len(pipe_fc)} орг, "
+                  f"{stats['pipe_np_raw']:.0f} чел заявлено → {stats['pipe_np']:.0f} "
+                  f"с поправкой на реализуемость (коэф. ТБ {tb_k:.2f})")
+    if n_hist and n_hist < 13:
+        progress.done(f"История короче 13 мес ({n_hist}) — сезонность год к году "
+                      f"не считается, работает только модель двух закрытых месяцев")
+    if classes:
+        progress.done("Классы оттока: " + " · ".join(
+            f"{k} {v}" for k, v in sorted(classes.items(), key=lambda x: -x[1])))
+
+    keep = ["new_gosb_id", "inn", "out_exp", "in_exp", "pipe_np", "pipe_np_raw",
+            "pipe_fot", "out_observed", "pred", "out_class", "note", "why",
+            "settled", "n_deals"]
+    merged = orgs.copy()
+    merged["new_gosb_id"] = merged["new_gosb_id"].astype("Int64")
+    if not fc.empty:
+        f = fc[keep].copy()
+        f["new_gosb_id"] = f["new_gosb_id"].astype("Int64")
+        f["inn"] = f["inn"].astype("int64")
+        merged = merged.merge(f, on=["new_gosb_id", "inn"], how="left")
+    for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fot",
+              "out_observed", "pred", "settled", "n_deals"):
+        merged[c] = pd.to_numeric(merged.get(c), errors="coerce").fillna(0.0)
+    for c in ("out_class", "note", "why"):
+        merged[c] = merged.get(c).fillna("") if c in merged else ""
+    merged["out_class"] = merged["out_class"].replace("", forecast.CLS_STABLE)
+    return merged, fc, stats
+
+
+def _check_waterfall(wf: dict, matrix: pd.DataFrame, stats: dict) -> None:
+    """Две проверки сходимости, обе пишутся в прогресс.
+
+    1. Водопад: база − отток + приток + пайплайн = прогноз. Это наша арифметика,
+       она обязана сходиться в ноль.
+    2. Сумма ячеек матрицы против итога по ТБ. Здесь расхождение возможно и НЕ
+       является ошибкой прогноза: уровни `tb` и `gosb` в витрине метрик — разные
+       строки и совпадать не обязаны. Плюс в справочнике ГОСБ встречаются
+       old_gosb_id, числящиеся сразу под двумя ТБ (_GMAP относит такой ГОСБ к
+       меньшему tb_id) — тогда его метрики попадают в итог ТБ, но не в матрицу.
+       Молчать об этом нельзя, поэтому печатаем.
+    """
+    diff = abs((wf["base"] - wf["out_exp"] + wf["in_exp"] + wf["pipe"]) - wf["forecast"])
+    if diff > 1.0:
+        progress.done(f"ВНИМАНИЕ: водопад не сходится, расхождение {diff:.1f} чел")
+    else:
+        progress.done(f"Водопад сходится (расхождение {diff:.2f} чел)")
+    if matrix.empty or not wf.get("forecast"):
+        return
+    cells = float(matrix["fact_amt"].sum())
+    dev = abs(cells - wf["forecast"]) / max(wf["forecast"], 1)
+    if dev > 0.01:
+        progress.done(
+            f"Сумма ячеек матрицы {cells:.0f} против итога ТБ {wf['forecast']:.0f} "
+            f"({dev * 100:.1f}%): уровни gosb и tb в витрине метрик не совпадают "
+            f"(в справочнике есть ГОСБ, числящиеся под двумя ТБ). Итог ТБ — по строке "
+            f"уровня tb, матрица — по строкам уровня gosb")
+    if stats.get("lost_delta", 0) > 0:
+        progress.done(f"Дельта {stats['lost_delta']:.0f} чел по {stats['lost_gosb']} ГОСБ "
+                      f"не разнесена: этих ГОСБ нет в плановой матрице")
+
+
+def _candidates(orgs: pd.DataFrame, days_left: int = 0) -> pd.DataFrame:
+    """Кандидаты к работе и рычаг: Привлечь / Вернуть / Удержать.
+
+    Рычагов теперь три, и «Удержать» — новый: пока месяц не закончился, ожидаемый
+    отток ТЕКУЩЕГО месяца ещё можно не допустить. Эффект удержания — весь `out_exp`,
+    а не «остаточный риск»: не зачислившиеся к отчётной дате люди и есть цель работы
+    (в витрине под это заведён отдельный признак is_d_outflow_task). Если месяц уже
+    закончился, удерживать нечего — рычаг выключается.
+
+    Возврат считается по оттоку ЗАКРЫТОГО месяца — это другая, уже ушедшая
+    популяция, поэтому рычаги не пересекаются.
+
+    Защита от двойного счёта: приход из пайплайна УЖЕ учтён в прогнозе, поэтому
+    эффект привлечения уменьшается на него — иначе одну и ту же сделку посчитали
+    бы дважды (в прогнозе и в списке «что добавит план»).
+    """
+    o = orgs.copy()
+    o["impact_attract"] = (o["emp_potential_qty"] - o["pipe_np"]).clip(lower=0)
+    o["impact_return"] = o["fl_outflow_qty"]
+    o["impact_retain"] = o["out_exp"].clip(lower=0) if days_left > 0 else 0.0
+    cand = o[(o.impact_attract >= 1) | (o.impact_return >= 1)
+             | (o.impact_retain >= 1)].copy()
+    if cand.empty:
+        cand["impact_fl"] = []
+        cand["lever"] = []
+        cand["impact_fot_mln"] = []
+        return cand
+    three = cand[["impact_attract", "impact_return", "impact_retain"]]
+    cand["impact_fl"] = three.max(axis=1)
+    cand["lever"] = three.idxmax(axis=1).map(
+        {"impact_attract": "Привлечь", "impact_return": "Вернуть",
+         "impact_retain": "Удержать"})
+    fot = []
+    for r in cand.itertuples():
+        if r.lever == "Привлечь":
+            # ФОТ привлечения пропорционально уменьшен на долю, уже стоящую в пайплайне
+            k = (r.impact_attract / r.emp_potential_qty) if r.emp_potential_qty else 0.0
+            fot.append(float(r.fot_potential_amt) * k)
+        elif r.lever == "Вернуть":
+            fot.append(float(r.fot_outflow_amt))
+        else:
+            fot.append(float(r.impact_retain) * float(r.avg_salary or 0))
+    cand["impact_fot_mln"] = [x / RUB_TO_MLN for x in fot]
+    return cand
 
 
 # --------------------------------------------------------------------------- #
@@ -255,13 +505,25 @@ def _classify(cand: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     Отдельная ветка — задачи, которые ЕЩЁ В РАБОТЕ и не просрочены: ни одна не
     закрыта, спрашивать результат рано, это не недоработка.
+
+    Удержание идёт ПЕРВЫМ: если получатели не зачисляются прямо сейчас, а месяц
+    ещё не кончился, это самое срочное, что есть в списке, — важнее и свежей
+    сделки, и разбора старых задач.
     """
     work_rows, skip_rows = [], []
     for _, o in cand.iterrows():
         fresh_dt = o.get("fresh_deal_dt")
         when = f" с {pd.Timestamp(fresh_dt):%m.%Y}" if pd.notna(fresh_dt) else ""
         n_ip = int(o.get("n_in_progress", 0))
-        if bool(o.get("has_fresh_deal", False)):
+        if o.get("lever") == "Удержать":
+            note = str(o.get("note") or "").strip()
+            seen = int(float(o.get("out_observed", 0) or 0))
+            fact = f" (уже не зачислились {seen})" if seen else ""
+            work_rows.append((o, f"Оттекает в этом месяце: "
+                                 f"{float(o.get('out_exp', 0)):.0f} чел{fact} — "
+                                 f"удержать до конца месяца"
+                                 + (f" · {note}" if note else "")))
+        elif bool(o.get("has_fresh_deal", False)):
             skip_rows.append((o, f"Сделка в работе{when} — ждём зачислений"))
         elif not bool(o.get("worked", False)):
             work_rows.append((o, "Не работали за 3 мес — начать отработку"))
@@ -406,12 +668,22 @@ def _facts(r) -> dict:
     Если нет — отсутствие сделки НЕ дефект, и спрашивать по ней факт зачислений нельзя.
     n_in_progress / n_closed: сколько задач ещё в работе (не просрочены) и сколько
     закрыто — без этого открытая задача выглядит как «не отработана».
+
+    Прогнозные поля (out_pred/out_class/pipe_np_cur) снимают два известных источника
+    ложных «нужна активность»: организация с планом на текущий месяц уже в работе,
+    а сезонный отток — вне зоны влияния банка.
     """
     return {
         "potential": int(getattr(r, "emp_potential_qty", 0) or 0),
         "outflow_fl": int(getattr(r, "fl_outflow_qty", 0) or 0),
         "outflow_fot_mln": float(getattr(r, "fot_outflow_mln", 0) or 0),
         "avg_salary": float(getattr(r, "avg_salary", 0) or 0),
+        "out_exp": float(getattr(r, "out_exp", 0) or 0),
+        "out_observed": float(getattr(r, "out_observed", 0) or 0),
+        "out_class": str(getattr(r, "out_class", "") or ""),
+        "out_note": str(getattr(r, "note", "") or ""),
+        "pipe_np_cur": float(getattr(r, "pipe_np_raw", 0) or 0),
+        "lever": str(getattr(r, "lever", "") or ""),
         "deal_expected": bool(getattr(r, "deal_expected", False)),
         "plan_deal_old": int(getattr(r, "plan_deal_old", 0) or 0),
         "fact_deal_old": int(getattr(r, "fact_deal_old", 0) or 0),

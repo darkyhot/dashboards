@@ -42,9 +42,25 @@ PROBLEM_CODES = (1092,)         # ММБ (Микро+Малые) западае�
 
 PROBLEM_TB_SHORT = "ЮЗБ"        # этот ТБ явно не выполняет план
 MONTHS = 24
-MAX_MONTH_END = pd.Timestamp("2026-06-30")
+MAX_MONTH_END = pd.Timestamp("2026-06-30")            # последний ЗАКРЫТЫЙ месяц
 # Задачи по метрикам идут месяцем позже метрик -> воронка в следующем месяце
 FUNNEL_END = MAX_MONTH_END + pd.offsets.MonthEnd(1)   # 2026-07-31
+
+# --- Текущий (незакрытый) месяц: на него дэш строит ПРОГНОЗ ---
+CUR_MONTH_END = FUNNEL_END                            # 2026-07-31
+# Дата актуальности ежедневной витрины: по какое число есть факт зачислений
+ACT_DT = CUR_MONTH_END - pd.Timedelta(days=5)         # 2026-07-26
+# Доля месяца, которая уже прошла — столько же риска оттока уже отыграно
+MONTH_ELAPSED = ACT_DT.day / CUR_MONTH_END.day
+# Сезонное окно организаций-«сезонников» начинается С ПРОГНОЗНОГО месяца: иначе
+# база (июнь) и прогноз (июль) лежат в одной фазе сезона и сезонной дельты нет.
+SEASON_MONTHS = (7, 8, 9)
+SEASON_UP, SEASON_DOWN = 1.40, 0.60
+# Частичная ЗП-ведомость текущего месяца: этот факт в дэше НЕ используется
+# (в этом и смысл прогноза), но в витрине он есть — как на проме.
+PARTIAL_FACT_SHARE = 0.62
+# Раскладка плана сделки по трём месяцам её жизни (пайплайн)
+PIPELINE_SPLIT = (0.2, 0.5, 0.3)
 # Месяц ПОСЛЕ опорного — для комментариев с ещё не наступившим сроком
 # («зачисления пройдут 08.2026»): такой срок не является недоработкой.
 _NEXT_MONTH = FUNNEL_END + pd.offsets.MonthEnd(1)
@@ -57,11 +73,16 @@ ORGS_TOTAL = 4000
 # --------------------------------------------------------------------------- #
 def generate_all(engine: Engine) -> dict[str, int]:
     gosb = _pick_gosb(engine)
-    metrics, latest = _metrics(gosb)
+    metrics, latest = _metrics(gosb)              # закрытые месяцы
     orgs = _orgs(gosb, latest)
-    company = _company_holding(orgs)
+    company, profiles = _company_holding(orgs)    # 24 месяца истории
     dim_company = _dim_company(orgs)
     funnel = _funnel(orgs, gosb)
+    pipeline = _pipeline(funnel, orgs)
+    day_outflow = _day_outflow(orgs, profiles)
+    # План текущего месяца выводится ИЗ прогноза, поэтому считается последним
+    metrics_cur = _metrics_current(orgs, latest, company, funnel, pipeline, day_outflow)
+    metrics = pd.concat([metrics, metrics_cur], ignore_index=True)
     ref_base = _reference_base(orgs, gosb)
 
     counts = {}
@@ -70,6 +91,9 @@ def generate_all(engine: Engine) -> dict[str, int]:
     counts["uzp_dwh_metrics"] = _bulk(engine, metrics, "uzp_dwh_metrics")
     counts["uzp_dwh_company_holding_metric"] = _bulk(engine, company, "uzp_dwh_company_holding_metric")
     counts["uzp_dwh_sale_funnel_task"] = _bulk(engine, funnel, "uzp_dwh_sale_funnel_task")
+    counts["uzp_dwh_day_outflow"] = _bulk(engine, day_outflow, "uzp_dwh_day_outflow")
+    counts["yva_pl_task_deal_code"] = _bulk(engine, pipeline, "yva_pl_task_deal_code",
+                                            schema=config.SCHEMA_T)
     return counts
 
 
@@ -142,10 +166,13 @@ OUT_COLS = [
 
 
 def _metrics(gosb: pd.DataFrame):
-    """uzp_dwh_metrics: обе метрики, уровни gosb и tb, по сегментам и all(=1).
+    """uzp_dwh_metrics за ЗАКРЫТЫЕ месяцы: обе метрики, уровни gosb и tb,
+    по сегментам и all(=1).
 
     Возвращает (rows_df, latest_df). latest_df — план/факт получателей за
-    последний месяц по (gosb, seg) для увязки с витриной организаций.
+    последний закрытый месяц по (gosb, seg) для увязки с витриной организаций;
+    там же лежит целевое выполнение texec — план текущего месяца строится по
+    ТОМУ ЖЕ сценарию (см. _metrics_current), иначе картина ГОСБ поплывёт.
     """
     month_ends = pd.date_range(end=MAX_MONTH_END, periods=MONTHS, freq="ME")
     tidy = []   # длинная таблица: строка на (gosb, seg, month)
@@ -170,11 +197,12 @@ def _metrics(gosb: pd.DataFrame):
                 })
                 if mi == MONTHS - 1:
                     latest.append((gid, int(gr.tb_id), gr.tb_short_name, int(seg_id),
-                                   float(gr.avg_salary), plan_r, fact_r))
+                                   float(gr.avg_salary), plan_r, fact_r, texec))
 
     tidy = pd.DataFrame(tidy)
     latest_df = pd.DataFrame(latest, columns=[
-        "gosb_id", "tb_id", "tb_short", "seg_id", "avg_salary", "plan_r", "fact_r"])
+        "gosb_id", "tb_id", "tb_short", "seg_id", "avg_salary", "plan_r", "fact_r",
+        "texec"])
 
     frames = [
         _agg(tidy, "gosb_id", "gosb", by_segment=True),
@@ -329,36 +357,116 @@ def _spread_multi_gosb(df: pd.DataFrame, gosb: pd.DataFrame, frac: float = 0.12)
     return pd.concat([df, pd.DataFrame(extra)], ignore_index=True)
 
 
-def _company_holding(orgs: pd.DataFrame) -> pd.DataFrame:
+# Профили истории организации. Раздаются так, чтобы в синтетике встретился
+# КАЖДЫЙ класс модели прогноза (forecast.outflow_model):
+#   persistent — отток два закрытых месяца подряд;
+#   one_off    — отток только в последнем закрытом месяце;
+#   season_out — сезонный спад с прогнозного месяца, с восстановлением год назад;
+#   season_in  — сезонный бизнес: приход именно в прогнозном месяце;
+#   flat       — ровный, без сигнала.
+def _archetypes(orgs: pd.DataFrame) -> np.ndarray:
+    """Профиль истории по организации. Отточные профили достаются только тем,
+    у кого отток есть в последнем закрытом месяце, — иначе класс не сложится."""
+    has_out = orgs["fl_outflow_qty"].to_numpy() >= 1
+    r = RNG.random(len(orgs))
+    kind = np.where(
+        has_out,
+        np.where(r < 0.35, "persistent", np.where(r < 0.70, "one_off", "season_out")),
+        np.where(r < 0.75, "flat", "season_in"),
+    )
+    return kind.astype(object)
+
+
+def _company_holding(orgs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Витрина по организациям за MONTHS месяцев (нужна модели прогноза оттока).
+
+    История рисуется НАЗАД от текущих значений: последний месяц (MAX_MONTH_END) в
+    точности равен orgs, поэтому закрытый месяц и весь существующий дэш не
+    меняются ни на цифру.
+
+    Возвращает (строки витрины, профили организаций). Профиль нужен ежедневной
+    витрине, чтобы намеренно воспроизвести оба кейса стыковки прогноза и факта.
+    """
+    month_ends = pd.date_range(end=MAX_MONTH_END, periods=MONTHS, freq="ME")
+    cal = np.array([m.month for m in month_ends])
+    is_season = np.isin(cal, SEASON_MONTHS)
+    o = orgs.reset_index(drop=True)
+    n, M = len(o), len(month_ends)
+    kind = _archetypes(o)
+    base_fl = o["current_fl_qty"].to_numpy(dtype=float)
+    target_out = o["fl_outflow_qty"].to_numpy(dtype=float)
+    sal = o["avg_salary"].to_numpy(dtype=float)
+
+    # --- форма численности получателей (нормируется так, что последний мес = 1) ---
+    w = np.tile(0.88 + 0.12 * np.arange(M) / (M - 1), (n, 1))
+    w *= RNG.normal(1.0, 0.03, (n, M))
+    w[kind == "season_in"] *= np.where(is_season, SEASON_UP, 1.0)
+    w[kind == "season_out"] *= np.where(is_season, SEASON_DOWN, 1.0)
+    decline = np.ones(M)
+    decline[-3:] = (0.97, 0.93, 0.90)          # устойчивый отток «съедает» базу
+    w[kind == "persistent"] *= decline
+    w /= w[:, -1:]
+    fl = np.rint(w * base_fl[:, None]).clip(min=0)
+
+    # --- отток по месяцам ---
+    out = (RNG.random((n, M)) < 0.08).astype(float)          # фон: изредка 1 человек
+    pers = kind == "persistent"
+    out[pers, -2] = np.maximum(1.0, np.rint(target_out[pers] * 0.7))
+    out[pers, -3] = np.maximum(1.0, np.rint(target_out[pers] * 0.4))
+    season_cols = np.where(is_season)[0]
+    so = kind == "season_out"
+    if len(season_cols) and so.any():
+        out[np.ix_(so, season_cols)] = np.rint(base_fl[so, None] * 0.30)
+    oo = kind == "one_off"
+    out[oo, -3:-1] = 0.0                       # апрель и май чисто — отток разовый
+    np.minimum(out, fl, out=out)
+    # последний закрытый месяц — РОВНО значения orgs (регресс закрытого месяца)
+    fl[:, -1] = base_fl
+    out[:, -1] = target_out
+
+    idx = np.repeat(np.arange(n), M)
+    fl_flat, out_flat = fl.reshape(-1), out.reshape(-1)
+    sal_flat = sal[idx]
+    # год к году: разница с тем же месяцем прошлого года (первые 12 мес — 0)
+    d_fl = np.zeros_like(fl)
+    d_fl[:, 12:] = fl[:, 12:] - fl[:, :-12]
+
     df = pd.DataFrame({
-        "report_dt": MAX_MONTH_END.date(),
+        "report_dt": np.tile([m.date() for m in month_ends], n),
         "level_name": "gosb",
-        "level_id": orgs["gosb_id"].astype(int),
+        "level_id": o["gosb_id"].to_numpy()[idx].astype(int),
         "org_type": "inn",
-        "org_id": orgs["inn"].astype("int64"),
+        "org_id": o["inn"].to_numpy()[idx].astype("int64"),
         "ul_outflow_qty": 0,
-        "fl_outflow_qty": orgs["fl_outflow_qty"].astype(int),
-        "fot_outflow_amt": orgs["fot_outflow_amt"],
-        "current_fot_amt": orgs["current_fot_amt"],
-        "fot_y_1_diff_amt": (orgs["current_fot_amt"] * RNG.normal(0.05, 0.1, len(orgs))).round(2),
-        "current_fl_qty": orgs["current_fl_qty"].astype(int),
-        "fl_y_1_diff_qty": (orgs["current_fl_qty"] * RNG.normal(0.03, 0.1, len(orgs))).round().astype(int),
-        "emp_potential_qty": orgs["emp_potential_qty"],
-        "fot_potential_amt": orgs["fot_potential_amt"],
+        "fl_outflow_qty": out_flat.astype(int),
+        "fot_outflow_amt": (out_flat * sal_flat).round(2),
+        "current_fot_amt": (fl_flat * sal_flat).round(2),
+        "fot_y_1_diff_amt": (d_fl.reshape(-1) * sal_flat).round(2),
+        "current_fl_qty": fl_flat.astype(int),
+        "fl_y_1_diff_qty": d_fl.reshape(-1).astype(int),
+        "emp_potential_qty": o["emp_potential_qty"].to_numpy()[idx],
+        "fot_potential_amt": o["fot_potential_amt"].to_numpy()[idx],
         "modified_dttm": pd.Timestamp.now(),
     })
+    # ФОТ/отток закрытого месяца — ровно из orgs (там неокруглённая база)
+    last = np.arange(n) * M + (M - 1)
+    df.loc[last, "fot_outflow_amt"] = o["fot_outflow_amt"].to_numpy()
+    df.loc[last, "current_fot_amt"] = o["current_fot_amt"].to_numpy()
+
     # штат ≥ получателей; проникновение = получатели/штат (низкое = резерв привлечения)
-    total_emp = (orgs["current_fl_qty"].to_numpy() * RNG.uniform(1.05, 2.5, len(orgs))).round(0)
-    total_emp = pd.Series(total_emp, index=df.index).clip(lower=df["current_fl_qty"])
+    emp_k = RNG.uniform(1.05, 2.5, n)[idx]
+    total_emp = np.maximum(np.rint(fl_flat * emp_k), fl_flat)
     df["total_emp_qty"] = total_emp
-    df["zp_fl_perc"] = (df["current_fl_qty"] / total_emp).round(4)
-    df["new_fl_cnt"] = RNG.integers(0, 20, len(orgs))
-    df["np_cnt"] = RNG.integers(0, 10, len(orgs))
+    df["zp_fl_perc"] = (fl_flat / np.maximum(total_emp, 1)).round(4)
+    df["new_fl_cnt"] = RNG.integers(0, 20, len(df))
+    df["np_cnt"] = RNG.integers(0, 10, len(df))
 
     # Строки уровня holding / head_holding (в отчёте фильтруются: org_type='inn').
     # org_id у них — id холдинга, а не ИНН; значения крупнее (агрегаты).
-    n_h = max(50, len(df) // 12)
-    samp = df.sample(n=n_h, random_state=7).copy()
+    # Достаточно последнего месяца: история по холдингам нигде не читается.
+    lastm = df[df["report_dt"] == MAX_MONTH_END.date()]
+    n_h = max(50, len(lastm) // 12)
+    samp = lastm.sample(n=n_h, random_state=7).copy()
     samp["org_type"] = RNG.choice(["holding", "head_holding"], size=n_h, p=[0.7, 0.3])
     samp["org_id"] = (9_000_000_000_000 + np.arange(n_h)).astype("int64")
     mult = RNG.integers(2, 6, n_h)
@@ -366,7 +474,249 @@ def _company_holding(orgs: pd.DataFrame) -> pd.DataFrame:
         samp[c] = (samp[c].to_numpy() * mult)
     samp["current_fot_amt"] = samp["current_fot_amt"].to_numpy() * mult
     samp["fot_potential_amt"] = samp["fot_potential_amt"].to_numpy() * mult
-    return pd.concat([df, samp], ignore_index=True)
+
+    profiles = pd.DataFrame({
+        "inn": o["inn"].astype("int64"), "gosb_id": o["gosb_id"].astype(int),
+        "kind": kind, "base_fl": base_fl.astype(int),
+    })
+    return pd.concat([df, samp], ignore_index=True), profiles
+
+
+def _day_outflow(orgs: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
+    """Ежедневная витрина оттока ТЕКУЩЕГО (незакрытого) месяца.
+
+    Строка на каждую ПРОШЕДШУЮ выплатную дату месяца (аванс + основная). У аванса
+    неоплаченных больше, поэтому min(outflow_unpaid_m_qty) по двум датам — это и
+    есть «отток по итогу обеих дат зачисления», как считает бизнес.
+
+    Намеренно воспроизводим оба кейса стыковки прогноза и факта:
+      * у части организаций с сильным прогнозным оттоком факт ≈ 0 — прогноз не
+        оправдался, почти все уже зачислились;
+      * у части ровных, наоборот, крупный наблюдаемый отток, которого модель не ждала.
+    У ~30% организаций прошёл только аванс — на них проверяется остаточный риск.
+    """
+    o = orgs.merge(profiles, on=["inn", "gosb_id"], how="left")
+    rows = []
+    for r in o.itertuples():
+        fl_prev = int(r.current_fl_qty)
+        kind = r.kind if isinstance(r.kind, str) else "flat"
+        u = float(RNG.random())
+        if kind in ("persistent", "season_out"):
+            observed = (int(RNG.integers(0, 4)) if u < 0.45
+                        else int(round(fl_prev * RNG.uniform(0.05, 0.20))))
+        elif kind == "flat" and u > 0.85:
+            observed = int(round(fl_prev * RNG.uniform(0.15, 0.30)))
+        else:
+            observed = int(RNG.integers(0, 3))
+        observed = min(observed, fl_prev)
+        two_pay = bool(RNG.random() < 0.70)
+        paid = fl_prev - observed
+        if not two_pay:                      # прошёл только аванс — часть ещё в пути
+            paid = int(round(paid * RNG.uniform(0.80, 0.92)))
+        sal = float(r.avg_salary)
+        expect = max(1, fl_prev)
+        for order in ((1, 2) if two_pay else (1,)):
+            # у аванса «неоплаченных» больше: часть получит только основную выплату
+            extra = int(RNG.integers(0, 6)) if (two_pay and order == 1) else 0
+            unpaid_m = min(expect, observed + extra)
+            day_out = min(expect, unpaid_m + int(RNG.integers(0, 3)))
+            pay_dt = CUR_MONTH_END.replace(day=10 if order == 1 else 25)
+            rows.append({
+                "row_code": (f"{CUR_MONTH_END:%Y%m%d}_{ACT_DT:%Y%m%d}_"
+                             f"{int(r.gosb_id)}_{int(r.inn)}_{order}"),
+                "report_dt": CUR_MONTH_END.date(),
+                "act_dt": ACT_DT.date(),
+                "tb_id": int(r.tb_id),
+                "gosb_id": int(r.gosb_id),
+                "org_inn": int(r.inn),
+                "segment_name": SEG_SHORT[int(r.seg_code)],
+                "company_name": None,
+                "holding_name": None,
+                "is_security_force": False,
+                "saphr_id": (None if RNG.random() < 0.15
+                             else int(1_000_000 + int(r.inn) % 900_000)),
+                "salary_payment_dt": pay_dt.date(),
+                "payment_order_num": order,
+                "expect_fl_qty": expect,
+                "overflow_qty": 0,
+                "plan_fl_qty": expect,
+                "fl_day_qty": max(0, expect - day_out),
+                "fl_2_d_qty": max(0, expect - unpaid_m),
+                "fact_fl_qty": paid,
+                "outflow_unpaid_report_qty": day_out,
+                "outflow_unpaid_2_d_qty": unpaid_m,
+                "outflow_unpaid_m_qty": unpaid_m,
+                "outflow_day_perc": round(day_out / expect, 4),
+                "outflow_2_d_perc": round(unpaid_m / expect, 4),
+                "outflow_unpaid_m_perc": round(unpaid_m / expect, 4),
+                "overflow_other_inn_perc": 0.0,
+                "m_avg_salary_amt": round(sal, 2),
+                "prev_m_avg_salary_amt": round(sal * float(RNG.uniform(0.95, 1.05)), 2),
+                "next_m_avg_salary_amt": None,
+                "fl_crnt_m_qty": paid,
+                "fl_prev_m_qty": fl_prev,
+                "fl_next_m_qty": 0,
+                "is_d_outflow_task": bool(unpaid_m > 0 and RNG.random() < 0.3),
+                "client_communication_infopovod": None,
+                "is_oktmo": None,
+                "oktmo_subject_code": None,
+                "oktmo_subject_district_code": None,
+                "oktmo_subject_district_city_code": None,
+                "oktmo_code": None,
+                "inserted_dttm": pd.Timestamp.now(),
+                "author_login": "synth",
+            })
+    return pd.DataFrame(rows)
+
+
+def _pipeline(funnel: pd.DataFrame, orgs: pd.DataFrame) -> pd.DataFrame:
+    """Помесячная раскладка плана привлечения (инструмент «Пайплайн»).
+
+    В воронке plan_staff_deal_qty — план на все ТРИ месяца жизни сделки; здесь он
+    раскладывается по месяцам, начиная с месяца создания. Ключ —
+    coalesce(deal_code, task_code), поэтому в пайплайн попадают и офферы без
+    заведённой сделки: на них проверяется ветка COALESCE в запросе дэша.
+    """
+    sal_by_inn = orgs.groupby("inn")["avg_salary"].mean().to_dict()
+    rows, seen = [], set()
+    for r in funnel.itertuples():
+        deal = None if pd.isna(r.deal_code) else r.deal_code
+        code = deal or r.task_code
+        if not code or code in seen:
+            continue
+        plan = int(r.plan_staff_deal_qty or 0)
+        if deal is None:
+            # часть офферов без сделки тоже стоит в пайплайне — план по потенциалу
+            unreal = int(r.unrealized_deal_potential or 0)
+            if unreal <= 0 or RNG.random() > 0.15:
+                continue
+            plan = int(max(1, round(unreal * RNG.uniform(0.2, 0.6))))
+        if plan <= 0:
+            continue
+        seen.add(code)
+        start = (pd.Timestamp(r.deal_create_dttm) if not pd.isna(r.deal_create_dttm)
+                 else pd.Timestamp(r.task_create_dt))
+        parts = [int(round(plan * s)) for s in PIPELINE_SPLIT[:-1]]
+        parts.append(plan - sum(parts))
+        sal = float(sal_by_inn.get(int(r.inn), 60_000))
+        for k, part in enumerate(parts):
+            part = max(0, part)
+            rows.append({
+                "pl_task_deal_code": code,
+                "pl_month_num": int((start.to_period("M") + k).month),
+                "pl_plan_np_amt": part,
+                "pl_plan_fot_amt": int(round(part * sal)),
+            })
+    if not rows:
+        return pd.DataFrame(columns=["pl_task_deal_code", "pl_month_num",
+                                     "pl_plan_np_amt", "pl_plan_fot_amt"])
+    return (pd.DataFrame(rows)
+            .drop_duplicates(subset=["pl_task_deal_code", "pl_month_num"])
+            .reset_index(drop=True))
+
+
+def _forecast_delta(orgs: pd.DataFrame, company: pd.DataFrame, funnel: pd.DataFrame,
+                    pipeline: pd.DataFrame, day_outflow: pd.DataFrame) -> dict:
+    """Дельта прогноза по (ГОСБ, сегмент): −отток +приток +пайплайн.
+
+    Считается ТЕМИ ЖЕ функциями forecast.py, что и в дэше, и из тех же таблиц,
+    поэтому план текущего месяца не разъезжается с прогнозом, который дэш покажет.
+    """
+    from uzp_dash.dashboards.tb_health import forecast
+
+    hist = (company[company["org_type"] == "inn"]
+            .rename(columns={"level_id": "new_gosb_id", "org_id": "inn"})
+            [["new_gosb_id", "inn", "report_dt", "fl_outflow_qty", "current_fl_qty"]])
+
+    day = (day_outflow.groupby(["gosb_id", "org_inn"], as_index=False)
+           .agg(seg_day=("segment_name", "max"),
+                out_observed=("outflow_unpaid_m_qty", "min"),
+                paid_mtd=("fact_fl_qty", "max"),
+                fl_prev_m=("fl_prev_m_qty", "max"),
+                avg_salary_m=("m_avg_salary_amt", "max"))
+           .rename(columns={"gosb_id": "new_gosb_id", "org_inn": "inn"}))
+
+    codes = funnel.copy()
+    codes["code"] = codes["deal_code"].where(codes["deal_code"].notna(), codes["task_code"])
+    codes = codes.groupby(["gosb_id", "inn", "code"], as_index=False).agg(
+        seg_funnel=("segment_name", "min"))
+    pl = pipeline[pipeline["pl_month_num"] == CUR_MONTH_END.month]
+    pj = codes.merge(pl, left_on="code", right_on="pl_task_deal_code", how="inner")
+    pipe = (pj.groupby(["gosb_id", "inn"], as_index=False)
+            .agg(seg_funnel=("seg_funnel", "min"),
+                 pipe_np_raw=("pl_plan_np_amt", "sum"),
+                 pipe_fot_raw=("pl_plan_fot_amt", "sum"),
+                 n_deals=("code", "count"))
+            .rename(columns={"gosb_id": "new_gosb_id"}))
+
+    # историческая реализуемость сделок — только по «старым» сделкам, как в дэше
+    fresh_from = (CUR_MONTH_END.to_period("M") - 1).to_timestamp()
+    fd = funnel[(funnel["plan_staff_deal_qty"] > 0) & funnel["deal_create_dttm"].notna()]
+    fd = fd[pd.to_datetime(fd["deal_create_dttm"]) < fresh_from]
+    conv = fd.groupby("gosb_id", as_index=False).agg(
+        plan_q=("plan_staff_deal_qty", "sum"), fact_q=("fact_staff_deal_qty", "sum"))
+    conv = conv.rename(columns={"gosb_id": "new_gosb_id"})
+    conv = pd.concat([conv, pd.DataFrame([{
+        "new_gosb_id": np.nan,
+        "plan_q": float(fd["plan_staff_deal_qty"].sum()),
+        "fact_q": float(fd["fact_staff_deal_qty"].sum()),
+    }])], ignore_index=True)
+    by_gosb, tb_k = forecast.conversion(conv)
+
+    pred = forecast.outflow_model(hist, CUR_MONTH_END)
+    rec = forecast.reconcile(day, pred, MONTH_ELAPSED)
+    pipe_fc = forecast.pipeline_np(pipe, by_gosb, tb_k)
+    ofc = forecast.org_forecast(rec, pipe_fc, seg_of={})
+
+    code_of = {v: k for k, v in SEG_SHORT.items()}
+    delta: dict = {}
+    for r in ofc.itertuples():
+        seg = code_of.get(r.seg_name)
+        if seg is None or pd.isna(r.new_gosb_id):
+            continue
+        d_fl = float(r.delta_fl)
+        cur = delta.setdefault((int(r.new_gosb_id), int(seg)), [0.0, 0.0])
+        cur[0] += d_fl
+        cur[1] += d_fl * float(r.avg_salary_m or 0.0)
+    return {k: (v[0], v[1]) for k, v in delta.items()}
+
+
+def _metrics_current(orgs: pd.DataFrame, latest: pd.DataFrame, company: pd.DataFrame,
+                     funnel: pd.DataFrame, pipeline: pd.DataFrame,
+                     day_outflow: pd.DataFrame) -> pd.DataFrame:
+    """Строки uzp_dwh_metrics за ТЕКУЩИЙ (незакрытый) месяц.
+
+    План выводится ИЗ прогноза: plan = прогноз / целевое выполнение. Так сценарий
+    («ЮЗБ проваливает план, остальные в норме») воспроизводится точно, без подгонки,
+    и при этом план текущего месяца не равен факту закрытого.
+
+    fact_amt — ЧАСТИЧНАЯ ведомость. Дэш её не использует (в этом и смысл прогноза),
+    но она должна быть, как на проме: если кто-то возьмёт её по ошибке, это сразу
+    видно по заниженным цифрам.
+    """
+    delta = _forecast_delta(orgs, company, funnel, pipeline, day_outflow)
+    start = CUR_MONTH_END.replace(day=1)
+    tidy = []
+    for r in latest.itertuples():
+        d_fl, d_fot = delta.get((int(r.gosb_id), int(r.seg_id)), (0.0, 0.0))
+        sal = float(r.avg_salary)
+        fc_r = max(0.0, float(r.fact_r) + d_fl)
+        fc_fot = max(0.0, float(r.fact_r) * sal + d_fot)
+        plan_r = fc_r / float(r.texec) if float(r.texec) else fc_r
+        tidy.append({
+            "tb_id": int(r.tb_id), "gosb_id": int(r.gosb_id), "seg_id": int(r.seg_id),
+            "start_dt": start.date(), "end_dt": CUR_MONTH_END.date(),
+            "plan_r": plan_r, "fact_r": fc_r * PARTIAL_FACT_SHARE,
+            "fot_plan": plan_r * sal, "fot_fact": fc_fot * PARTIAL_FACT_SHARE,
+        })
+    tidy = pd.DataFrame(tidy)
+    frames = [
+        _agg(tidy, "gosb_id", "gosb", by_segment=True),
+        _agg(tidy, "gosb_id", "gosb", by_segment=False),
+        _agg(tidy, "tb_id", "tb", by_segment=True),
+        _agg(tidy, "tb_id", "tb", by_segment=False),
+    ]
+    return pd.concat(frames, ignore_index=True)[OUT_COLS]
 
 
 def _dim_company(orgs: pd.DataFrame) -> pd.DataFrame:
@@ -621,8 +971,8 @@ def _text_outflow(o, success: bool):
 
 
 # --------------------------------------------------------------------------- #
-def _bulk(engine: Engine, df: pd.DataFrame, table: str) -> int:
+def _bulk(engine: Engine, df: pd.DataFrame, table: str, schema: str | None = None) -> int:
     df = df.where(pd.notnull(df), None)
-    df.to_sql(table, engine, schema=config.SCHEMA, if_exists="append",
+    df.to_sql(table, engine, schema=schema or config.SCHEMA, if_exists="append",
               index=False, method="multi", chunksize=1000)
     return len(df)
