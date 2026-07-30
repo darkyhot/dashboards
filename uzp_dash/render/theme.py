@@ -85,6 +85,10 @@ h3 { font-size: 20px; line-height: 1.2; letter-spacing: -0.01em; font-weight: 60
 .kpi .label { color: var(--text-2); font-size: 14px; letter-spacing: -0.003em; }
 .kpi .value { font-size: 40px; line-height: 1.05; letter-spacing: -0.02em; font-weight: 680; margin: 6px 0 2px; font-variant-numeric: tabular-nums; }
 .kpi .delta { font-size: 15px; font-weight: 560; letter-spacing: -0.005em; }
+/* подвал карточки: факты ЗАКРЫТОГО месяца — отделены линией от прогноза сверху */
+.kpi .foot { font-size: 13px; line-height: 1.45; color: var(--text-2); margin-top: 12px;
+             padding-top: 10px; border-top: 1px solid var(--separator);
+             font-variant-numeric: tabular-nums; }
 
 /* Бэйдж статуса */
 .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; letter-spacing: -0.003em; padding: 4px 11px; border-radius: 980px; }
@@ -207,7 +211,6 @@ dialog.gd[open] { animation: gd-in 0.22s cubic-bezier(0.22, 1, 0.36, 1); }
 .gd-block { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--separator); }
 .gd-block h4 { margin: 0 0 8px; font-size: 14px; letter-spacing: -0.01em; }
 .gd-note { font-size: 13px; color: var(--text-2); line-height: 1.45; margin: 6px 0 0; }
-.gd-lead { font-size: 15px; font-weight: 600; letter-spacing: -0.006em; margin: 10px 0 0; }
 .gd-row { display: grid; grid-template-columns: 1fr 72px 1.35fr; gap: 10px;
           align-items: baseline; font-size: 13px; line-height: 1.45; padding: 4px 0;
           border-top: 1px solid var(--separator); }

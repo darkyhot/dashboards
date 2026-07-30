@@ -47,13 +47,13 @@ def _hero(a: analyze.Analysis) -> str:
     это единственная твёрдая цифра, и по ней же считается ранг ТБ."""
     r = a.verdict["rcp"]
     d = a.dates or {}
-    cl = (a.closed or {}).get("rcp", {})
     st = C.status_of(r["exec"])
     word = {"good": "План выполняется", "warn": "План под угрозой",
             "bad": "План не выполняется"}[st]
     rank = f'{r["rank"]}/{r["n_tb"]}' if r["rank"] else "—"
-    closed_txt = (f'{C.esc(d.get("closed_label", ""))} закрыт: '
-                  f'{(cl.get("exec") or 0) * 100:.0f}% плана · ранг ТБ {rank} за закрытый месяц')
+    # сами цифры закрытого месяца живут в KPI-карточках ниже (по каждой метрике),
+    # здесь остаётся только ранг: он один на ТБ и к отдельной метрике не привязан
+    closed_txt = f'ранг ТБ {rank} за закрытый месяц {C.esc(d.get("closed_label", ""))}'
     inner = (
         f'<div class="eyebrow">Прогноз по получателям на {C.esc(d.get("label", ""))}</div>'
         f'<div class="verdict">{C.esc(word)} · '
@@ -68,31 +68,63 @@ def _hero(a: analyze.Analysis) -> str:
 
 
 def _kpis(a: analyze.Analysis) -> str:
-    def kpi(title, d, unit, scale=1.0):
+    """Две карточки по метрикам: сверху ПРОГНОЗ против плана, снизу — твёрдые факты
+    ЗАКРЫТОГО месяца и прирост год к году. Разделены линией, потому что это разные по
+    природе числа: прогноз может не сбыться, факт закрытого месяца — уже нет."""
+    d = a.dates or {}
+    closed = a.closed or {}
+    yoy = a.yoy or {}
+
+    def foot(key, scale, unit):
+        cl = closed.get(key, {})
+        if not cl.get("fact"):
+            return ""
+        head = (f'{C.esc(d.get("closed_label", ""))} закрыт: '
+                f'{C.fmt_num(cl["fact"] / scale, unit)} '
+                f'({(cl.get("exec") or 0) * 100:.0f}% плана)')
+        y = yoy.get(key)
+        if not y:
+            # год к году не рассчитан — честное «—», а не молчаливый ноль
+            tail = 'год к году —'
+        else:
+            col = "var(--good)" if y["delta"] >= 0 else "var(--bad)"
+            sign = "+" if y["delta"] >= 0 else "−"
+            tail = (f'год к году <b style="color:{col}">{sign}'
+                    f'{C.fmt_num(abs(y["delta"]) / scale, unit)} '
+                    f'({sign}{abs(y["pct"]) * 100:.1f}%)</b>')
+        return f'<div class="foot">{head}<br>{tail}</div>'
+
+    def kpi(title, v, key, scale=1.0, unit=""):
         return C.card(
             f'<div class="label">{C.esc(title)}</div>'
-            f'<div class="value">{C.fmt_num(d["fact"] / scale, unit)}</div>'
-            f'<div class="delta">план {C.fmt_num(d["plan"] / scale, unit)} · '
-            f'<b style="color:{_col(d["exec"])}">{(d["exec"] or 0)*100:.0f}%</b></div>'
-            + C.meter(d["exec"]),
+            f'<div class="value">{C.fmt_num(v["fact"] / scale, unit)}</div>'
+            f'<div class="delta">план {C.fmt_num(v["plan"] / scale, unit)} · '
+            f'<b style="color:{_col(v["exec"])}">{(v["exec"] or 0)*100:.0f}%</b></div>'
+            + C.meter(v["exec"]) + foot(key, scale, unit),
             cls="kpi",
         )
     # ФОТ в БД — рубли, выводим в млн ₽ (÷ 1e6)
-    cards = (kpi("Получатели (прогноз), чел", a.verdict["rcp"], "")
-             + kpi("Общий ФОТ (прогноз), млн ₽", a.verdict["fot"], "", scale=1e6))
+    cards = (kpi("Получатели (прогноз), чел", a.verdict["rcp"], "rcp")
+             + kpi("Общий ФОТ (прогноз), млн ₽", a.verdict["fot"], "fot", scale=1e6))
     return f'<div class="grid cols-2">{cards}</div>'
 
 
-def _wf_lines(wf: dict, d: dict, conv: float) -> str:
+def _wf_lines(wf: dict, d: dict, conv: float, conv_diag: dict | None = None) -> str:
     """Строки водопада. Общие для блока по ТБ и для оверлея по ГОСБ — слагаемые
     и порядок одни и те же, меняется только срез данных."""
+    # если фактическая конверсия ниже пола, показываем и её: иначе в отчёте стоит
+    # ровно «0.20» и не отличить настоящую конверсию от сработавшей границы
+    raw = (conv_diag or {}).get("tb_raw")
+    conv_txt = (f'коэф. реализуемости {raw:.2f} → поднят до пола {conv:.2f}'
+                if (conv_diag or {}).get("tb_clipped") and raw is not None
+                else f'коэф. реализуемости {conv:.2f}')
     rows = [
         (f'Портфель — {C.esc(d.get("closed_label", ""))} закрыт', wf["base"], 0, ""),
         (f'Ежедневный отток на {C.esc(str(d.get("act_dt", "")))}', wf["observed"], -1, ""),
         ("Риск оттока до конца месяца", wf["risk"], -1, "прогноз по истории"),
         ("Сезонный приход", wf["in_exp"], 1, "клиенты, которые обычно возвращаются"),
         ("Пайплайн на месяц", wf["pipe"], 1,
-         f'заявлено {C.fmt_num(wf["pipe_raw"])}, коэф. реализуемости {conv:.2f}'),
+         f'заявлено {C.fmt_num(wf["pipe_raw"])}, {conv_txt}'),
     ]
     # подсказка идёт классом g-hint, а НЕ .sub: .sub — это стиль подзаголовка
     # страницы (19px), внутри строки водопада он выглядит крупнее самой строки
@@ -115,7 +147,7 @@ def _waterfall(a: analyze.Analysis) -> str:
         return ""
     d = a.dates or {}
     fc = a.fc_stats or {}
-    body = _wf_lines(wf, d, fc.get("conv_tb", 1.0))
+    body = _wf_lines(wf, d, fc.get("conv_tb", 1.0), fc.get("conv"))
     ex = wf.get("exec") or 0
     st = C.status_of(wf.get("exec"))
     total = (
@@ -220,11 +252,16 @@ def _gosb_table(c: dict, wide: bool = False) -> str:
 
 
 def _org_rows(rows: list, key: str, tail_n: int, tail_fl: float,
-              tail_txt: str, sign: int = -1, why=None) -> str:
+              tail_txt: str, sign: int = -1, why=None,
+              cover: float = 0.0, n_all: int = 0) -> str:
     """Строки именной детализации: организация · вклад · причина и что сделать.
 
     Названия компаний приходят из БД — обязательно через C.esc.
-    Хвост не прячем: сколько организаций и человек осталось за кадром, видно явно.
+
+    Хвост не прячем, и покрытие тоже: подпись всегда говорит, сколько организаций из
+    общего числа показано и какую долю блока они объясняют. На проме в блоке бывает
+    несколько тысяч организаций, и 8 названных могут объяснять лишь пятую часть —
+    читатель обязан это видеть, иначе примет часть за целое.
     """
     if not rows:
         return '<div class="gd-note">нет организаций с заметным вкладом</div>'
@@ -232,6 +269,9 @@ def _org_rows(rows: list, key: str, tail_n: int, tail_fl: float,
     # отношения не имеет, поэтому текст задаётся вызывающим
     why_fn = why or (lambda r: " · ".join(x for x in (r.get("note"), r.get("action")) if x))
     out = []
+    if cover and n_all > len(rows):
+        out.append(f'<div class="gd-note">{len(rows)} из {C.fmt_num(n_all)} орг. — '
+                   f'это {cover * 100:.0f}% блока</div>')
     for r in rows:
         mark = "−" if sign < 0 else "+"
         out.append(
@@ -239,9 +279,23 @@ def _org_rows(rows: list, key: str, tail_n: int, tail_fl: float,
             f'<span>{mark}{C.fmt_num(abs(r[key]))}</span>'
             f'<span class="gd-why">{C.esc(why_fn(r)) or "—"}</span></div>')
     if tail_n:
-        out.append(f'<div class="gd-note">ещё {tail_n} орг. на {C.fmt_num(tail_fl)} чел '
-                   f'{C.esc(tail_txt)}</div>')
+        out.append(f'<div class="gd-note">ещё {C.fmt_num(tail_n)} орг. на '
+                   f'{C.fmt_num(tail_fl)} чел {C.esc(tail_txt)}</div>')
     return "".join(out)
+
+
+def _why_out(r: dict) -> str:
+    """Пояснение к строке оттока: причина, что делать, и — отдельно — можно ли вообще.
+
+    Пометка о зоне нужна именно здесь: в списке крупнейших неизбежно окажутся
+    организации, с которыми работать нельзя (нет в эталонной базе) или нечем (объективный
+    отток). Без пометки читатель начнёт распределять то, что не его.
+    """
+    parts = [x for x in (r.get("note"), r.get("action")) if x]
+    zone = r.get("zone")
+    if zone and zone != "можно работать":
+        parts.insert(0, zone)
+    return " · ".join(parts)
 
 
 def _why_pipe(r: dict) -> str:
@@ -257,21 +311,15 @@ def _why_size(r: dict) -> str:
 def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
     """Оверлей «почему прогноз такой» по одному ГОСБ.
 
-    Порядок блоков — от числа к именам: водопад → из чего сложился отток и что из
-    него в зоне влияния → крупнейшие организации → пайплайн → тренд базы →
-    разбор по сегментам. Именами объяснить число нельзя (топ-5 дают ~треть),
-    поэтому сначала структура, а имена — только материальные.
+    Порядок блоков: водопад → крупнейшие в оттоке → пайплайн → тренд портфеля →
+    разбор по сегментам. Имена показываются только материальные (топ-5 объясняют лишь
+    около трети оттока), поэтому у каждого именного блока стоит подпись о покрытии.
     """
     if not det:
         return ""
     wf = det["wf"]
     gid = c["gosb_id"]
     ex = wf.get("exec") or 0
-    zone = C.hbars([(k, v) for k, v, _, _ in det["by_zone"]], " чел")
-    cls = C.hbars([(k, v) for k, v, _, _ in det["by_class"]], " чел")
-    lead = (f'<div class="gd-lead">Реально ваши: <b>{C.fmt_num(det["workable_fl"])}</b> чел '
-            f'по {det["workable_n"]} организациям — они в списке «Организации к работе». '
-            f'Остальное — вне зоны влияния или вне эталонной базы.</div>')
     yoy = det["yoy_total"]
     yoy_head = (f'<h4>Портфель год к году: '
                 f'<span style="color:{"var(--bad)" if yoy < 0 else "var(--good)"}">'
@@ -285,20 +333,20 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
         f'aria-label="Закрыть">×</button></div>'
 
         f'<div class="gd-block"><h4>Из чего сложился прогноз</h4>'
-        f'{_wf_lines(wf, d, det["conv"])}</div>'
+        f'{_wf_lines(wf, d, det["conv"], det.get("conv_diag"))}</div>'
 
-        f'<div class="gd-block"><h4>Отток {C.fmt_num(det["out_tot"])} чел — '
-        f'что из этого ваше</h4>{zone}{lead}'
-        f'<div class="gd-note" style="margin-top:12px">по причине:</div>{cls}</div>'
-
-        f'<div class="gd-block"><h4>Крупнейшие в оттоке</h4>'
-        f'{_org_rows(det["top_out"], "out", det["out_tail_n"], det["out_tail_fl"], "— хвост")}'
-        f'</div>'
+        f'<div class="gd-block"><h4>Крупнейшие в оттоке — всего '
+        f'{C.fmt_num(det["out_tot"])} чел</h4>'
+        + _org_rows(det["top_out"], "out", det["out_tail_n"], det["out_tail_fl"],
+                    "— хвост", why=_why_out, cover=det.get("out_cov", 0.0),
+                    n_all=det.get("out_n_all", 0))
+        + '</div>'
 
         f'<div class="gd-block"><h4>Пайплайн на месяц: заявлено '
         f'{C.fmt_num(wf["pipe_raw"])}, в прогнозе {C.fmt_num(wf["pipe"])}</h4>'
         + _org_rows(det["top_pipe"], "pipe", det["pipe_tail_n"], det["pipe_tail_fl"],
-                    "— хвост", 1, _why_pipe)
+                    "— хвост", 1, _why_pipe, cover=det.get("pipe_cov", 0.0),
+                    n_all=det.get("pipe_n_all", 0))
         + '</div>'
 
         f'<div class="gd-block">{yoy_head}'

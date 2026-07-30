@@ -68,6 +68,7 @@ class Analysis:
     dates: dict = field(default_factory=dict)      # ref_cur / ref_closed / act_dt / …
     wf: dict = field(default_factory=dict)         # водопад прогноза по ТБ
     closed: dict = field(default_factory=dict)     # вердикт ЗАКРЫТОГО месяца + ранг
+    yoy: dict = field(default_factory=dict)        # прирост закрытого месяца год к году
     fc_stats: dict = field(default_factory=dict)   # диагностика прогноза
     gosb_detail: dict = field(default_factory=dict)  # new_gosb_id -> разбор прогноза
 
@@ -105,6 +106,7 @@ def run(ctx, tb_short: str) -> Analysis:
                   f"из {closed_verdict['rcp']['plan']:.0f} "
                   f"({(closed_verdict['rcp']['exec'] or 0) * 100:.0f}%) · "
                   f"план на {ref_cur}: {plan_cur['rcp']['plan']:.0f}")
+    yoy = _yoy(e, {**p_cls, "ref": d["ref_yoy"]}, tb_id, closed_verdict, d)
 
     # --- Организации (только закреплённые в эталонной базе ИУП) ---
     progress.step("Витрина организаций (потенциал/отток)")
@@ -211,11 +213,16 @@ def run(ctx, tb_short: str) -> Analysis:
     gosb_cards = _gosb_cards(gosb_gap, matrix, to_work, fagg, gosb_plan)
     org_detail = read_sql(e, Q.ORG_DETAIL, {"tb_id": tb_id, "ref_closed": ref_closed})
     gosb_detail = _gosb_detail(orgs_fc, org_detail, insights, to_work, no_point,
-                               gosb_gap, fc_stats.get("conv_tb", 1.0))
+                               gosb_gap, fc_stats.get("conv_tb", 1.0),
+                               fc_stats.get("conv", {}))
     n_named = sum(len(v["top_out"]) + len(v["top_pipe"]) for v in gosb_detail.values())
+    covs = [v["out_cov"] for v in gosb_detail.values() if v.get("out_n_all")]
+    cov_txt = (f" · названные объясняют в среднем {sum(covs)/len(covs)*100:.0f}% оттока ГОСБ"
+               if covs else "")
     progress.done(f"Карточек ГОСБ: {len(gosb_cards)} (все, включая выполняющие план) · "
                   f"детализация по {len(gosb_detail)} ГОСБ, названо {n_named} организаций "
-                  f"(порог {DETAIL_MIN_SHARE*100:.0f}% блока и {DETAIL_MIN_FL} чел)")
+                  f"(до {DETAIL_COVER*100:.0f}% блока, не мельче {DETAIL_MIN_FL} чел, "
+                  f"максимум {DETAIL_MAX_ROWS} строк){cov_txt}")
 
     a = Analysis(
         tb_short=tb_short, tb_id=tb_id, tb_full=tb_full, ref_date=ref_date,
@@ -224,7 +231,7 @@ def run(ctx, tb_short: str) -> Analysis:
         attract=attract, retention=retention, activity=activity,
         to_work=to_work, no_point=no_point, sim=sim, gosb_plan=gosb_plan,
         insights=insights, themes=themes, llm_stats=llm_stats,
-        dates=d, wf=wf, closed=closed_verdict, fc_stats=fc_stats,
+        dates=d, wf=wf, closed=closed_verdict, yoy=yoy, fc_stats=fc_stats,
         gosb_detail=gosb_detail,
     )
     a.gosb_cards = gosb_cards
@@ -271,6 +278,8 @@ def _dates(engine, params: dict) -> dict:
     # ещё не могли дать зачисления, по ним недоработку не считаем.
     fresh_from = (cur.to_period("M") - 1).to_timestamp().date()
     hist_from = (cur.to_period("M") - (HIST_MONTHS + 1)).to_timestamp("M").date()
+    # тот же месяц год назад — для прироста «год к году» по закрытому месяцу
+    ref_yoy = (cur.to_period("M") - 13).to_timestamp("M").date()
     elapsed = min(1.0, pd.Timestamp(act_dt).day / cur.day)
     left = max(0, (cur.date() - act_dt).days)
 
@@ -282,6 +291,7 @@ def _dates(engine, params: dict) -> dict:
     progress.done(f"Окно задач воронки: {funnel_from} … {ref_funnel} ({months}) · "
                   f"сделки с {fresh_from} — свежие")
     return {"ref_cur": ref_cur, "ref_closed": ref_closed, "act_dt": act_dt,
+            "ref_yoy": ref_yoy,
             "ref_funnel": ref_funnel, "funnel_from": funnel_from,
             "fresh_from": fresh_from, "hist_from": hist_from,
             "cur_month": int(cur.month), "month_elapsed": float(elapsed),
@@ -312,7 +322,7 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
 
     pred = forecast.outflow_model(hist, d["ref_cur"])
     rec = forecast.reconcile(day, pred, d["month_elapsed"])
-    by_gosb, tb_k = forecast.conversion(conv)
+    by_gosb, tb_k, conv_diag = forecast.conversion(conv)
     pipe_fc = forecast.pipeline_np(pipe, by_gosb, tb_k)
     # сегмент из воронки приходит БОЛЬШИМ именем — приводим к короткому,
     # иначе он не совпадёт с сегментами матрицы
@@ -332,22 +342,33 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
     fc["out_fot"] = fc["out_exp"] * fc["salary"]
     fc["in_fot"] = fc["in_exp"] * fc["salary"]
 
-    n_hist = int(pred["hist_months"].iloc[0]) if not pred.empty else 0
+    hd = pred.attrs.get("diag", {}) if not pred.empty else {}
+    n_hist = int(hd.get("hist_months", 0))
     classes = fc["out_class"].value_counts().to_dict() if not fc.empty else {}
     stats = {"n_day": len(day), "n_hist_orgs": len(pred), "hist_months": n_hist,
              "n_pipe": len(pipe_fc), "conv_tb": tb_k, "classes": classes,
+             "hist": hd, "conv": conv_diag,
              "pipe_np": float(fc["pipe_np"].sum()) if not fc.empty else 0.0,
              "pipe_np_raw": float(fc["pipe_np_raw"].sum()) if not fc.empty else 0.0}
-    progress.done(f"История: {n_hist} мес по {len(pred)} парам · ежедневная витрина: "
+    raw = conv_diag.get("tb_raw")
+    conv_txt = (f"коэф. ТБ {raw:.2f} → поднят до пола {tb_k:.2f}"
+                if conv_diag.get("tb_clipped") else f"коэф. ТБ {tb_k:.2f}")
+    progress.done(f"История: {n_hist} мес ({hd.get('hist_from','—')}…"
+                  f"{hd.get('hist_to','—')}) по {len(pred)} парам · ежедневная витрина: "
                   f"{len(day)} пар · пайплайн на {d['label']}: {len(pipe_fc)} орг, "
                   f"{stats['pipe_np_raw']:.0f} чел заявлено → {stats['pipe_np']:.0f} "
-                  f"с поправкой на реализуемость (коэф. ТБ {tb_k:.2f})")
-    if n_hist and n_hist < 13:
-        progress.done(f"История короче 13 мес ({n_hist}) — сезонность год к году "
-                      f"не считается, работает только модель двух закрытых месяцев")
+                  f"с поправкой на реализуемость ({conv_txt})")
+    if conv_diag.get("n_gosb_clipped"):
+        progress.done(f"Коэффициент реализуемости упёрся в границы "
+                      f"[{forecast.CONV_MIN}, {forecast.CONV_MAX}] у "
+                      f"{conv_diag['n_gosb_clipped']} из {conv_diag.get('n_gosb', 0)} ГОСБ — "
+                      f"по ним вклад пайплайна в прогноз завышен")
+    _log_history(hd, d)
     if classes:
+        n_all = sum(classes.values()) or 1
         progress.done("Классы оттока: " + " · ".join(
-            f"{k} {v}" for k, v in sorted(classes.items(), key=lambda x: -x[1])))
+            f"{k} {v} ({v / n_all * 100:.1f}%)"
+            for k, v in sorted(classes.items(), key=lambda x: -x[1])))
 
     keep = ["new_gosb_id", "inn", "out_exp", "in_exp", "pipe_np", "pipe_np_raw",
             "pipe_fot", "out_observed", "pred", "out_class", "note", "why",
@@ -366,6 +387,71 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
         merged[c] = merged.get(c).fillna("") if c in merged else ""
     merged["out_class"] = merged["out_class"].replace("", forecast.CLS_STABLE)
     return merged, fc, stats
+
+
+def _yoy(engine, params: dict, tb_id: int, closed: dict, d: dict) -> dict:
+    """Прирост год к году по ЗАКРЫТОМУ месяцу: два факта, а не факт против прогноза.
+
+    Берём тот же TB_VERDICT, только за месяц годом ранее. Если строки за этот месяц в
+    витрине нет (на проме витрина метрик может не уходить так глубоко), возвращаем
+    пустой результат — в карточке будет «—». Показать вместо этого ноль нельзя: его не
+    отличить от настоящего нулевого прироста.
+    """
+    out: dict = {}
+    v = read_sql(engine, Q.TB_VERDICT, params)
+    prev, _ = _verdict(v, tb_id)
+    for key, label, scale in (("rcp", "получатели", 1.0), ("fot", "ФОТ млн ₽", RUB_TO_MLN)):
+        was = float(prev.get(key, {}).get("fact") or 0)
+        now = float(closed.get(key, {}).get("fact") or 0)
+        if was <= 0:
+            out[key] = None
+            continue
+        out[key] = {"fact": was, "delta": now - was, "pct": now / was - 1}
+        progress.done(f"Год к году ({label}): {d['closed_label']} {now / scale:,.0f} против "
+                      f"{was / scale:,.0f} год назад → {(now - was) / scale:+,.0f} "
+                      f"({(now / was - 1) * 100:+.1f}%)".replace(",", " "))
+    if all(v is None for v in out.values()):
+        progress.done(f"Год к году НЕ рассчитан: в витрине метрик нет месяца "
+                      f"{params['ref']} — в карточках будет «—»")
+    return out
+
+
+def _log_history(hd: dict, d: dict) -> None:
+    """Диагностика истории витрины: хватает ли её модели и что вообще посчиталось.
+
+    Раньше здесь стоял чек `n_hist < 13`, и он был неверен дважды: при ровно 13
+    месяцах не срабатывал, а 13 месяцев и не хватает — у ПРОГНОЗНОГО месяца второе
+    наблюдение появляется только на 24-м месяце (`forecast.seasonal_depth_needed`).
+    Поэтому вместо порога печатаем факт: чем посчитана сезонность и у скольких пар.
+    """
+    if not hd:
+        return
+    # молчаливый сбой: если базового месяца нет в истории, отток закрытого месяца
+    # везде окажется нулём, и ВСЁ уедет в класс «стабильно» без единой жалобы
+    if not hd.get("base_present"):
+        progress.done(f"ВНИМАНИЕ: базового месяца {hd.get('base_month')} НЕТ в истории "
+                      f"витрины — отток закрытого месяца везде будет нулевым, "
+                      f"модель оттока фактически отключена")
+    n_pairs = max(int(hd.get("n_pairs", 0)), 1)
+    n_out = int(hd.get("n_with_outflow", 0))
+    progress.done(f"Отток в закрытом месяце есть у {n_out} из {n_pairs} пар "
+                  f"({n_out / n_pairs * 100:.1f}%) — остальные попадут в «стабильно»")
+    src = hd.get("seas_src", {})
+    need, have = int(hd.get("need_months", 0)), int(hd.get("hist_months", 0))
+    n_idx = int(src.get(forecast.SRC_INDEX, 0))
+    n_yoy = int(src.get(forecast.SRC_YOY, 0))
+    if n_idx:
+        progress.done(f"Сезонность: индекс по ≥{forecast.MIN_SEASON_OBS} наблюдениям "
+                      f"у {n_idx} пар, переход год назад у {n_yoy}, без сигнала "
+                      f"{int(src.get(forecast.SRC_NONE, 0))}")
+    elif n_yoy:
+        progress.done(f"Сезонность: индекса нет (для месяца {d.get('label','')} нужно "
+                      f"{need} мес истории, есть {have}) → считаем по переходу год "
+                      f"назад, сигнал у {n_yoy} пар из {n_pairs}")
+    else:
+        progress.done(f"Сезонность НЕ рассчитана: для месяца {d.get('label','')} нужно "
+                      f"{need} мес истории (есть {have}), а перехода год назад нет — "
+                      f"работает только модель двух закрытых месяцев")
 
 
 def _check_waterfall(wf: dict, matrix: pd.DataFrame, stats: dict) -> None:
@@ -1056,38 +1142,37 @@ REST_MIN_SHARE = 0.005
 # ожидаемый отток 552 чел размазан по 67 организациям, топ-5 дают лишь 32%, топ-20 —
 # 80%. Поэтому называем только тех, кто реально двигает цифру, а хвост честно
 # сворачиваем в одну строку; структуру объясняют разборы по причине и зоне влияния.
-DETAIL_MIN_SHARE = 0.05   # доля блока
-DETAIL_MIN_FL = 3         # и не меньше стольких человек
+DETAIL_COVER = 0.60       # набираем строки, пока не покрыто столько блока
+DETAIL_MIN_FL = 3         # но не показываем строки мельче стольких человек
 DETAIL_MAX_ROWS = 8       # потолок строк в блоке
 
 
 def _material(rows: list, key: str, cap: int = DETAIL_MAX_ROWS) -> tuple:
-    """Материальные строки блока + честный хвост (сколько организаций и человек)."""
+    """Материальные строки блока + честный хвост (сколько организаций и человек).
+
+    Отбор идёт по НАКОПЛЕННОМУ ПОКРЫТИЮ, а не по доле каждой строки. Прежний порог
+    «≥5% блока» не масштабируется: на проме в блоке бывает 1 000–5 000 организаций,
+    и 5% не набирает никто — детализация вырождалась в «нет организаций с заметным
+    вкладом» почти везде. Покрытие устойчиво к размеру блока: сколько бы строк ни
+    было, крупнейшие набираются, пока не объяснят DETAIL_COVER блока.
+
+    Абсолютный пол DETAIL_MIN_FL остаётся: в мелком ГОСБ строки по одному человеку
+    покрытие бы набрали, но смысла в них нет.
+
+    Возвращает (строки, число орг в хвосте, человек в хвосте, покрытие показанных).
+    """
     total = float(sum(abs(r[key]) for r in rows))
     if total <= 0:
-        return [], 0, 0.0
+        return [], 0, 0.0, 0.0
     ordered = sorted(rows, key=lambda r: -abs(r[key]))
-    thr = max(DETAIL_MIN_SHARE * total, DETAIL_MIN_FL)
-    n = 0
+    acc, n = 0.0, 0
     for r in ordered:
-        if n >= cap or abs(r[key]) < thr:
+        if n >= cap or acc >= DETAIL_COVER * total or abs(r[key]) < DETAIL_MIN_FL:
             break
+        acc += abs(r[key])
         n += 1
     tail = ordered[n:]
-    return ordered[:n], len(tail), float(sum(abs(r[key]) for r in tail))
-
-
-def _bucket(rows: list, val: str, key: str) -> list:
-    """Свод блока по признаку: [(метка, сумма, число орг, доля)] по убыванию."""
-    agg: dict = {}
-    for r in rows:
-        if r[val] <= 0:
-            continue
-        a = agg.setdefault(r[key] or "—", [0.0, 0])
-        a[0] += r[val]; a[1] += 1
-    total = sum(v[0] for v in agg.values())
-    out = [(k, v[0], v[1], (v[0] / total) if total else 0.0) for k, v in agg.items()]
-    return sorted(out, key=lambda x: -x[1])
+    return ordered[:n], len(tail), float(sum(abs(r[key]) for r in tail)), acc / total
 
 
 def _rest_row(gosb_row, segs: list, n_need_total: int) -> dict | None:
@@ -1109,13 +1194,16 @@ def _rest_row(gosb_row, segs: list, n_need_total: int) -> dict | None:
 
 def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
                  to_work: pd.DataFrame, no_point: pd.DataFrame,
-                 gosb_gap: pd.DataFrame, conv_tb: float) -> dict:
+                 gosb_gap: pd.DataFrame, conv_tb: float,
+                 conv_diag: dict | None = None) -> dict:
     """Разбор прогноза по каждому ГОСБ — то, что открывается по клику на карточку.
 
-    Отвечает на два вопроса. «Почему прогноз такой» — водопад этого ГОСБ. И главное,
-    «что из этого ваше»: отток раскладывается по ПРИЧИНЕ (устойчивый / сезонный /
-    разовый) и по ЗОНЕ ВЛИЯНИЯ (можно работать / влиять нечем / вне эталонной базы).
-    Именами объясняется только материальная часть — см. `_material`.
+    Отвечает на вопрос «почему прогноз такой»: водопад этого ГОСБ, затем крупнейшие
+    организации в оттоке и в пайплайне и тренд портфеля год к году. Именами объясняется
+    только материальная часть (см. `_material`), поэтому у каждого именного блока
+    показывается покрытие. У строки остаётся признак `zone` (можно работать / влиять
+    нечем / вне эталонной базы) — он помечает организации, которые в список к работе не
+    попадут, чтобы их не пытались распределять.
     """
     out: dict = {}
     if orgs_fc is None or orgs_fc.empty:
@@ -1161,20 +1249,19 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
             })
         # порог > 0, а не >= 1: организации с долей человека тоже должны попасть
         # в хвост, иначе «названные + хвост» не сойдутся с итогом блока
-        top_out, out_n, out_fl = _material([r for r in rows if r["out"] > 0], "out")
-        top_pipe, pipe_n, pipe_fl = _material([r for r in rows if r["pipe"] > 0], "pipe")
-        up, _, _ = _material([r for r in rows if r["yoy"] >= 1], "yoy", cap=5)
-        down, _, _ = _material([r for r in rows if r["yoy"] <= -1], "yoy", cap=5)
-        workable = [r for r in rows if r["zone"] == "можно работать" and r["out"] >= 1]
+        out_rows = [r for r in rows if r["out"] > 0]
+        pipe_rows = [r for r in rows if r["pipe"] > 0]
+        top_out, out_n, out_fl, out_cov = _material(out_rows, "out")
+        top_pipe, pipe_n, pipe_fl, pipe_cov = _material(pipe_rows, "pipe")
+        up, *_ = _material([r for r in rows if r["yoy"] >= 1], "yoy", cap=5)
+        down, *_ = _material([r for r in rows if r["yoy"] <= -1], "yoy", cap=5)
         out[nid] = {
-            "wf": wf, "conv": conv_tb,
+            "wf": wf, "conv": conv_tb, "conv_diag": conv_diag or {},
             "out_tot": float(sum(r["out"] for r in rows)),
-            "by_class": _bucket(rows, "out", "cls"),
-            "by_zone": _bucket(rows, "out", "zone"),
-            "workable_fl": float(sum(r["out"] for r in workable)),
-            "workable_n": len(workable),
             "top_out": top_out, "out_tail_n": out_n, "out_tail_fl": out_fl,
+            "out_cov": out_cov, "out_n_all": len(out_rows),
             "top_pipe": top_pipe, "pipe_tail_n": pipe_n, "pipe_tail_fl": pipe_fl,
+            "pipe_cov": pipe_cov, "pipe_n_all": len(pipe_rows),
             "yoy_total": float(yoy_tot.get(nid, 0.0)), "yoy_up": up, "yoy_down": down,
         }
     return out

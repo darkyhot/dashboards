@@ -27,6 +27,15 @@ RUB_TO_MLN = 1e6
 # Сезонный сигнал засчитывается, только если календарный месяц наблюдался
 # минимум дважды — иначе это шум одного года, а не сезонность.
 MIN_SEASON_OBS = 2
+# Фолбэк сезонности, когда индекса по ≥2 наблюдениям нет. Индекс требует глубины
+# ~24 мес: на истории, кончающейся июнем, июль получает второе наблюдение только
+# на 24-м месяце. При 13 мес доступен зато САМ ПЕРЕХОД «базовый → прогнозный
+# месяц», наблюдённый год назад, — им и оцениваем сезонность.
+# Порог по размеру: у микроорганизации переход 3→1 дал бы «сезонный спад −67%».
+SEASON_FALLBACK_MIN_FL = 5
+SRC_INDEX = "индекс"          # сезонность из индекса (≥2 наблюдения месяца)
+SRC_YOY = "год назад"         # сезонность из перехода год назад (1 наблюдение)
+SRC_NONE = "—"                # сезонного сигнала нет
 # Пороги «есть сезонность»: ±10% к уровню базового месяца.
 SEASON_UP = 1.10
 SEASON_DOWN = 0.90
@@ -53,6 +62,43 @@ def _m(p: pd.Period) -> str:
     return f"{p.month:02d}.{p.year}"
 
 
+# --- Безопасные агрегаты по строкам с пропусками ---------------------------- #
+# На проме пара (ГОСБ, организация) присутствует НЕ во всех месяцах истории,
+# поэтому строка может целиком состоять из NaN. Прямые np.nanmean/np.nanmax на
+# таком срезе печатают RuntimeWarning («Mean of empty slice»), и лог выглядит как
+# сбой. Считаем маску «есть хотя бы одно значение» явно: результат тот же (NaN),
+# но без предупреждений и видно, что случай обработан осознанно.
+def _row_mean(vals: np.ndarray) -> np.ndarray:
+    n = np.count_nonzero(~np.isnan(vals), axis=1)
+    s = np.nansum(vals, axis=1)
+    return np.where(n > 0, s / np.maximum(n, 1), np.nan)
+
+
+def _row_max(vals: np.ndarray) -> np.ndarray:
+    if vals.size == 0:
+        return np.full(vals.shape[0], np.nan)
+    any_val = np.any(~np.isnan(vals), axis=1)
+    filled = np.where(np.isnan(vals), -np.inf, vals)
+    return np.where(any_val, filled.max(axis=1), np.nan)
+
+
+def seasonal_depth_needed(ref_cur) -> int:
+    """Сколько месяцев истории нужно, чтобы у ПРОГНОЗНОГО месяца было 2 наблюдения.
+
+    История кончается ЗАКРЫТЫМ месяцем (`ref_cur − 1`), а прогнозный месяц в ней
+    впервые встречается годом ранее и второй раз — ещё годом ранее. Прогнозный месяц
+    всегда следующий за концом истории, то есть отстоит от него на 11 месяцев назад:
+    прогноз июль, история по июнь → июль 2025 на 11-м месяце назад (нужно 12 месяцев),
+    июль 2024 на 23-м (нужно 24). Отсюда 24 месяца.
+
+    Для сравнения: у БАЗОВОГО месяца (конец истории) второе наблюдение появляется уже
+    на 13-м месяце — поэтому на 13-месячной истории индекс есть только у него, а у
+    прогнозного месяца нет, и отношение посчитать не из чего.
+    """
+    back = 11                                  # ref_cur всегда = ref_closed + 1 месяц
+    return int(back + 1 + 12 * (MIN_SEASON_OBS - 1))
+
+
 # --------------------------------------------------------------------------- #
 def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     """Прогноз оттока на месяц :ref_cur по истории витрины. Грейн (ГОСБ, ИНН).
@@ -70,7 +116,7 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     Отрицательный `pred` = ожидаемый ПРИТОК (сезонный бизнес).
     """
     cols = ["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note",
-            "out_1", "out_2", "seas_ratio", "hist_months"]
+            "out_1", "out_2", "seas_ratio", "seas_src", "hist_months"]
     if hist is None or hist.empty:
         return pd.DataFrame(columns=cols)
 
@@ -99,7 +145,7 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
 
     # --- сезонные индексы: среднее по календарному месяцу / среднее за всё --- #
     vals = fl.to_numpy(dtype="float64")
-    overall = np.nanmean(np.where(np.isnan(vals), np.nan, vals), axis=1)
+    overall = _row_mean(vals)
     overall = np.where((overall > 0) & np.isfinite(overall), overall, np.nan)
 
     def month_idx(month: int):
@@ -107,20 +153,33 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
         if len(cols_m) < MIN_SEASON_OBS:
             return np.full(len(fl), np.nan)
         with np.errstate(invalid="ignore"):
-            return np.nanmean(vals[:, cols_m], axis=1) / overall
+            return _row_mean(vals[:, cols_m]) / overall
 
     idx_cur, idx_closed = month_idx(p_cur.month), month_idx(p_closed.month)
     with np.errstate(invalid="ignore", divide="ignore"):
-        seas_ratio = np.where(idx_closed > 0, idx_cur / idx_closed, np.nan)
+        ratio_idx = np.where(idx_closed > 0, idx_cur / idx_closed, np.nan)
 
     # --- год назад: был ли отток в этом месяце и вернулся ли клиент --------- #
     p_yoy = p_cur - 12
     yoy_out = np.nan_to_num(col(out, p_yoy))
-    before = np.nan_to_num(col(fl, p_yoy - 1))
+    fl_yoy = col(fl, p_yoy)                      # прогнозный месяц год назад
+    before = np.nan_to_num(col(fl, p_yoy - 1))   # базовый месяц год назад
     after_cols = [p_yoy + k for k in (1, 2, 3) if (p_yoy + k) in fl.columns]
-    after = (np.nanmax(np.column_stack([col(fl, p) for p in after_cols]), axis=1)
-             if after_cols else np.zeros(len(fl)))
+    after = (_row_max(np.column_stack([col(fl, p) for p in after_cols]))
+             if after_cols else np.full(len(fl), np.nan))
     yoy_recovered = (yoy_out > 0) & (before > 0) & (np.nan_to_num(after) >= 0.95 * before)
+
+    # --- ФОЛБЭК сезонности: тот же переход «база → прогноз», но год назад ---- #
+    # Индексу нужно ~24 мес истории (см. seasonal_depth_needed); переход год назад
+    # доступен уже на 13 мес, и это ровно то, что описывает бизнес: «год назад
+    # клиент в этом месяце тоже оттекал». Оценка по ОДНОМУ наблюдению — помечаем.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio_yoy = np.where(before >= SEASON_FALLBACK_MIN_FL,
+                             np.nan_to_num(fl_yoy) / np.maximum(before, 1), np.nan)
+    use_idx = np.isfinite(ratio_idx)
+    seas_ratio = np.where(use_idx, ratio_idx, ratio_yoy)
+    seas_src = np.where(use_idx, SRC_INDEX,
+                        np.where(np.isfinite(ratio_yoy), SRC_YOY, SRC_NONE))
 
     hist_months = int(len(periods))
     keys = fl.index.to_frame(index=False)
@@ -129,15 +188,18 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
         b, o1, o2 = float(base_fl[i]), float(out_1[i]), float(out_2[i])
         ratio = float(seas_ratio[i]) if np.isfinite(seas_ratio[i]) else None
         persist = (o1 + o2) / 2 if (o1 > 0 and o2 > 0) else 0.0
+        # оценка по одному наблюдению слабее индекса — говорим об этом прямо в причине
+        weak = " (по одному наблюдению год назад)" if seas_src[i] == SRC_YOY else ""
 
         if ratio is not None and ratio > SEASON_UP:
             cls = CLS_SEASON_IN
             pred = -b * (ratio - 1)
-            note = f"сезонный бизнес: в этом месяце обычно +{(ratio - 1) * 100:.0f}%"
+            note = (f"сезонный бизнес: в этом месяце обычно "
+                    f"+{(ratio - 1) * 100:.0f}%{weak}")
         elif ratio is not None and ratio < SEASON_DOWN:
             cls = CLS_SEASON_OUT
             pred = max(persist, b * (1 - ratio))
-            note = f"сезонный спад: в этом месяце обычно −{(1 - ratio) * 100:.0f}%"
+            note = f"сезонный спад: в этом месяце обычно −{(1 - ratio) * 100:.0f}%{weak}"
             if yoy_recovered[i]:
                 pred *= RECOVERED_K
                 note += (f" · год назад тоже оттекал и восстановился "
@@ -163,10 +225,27 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     res["out_1"] = out_1
     res["out_2"] = out_2
     res["seas_ratio"] = seas_ratio
+    res["seas_src"] = seas_src
     res["out_class"] = [r[0] for r in rows]
     res["pred"] = [r[1] for r in rows]
     res["note"] = [r[2] for r in rows]
     res["hist_months"] = hist_months
+    # Диагностика: без неё молчаливый сбой (нет базового месяца в истории →
+    # col() вернёт нули → всё «стабильно») выглядит как нормальный результат.
+    res.attrs["diag"] = {
+        "hist_months": hist_months,
+        "hist_from": str(periods[0]) if periods else "—",
+        "hist_to": str(periods[-1]) if periods else "—",
+        "base_month": str(p_closed),
+        "base_present": bool(p_closed in fl.columns),
+        "prev_present": bool((p_closed - 1) in fl.columns),
+        "yoy_present": bool(p_yoy in fl.columns),
+        "need_months": seasonal_depth_needed(ref_cur),
+        "n_pairs": int(len(fl)),
+        "n_with_outflow": int((out_1 > 0).sum()),
+        "seas_src": {k: int(v) for k, v in
+                     pd.Series(seas_src).value_counts().to_dict().items()},
+    }
     return res[cols]
 
 
@@ -259,28 +338,37 @@ def _why(pred, observed, settled, out_exp, in_exp, has_day) -> str:
             f"отыграно {settled * 100:.0f}% → {out_exp:.0f}")
 
 
-def conversion(conv: pd.DataFrame) -> tuple[dict, float]:
-    """Историческая реализуемость сделок: (по ГОСБ, фолбэк по ТБ).
+def conversion(conv: pd.DataFrame) -> tuple[dict, float, dict]:
+    """Историческая реализуемость сделок: (по ГОСБ, фолбэк по ТБ, диагностика).
 
     Строка с пустым new_gosb_id — итог по ТБ (см. DEAL_CONVERSION).
+
+    Диагностика возвращает СЫРОЕ значение до клипа: если фактическая конверсия ниже
+    CONV_MIN, клип поднимает её до пола и тем самым ЗАВЫШАЕТ вклад пайплайна в
+    прогноз. Молчать об этом нельзя — иначе в логе видно ровно «0.20» и непонятно,
+    это настоящая конверсия или сработавшая граница.
     """
     if conv is None or conv.empty:
-        return {}, 1.0
+        return {}, 1.0, {"tb_raw": None, "tb_clipped": False, "n_gosb_clipped": 0}
     c = conv.copy()
     c["plan_q"] = pd.to_numeric(c["plan_q"], errors="coerce").fillna(0.0)
     c["fact_q"] = pd.to_numeric(c["fact_q"], errors="coerce").fillna(0.0)
     tb_row = c[c["new_gosb_id"].isna()]
-    tb_k = 1.0
+    tb_raw = None
     if not tb_row.empty and float(tb_row["plan_q"].iloc[0]) > 0:
-        tb_k = float(tb_row["fact_q"].iloc[0]) / float(tb_row["plan_q"].iloc[0])
-    tb_k = float(np.clip(tb_k, CONV_MIN, CONV_MAX))
-    by_gosb = {}
+        tb_raw = float(tb_row["fact_q"].iloc[0]) / float(tb_row["plan_q"].iloc[0])
+    tb_k = float(np.clip(tb_raw if tb_raw is not None else 1.0, CONV_MIN, CONV_MAX))
+    by_gosb, n_clipped = {}, 0
     for r in c[c["new_gosb_id"].notna()].itertuples():
         if float(r.plan_q) <= 0:
             continue
-        by_gosb[int(r.new_gosb_id)] = float(np.clip(float(r.fact_q) / float(r.plan_q),
-                                                    CONV_MIN, CONV_MAX))
-    return by_gosb, tb_k
+        raw = float(r.fact_q) / float(r.plan_q)
+        by_gosb[int(r.new_gosb_id)] = float(np.clip(raw, CONV_MIN, CONV_MAX))
+        if raw < CONV_MIN or raw > CONV_MAX:
+            n_clipped += 1
+    diag = {"tb_raw": tb_raw, "n_gosb": len(by_gosb), "n_gosb_clipped": n_clipped,
+            "tb_clipped": tb_raw is not None and not (CONV_MIN <= tb_raw <= CONV_MAX)}
+    return by_gosb, tb_k, diag
 
 
 def pipeline_np(pipe: pd.DataFrame, by_gosb: dict, tb_k: float) -> pd.DataFrame:
