@@ -47,6 +47,10 @@ ONE_OFF_K = 0.5
 # Коэффициент реализуемости пайплайна держим в разумных пределах: 0 занулил бы
 # весь пайплайн, >1 означал бы перевыполнение планов сделок.
 CONV_MIN, CONV_MAX = 0.2, 1.0
+# Свой коэффициент ГОСБ считается, только если за закрытые месяцы он планировал не
+# меньше этого. На меньших объёмах отношение факт/план — шум: одна сделка даёт 0.0 или
+# 1.0. Такие ГОСБ берут коэффициент ТБ, и в карточке это подписано явно.
+CONV_MIN_PLAN = 30.0
 
 CLS_SEASON_IN = "сезонный приход"
 CLS_SEASON_OUT = "сезонный отток"
@@ -364,8 +368,8 @@ def conversion_by_month(plan_m: pd.DataFrame, fact_m: pd.DataFrame,
     об этом нельзя — иначе в логе видно ровно «0.20» и непонятно, это настоящая
     конверсия или сработавшая граница.
     """
-    diag = {"months": 0, "plan": 0.0, "fact": 0.0, "tb_raw": None,
-            "tb_clipped": False, "n_gosb": 0, "n_gosb_clipped": 0}
+    diag = {"months": 0, "plan": 0.0, "fact": 0.0, "tb_raw": None, "tb_clipped": False,
+            "n_gosb": 0, "n_gosb_clipped": 0, "n_gosb_fallback": 0}
     if plan_m is None or plan_m.empty:
         return {}, 1.0, diag
     cur = pd.Period(pd.Timestamp(ref_cur), freq="M")
@@ -383,10 +387,12 @@ def conversion_by_month(plan_m: pd.DataFrame, fact_m: pd.DataFrame,
     diag.update({"months": int(p["per"].nunique()),
                  "plan": float(p["plan_np"].sum()), "fact": float(p["fact_np"].sum())})
 
-    by_gosb, n_clipped = {}, 0
+    by_gosb, n_clipped, n_fallback = {}, 0, 0
     for gid, g in p.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
         pl = float(g["plan_np"].sum())
-        if pl <= 0:
+        if pl < CONV_MIN_PLAN:
+            # объёма мало — свой коэффициент был бы шумом, ГОСБ уйдёт на коэффициент ТБ
+            n_fallback += 1
             continue
         raw = float(g["fact_np"].sum()) / pl
         by_gosb[int(gid)] = float(np.clip(raw, CONV_MIN, CONV_MAX))
@@ -394,25 +400,40 @@ def conversion_by_month(plan_m: pd.DataFrame, fact_m: pd.DataFrame,
             n_clipped += 1
     tb_raw = (diag["fact"] / diag["plan"]) if diag["plan"] > 0 else None
     diag.update({"tb_raw": tb_raw, "n_gosb": len(by_gosb), "n_gosb_clipped": n_clipped,
+                 "n_gosb_fallback": n_fallback,
                  "tb_clipped": tb_raw is not None and not (CONV_MIN <= tb_raw <= CONV_MAX)})
     return by_gosb, float(np.clip(tb_raw if tb_raw is not None else 1.0,
                                   CONV_MIN, CONV_MAX)), diag
 
 
 def pipeline_current(plan_m: pd.DataFrame, fact_m: pd.DataFrame, ref_cur,
-                     by_gosb: dict, tb_k: float) -> pd.DataFrame:
+                     by_gosb: dict, tb_k: float, time_left: float = 1.0) -> pd.DataFrame:
     """Пайплайн ТЕКУЩЕГО месяца по (ГОСБ, ИНН): план, уже пришедший факт, прогноз.
 
-    Вклад в прогноз считается симметрично оттоку — факт как нижняя граница:
+    В витрине премирования есть факт и за текущий месяц, поэтому известно, сколько НП
+    уже привлечено на отчётную дату. Пришедшее — уже в кармане, под риском остаётся
+    только невыполненная часть плана:
 
-        pipe_np = max(факт_на_сегодня, план × реализуемость)
+        rest    = max(0, план − факт)
+        pipe_np = факт + rest × реализуемость(ГОСБ) × time_left
 
-    Факт уже случился, поэтому прогноз не может быть меньше него; план со скидкой на
-    историческую реализуемость — оценка того, что ещё придёт до конца месяца.
+    `time_left` — доля КАЛЕНДАРНОГО месяца, которая ещё впереди, считается от РЕАЛЬНОЙ
+    текущей даты (см. `analyze._dates`). Это не то же самое, что доля отыгранных выплат
+    в модели оттока: та меряется по `act_dt` витрины и отвечает на вопрос «сколько мы
+    уже увидели», а здесь вопрос другой — «сколько времени осталось, чтобы привлечения
+    успели дойти». Витрина оттока про будущие дни ничего не знает.
+
+    Множитель обязателен: без него формула не знает про календарь и в последний день
+    месяца всё равно прибавляла бы к факту людей, которые уже физически не придут.
+
+    Клип `max(0, …)` нужен: у организации факт может превысить план, и остаток тогда
+    нулевой, а не отрицательный (иначе прогноз оказался бы НИЖЕ уже случившегося факта).
+
     Сотрудники сворачиваются: в прогнозе организация фигурирует целиком.
     """
     cols = ["new_gosb_id", "inn", "seg_funnel", "pipe_np_raw", "pipe_np",
-            "pipe_fact_mtd", "pipe_fot_raw", "pipe_fot", "conv", "n_deals"]
+            "pipe_fact_mtd", "pipe_rest", "pipe_expect",
+            "pipe_fot_raw", "pipe_fot", "conv", "n_deals"]
     if plan_m is None or plan_m.empty:
         return pd.DataFrame(columns=cols)
     cur = pd.Period(pd.Timestamp(ref_cur), freq="M")
@@ -436,8 +457,14 @@ def pipeline_current(plan_m: pd.DataFrame, fact_m: pd.DataFrame, ref_cur,
     for c in ("pipe_np_raw", "pipe_fot_raw"):
         agg[c] = pd.to_numeric(agg[c], errors="coerce").fillna(0.0)
     agg["conv"] = [by_gosb.get(int(g), tb_k) for g in agg["new_gosb_id"]]
-    agg["pipe_np"] = np.maximum(agg["pipe_fact_mtd"], agg["pipe_np_raw"] * agg["conv"])
-    agg["pipe_fot"] = agg["pipe_fot_raw"] * agg["conv"]
+    left = float(np.clip(time_left, 0.0, 1.0))
+    agg["pipe_rest"] = (agg["pipe_np_raw"] - agg["pipe_fact_mtd"]).clip(lower=0)
+    agg["pipe_expect"] = agg["pipe_rest"] * agg["conv"] * left
+    agg["pipe_np"] = agg["pipe_fact_mtd"] + agg["pipe_expect"]
+    # ФОТ — тем же множителем, иначе разъедется с получателями
+    with np.errstate(invalid="ignore", divide="ignore"):
+        share = np.where(agg["pipe_np_raw"] > 0, agg["pipe_np"] / agg["pipe_np_raw"], 0.0)
+    agg["pipe_fot"] = agg["pipe_fot_raw"] * share
     return agg[cols]
 
 
@@ -475,7 +502,8 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
     где организации нет в ежедневной витрине и сегмент взять больше неоткуда.
     """
     cols = ["new_gosb_id", "inn", "seg_name", "out_exp", "in_exp", "pipe_np",
-            "pipe_np_raw", "pipe_fact_mtd", "pipe_fot", "pipe_fot_raw", "n_deals",
+            "pipe_np_raw", "pipe_fact_mtd", "pipe_rest", "pipe_expect",
+            "pipe_fot", "pipe_fot_raw", "n_deals",
             "out_observed", "pred", "out_class", "note", "why", "settled",
             "avg_salary_m", "delta_fl"]
     base = rec if rec is not None and not rec.empty else pd.DataFrame(
@@ -486,7 +514,8 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
         return pd.DataFrame(columns=cols)
 
     m = base.merge(p, on=["new_gosb_id", "inn"], how="outer")
-    for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd", "pipe_fot",
+    for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd",
+              "pipe_rest", "pipe_expect", "pipe_fot",
               "pipe_fot_raw", "n_deals", "out_observed",
               "pred", "settled", "avg_salary_m"):
         m[c] = pd.to_numeric(m.get(c), errors="coerce").fillna(0.0)
@@ -595,9 +624,11 @@ def waterfall(base: float, orgs_fc: pd.DataFrame, plan: float,
     (их добавляет analyze, где известна средняя ЗП организации).
     """
     z = {c: 0.0 for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd",
-                          "observed", "out_fot", "in_fot", "pipe_fot", "pipe_fot_raw")}
+                          "pipe_rest", "pipe_expect", "observed", "out_fot", "in_fot",
+                          "pipe_fot", "pipe_fot_raw")}
     if orgs_fc is not None and not orgs_fc.empty:
         for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd",
+                  "pipe_rest", "pipe_expect",
                   "out_fot", "in_fot", "pipe_fot", "pipe_fot_raw"):
             if c in orgs_fc:
                 z[c] = float(pd.to_numeric(orgs_fc[c], errors="coerce").fillna(0).sum())
@@ -609,7 +640,8 @@ def waterfall(base: float, orgs_fc: pd.DataFrame, plan: float,
         "base": base, "out_exp": z["out_exp"], "observed": z["observed"],
         "risk": max(0.0, z["out_exp"] - z["observed"]), "in_exp": z["in_exp"],
         "pipe": z["pipe_np"], "pipe_raw": z["pipe_np_raw"],
-        "pipe_fact": z["pipe_fact_mtd"],
+        "pipe_fact": z["pipe_fact_mtd"], "pipe_rest": z["pipe_rest"],
+        "pipe_expect": z["pipe_expect"],
         "pipe_upside": max(0.0, z["pipe_np_raw"] - z["pipe_np"]),
         "forecast": fc, "plan": plan,
         "exec": (fc / plan) if plan else None,

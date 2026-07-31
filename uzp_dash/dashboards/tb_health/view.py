@@ -108,22 +108,37 @@ def _kpis(a: analyze.Analysis) -> str:
     return f'<div class="grid cols-2">{cards}</div>'
 
 
-def _wf_lines(wf: dict, d: dict, conv: float, conv_diag: dict | None = None) -> str:
+def _wf_lines(wf: dict, d: dict, conv: float, conv_diag: dict | None = None,
+              conv_is_tb: bool = False) -> str:
     """Строки водопада. Общие для блока по ТБ и для оверлея по ГОСБ — слагаемые
-    и порядок одни и те же, меняется только срез данных."""
+    и порядок одни и те же, меняется только срез данных.
+
+    `conv` — коэффициент ИМЕННО ЭТОГО уровня (у ГОСБ свой), `conv_is_tb` — что он
+    подменён коэффициентом ТБ из-за малого объёма истории.
+    """
     # если фактическая конверсия ниже пола, показываем и её: иначе в отчёте стоит
     # ровно «0.20» и не отличить настоящую конверсию от сработавшей границы
     raw = (conv_diag or {}).get("tb_raw")
-    conv_txt = (f'коэф. реализуемости {raw:.2f} → поднят до пола {conv:.2f}'
-                if (conv_diag or {}).get("tb_clipped") and raw is not None
-                else f'коэф. реализуемости {conv:.2f}')
+    if (conv_diag or {}).get("tb_clipped") and raw is not None and conv_is_tb:
+        conv_txt = f'коэф. ТБ {raw:.2f} → поднят до пола {conv:.2f}, своей истории мало'
+    elif conv_is_tb:
+        conv_txt = f'коэф. ТБ {conv:.2f} — своей истории мало'
+    else:
+        conv_txt = f'коэф. {conv:.2f}'
+    # Время у пайплайна меряется в КАЛЕНДАРНЫХ днях от реальной даты — показываем
+    # именно дни, а не проценты: «осталось 1 из 31 дн.» читается однозначно, а «3%»
+    # можно спутать с долей отыгранных выплат в строке оттока выше.
+    dl, dm = int(d.get("days_left", 0)), int(d.get("days_in_month", 0) or 1)
+    pipe_hint = (f'заявлено {C.fmt_num(wf.get("pipe_raw", 0))} · '
+                 f'пришло {C.fmt_num(wf.get("pipe_fact", 0))} · '
+                 f'остаток {C.fmt_num(wf.get("pipe_rest", 0))} × {conv_txt} × '
+                 f'осталось {dl} из {dm} дн. → +{C.fmt_num(wf.get("pipe_expect", 0))}')
     rows = [
         (f'Портфель — {C.esc(d.get("closed_label", ""))} закрыт', wf["base"], 0, ""),
         (f'Ежедневный отток на {C.esc(str(d.get("act_dt", "")))}', wf["observed"], -1, ""),
         ("Риск оттока до конца месяца", wf["risk"], -1, "прогноз по истории"),
         ("Сезонный приход", wf["in_exp"], 1, "клиенты, которые обычно возвращаются"),
-        ("Пайплайн на месяц", wf["pipe"], 1,
-         f'заявлено {C.fmt_num(wf["pipe_raw"])}, {conv_txt}'),
+        ("Пайплайн на месяц", wf["pipe"], 1, pipe_hint),
     ]
     # подсказка идёт классом g-hint, а НЕ .sub: .sub — это стиль подзаголовка
     # страницы (19px), внутри строки водопада он выглядит крупнее самой строки
@@ -146,7 +161,7 @@ def _waterfall(a: analyze.Analysis, ai: str | None = None) -> str:
         return ""
     d = a.dates or {}
     fc = a.fc_stats or {}
-    body = _wf_lines(wf, d, fc.get("conv_tb", 1.0), fc.get("conv"))
+    body = _wf_lines(wf, d, fc.get("conv_tb", 1.0), fc.get("conv"), conv_is_tb=False)
     ex = wf.get("exec") or 0
     st = C.status_of(wf.get("exec"))
     total = (
@@ -320,6 +335,9 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
     wf = det["wf"]
     gid = c["gosb_id"]
     ex = wf.get("exec") or 0
+    # у ГОСБ свой коэффициент реализуемости и своя доля пройденного месяца
+    wf_html = _wf_lines(wf, d, det["conv"], det.get("conv_diag"),
+                        det.get("conv_is_tb", False))
     yoy = det["yoy_total"]
     yoy_head = (f'<h4>Портфель год к году: '
                 f'<span style="color:{"var(--bad)" if yoy < 0 else "var(--good)"}">'
@@ -332,8 +350,7 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
         f'<button class="gd-close" onclick="gdClose({gid})" '
         f'aria-label="Закрыть">×</button></div>'
 
-        f'<div class="gd-block"><h4>Из чего сложился прогноз</h4>'
-        f'{_wf_lines(wf, d, det["conv"], det.get("conv_diag"))}</div>'
+        f'<div class="gd-block"><h4>Из чего сложился прогноз</h4>{wf_html}</div>'
 
         f'<div class="gd-block"><h4>Крупнейшие в оттоке — всего '
         f'{C.fmt_num(det["out_tot"])} чел</h4>'

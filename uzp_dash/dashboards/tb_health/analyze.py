@@ -215,7 +215,8 @@ def run(ctx, tb_short: str) -> Analysis:
     org_detail = read_sql(e, Q.ORG_DETAIL, {"tb_id": tb_id, "ref_closed": ref_closed})
     gosb_detail = _gosb_detail(orgs_fc, org_detail, insights, to_work, no_point,
                                gosb_gap, fc_stats.get("conv_tb", 1.0),
-                               fc_stats.get("conv", {}))
+                               fc_stats.get("conv", {}),
+                               fc_stats.get("conv_by_gosb", {}), d)
     n_named = sum(len(v["top_out"]) + len(v["top_pipe"]) for v in gosb_detail.values())
     covs = [v["out_cov"] for v in gosb_detail.values() if v.get("out_n_all")]
     cov_txt = (f" · названные объясняют в среднем {sum(covs)/len(covs)*100:.0f}% оттока ГОСБ"
@@ -284,11 +285,30 @@ def _dates(engine, params: dict) -> dict:
     # окно сделок для помесячного план/факт: PIPE_MONTHS закрытых месяцев + текущий.
     # Шире окна активностей: коэффициент реализуемости считается по закрытым месяцам.
     plan_from = (cur.to_period("M") - PIPE_MONTHS).to_timestamp().date()
-    elapsed = min(1.0, pd.Timestamp(act_dt).day / cur.day)
-    left = max(0, (cur.date() - act_dt).days)
+    # ДВЕ РАЗНЫЕ величины, их нельзя путать:
+    #  * observed — какую долю выплатных событий месяца мы уже УВИДЕЛИ. Меряется по
+    #    act_dt (дата актуальности витрины оттока) и отвечает за то, сколько риска
+    #    оттока уже отыграно;
+    #  * days_left — сколько КАЛЕНДАРНОГО времени осталось, чтобы привлечения по
+    #    сделкам успели дойти. Меряется по РЕАЛЬНОЙ текущей дате: витрина оттока про
+    #    будущие дни ничего не знает, и её act_dt тут ни при чём.
+    observed = min(1.0, pd.Timestamp(act_dt).day / cur.day)
+    today = params.get("today")
+    today = (pd.Timestamp(today).date() if today
+             else pd.Timestamp.now().date())
+    if today > cur.date():
+        days_left = 0                      # месяц уже закончился
+    elif today < cur.replace(day=1).date():
+        days_left = int(cur.day)           # месяц ещё не начался
+    else:
+        # сегодняшний день ещё в игре: 31-е из 31 — это 1 оставшийся день, а не 0
+        days_left = int(cur.day) - today.day + 1
+    pipe_left = days_left / float(cur.day)
 
     progress.done(f"Прогнозный месяц: {ref_cur} ({src}) · факт зачислений по {act_dt} "
-                  f"(месяц пройден на {elapsed * 100:.0f}%, до конца {left} дн.)")
+                  f"(выплат месяца отыграно {observed * 100:.0f}%)")
+    progress.done(f"Сегодня {today}: до конца месяца {days_left} из {cur.day} дн. "
+                  f"({pipe_left * 100:.0f}%) — столько времени осталось у пайплайна")
     progress.done(f"Портфель-база прогноза — закрытый месяц {ref_closed}; "
                   f"история витрины с {hist_from} ({HIST_MONTHS} мес)")
     months = ", ".join((cur.to_period("M") - k).strftime("%m.%Y") for k in (2, 1, 0))
@@ -298,8 +318,9 @@ def _dates(engine, params: dict) -> dict:
             "ref_yoy": ref_yoy,
             "ref_funnel": ref_funnel, "funnel_from": funnel_from,
             "fresh_from": fresh_from, "hist_from": hist_from, "plan_from": plan_from,
-            "cur_month": int(cur.month), "month_elapsed": float(elapsed),
-            "days_left": int(left), "src": src,
+            "cur_month": int(cur.month), "month_elapsed": float(observed),
+            "today": today, "days_left": int(days_left),
+            "days_in_month": int(cur.day), "pipe_left": float(pipe_left), "src": src,
             "label": f"{cur.month:02d}.{cur.year}",
             "closed_label": f"{pd.Timestamp(ref_closed).month:02d}."
                             f"{pd.Timestamp(ref_closed).year}"}
@@ -334,7 +355,10 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
     pred = forecast.outflow_model(hist, d["ref_cur"])
     rec = forecast.reconcile(day, pred, d["month_elapsed"])
     by_gosb, tb_k, conv_diag = forecast.conversion_by_month(plan_m, fact_m, d["ref_cur"])
-    pipe_fc = forecast.pipeline_current(plan_m, fact_m, d["ref_cur"], by_gosb, tb_k)
+    # у пайплайна своя мера времени — сколько КАЛЕНДАРНЫХ дней осталось до конца
+    # месяца (от реальной даты), а не сколько выплат мы увидели в витрине оттока
+    pipe_fc = forecast.pipeline_current(plan_m, fact_m, d["ref_cur"], by_gosb, tb_k,
+                                        d["pipe_left"])
     due = forecast.deal_due(plan_m, fact_m, d["ref_cur"])
     _log_pipeline(fstat, pstat, conv_diag, d)
     # сегмент из воронки приходит БОЛЬШИМ именем — приводим к короткому,
@@ -359,8 +383,8 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
     n_hist = int(hd.get("hist_months", 0))
     classes = fc["out_class"].value_counts().to_dict() if not fc.empty else {}
     stats = {"n_day": len(day), "n_hist_orgs": len(pred), "hist_months": n_hist,
-             "n_pipe": len(pipe_fc), "conv_tb": tb_k, "classes": classes,
-             "hist": hd, "conv": conv_diag,
+             "n_pipe": len(pipe_fc), "conv_tb": tb_k, "conv_by_gosb": by_gosb,
+             "classes": classes, "hist": hd, "conv": conv_diag,
              "pipe_np": float(fc["pipe_np"].sum()) if not fc.empty else 0.0,
              "pipe_np_raw": float(fc["pipe_np_raw"].sum()) if not fc.empty else 0.0}
     raw = conv_diag.get("tb_raw")
@@ -1260,7 +1284,8 @@ def _rest_row(gosb_row, segs: list, n_need_total: int) -> dict | None:
 def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
                  to_work: pd.DataFrame, no_point: pd.DataFrame,
                  gosb_gap: pd.DataFrame, conv_tb: float,
-                 conv_diag: dict | None = None) -> dict:
+                 conv_diag: dict | None = None,
+                 conv_by_gosb: dict | None = None, dates: dict | None = None) -> dict:
     """Разбор прогноза по каждому ГОСБ — то, что открывается по клику на карточку.
 
     Отвечает на вопрос «почему прогноз такой»: водопад этого ГОСБ, затем крупнейшие
@@ -1292,11 +1317,18 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
     work, nopt = _keys(to_work), _keys(no_point)
     totals = {int(r.new_gosb_id): r for r in gosb_gap.itertuples()}
 
+    skipped_no_base = []
     for nid, g in orgs_fc.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
         nid = int(nid)
         t = totals.get(nid)
-        wf = forecast.waterfall(float(t.base_amt) if t is not None else 0.0, g,
-                                float(t.plan_amt) if t is not None else 0.0)
+        if t is None:
+            # ГОСБ нет в витрине метрик этого ТБ — ни плана, ни базы. Такое бывает у
+            # old_gosb_id, числящихся сразу под двумя tb_id (см. _GMAP): организации на
+            # него мапятся, а метрики уходят в другой ТБ. Водопад без базы построить
+            # нельзя, карточка для него всё равно не строится — пропускаем, но считаем.
+            skipped_no_base.append((nid, float(g["out_exp"].sum())))
+            continue
+        wf = forecast.waterfall(float(t.base_amt), g, float(t.plan_amt))
         rows = []
         for r in g.itertuples():
             k = (nid, int(r.inn))
@@ -1321,7 +1353,11 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
         up, *_ = _material([r for r in rows if r["yoy"] >= 1], "yoy", cap=5)
         down, *_ = _material([r for r in rows if r["yoy"] <= -1], "yoy", cap=5)
         out[nid] = {
-            "wf": wf, "conv": conv_tb, "conv_diag": conv_diag or {},
+            # коэффициент ИМЕННО ЭТОГО ГОСБ; если своей истории мало, он ушёл на
+            # коэффициент ТБ — тогда это подписывается в карточке явно
+            "wf": wf, "conv": (conv_by_gosb or {}).get(nid, conv_tb),
+            "conv_is_tb": nid not in (conv_by_gosb or {}),
+            "conv_diag": conv_diag or {}, "month_elapsed": (dates or {}).get("month_elapsed", 0.0),
             "out_tot": float(sum(r["out"] for r in rows)),
             "top_out": top_out, "out_tail_n": out_n, "out_tail_fl": out_fl,
             "out_cov": out_cov, "out_n_all": len(out_rows),
@@ -1329,6 +1365,11 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
             "pipe_cov": pipe_cov, "pipe_n_all": len(pipe_rows),
             "yoy_total": float(yoy_tot.get(nid, 0.0)), "yoy_up": up, "yoy_down": down,
         }
+    if skipped_no_base:
+        fl = sum(x[1] for x in skipped_no_base)
+        progress.done(f"Пропущено ГОСБ без базы в витрине метрик: {len(skipped_no_base)} "
+                      f"(отток {fl:.0f} чел) — их old_gosb_id числится под другим ТБ, "
+                      f"карточки для них и так не строятся")
     return out
 
 
