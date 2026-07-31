@@ -20,18 +20,17 @@ def build(ctx: Context) -> str:
     tb = ctx.params.get("tb", "ЮЗБ")
     a = analyze.run(ctx, tb)          # включает разбор текста (правила + LLM)
     _log_llm_stats(a)
-    progress.step("LLM: нарратив «что плохо и что делать»")
-    story = prompts.narrative(ctx, a)
+    progress.step("LLM: выводы по разделам")
+    story = prompts.section_narratives(ctx, a)
     progress.step("Сборка HTML")
 
     body = (
         _hero(a)
         + _kpis(a)
-        + _waterfall(a)
-        + _matrix(a)
-        + _problem_gosb(a)
-        + _orgs(a)
-        + C.section("Что делать — резюме", C.card(C.narrative_html(story)), eyebrow="AI")
+        + _waterfall(a, story.get("forecast"))
+        + _matrix(a, story.get("matrix"))
+        + _problem_gosb(a, story.get("gosb"))
+        + _orgs(a, story.get("orgs"))
     )
     d = a.dates or {}
     return page(
@@ -136,7 +135,7 @@ def _wf_lines(wf: dict, d: dict, conv: float, conv_diag: dict | None = None) -> 
         for lbl, val, sign, hint in rows)
 
 
-def _waterfall(a: analyze.Analysis) -> str:
+def _waterfall(a: analyze.Analysis, ai: str | None = None) -> str:
     """Из чего складывается прогноз: база закрытого месяца → отток → пайплайн.
 
     Отток намеренно разбит на «уже не зачислились» и «риск»: первое уже случилось,
@@ -165,11 +164,12 @@ def _waterfall(a: analyze.Analysis) -> str:
             'в нём уже учтён, а потенциал привлечения и удержание — нет. '
             'Список организаций ниже показывает, чем прогноз можно улучшить.</p>')
     return C.section("Из чего складывается прогноз",
-                     C.card('<h3>Расчёт по получателям</h3>' + note + body + total + upside),
+                     C.card('<h3>Расчёт по получателям</h3>' + note + body + total + upside)
+                     + _ai(ai),
                      eyebrow="Метод")
 
 
-def _matrix(a: analyze.Analysis) -> str:
+def _matrix(a: analyze.Analysis, ai: str | None = None) -> str:
     m = a.matrix
     if m.empty:
         return ""
@@ -196,7 +196,7 @@ def _matrix(a: analyze.Analysis) -> str:
                      + C.table(["Провальная зона", "Выполн.", "Недобор, чел", "Доля разрыва"],
                                top, num_cols=[2, 3]))
     return C.section("Где провал — ГОСБ × сегмент",
-                     f'<div class="grid cols-2">{heat}{top_tbl}</div>',
+                     f'<div class="grid cols-2">{heat}{top_tbl}</div>' + _ai(ai),
                      eyebrow="Диагностика по прогнозу")
 
 
@@ -360,7 +360,7 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
     )
 
 
-def _problem_gosb(a: analyze.Analysis) -> str:
+def _problem_gosb(a: analyze.Analysis, ai: str | None = None) -> str:
     if not a.gosb_cards:
         return ""
     cards, dialogs = [], []
@@ -422,7 +422,7 @@ def _problem_gosb(a: analyze.Analysis) -> str:
             dialogs.append(_gosb_dialog(c, det, d))
     grid = (f'<div class="gcards">{"".join(cards)}</div>{"".join(dialogs)}'
             + _GD_JS)
-    return C.section("ГОСБ — что сделать по каждому", grid,
+    return C.section("ГОСБ — что сделать по каждому", grid + _ai(ai),
                      eyebrow="Все ГОСБ · клик открывает разбор прогноза")
 
 
@@ -439,7 +439,7 @@ document.querySelectorAll('dialog.gd').forEach(function(d){
 """
 
 
-def _orgs(a: analyze.Analysis) -> str:
+def _orgs(a: analyze.Analysis, ai: str | None = None) -> str:
     """Список к отработке: по умолчанию — ровно те, кем закрывается план.
 
     Отбор считается в Python внутри западающих сегментов каждого ГОСБ, а строке
@@ -477,7 +477,8 @@ def _orgs(a: analyze.Analysis) -> str:
             f'({C.esc(", ".join(bad_segs)) or "—"}), по величине эффекта, пока разрыв '
             f'сегмента не закрыт · переключатель «Цель» задаёт перевыполнение · '
             f'всего кандидатов {len(rows)}{hold}</p>')
-    return C.section("Организации к работе", C.card(head + explorer), eyebrow="Список к отработке")
+    return C.section("Организации к работе", C.card(head + explorer) + _ai(ai),
+                     eyebrow="Список к отработке")
 
 
 def _log_llm_stats(a: analyze.Analysis) -> None:
@@ -497,6 +498,19 @@ def _log_llm_stats(a: analyze.Analysis) -> None:
         f"Из них не требуют действий сейчас: влиять нечем {s.get('no_influence',0)} · "
         f"назван будущий срок {s.get('deadline',0)}"
     )
+
+
+def _ai(text: str | None) -> str:
+    """Вывод LLM карточкой в конце своего раздела.
+
+    Раньше все выводы жили одним блоком «Что делать — резюме» в конце страницы, и
+    читателю приходилось возвращаться к цифрам. Теперь вывод стоит там, где стоят
+    данные, к которым он относится.
+    """
+    if not text or not str(text).strip():
+        return ""
+    return C.card('<div class="ai-head">Вывод</div>'
+                  + C.narrative_html(str(text)), cls="ai")
 
 
 def _col(exec_pct):

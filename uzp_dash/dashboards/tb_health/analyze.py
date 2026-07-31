@@ -32,6 +32,7 @@ LLM_MIN_IMPACT_DEFAULT = 1  # ниже этого эффекта (чел) в LLM
 LLM_MAX_CALLS_DEFAULT = 80  # жёсткий потолок вызовов на весь ТБ; хвост уходит на правила
 PLAN_TARGETS = (1.0, 1.2, 1.5)   # цели в дэше: выполнить план / +20% / +50%
 HIST_MONTHS = 24                 # глубина истории витрины под модель сезонности
+PIPE_MONTHS = 12                 # закрытых месяцев сделок для коэффициента реализуемости
 # Сегмент западает, если план не выполнен (exec < 1) — тот же признак, что даёт
 # красную ячейку в тепловой карте (render.components.heat_bg). Порог в одного
 # получателя отсекает только шум округления.
@@ -280,6 +281,9 @@ def _dates(engine, params: dict) -> dict:
     hist_from = (cur.to_period("M") - (HIST_MONTHS + 1)).to_timestamp("M").date()
     # тот же месяц год назад — для прироста «год к году» по закрытому месяцу
     ref_yoy = (cur.to_period("M") - 13).to_timestamp("M").date()
+    # окно сделок для помесячного план/факт: PIPE_MONTHS закрытых месяцев + текущий.
+    # Шире окна активностей: коэффициент реализуемости считается по закрытым месяцам.
+    plan_from = (cur.to_period("M") - PIPE_MONTHS).to_timestamp().date()
     elapsed = min(1.0, pd.Timestamp(act_dt).day / cur.day)
     left = max(0, (cur.date() - act_dt).days)
 
@@ -293,7 +297,7 @@ def _dates(engine, params: dict) -> dict:
     return {"ref_cur": ref_cur, "ref_closed": ref_closed, "act_dt": act_dt,
             "ref_yoy": ref_yoy,
             "ref_funnel": ref_funnel, "funnel_from": funnel_from,
-            "fresh_from": fresh_from, "hist_from": hist_from,
+            "fresh_from": fresh_from, "hist_from": hist_from, "plan_from": plan_from,
             "cur_month": int(cur.month), "month_elapsed": float(elapsed),
             "days_left": int(left), "src": src,
             "label": f"{cur.month:02d}.{cur.year}",
@@ -314,16 +318,25 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
     hist = read_sql(engine, Q.OUTFLOW_HISTORY,
                     {"tb_id": tb_id, "hist_from": d["hist_from"],
                      "ref_closed": d["ref_closed"]})
-    pipe = read_sql(engine, Q.PIPELINE, {"tb_id": tb_id, "funnel_from": d["funnel_from"],
-                                         "ref_funnel": d["ref_funnel"],
-                                         "cur_month": d["cur_month"]})
-    conv = read_sql(engine, Q.DEAL_CONVERSION,
-                    {"tb_id": tb_id, "fresh_from": d["fresh_from"]})
+    # План и ФАКТ пайплайна помесячно на грейне (ГОСБ, ИНН, сотрудник): именно на нём
+    # план двух сделок одного месяца складывается в одно число, с которым и сравнивается
+    # пришедший факт.
+    pp = {"tb_id": tb_id, "plan_from": d["plan_from"], "ref_funnel": d["ref_funnel"]}
+    plan_m = read_sql(engine, Q.PIPELINE_PLAN_M, pp)
+    fact_m = read_sql(engine, Q.PIPELINE_FACT_M,
+                      {"tb_id": tb_id, "plan_from": d["plan_from"], "ref_cur": d["ref_cur"],
+                       "m_np": Q.METRIC_NEW_RECIPIENTS_B2B, "counted": Q.MOTIV_COUNTED})
+    fstat = read_sql(engine, Q.PIPELINE_FACT_STATS,
+                     {"tb_id": tb_id, "plan_from": d["plan_from"], "ref_cur": d["ref_cur"],
+                      "m_np": Q.METRIC_NEW_RECIPIENTS_B2B, "counted": Q.MOTIV_COUNTED})
+    pstat = read_sql(engine, Q.PIPELINE_PLAN_STATS, pp)
 
     pred = forecast.outflow_model(hist, d["ref_cur"])
     rec = forecast.reconcile(day, pred, d["month_elapsed"])
-    by_gosb, tb_k, conv_diag = forecast.conversion(conv)
-    pipe_fc = forecast.pipeline_np(pipe, by_gosb, tb_k)
+    by_gosb, tb_k, conv_diag = forecast.conversion_by_month(plan_m, fact_m, d["ref_cur"])
+    pipe_fc = forecast.pipeline_current(plan_m, fact_m, d["ref_cur"], by_gosb, tb_k)
+    due = forecast.deal_due(plan_m, fact_m, d["ref_cur"])
+    _log_pipeline(fstat, pstat, conv_diag, d)
     # сегмент из воронки приходит БОЛЬШИМ именем — приводим к короткому,
     # иначе он не совпадёт с сегментами матрицы
     if not pipe_fc.empty:
@@ -371,8 +384,8 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
             for k, v in sorted(classes.items(), key=lambda x: -x[1])))
 
     keep = ["new_gosb_id", "inn", "out_exp", "in_exp", "pipe_np", "pipe_np_raw",
-            "pipe_fot", "out_observed", "pred", "out_class", "note", "why",
-            "settled", "n_deals"]
+            "pipe_fact_mtd", "pipe_fot", "out_observed", "pred", "out_class", "note",
+            "why", "settled", "n_deals"]
     merged = orgs.copy()
     merged["new_gosb_id"] = merged["new_gosb_id"].astype("Int64")
     if not fc.empty:
@@ -380,8 +393,15 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
         f["new_gosb_id"] = f["new_gosb_id"].astype("Int64")
         f["inn"] = f["inn"].astype("int64")
         merged = merged.merge(f, on=["new_gosb_id", "inn"], how="left")
-    for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fot",
-              "out_observed", "pred", "settled", "n_deals"):
+    # план/факт по сделкам за ЗАКРЫТЫЕ месяцы — на них опирается аудит отработки
+    if due is not None and not due.empty:
+        dd = due.copy()
+        dd["new_gosb_id"] = dd["new_gosb_id"].astype("Int64")
+        dd["inn"] = dd["inn"].astype("int64")
+        merged = merged.merge(dd, on=["new_gosb_id", "inn"], how="left")
+    for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd", "pipe_fot",
+              "out_observed", "pred", "settled", "n_deals",
+              "plan_np_due", "fact_np_due", "due_months"):
         merged[c] = pd.to_numeric(merged.get(c), errors="coerce").fillna(0.0)
     for c in ("out_class", "note", "why"):
         merged[c] = merged.get(c).fillna("") if c in merged else ""
@@ -414,6 +434,43 @@ def _yoy(engine, params: dict, tb_id: int, closed: dict, d: dict) -> dict:
         progress.done(f"Год к году НЕ рассчитан: в витрине метрик нет месяца "
                       f"{params['ref']} — в карточках будет «—»")
     return out
+
+
+def _log_pipeline(fstat: pd.DataFrame, pstat: pd.DataFrame, conv: dict, d: dict) -> None:
+    """Диагностика пайплайна: что отсеяли фильтрами и на чём стоит коэффициент.
+
+    Обе доли важны для доверия к цифре: фильтр «учтено» убирает фрод, а строки с
+    неразрешимым месяцем плана вообще не участвуют в расчёте.
+    """
+    if fstat is not None and not fstat.empty:
+        r = fstat.iloc[0]
+        n_all = int(r.n_all or 0)
+        if n_all:
+            drop = n_all - int(r.n_counted or 0)
+            amt_all = float(r.amt_all or 0)
+            amt_drop = amt_all - float(r.amt_counted or 0)
+            progress.done(
+                f"Факт по сделкам: {int(r.n_counted or 0)} из {n_all} строк «учтено» "
+                f"(отсеяно {drop}, {drop / n_all * 100:.0f}%) · "
+                f"{float(r.amt_counted or 0):.0f} НП из {amt_all:.0f} "
+                f"(не в учёте {amt_drop:.0f})")
+    if pstat is not None and not pstat.empty:
+        r = pstat.iloc[0]
+        n_all, n_bad = int(r.n_all or 0), int(r.n_bad or 0)
+        if n_bad:
+            progress.done(f"Пайплайн: у {n_bad} из {n_all} строк ({n_bad / max(n_all,1)*100:.1f}%) "
+                          f"месяц плана вне 3 месяцев жизни сделки — год не восстановить, "
+                          f"в расчёт не идут")
+    if conv.get("months"):
+        progress.done(f"Реализуемость: план {conv['plan']:.0f} → факт {conv['fact']:.0f} "
+                      f"по {conv['months']} закрытым месяцам, {conv['n_gosb']} ГОСБ "
+                      f"(окно с {d['plan_from']})")
+        if conv["months"] < 3:
+            progress.done(f"Коэффициент стоит всего на {conv['months']} закрытых мес — "
+                          f"мало для устойчивой оценки: в окне нет сделок постарше")
+    else:
+        progress.done("Реализуемость НЕ рассчитана: закрытых месяцев с планом нет — "
+                      "пайплайн войдёт в прогноз без поправки (коэф. 1.0)")
 
 
 def _log_history(hd: dict, d: dict) -> None:
@@ -624,10 +681,14 @@ def _classify(cand: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             work_rows.append((o, "Не работали за 3 мес — начать отработку"))
         elif n_ip > 0 and int(o.get("n_closed", 0)) == 0 and int(o.get("n_overdue", 0)) == 0:
             skip_rows.append((o, f"Задач в работе: {n_ip} — срок не вышел, ждём результата"))
-        elif (bool(o.get("deal_expected", False))
-                and int(o.get("fact_deal_old", 0)) < int(o.get("plan_deal_old", 0))):
-            work_rows.append((o, f"Недоработка по сделке: {int(o['fact_deal_old'])} "
-                                 f"из {int(o['plan_deal_old'])} получателей"))
+        elif (float(o.get("plan_np_due", 0)) >= 1
+                and float(o.get("fact_np_due", 0)) < float(o.get("plan_np_due", 0))):
+            # сравниваем с АГРЕГАТОМ планов закрытых месяцев: сотрудник мог завести
+            # несколько сделок на один месяц, и пришедшие люди относятся к их сумме
+            work_rows.append((o, f"Недоработка по сделкам: пришло "
+                                 f"{float(o['fact_np_due']):.0f} из "
+                                 f"{float(o['plan_np_due']):.0f} запланированных "
+                                 f"получателей за {int(o.get('due_months', 0))} мес"))
         elif int(o.get("n_overdue", 0)) > 0:
             work_rows.append((o, f"Просроченных задач: {int(o['n_overdue'])} — вернуть в работу"))
         elif bool(o.get("any_success", False)):
@@ -694,8 +755,7 @@ def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFram
         # «лишь бы закрыть»: правило заявляет успех (согласие/расширение), но по СТАРОЙ
         # сделке план>0, факт=0 — не закрываем правилом, отдаём модели на проверку
         # формальности (это и есть вопрос «качественно или просто закрыли»).
-        suspect_formal = (facts["deal_expected"] and facts["plan_deal_old"] > 0
-                          and facts["fact_deal_old"] == 0)
+        suspect_formal = (facts["plan_np_due"] > 0 and facts["fact_np_due"] == 0)
         if det and not (suspect_formal and det.get("reason") in _POSITIVE_REASONS):
             insights[key] = det
             stats["checklist" if det["source"].startswith("чек-лист") else "keyword"] += 1
@@ -782,6 +842,11 @@ def _facts(r) -> dict:
         "deal_expected": bool(getattr(r, "deal_expected", False)),
         "plan_deal_old": int(getattr(r, "plan_deal_old", 0) or 0),
         "fact_deal_old": int(getattr(r, "fact_deal_old", 0) or 0),
+        # план/факт по сделкам за ЗАКРЫТЫЕ месяцы — агрегат по всем сделкам организации
+        "plan_np_due": float(getattr(r, "plan_np_due", 0) or 0),
+        "fact_np_due": float(getattr(r, "fact_np_due", 0) or 0),
+        "due_months": int(getattr(r, "due_months", 0) or 0),
+        "pipe_fact_mtd": float(getattr(r, "pipe_fact_mtd", 0) or 0),
         "has_fresh_deal": bool(getattr(r, "has_fresh_deal", False)),
         "n_overdue": int(getattr(r, "n_overdue", 0) or 0),
         "n_in_progress": int(getattr(r, "n_in_progress", 0) or 0),

@@ -13,6 +13,11 @@
 
 METRIC_FOT = 1000164          # Общий ФОТ, млн ₽
 METRIC_RECIPIENTS = 12400196  # Количество уникальных получателей до ИНН
+# Метрика витрины премирования: «Новые получатели b2b» — факт привлечения по сделкам
+METRIC_NEW_RECIPIENTS_B2B = 1000636
+# В факт идут только зачтённые строки: остальное — фрод и «для информации, не
+# участвует в расчёте kpi», реального привлечения они не означают
+MOTIV_COUNTED = "учтено"
 
 # Закрытый месяц: последний день месяца из report_dt операционных витрин.
 # Используется как ФОЛБЭК опорной даты, если ежедневная витрина пуста.
@@ -323,51 +328,108 @@ WHERE g.tb_id = :tb_id AND c.org_type = 'inn'
 # воронки (несколько задач по сделке), и join напрямую задвоил бы план.
 # Окно воронки то же, что у активностей: сделка живёт 3 месяца, поэтому запланировать
 # текущий месяц могли только сделки этого окна.
-PIPELINE = """
+# План пайплайна ПО МЕСЯЦАМ на грейне (ГОСБ, ИНН, СОТРУДНИК).
+#
+# Грейн именно такой, потому что сравнивать факт надо с АГРЕГАТОМ планов: сотрудник
+# мог завести две сделки по одной организации и обе запланировать на один месяц
+# (10 и 15) — факт месяца относится к их сумме (25), а не к каждой сделке отдельно.
+#
+# Восстановление ГОДА. В pl_month_num лежит только НОМЕР месяца. Сделка живёт три
+# месяца, поэтому планировать она может лишь месяц создания m0, m0+1 или m0+2:
+#     off = (pl_month_num − месяц(m0) + 12) % 12,   строка годна при off <= 2
+# и тогда план относится к месяцу m0 + off. Строки с off > 2 несогласованы и
+# отбрасываются (их доля печатается в прогресс).
+PIPELINE_PLAN_M = """
 WITH gmap AS (""" + _GMAP + """),
 codes AS (
   SELECT COALESCE(f.deal_code, f.task_code) AS code,
          f.inn,
-         min(g.new_gosb_id)                       AS new_gosb_id,
-         min(f.segment_name)                      AS seg_funnel,
-         sum(COALESCE(f.fact_staff_deal_qty, 0))  AS fact_deal
+         min(g.new_gosb_id)            AS new_gosb_id,
+         min(f.isu_struct_saphr_id)    AS saphr_id,
+         min(f.segment_name)           AS seg_funnel,
+         min(date_trunc('month', COALESCE(f.deal_create_dttm,
+                                          CAST(f.task_create_dt AS timestamp)))) AS m0
   FROM {schema}.uzp_dwh_sale_funnel_task f
   LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
   WHERE f.tb_id = :tb_id
-    AND f.task_create_dt >= CAST(:funnel_from AS date)
-    AND f.task_create_dt <= CAST(:ref_funnel  AS date)
+    AND f.task_create_dt >= CAST(:plan_from AS date)
+    AND f.task_create_dt <= CAST(:ref_funnel AS date)
     AND COALESCE(f.deal_code, f.task_code) IS NOT NULL
   GROUP BY 1, 2
+),
+resolved AS (
+  SELECT c.new_gosb_id, c.inn, c.saphr_id, c.seg_funnel, c.code,
+         -- КОНЕЦ месяца: report_dt в витрине факта тоже конец месяца, иначе не сойдётся
+         CAST(c.m0 + make_interval(months =>
+                ((p.pl_month_num - CAST(EXTRACT(MONTH FROM c.m0) AS int) + 12) % 12))
+              + interval '1 month - 1 day' AS date)                   AS plan_month,
+         ((p.pl_month_num - CAST(EXTRACT(MONTH FROM c.m0) AS int) + 12) % 12) AS off_m,
+         COALESCE(p.pl_plan_np_amt, 0)  AS plan_np,
+         COALESCE(p.pl_plan_fot_amt, 0) AS plan_fot
+  FROM codes c
+  JOIN {schema_t}.yva_pl_task_deal_code p ON p.pl_task_deal_code = c.code
 )
-SELECT c.new_gosb_id, c.inn, min(c.seg_funnel) AS seg_funnel,
-       sum(COALESCE(p.pl_plan_np_amt, 0))  AS pipe_np_raw,
-       sum(COALESCE(p.pl_plan_fot_amt, 0)) AS pipe_fot_raw,
-       sum(c.fact_deal)                    AS fact_deal,
-       count(*)                            AS n_deals
-FROM codes c
-JOIN {schema_t}.yva_pl_task_deal_code p ON p.pl_task_deal_code = c.code
-WHERE p.pl_month_num = :cur_month
-GROUP BY c.new_gosb_id, c.inn
+SELECT new_gosb_id, inn, saphr_id, plan_month,
+       min(seg_funnel)       AS seg_funnel,
+       sum(plan_np)          AS plan_np,
+       sum(plan_fot)         AS plan_fot,
+       count(DISTINCT code)  AS n_deals
+FROM resolved
+WHERE off_m <= 2
+GROUP BY new_gosb_id, inn, saphr_id, plan_month
 """
 
-# Историческая реализуемость пайплайна: какая доля запланированных по сделке
-# получателей реально доходит. Считаем ТОЛЬКО по сделкам, созданным раньше
-# :fresh_from — свежие ещё не успели реализоваться и занизили бы коэффициент.
-# Строка level='tb' (new_gosb_id IS NULL) — фолбэк для ГОСБ без своей истории.
-DEAL_CONVERSION = """
+# Доля строк пайплайна, у которых месяц плана не попадает в 3 месяца жизни сделки:
+# считать их нельзя (год не восстанавливается), но молчать о них тоже нельзя.
+PIPELINE_PLAN_STATS = """
 WITH gmap AS (""" + _GMAP + """),
-base AS (
-  SELECT g.new_gosb_id,
-         COALESCE(f.plan_staff_deal_qty, 0) AS plan_q,
-         COALESCE(f.fact_staff_deal_qty, 0) AS fact_q
+codes AS (
+  SELECT COALESCE(f.deal_code, f.task_code) AS code,
+         min(date_trunc('month', COALESCE(f.deal_create_dttm,
+                                          CAST(f.task_create_dt AS timestamp)))) AS m0
   FROM {schema}.uzp_dwh_sale_funnel_task f
   LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
   WHERE f.tb_id = :tb_id
-    AND COALESCE(f.plan_staff_deal_qty, 0) > 0
-    AND f.deal_create_dttm IS NOT NULL
-    AND f.deal_create_dttm < CAST(:fresh_from AS date)
+    AND f.task_create_dt >= CAST(:plan_from AS date)
+    AND f.task_create_dt <= CAST(:ref_funnel AS date)
+    AND COALESCE(f.deal_code, f.task_code) IS NOT NULL
+  GROUP BY 1
 )
-SELECT new_gosb_id, sum(plan_q) AS plan_q, sum(fact_q) AS fact_q FROM base GROUP BY 1
-UNION ALL
-SELECT NULL, sum(plan_q), sum(fact_q) FROM base
+SELECT count(*) AS n_all,
+       count(*) FILTER (
+         WHERE ((p.pl_month_num - CAST(EXTRACT(MONTH FROM c.m0) AS int) + 12) % 12) > 2
+       ) AS n_bad
+FROM codes c
+JOIN {schema_t}.yva_pl_task_deal_code p ON p.pl_task_deal_code = c.code
+"""
+
+# Сколько НП по сделкам реально пришло — ФАКТ, помесячно, тот же грейн.
+# report_dt здесь — месяц ИЗ ПАЙПЛАЙНА, на который сделка обещала привлечение.
+# Берём только зачтённые строки: фрод и «для информации» реального привлечения
+# не означают. metric_id — «Новые получатели b2b».
+PIPELINE_FACT_M = """
+WITH gmap AS (""" + _GMAP + """)
+SELECT g.new_gosb_id, m.inn, m.saphr_id,
+       CAST(date_trunc('month', m.report_dt) + interval '1 month - 1 day' AS date)
+                                AS plan_month,
+       sum(COALESCE(m.sales_amt, 0)) AS fact_np
+FROM {schema}.uzp_data_mzp_motivation_detail_corr m
+LEFT JOIN gmap g ON g.old_gosb_id = m.gosb_id
+WHERE m.tb_id = :tb_id
+  AND m.metric_id = :m_np
+  AND m.product_cmnt = :counted
+  AND m.report_dt >= CAST(:plan_from AS date)
+  AND m.report_dt <= CAST(:ref_cur   AS date)
+GROUP BY g.new_gosb_id, m.inn, m.saphr_id, 4
+"""
+
+# Сколько строк отсекается фильтром «учтено» — для прогресса (доверие к цифре)
+PIPELINE_FACT_STATS = """
+SELECT count(*) AS n_all,
+       count(*) FILTER (WHERE product_cmnt = :counted) AS n_counted,
+       sum(COALESCE(sales_amt, 0)) AS amt_all,
+       sum(COALESCE(sales_amt, 0)) FILTER (WHERE product_cmnt = :counted) AS amt_counted
+FROM {schema}.uzp_data_mzp_motivation_detail_corr
+WHERE tb_id = :tb_id AND metric_id = :m_np
+  AND report_dt >= CAST(:plan_from AS date) AND report_dt <= CAST(:ref_cur AS date)
 """

@@ -338,60 +338,133 @@ def _why(pred, observed, settled, out_exp, in_exp, has_day) -> str:
             f"отыграно {settled * 100:.0f}% → {out_exp:.0f}")
 
 
-def conversion(conv: pd.DataFrame) -> tuple[dict, float, dict]:
-    """Историческая реализуемость сделок: (по ГОСБ, фолбэк по ТБ, диагностика).
+def _as_period(df: pd.DataFrame, col: str = "plan_month") -> pd.DataFrame:
+    """Привести месяц к Period и ключи к Int64 — иначе merge молча не сойдётся."""
+    out = df.copy()
+    out["per"] = pd.PeriodIndex(pd.to_datetime(out[col]), freq="M")
+    for c in ("new_gosb_id", "inn", "saphr_id"):
+        if c in out:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("Int64")
+    return out
 
-    Строка с пустым new_gosb_id — итог по ТБ (см. DEAL_CONVERSION).
 
-    Диагностика возвращает СЫРОЕ значение до клипа: если фактическая конверсия ниже
-    CONV_MIN, клип поднимает её до пола и тем самым ЗАВЫШАЕТ вклад пайплайна в
-    прогноз. Молчать об этом нельзя — иначе в логе видно ровно «0.20» и непонятно,
-    это настоящая конверсия или сработавшая граница.
+def conversion_by_month(plan_m: pd.DataFrame, fact_m: pd.DataFrame,
+                        ref_cur) -> tuple[dict, float, dict]:
+    """Реализуемость пайплайна: ФАКТ продаж против плана по ЗАКРЫТЫМ месяцам.
+
+    Грейн сравнения — (месяц, ГОСБ, ИНН, сотрудник). Это принципиально: сотрудник мог
+    завести две сделки по одной организации и обе запланировать на один месяц (10 и 15),
+    и пришедшие люди относятся к их СУММЕ (25), а не к каждой сделке по отдельности.
+    Группировку даёт запрос, здесь остаётся свернуть по ГОСБ.
+
+    Текущий месяц исключён: он не отработан, его неполный факт занизил бы коэффициент.
+
+    Диагностика возвращает СЫРОЕ значение до клипа: если реальная конверсия ниже
+    CONV_MIN, клип поднимает её до пола и тем самым ЗАВЫШАЕТ вклад пайплайна. Молчать
+    об этом нельзя — иначе в логе видно ровно «0.20» и непонятно, это настоящая
+    конверсия или сработавшая граница.
     """
-    if conv is None or conv.empty:
-        return {}, 1.0, {"tb_raw": None, "tb_clipped": False, "n_gosb_clipped": 0}
-    c = conv.copy()
-    c["plan_q"] = pd.to_numeric(c["plan_q"], errors="coerce").fillna(0.0)
-    c["fact_q"] = pd.to_numeric(c["fact_q"], errors="coerce").fillna(0.0)
-    tb_row = c[c["new_gosb_id"].isna()]
-    tb_raw = None
-    if not tb_row.empty and float(tb_row["plan_q"].iloc[0]) > 0:
-        tb_raw = float(tb_row["fact_q"].iloc[0]) / float(tb_row["plan_q"].iloc[0])
-    tb_k = float(np.clip(tb_raw if tb_raw is not None else 1.0, CONV_MIN, CONV_MAX))
+    diag = {"months": 0, "plan": 0.0, "fact": 0.0, "tb_raw": None,
+            "tb_clipped": False, "n_gosb": 0, "n_gosb_clipped": 0}
+    if plan_m is None or plan_m.empty:
+        return {}, 1.0, diag
+    cur = pd.Period(pd.Timestamp(ref_cur), freq="M")
+    p = _as_period(plan_m)
+    p = p[p["per"] < cur]                       # только закрытые месяцы
+    if p.empty:
+        return {}, 1.0, diag
+
+    keys = ["new_gosb_id", "inn", "saphr_id", "per"]
+    if fact_m is not None and not fact_m.empty:
+        f = _as_period(fact_m)
+        p = p.merge(f[keys + ["fact_np"]], on=keys, how="left")
+    p["fact_np"] = pd.to_numeric(p.get("fact_np"), errors="coerce").fillna(0.0)
+    p["plan_np"] = pd.to_numeric(p["plan_np"], errors="coerce").fillna(0.0)
+    diag.update({"months": int(p["per"].nunique()),
+                 "plan": float(p["plan_np"].sum()), "fact": float(p["fact_np"].sum())})
+
     by_gosb, n_clipped = {}, 0
-    for r in c[c["new_gosb_id"].notna()].itertuples():
-        if float(r.plan_q) <= 0:
+    for gid, g in p.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
+        pl = float(g["plan_np"].sum())
+        if pl <= 0:
             continue
-        raw = float(r.fact_q) / float(r.plan_q)
-        by_gosb[int(r.new_gosb_id)] = float(np.clip(raw, CONV_MIN, CONV_MAX))
-        if raw < CONV_MIN or raw > CONV_MAX:
+        raw = float(g["fact_np"].sum()) / pl
+        by_gosb[int(gid)] = float(np.clip(raw, CONV_MIN, CONV_MAX))
+        if not (CONV_MIN <= raw <= CONV_MAX):
             n_clipped += 1
-    diag = {"tb_raw": tb_raw, "n_gosb": len(by_gosb), "n_gosb_clipped": n_clipped,
-            "tb_clipped": tb_raw is not None and not (CONV_MIN <= tb_raw <= CONV_MAX)}
-    return by_gosb, tb_k, diag
+    tb_raw = (diag["fact"] / diag["plan"]) if diag["plan"] > 0 else None
+    diag.update({"tb_raw": tb_raw, "n_gosb": len(by_gosb), "n_gosb_clipped": n_clipped,
+                 "tb_clipped": tb_raw is not None and not (CONV_MIN <= tb_raw <= CONV_MAX)})
+    return by_gosb, float(np.clip(tb_raw if tb_raw is not None else 1.0,
+                                  CONV_MIN, CONV_MAX)), diag
 
 
-def pipeline_np(pipe: pd.DataFrame, by_gosb: dict, tb_k: float) -> pd.DataFrame:
-    """План прихода НП на текущий месяц с поправкой на реализуемость.
+def pipeline_current(plan_m: pd.DataFrame, fact_m: pd.DataFrame, ref_cur,
+                     by_gosb: dict, tb_k: float) -> pd.DataFrame:
+    """Пайплайн ТЕКУЩЕГО месяца по (ГОСБ, ИНН): план, уже пришедший факт, прогноз.
 
-    `pipe_np_raw` — как заявил сотрудник (потолок «если отработают на 100%»),
-    `pipe_np` — с поправкой (базовый прогноз).
+    Вклад в прогноз считается симметрично оттоку — факт как нижняя граница:
+
+        pipe_np = max(факт_на_сегодня, план × реализуемость)
+
+    Факт уже случился, поэтому прогноз не может быть меньше него; план со скидкой на
+    историческую реализуемость — оценка того, что ещё придёт до конца месяца.
+    Сотрудники сворачиваются: в прогнозе организация фигурирует целиком.
     """
     cols = ["new_gosb_id", "inn", "seg_funnel", "pipe_np_raw", "pipe_np",
-            "pipe_fot_raw", "pipe_fot", "conv", "n_deals"]
-    if pipe is None or pipe.empty:
+            "pipe_fact_mtd", "pipe_fot_raw", "pipe_fot", "conv", "n_deals"]
+    if plan_m is None or plan_m.empty:
         return pd.DataFrame(columns=cols)
-    p = pipe.dropna(subset=["new_gosb_id"]).copy()
-    p["new_gosb_id"] = p["new_gosb_id"].astype("int64")
-    p["inn"] = p["inn"].astype("int64")
+    cur = pd.Period(pd.Timestamp(ref_cur), freq="M")
+    p = _as_period(plan_m)
+    p = p[(p["per"] == cur) & p["new_gosb_id"].notna()]
+    if p.empty:
+        return pd.DataFrame(columns=cols)
+
+    agg = p.groupby(["new_gosb_id", "inn"], as_index=False).agg(
+        seg_funnel=("seg_funnel", "min"), pipe_np_raw=("plan_np", "sum"),
+        pipe_fot_raw=("plan_fot", "sum"), n_deals=("n_deals", "sum"))
+    if fact_m is not None and not fact_m.empty:
+        f = _as_period(fact_m)
+        f = f[f["per"] == cur]
+        if not f.empty:
+            fa = f.groupby(["new_gosb_id", "inn"], as_index=False).agg(
+                pipe_fact_mtd=("fact_np", "sum"))
+            agg = agg.merge(fa, on=["new_gosb_id", "inn"], how="left")
+    agg["pipe_fact_mtd"] = pd.to_numeric(agg.get("pipe_fact_mtd"),
+                                         errors="coerce").fillna(0.0)
     for c in ("pipe_np_raw", "pipe_fot_raw"):
-        p[c] = pd.to_numeric(p[c], errors="coerce").fillna(0.0)
-    p["conv"] = [by_gosb.get(int(g), tb_k) for g in p["new_gosb_id"]]
-    p["pipe_np"] = p["pipe_np_raw"] * p["conv"]
-    p["pipe_fot"] = p["pipe_fot_raw"] * p["conv"]
-    if "n_deals" not in p:
-        p["n_deals"] = 0
-    return p[cols]
+        agg[c] = pd.to_numeric(agg[c], errors="coerce").fillna(0.0)
+    agg["conv"] = [by_gosb.get(int(g), tb_k) for g in agg["new_gosb_id"]]
+    agg["pipe_np"] = np.maximum(agg["pipe_fact_mtd"], agg["pipe_np_raw"] * agg["conv"])
+    agg["pipe_fot"] = agg["pipe_fot_raw"] * agg["conv"]
+    return agg[cols]
+
+
+def deal_due(plan_m: pd.DataFrame, fact_m: pd.DataFrame, ref_cur) -> pd.DataFrame:
+    """План и факт по сделкам за ЗАКРЫТЫЕ месяцы, свёрнутые до (ГОСБ, ИНН).
+
+    Это то, с чем аудит сравнивает результат: срок по этим месяцам уже прошёл, значит
+    спрашивать за них правомерно. Сумма по сотрудникам и сделкам — по той же причине,
+    что и в conversion_by_month: две сделки одного месяца дают один общий план.
+    """
+    cols = ["new_gosb_id", "inn", "plan_np_due", "fact_np_due", "due_months"]
+    if plan_m is None or plan_m.empty:
+        return pd.DataFrame(columns=cols)
+    cur = pd.Period(pd.Timestamp(ref_cur), freq="M")
+    p = _as_period(plan_m)
+    p = p[(p["per"] < cur) & p["new_gosb_id"].notna()]
+    if p.empty:
+        return pd.DataFrame(columns=cols)
+    keys = ["new_gosb_id", "inn", "saphr_id", "per"]
+    if fact_m is not None and not fact_m.empty:
+        f = _as_period(fact_m)
+        p = p.merge(f[keys + ["fact_np"]], on=keys, how="left")
+    p["fact_np"] = pd.to_numeric(p.get("fact_np"), errors="coerce").fillna(0.0)
+    out = p.groupby(["new_gosb_id", "inn"], as_index=False).agg(
+        plan_np_due=("plan_np", "sum"), fact_np_due=("fact_np", "sum"),
+        due_months=("per", "nunique"))
+    return out[cols]
 
 
 # --------------------------------------------------------------------------- #
@@ -402,8 +475,9 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
     где организации нет в ежедневной витрине и сегмент взять больше неоткуда.
     """
     cols = ["new_gosb_id", "inn", "seg_name", "out_exp", "in_exp", "pipe_np",
-            "pipe_np_raw", "pipe_fot", "pipe_fot_raw", "n_deals", "out_observed",
-            "pred", "out_class", "note", "why", "settled", "avg_salary_m", "delta_fl"]
+            "pipe_np_raw", "pipe_fact_mtd", "pipe_fot", "pipe_fot_raw", "n_deals",
+            "out_observed", "pred", "out_class", "note", "why", "settled",
+            "avg_salary_m", "delta_fl"]
     base = rec if rec is not None and not rec.empty else pd.DataFrame(
         columns=["new_gosb_id", "inn"])
     p = pipe if pipe is not None and not pipe.empty else pd.DataFrame(
@@ -412,7 +486,7 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
         return pd.DataFrame(columns=cols)
 
     m = base.merge(p, on=["new_gosb_id", "inn"], how="outer")
-    for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fot",
+    for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd", "pipe_fot",
               "pipe_fot_raw", "n_deals", "out_observed",
               "pred", "settled", "avg_salary_m"):
         m[c] = pd.to_numeric(m.get(c), errors="coerce").fillna(0.0)
@@ -520,10 +594,10 @@ def waterfall(base: float, orgs_fc: pd.DataFrame, plan: float,
     ФОТ считается по колонкам out_fot / in_fot / pipe_fot, если они есть
     (их добавляет analyze, где известна средняя ЗП организации).
     """
-    z = {c: 0.0 for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw",
+    z = {c: 0.0 for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd",
                           "observed", "out_fot", "in_fot", "pipe_fot", "pipe_fot_raw")}
     if orgs_fc is not None and not orgs_fc.empty:
-        for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw",
+        for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd",
                   "out_fot", "in_fot", "pipe_fot", "pipe_fot_raw"):
             if c in orgs_fc:
                 z[c] = float(pd.to_numeric(orgs_fc[c], errors="coerce").fillna(0).sum())
@@ -535,6 +609,7 @@ def waterfall(base: float, orgs_fc: pd.DataFrame, plan: float,
         "base": base, "out_exp": z["out_exp"], "observed": z["observed"],
         "risk": max(0.0, z["out_exp"] - z["observed"]), "in_exp": z["in_exp"],
         "pipe": z["pipe_np"], "pipe_raw": z["pipe_np_raw"],
+        "pipe_fact": z["pipe_fact_mtd"],
         "pipe_upside": max(0.0, z["pipe_np_raw"] - z["pipe_np"]),
         "forecast": fc, "plan": plan,
         "exec": (fc / plan) if plan else None,

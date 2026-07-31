@@ -176,6 +176,10 @@ td.heat { font-weight: 600; font-variant-numeric: tabular-nums; border-radius: 6
 .g-seg { font-size: 13.5px; line-height: 1.5; letter-spacing: -0.004em; margin: 5px 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
 .g-seg b { font-variant-numeric: tabular-nums; }
 .g-hint { color: var(--text-2); font-size: 12.5px; letter-spacing: -0.003em; }
+/* Вывод LLM в конце своего раздела — тише данных, но с явной пометкой авторства */
+.ai { margin-top: 14px; border-left: 3px solid var(--accent); }
+.ai-head { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+           color: var(--accent); margin-bottom: 6px; }
 /* Таблица «прогноз / план / недобор / орг»: строка «Всего» по ГОСБ и строки сегментов
    в одних колонках — выравнивание делает сравнение за читателя. */
 .g-tbl { margin: 12px 0 0; overflow-x: auto; }

@@ -79,9 +79,11 @@ def generate_all(engine: Engine) -> dict[str, int]:
     dim_company = _dim_company(orgs)
     funnel = _funnel(orgs, gosb)
     pipeline = _pipeline(funnel, orgs)
+    motivation = _motivation(funnel, pipeline, orgs)
     day_outflow = _day_outflow(orgs, profiles)
     # План текущего месяца выводится ИЗ прогноза, поэтому считается последним
-    metrics_cur = _metrics_current(orgs, latest, company, funnel, pipeline, day_outflow)
+    metrics_cur = _metrics_current(orgs, latest, company, funnel, pipeline,
+                                   day_outflow, motivation)
     metrics = pd.concat([metrics, metrics_cur], ignore_index=True)
     ref_base = _reference_base(orgs, gosb)
 
@@ -94,6 +96,8 @@ def generate_all(engine: Engine) -> dict[str, int]:
     counts["uzp_dwh_day_outflow"] = _bulk(engine, day_outflow, "uzp_dwh_day_outflow")
     counts["yva_pl_task_deal_code"] = _bulk(engine, pipeline, "yva_pl_task_deal_code",
                                             schema=config.SCHEMA_T)
+    counts["uzp_data_mzp_motivation_detail_corr"] = _bulk(
+        engine, motivation, "uzp_data_mzp_motivation_detail_corr")
     return counts
 
 
@@ -615,8 +619,120 @@ def _pipeline(funnel: pd.DataFrame, orgs: pd.DataFrame) -> pd.DataFrame:
             .reset_index(drop=True))
 
 
+def _deal_codes(funnel: pd.DataFrame) -> pd.DataFrame:
+    """Справочник кодов сделок: код → (ГОСБ, ИНН, сотрудник, месяц создания).
+
+    Месяц создания нужен, чтобы восстановить ГОД для `pl_month_num` (в пайплайне лежит
+    только номер месяца): сделка живёт 3 месяца, значит планировать может лишь
+    m0, m0+1, m0+2.
+    """
+    f = funnel.copy()
+    f["code"] = f["deal_code"].where(f["deal_code"].notna(), f["task_code"])
+    f["m0"] = pd.to_datetime(
+        f["deal_create_dttm"].where(f["deal_create_dttm"].notna(),
+                                    pd.to_datetime(f["task_create_dt"]))
+    ).dt.to_period("M")
+    return (f.dropna(subset=["code"])
+            .groupby("code", as_index=False)
+            .agg(tb_id=("tb_id", "min"), gosb_id=("gosb_id", "min"), inn=("inn", "min"),
+                 saphr_id=("isu_struct_saphr_id", "min"), m0=("m0", "min"),
+                 segment_name=("segment_name", "min"), company_name=("company_name", "min"),
+                 deal_code=("deal_code", "min"), task_code=("task_code", "min")))
+
+
+def _plan_months(funnel: pd.DataFrame, pipeline: pd.DataFrame) -> pd.DataFrame:
+    """План пайплайна с ВОССТАНОВЛЕННЫМ месяцем (год берётся из даты создания сделки)."""
+    codes = _deal_codes(funnel)
+    pj = pipeline.merge(codes, left_on="pl_task_deal_code", right_on="code", how="inner")
+    off = (pj["pl_month_num"] - pj["m0"].apply(lambda p: p.month) + 12) % 12
+    pj = pj[off <= 2].copy()
+    pj["plan_month"] = [m0 + int(o) for m0, o in zip(pj["m0"], off[off <= 2])]
+    return pj
+
+
+# Распределение product_cmnt как на проме: учтено / не в учёте / для информации
+_CMNT = ("учтено", "не соответствует критериям учета",
+         "для информации, не участвует в расчете kpi")
+_CMNT_P = (0.823, 0.123, 0.054)
+
+
+def _motivation(funnel: pd.DataFrame, pipeline: pd.DataFrame,
+                orgs: pd.DataFrame) -> pd.DataFrame:
+    """Факт привлечения по сделкам, помесячно (витрина премирования МЗП).
+
+    По каждой паре (код сделки, месяц плана) генерируется факт: за ЗАКРЫТЫЕ месяцы —
+    план × реализуемость ГОСБ с шумом, за текущий — частично (месяц ещё идёт), за
+    будущие — ноль. Часть строк помечается как не «учтено» (фрод и «для информации»),
+    чтобы фильтр было на чём проверить; в них факт тоже есть — иначе фильтр ничего
+    бы не менял. Плюс строки чужой метрики (1003007), которые дэш обязан отбросить.
+    """
+    pj = _plan_months(funnel, pipeline)
+    if pj.empty:
+        return pd.DataFrame()
+    # реализуемость своя у каждого ГОСБ — иначе коэффициент везде одинаковый
+    real_by_gosb = {int(g): float(RNG.uniform(0.35, 0.85))
+                    for g in pj["gosb_id"].dropna().unique()}
+    seg_of_inn = {int(i): SEG_SHORT[int(s)]
+                  for i, s in zip(orgs["inn"], orgs["seg_code"])}
+    cur = CUR_MONTH_END.to_period("M")
+    rows = []
+    for r in pj.itertuples():
+        plan = int(r.pl_plan_np_amt or 0)
+        if plan <= 0:
+            continue
+        k = real_by_gosb.get(int(r.gosb_id), 0.6) * float(RNG.uniform(0.7, 1.3))
+        if r.plan_month < cur:
+            fact = int(round(plan * k))                    # месяц закрыт — факт полный
+        elif r.plan_month == cur:
+            fact = int(round(plan * k * MONTH_ELAPSED))    # месяц идёт — факт частичный
+        else:
+            fact = 0                                       # будущее — фактa ещё нет
+        cmnt = str(RNG.choice(_CMNT, p=_CMNT_P))
+        bad = cmnt != "учтено"
+        month_end = r.plan_month.to_timestamp("M").date()
+        base = {
+            "report_dt": month_end, "tb_id": int(r.tb_id), "gosb_id": int(r.gosb_id),
+            "inn": int(r.inn), "company_name": r.company_name,
+            "segment_name": seg_of_inn.get(int(r.inn), "ММБ"),
+            "agrmnt_num": int(RNG.integers(30_000_000, 90_000_000)),
+            "saphr_id": int(r.saphr_id) if pd.notna(r.saphr_id) else None,
+            "position_name": "Менеджер по продаже зарплатных проектов",
+            "metric_id": 1000636,
+            "product_group_name": "Новые получатели", "product_id": 2,
+            "product_name": "Новые получатели b2b",
+            "sales_amt": float(fact),
+            "up_weight": 1.0,
+            "sales_prediction_percent": round(float(k) * 100, 2),
+            "up_sales_amt": float(fact),
+            "consultation_start_dt": r.m0.to_timestamp().date(),
+            "consultation_success_dt": r.m0.to_timestamp("M").date(),
+            "product_cmnt": cmnt, "is_motiv": not bad, "is_fraud": bad,
+            "metric_name": "Новые получатели b2b",
+            "sale_plan_amt": None, "sale_prediction_amt": float(plan),
+            "up_sale_prediction_amt": None, "kpp": None,
+            "deal_code": r.deal_code if pd.notna(r.deal_code) else None,
+            "offer_code": None,
+            "task_code": r.task_code if pd.notna(r.task_code) else None,
+            "ul_epk_id": int(1_200_000_000_000_000_000 + int(r.inn)),
+            "fl_epk_id": None, "sale_approve_dt": None,
+            "calc_dttm": pd.Timestamp.now(), "inserted_dttm": pd.Timestamp.now(),
+            "author_login": "synth",
+        }
+        rows.append(base)
+        # строка ЧУЖОЙ метрики: дэш обязан отбросить её по metric_id
+        if RNG.random() < 0.25:
+            other = dict(base)
+            other.update({"metric_id": 1003007, "metric_name": "Новые физические лица b2b",
+                          "product_name": "Новые физические лица b2b", "product_id": 1,
+                          "product_group_name": "Новые физические лица",
+                          "sales_amt": float(fact * 3)})
+            rows.append(other)
+    return pd.DataFrame(rows)
+
+
 def _forecast_delta(orgs: pd.DataFrame, company: pd.DataFrame, funnel: pd.DataFrame,
-                    pipeline: pd.DataFrame, day_outflow: pd.DataFrame) -> dict:
+                    pipeline: pd.DataFrame, day_outflow: pd.DataFrame,
+                    motivation: pd.DataFrame) -> dict:
     """Дельта прогноза по (ГОСБ, сегмент): −отток +приток +пайплайн.
 
     Считается ТЕМИ ЖЕ функциями forecast.py, что и в дэше, и из тех же таблиц,
@@ -636,36 +752,24 @@ def _forecast_delta(orgs: pd.DataFrame, company: pd.DataFrame, funnel: pd.DataFr
                 avg_salary_m=("m_avg_salary_amt", "max"))
            .rename(columns={"gosb_id": "new_gosb_id", "org_inn": "inn"}))
 
-    codes = funnel.copy()
-    codes["code"] = codes["deal_code"].where(codes["deal_code"].notna(), codes["task_code"])
-    codes = codes.groupby(["gosb_id", "inn", "code"], as_index=False).agg(
-        seg_funnel=("segment_name", "min"))
-    pl = pipeline[pipeline["pl_month_num"] == CUR_MONTH_END.month]
-    pj = codes.merge(pl, left_on="code", right_on="pl_task_deal_code", how="inner")
-    pipe = (pj.groupby(["gosb_id", "inn"], as_index=False)
-            .agg(seg_funnel=("seg_funnel", "min"),
-                 pipe_np_raw=("pl_plan_np_amt", "sum"),
-                 pipe_fot_raw=("pl_plan_fot_amt", "sum"),
-                 n_deals=("code", "count"))
-            .rename(columns={"gosb_id": "new_gosb_id"}))
+    # план и факт пайплайна помесячно — ровно те же функции, что и в дэше
+    plan_m = (_plan_months(funnel, pipeline)
+              .rename(columns={"gosb_id": "new_gosb_id"})
+              .groupby(["new_gosb_id", "inn", "saphr_id", "plan_month"], as_index=False)
+              .agg(seg_funnel=("segment_name", "min"), plan_np=("pl_plan_np_amt", "sum"),
+                   plan_fot=("pl_plan_fot_amt", "sum"), n_deals=("code", "nunique")))
+    plan_m["plan_month"] = [p.to_timestamp("M").date() for p in plan_m["plan_month"]]
+    mv = motivation[(motivation["metric_id"] == 1000636)
+                    & (motivation["product_cmnt"] == "учтено")]
+    fact_m = (mv.rename(columns={"gosb_id": "new_gosb_id"})
+              .groupby(["new_gosb_id", "inn", "saphr_id", "report_dt"], as_index=False)
+              .agg(fact_np=("sales_amt", "sum"))
+              .rename(columns={"report_dt": "plan_month"}))
 
-    # историческая реализуемость сделок — только по «старым» сделкам, как в дэше
-    fresh_from = (CUR_MONTH_END.to_period("M") - 1).to_timestamp()
-    fd = funnel[(funnel["plan_staff_deal_qty"] > 0) & funnel["deal_create_dttm"].notna()]
-    fd = fd[pd.to_datetime(fd["deal_create_dttm"]) < fresh_from]
-    conv = fd.groupby("gosb_id", as_index=False).agg(
-        plan_q=("plan_staff_deal_qty", "sum"), fact_q=("fact_staff_deal_qty", "sum"))
-    conv = conv.rename(columns={"gosb_id": "new_gosb_id"})
-    conv = pd.concat([conv, pd.DataFrame([{
-        "new_gosb_id": np.nan,
-        "plan_q": float(fd["plan_staff_deal_qty"].sum()),
-        "fact_q": float(fd["fact_staff_deal_qty"].sum()),
-    }])], ignore_index=True)
-    by_gosb, tb_k = forecast.conversion(conv)
-
+    by_gosb, tb_k, _ = forecast.conversion_by_month(plan_m, fact_m, CUR_MONTH_END)
     pred = forecast.outflow_model(hist, CUR_MONTH_END)
     rec = forecast.reconcile(day, pred, MONTH_ELAPSED)
-    pipe_fc = forecast.pipeline_np(pipe, by_gosb, tb_k)
+    pipe_fc = forecast.pipeline_current(plan_m, fact_m, CUR_MONTH_END, by_gosb, tb_k)
     ofc = forecast.org_forecast(rec, pipe_fc, seg_of={})
 
     code_of = {v: k for k, v in SEG_SHORT.items()}
@@ -683,7 +787,7 @@ def _forecast_delta(orgs: pd.DataFrame, company: pd.DataFrame, funnel: pd.DataFr
 
 def _metrics_current(orgs: pd.DataFrame, latest: pd.DataFrame, company: pd.DataFrame,
                      funnel: pd.DataFrame, pipeline: pd.DataFrame,
-                     day_outflow: pd.DataFrame) -> pd.DataFrame:
+                     day_outflow: pd.DataFrame, motivation: pd.DataFrame) -> pd.DataFrame:
     """Строки uzp_dwh_metrics за ТЕКУЩИЙ (незакрытый) месяц.
 
     План выводится ИЗ прогноза: plan = прогноз / целевое выполнение. Так сценарий
@@ -694,7 +798,7 @@ def _metrics_current(orgs: pd.DataFrame, latest: pd.DataFrame, company: pd.DataF
     но она должна быть, как на проме: если кто-то возьмёт её по ошибке, это сразу
     видно по заниженным цифрам.
     """
-    delta = _forecast_delta(orgs, company, funnel, pipeline, day_outflow)
+    delta = _forecast_delta(orgs, company, funnel, pipeline, day_outflow, motivation)
     start = CUR_MONTH_END.replace(day=1)
     tidy = []
     for r in latest.itertuples():

@@ -16,6 +16,7 @@ DROP TABLE IF EXISTS uzp_dwh_sale_funnel_task CASCADE;
 DROP TABLE IF EXISTS uzp_dim_company CASCADE;
 DROP TABLE IF EXISTS uzp_dim_mzp_reference_base CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_day_outflow CASCADE;
+DROP TABLE IF EXISTS uzp_data_mzp_motivation_detail_corr CASCADE;
 DROP TABLE IF EXISTS __SCHEMA_T__.yva_pl_task_deal_code CASCADE;
 
 -- ============ Справочники (грузятся из CSV как есть) ============
@@ -259,6 +260,54 @@ CREATE TABLE __SCHEMA_T__.yva_pl_task_deal_code (
   PRIMARY KEY (pl_task_deal_code, pl_month_num)
 );
 
+-- ============ Факт привлечения по сделкам, помесячно ============
+-- Витрина премирования МЗП. Для дэша важны четыре вещи:
+--   report_dt  — МЕСЯЦ ИЗ ПАЙПЛАЙНА, на который сделка обещала привлечение;
+--   sales_amt  — сколько НП по ней реально пришло (факт продаж, количество);
+--   (gosb_id, inn, saphr_id) — грейн сравнения плана с фактом.
+-- Сравнивать надо АГРЕГАТ: сотрудник мог завести две сделки по одной организации и
+-- обе запланировать на один месяц — факт месяца относится к их сумме, а не к каждой.
+-- metric_id = 1000636 («Новые получатели b2b»), учитываются строки product_cmnt='учтено'.
+
+CREATE TABLE uzp_data_mzp_motivation_detail_corr (
+  report_dt                date,        -- отчётный месяц (месяц из пайплайна)
+  tb_id                    smallint,
+  gosb_id                  integer,
+  inn                      bigint,
+  company_name             text,
+  segment_name             text,
+  agrmnt_num               integer,
+  saphr_id                 bigint,      -- табельный сотрудника (= isu_struct_saphr_id)
+  position_name            text,
+  metric_id                bigint,
+  product_group_name       text,
+  product_id               bigint,
+  product_name             text,
+  sales_amt                numeric,     -- ФАКТ продаж, количество
+  up_weight                numeric,
+  sales_prediction_percent numeric,
+  up_sales_amt             numeric,
+  consultation_start_dt    date,
+  consultation_success_dt  date,
+  product_cmnt             text,        -- 'учтено' | 'не соответствует критериям учета' | …
+  is_motiv                 boolean,
+  is_fraud                 boolean,
+  metric_name              varchar,
+  sale_plan_amt            numeric,
+  sale_prediction_amt      numeric,
+  up_sale_prediction_amt   numeric,
+  kpp                      varchar,
+  deal_code                varchar,
+  offer_code               varchar,
+  task_code                varchar,
+  ul_epk_id                bigint,
+  fl_epk_id                bigint,
+  sale_approve_dt          timestamp,
+  calc_dttm                timestamp,
+  inserted_dttm            timestamp,
+  author_login             text
+);
+
 -- Индексы под запросы дэшей
 CREATE INDEX ix_metrics_lookup ON uzp_dwh_metrics (metric_id, level_name, period_type, end_dt);
 CREATE INDEX ix_chm_gosb ON uzp_dwh_company_holding_metric (level_id, report_dt);
@@ -267,3 +316,4 @@ CREATE INDEX ix_gosb_tb ON uzp_dim_gosb (tb_id);
 CREATE INDEX ix_ref_base ON uzp_dim_mzp_reference_base (gosb_id, inn);
 CREATE INDEX ix_chm_hist ON uzp_dwh_company_holding_metric (org_id, level_id, report_dt);
 CREATE INDEX ix_day_outflow ON uzp_dwh_day_outflow (report_dt, act_dt, gosb_id);
+CREATE INDEX ix_motiv ON uzp_data_mzp_motivation_detail_corr (tb_id, metric_id, report_dt);
