@@ -359,10 +359,14 @@ codes AS (
 ),
 resolved AS (
   SELECT c.new_gosb_id, c.inn, c.saphr_id, c.seg_funnel, c.code,
-         -- КОНЕЦ месяца: report_dt в витрине факта тоже конец месяца, иначе не сойдётся
-         CAST(c.m0 + make_interval(months =>
-                ((p.pl_month_num - CAST(EXTRACT(MONTH FROM c.m0) AS int) + 12) % 12))
-              + interval '1 month - 1 day' AS date)                   AS plan_month,
+         -- КОНЕЦ месяца: report_dt в витрине факта тоже конец месяца, иначе не сойдётся.
+         -- Сдвиг через умножение интервала, а НЕ make_interval(months => …): именованные
+         -- аргументы через «=>» появились только в PostgreSQL 9.5, а Greenplum стоит на
+         -- ядре 9.4 и разбирает «=>» как оператор («column months does not exist»).
+         CAST(c.m0
+              + ((p.pl_month_num - CAST(EXTRACT(MONTH FROM c.m0) AS int) + 12) % 12)
+                * interval '1 month'
+              + interval '1 month' - interval '1 day' AS date)        AS plan_month,
          ((p.pl_month_num - CAST(EXTRACT(MONTH FROM c.m0) AS int) + 12) % 12) AS off_m,
          COALESCE(p.pl_plan_np_amt, 0)  AS plan_np,
          COALESCE(p.pl_plan_fot_amt, 0) AS plan_fot
@@ -410,8 +414,8 @@ JOIN {schema_t}.yva_pl_task_deal_code p ON p.pl_task_deal_code = c.code
 PIPELINE_FACT_M = """
 WITH gmap AS (""" + _GMAP + """)
 SELECT g.new_gosb_id, m.inn, m.saphr_id,
-       CAST(date_trunc('month', m.report_dt) + interval '1 month - 1 day' AS date)
-                                AS plan_month,
+       CAST(date_trunc('month', m.report_dt)
+            + interval '1 month' - interval '1 day' AS date) AS plan_month,
        sum(COALESCE(m.sales_amt, 0)) AS fact_np
 FROM {schema}.uzp_data_mzp_motivation_detail_corr m
 LEFT JOIN gmap g ON g.old_gosb_id = m.gosb_id
