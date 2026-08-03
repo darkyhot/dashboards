@@ -244,26 +244,41 @@ def run(ctx, tb_short: str) -> Analysis:
 def _dates(engine, params: dict) -> dict:
     """Опорные даты дэша.
 
-    Ежедневная витрина оттока живёт ТОЛЬКО за текущий месяц (один report_dt и один
-    act_dt), поэтому именно она задаёт «сегодня»: прогнозный месяц и дату, по
-    которую есть факт зачислений. Параметр `date`, если задан, означает
-    ПРОГНОЗНЫЙ месяц. Если витрины нет — откатываемся на прежнюю логику
-    (закрытый месяц company_holding + 1 месяц) и говорим об этом явно.
+    ПРОГНОЗНЫЙ месяц задаётся параметром `report_month` (синоним — устаревший `date`).
+    Если он не задан, берётся самый свежий месяц ежедневной витрины оттока. Витрина
+    хранит ВСЕ месяцы, поэтому отчёт можно пересобрать и за прошлый период — но тогда
+    дату актуальности надо брать ИМЕННО ЗА ЭТОТ месяц (`ACT_DT_FOR`), а не за
+    последний: иначе весь расчёт «сколько выплат уже увидели» считается по чужому
+    периоду. Если витрины нет вовсе — откат на закрытый месяц company_holding + 1.
     """
     ref_cur = act_dt = None
     src = ""
-    if params.get("date"):
-        ref_cur = (pd.to_datetime(params["date"]) + pd.offsets.MonthEnd(0)).date()
-        src = "задан параметром date"
+    asked = params.get("report_month") or params.get("date")
+    if asked:
+        ref_cur = (pd.to_datetime(asked) + pd.offsets.MonthEnd(0)).date()
+        src = "задан параметром report_month"
     row = read_sql(engine, Q.REF_CUR)
     if not row.empty and pd.notna(row.ref_cur.iloc[0]):
         d_cur = pd.to_datetime(row.ref_cur.iloc[0]).date()
         d_act = (pd.to_datetime(row.act_dt.iloc[0]).date()
                  if pd.notna(row.act_dt.iloc[0]) else d_cur)
         if ref_cur is None:
-            ref_cur, act_dt, src = d_cur, d_act, "ежедневная витрина оттока"
+            ref_cur, act_dt, src = d_cur, d_act, "последний месяц ежедневной витрины"
         elif d_cur == ref_cur:
             act_dt = d_act
+        else:
+            # заданный месяц не последний — берём дату актуальности ЭТОГО месяца
+            a = read_sql(engine, Q.ACT_DT_FOR, {"ref_cur": ref_cur})
+            n_rows = int(a.n_rows.iloc[0] or 0) if not a.empty else 0
+            if n_rows and pd.notna(a.act_dt.iloc[0]):
+                act_dt = pd.to_datetime(a.act_dt.iloc[0]).date()
+                progress.done(f"Месяц отчёта {ref_cur} — не последний в витрине "
+                              f"(там {d_cur}); дата актуальности взята за этот месяц: "
+                              f"{act_dt}, строк {n_rows}")
+            else:
+                progress.done(f"ВНИМАНИЕ: за {ref_cur} в ежедневной витрине нет строк "
+                              f"(последний месяц там {d_cur}) — наблюдаемого оттока не "
+                              f"будет, отток посчитается только по модели истории")
     if ref_cur is None:
         closed = pd.to_datetime(read_sql(engine, Q.REF_DATE).iloc[0, 0]).date()
         ref_cur = (pd.Timestamp(closed) + pd.offsets.MonthEnd(1)).date()
@@ -426,7 +441,7 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
     for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd", "pipe_fot",
               "out_observed", "pred", "settled", "n_deals",
               "plan_np_due", "fact_np_due", "due_months"):
-        merged[c] = pd.to_numeric(merged.get(c), errors="coerce").fillna(0.0)
+        merged[c] = forecast.num(merged, c)
     for c in ("out_class", "note", "why"):
         merged[c] = merged.get(c).fillna("") if c in merged else ""
     merged["out_class"] = merged["out_class"].replace("", forecast.CLS_STABLE)

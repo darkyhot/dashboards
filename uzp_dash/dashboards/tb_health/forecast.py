@@ -296,7 +296,7 @@ def reconcile(day: pd.DataFrame, pred: pd.DataFrame, month_elapsed: float) -> pd
 
     m["has_day"] = m["out_observed"].notna() if "out_observed" in m else False
     for c in ("pred", "base_fl", "out_observed", "paid_mtd", "fl_prev_m", "avg_salary_m"):
-        m[c] = pd.to_numeric(m.get(c), errors="coerce").fillna(0.0)
+        m[c] = num(m, c)
     m["out_class"] = m.get("out_class").fillna(CLS_STABLE) if "out_class" in m else CLS_STABLE
     m["note"] = m.get("note").fillna("") if "note" in m else ""
     # база: закрытый месяц из витрины, фолбэк — ФЛ прошлого месяца из дневной
@@ -342,6 +342,18 @@ def _why(pred, observed, settled, out_exp, in_exp, has_day) -> str:
             f"отыграно {settled * 100:.0f}% → {out_exp:.0f}")
 
 
+def num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    """Числовая колонка, которой может не быть вовсе.
+
+    `pd.to_numeric(df.get(col))` для отсутствующей колонки возвращает СКАЛЯР (nan),
+    и следующий `.fillna()` падает с AttributeError. Это выстреливает на пустых
+    срезах — например, когда у ТБ нет ни одной сделки в пайплайне.
+    """
+    if col in df:
+        return pd.to_numeric(df[col], errors="coerce").fillna(default)
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
 def _as_period(df: pd.DataFrame, col: str = "plan_month") -> pd.DataFrame:
     """Привести месяц к Period и ключи к Int64 — иначе merge молча не сойдётся."""
     out = df.copy()
@@ -382,7 +394,7 @@ def conversion_by_month(plan_m: pd.DataFrame, fact_m: pd.DataFrame,
     if fact_m is not None and not fact_m.empty:
         f = _as_period(fact_m)
         p = p.merge(f[keys + ["fact_np"]], on=keys, how="left")
-    p["fact_np"] = pd.to_numeric(p.get("fact_np"), errors="coerce").fillna(0.0)
+    p["fact_np"] = num(p, "fact_np")
     p["plan_np"] = pd.to_numeric(p["plan_np"], errors="coerce").fillna(0.0)
     diag.update({"months": int(p["per"].nunique()),
                  "plan": float(p["plan_np"].sum()), "fact": float(p["fact_np"].sum())})
@@ -452,8 +464,7 @@ def pipeline_current(plan_m: pd.DataFrame, fact_m: pd.DataFrame, ref_cur,
             fa = f.groupby(["new_gosb_id", "inn"], as_index=False).agg(
                 pipe_fact_mtd=("fact_np", "sum"))
             agg = agg.merge(fa, on=["new_gosb_id", "inn"], how="left")
-    agg["pipe_fact_mtd"] = pd.to_numeric(agg.get("pipe_fact_mtd"),
-                                         errors="coerce").fillna(0.0)
+    agg["pipe_fact_mtd"] = num(agg, "pipe_fact_mtd")
     for c in ("pipe_np_raw", "pipe_fot_raw"):
         agg[c] = pd.to_numeric(agg[c], errors="coerce").fillna(0.0)
     agg["conv"] = [by_gosb.get(int(g), tb_k) for g in agg["new_gosb_id"]]
@@ -487,7 +498,7 @@ def deal_due(plan_m: pd.DataFrame, fact_m: pd.DataFrame, ref_cur) -> pd.DataFram
     if fact_m is not None and not fact_m.empty:
         f = _as_period(fact_m)
         p = p.merge(f[keys + ["fact_np"]], on=keys, how="left")
-    p["fact_np"] = pd.to_numeric(p.get("fact_np"), errors="coerce").fillna(0.0)
+    p["fact_np"] = num(p, "fact_np")
     out = p.groupby(["new_gosb_id", "inn"], as_index=False).agg(
         plan_np_due=("plan_np", "sum"), fact_np_due=("fact_np", "sum"),
         due_months=("per", "nunique"))
@@ -518,7 +529,7 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
               "pipe_rest", "pipe_expect", "pipe_fot",
               "pipe_fot_raw", "n_deals", "out_observed",
               "pred", "settled", "avg_salary_m"):
-        m[c] = pd.to_numeric(m.get(c), errors="coerce").fillna(0.0)
+        m[c] = num(m, c)
     for c in ("out_class", "note", "why"):
         m[c] = m.get(c).fillna("") if c in m else ""
     m["out_class"] = m["out_class"].replace("", CLS_STABLE)

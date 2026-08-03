@@ -25,15 +25,25 @@ REF_DATE = """
 SELECT max(report_dt) AS ref FROM {schema}.uzp_dwh_company_holding_metric
 """
 
-# Опорные даты дэша. Ежедневная витрина живёт ТОЛЬКО за текущий месяц (один
-# report_dt и один act_dt), поэтому именно она задаёт «сегодня»: прогнозный месяц
-# и дату, по которую есть факт зачислений.
+# Опорные даты дэша по умолчанию: САМЫЙ СВЕЖИЙ месяц ежедневной витрины и дата, по
+# которую в нём есть факт зачислений. Витрина хранит ВСЕ месяцы, поэтому max() здесь
+# означает «последний доступный», а не «единственный»; чтобы построить отчёт за более
+# ранний месяц, он задаётся параметром, и тогда act_dt берётся запросом ACT_DT_FOR.
 REF_CUR = """
 SELECT r.ref_cur,
        (SELECT max(d.act_dt) FROM {schema}.uzp_dwh_day_outflow d
         WHERE d.report_dt = r.ref_cur) AS act_dt
 FROM (SELECT max(report_dt) AS ref_cur FROM {schema}.uzp_dwh_day_outflow) r
 WHERE r.ref_cur IS NOT NULL
+"""
+
+# Дата актуальности ИМЕННО ЗАДАННОГО месяца. Нужна, когда месяц отчёта задан
+# параметром и не совпадает с последним: брать act_dt последнего месяца нельзя —
+# он из другого периода, и весь расчёт «сколько выплат уже увидели» поедет.
+ACT_DT_FOR = """
+SELECT max(act_dt) AS act_dt, count(*) AS n_rows
+FROM {schema}.uzp_dwh_day_outflow
+WHERE report_dt = :ref_cur
 """
 
 # Резолв ТБ по короткому имени -> tb_id, полное имя

@@ -42,6 +42,9 @@ OPTIONS: dict = {
     "extra": {},
     # (connect, read). Генерация длинного JSON у думающей модели > 30 с.
     "timeout": (10, int(os.environ.get("UZP_LLM_READ_TIMEOUT", "120"))),
+    # Модель. None -> берётся из .env по контуру (см. _model_for). Задаётся из
+    # тетрадки: generate_dashboard(llm_opts={"model": "glm-5.1"}).
+    "model": None,
 }
 
 # Метаданные последнего вызова — для логов в тетрадке.
@@ -49,7 +52,7 @@ LAST_META: dict = {}
 
 
 def configure(max_tokens: int | None = None, extra: dict | None = None,
-              timeout: tuple | int | None = None) -> dict:
+              timeout: tuple | int | None = None, model: str | None = None) -> dict:
     """Настроить вызовы LLM из тетрадки. Возвращает актуальные опции."""
     if max_tokens is not None:
         OPTIONS["max_tokens"] = int(max_tokens)
@@ -57,7 +60,25 @@ def configure(max_tokens: int | None = None, extra: dict | None = None,
         OPTIONS["extra"] = dict(extra)
     if timeout is not None:
         OPTIONS["timeout"] = timeout
+    if model is not None:
+        OPTIONS["model"] = str(model).strip() or None
     return dict(OPTIONS)
+
+
+def _model_for(contour: str, model: str | None) -> str:
+    """Какая модель поедет в запрос.
+
+    Приоритет: явный аргумент вызова → опция из тетрадки (llm_opts["model"]) →
+    переменная окружения контура → дефолт. Так тетрадка может переопределить .env,
+    не трогая окружение.
+    """
+    if model:
+        return model
+    if OPTIONS.get("model"):
+        return str(OPTIONS["model"])
+    if contour == "closed":
+        return os.environ.get("UZP_LLM_MODEL", "glm-5.1")
+    return os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 
 _SESSION = None
@@ -168,7 +189,7 @@ def _complete_deepseek(prompt: str, model: str | None, temperature: float) -> st
     if not key:
         raise LLMError("Не задан DEEPSEEK_API_KEY (.env)")
     url = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com").rstrip("/")
-    model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+    model = _model_for("open", model)
     data, meta = _post_json(
         f"{url}/chat/completions",
         {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -183,7 +204,7 @@ def _complete_corporate(prompt: str, model: str | None, temperature: float) -> s
     base = os.environ.get("GIGACHAT_API_URL")
     if not token or not base:
         raise LLMError("Не заданы JPY_API_TOKEN / GIGACHAT_API_URL (закрытый контур)")
-    model = model or os.environ.get("UZP_LLM_MODEL", "glm-5.1")
+    model = _model_for("closed", model)
     data, meta = _post_json(
         f"{base.rstrip('/')}/chat/completions",
         {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},

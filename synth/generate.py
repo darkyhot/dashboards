@@ -56,6 +56,9 @@ MONTH_ELAPSED = ACT_DT.day / CUR_MONTH_END.day
 # база (июнь) и прогноз (июль) лежат в одной фазе сезона и сезонной дельты нет.
 SEASON_MONTHS = (7, 8, 9)
 SEASON_UP, SEASON_DOWN = 1.40, 0.60
+# Ежедневная витрина оттока хранит ВСЕ месяцы, а не только текущий: без этого не
+# проверить пересборку отчёта за прошлый месяц. Закрытые месяцы отдаются целиком.
+DAY_OUTFLOW_MONTHS = 4
 # Частичная ЗП-ведомость текущего месяца: этот факт в дэше НЕ используется
 # (в этом и смысл прогноза), но в витрине он есть — как на проме.
 PARTIAL_FACT_SHARE = 0.62
@@ -487,7 +490,11 @@ def _company_holding(orgs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _day_outflow(orgs: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
-    """Ежедневная витрина оттока ТЕКУЩЕГО (незакрытого) месяца.
+    """Ежедневная витрина оттока за DAY_OUTFLOW_MONTHS месяцев.
+
+    Витрина хранит ВСЕ месяцы, а не только текущий, — иначе не проверить сценарий
+    «пересобрать отчёт за прошлый месяц». Закрытые месяцы отдаются целиком
+    (act_dt = конец месяца), текущий — частично (act_dt = ACT_DT).
 
     Строка на каждую ПРОШЕДШУЮ выплатную дату месяца (аванс + основная). У аванса
     неоплаченных больше, поэтому min(outflow_unpaid_m_qty) по двум датам — это и
@@ -501,75 +508,80 @@ def _day_outflow(orgs: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
     """
     o = orgs.merge(profiles, on=["inn", "gosb_id"], how="left")
     rows = []
-    for r in o.itertuples():
-        fl_prev = int(r.current_fl_qty)
-        kind = r.kind if isinstance(r.kind, str) else "flat"
-        u = float(RNG.random())
-        if kind in ("persistent", "season_out"):
-            observed = (int(RNG.integers(0, 4)) if u < 0.45
-                        else int(round(fl_prev * RNG.uniform(0.05, 0.20))))
-        elif kind == "flat" and u > 0.85:
-            observed = int(round(fl_prev * RNG.uniform(0.15, 0.30)))
-        else:
-            observed = int(RNG.integers(0, 3))
-        observed = min(observed, fl_prev)
-        two_pay = bool(RNG.random() < 0.70)
-        paid = fl_prev - observed
-        if not two_pay:                      # прошёл только аванс — часть ещё в пути
-            paid = int(round(paid * RNG.uniform(0.80, 0.92)))
-        sal = float(r.avg_salary)
-        expect = max(1, fl_prev)
-        for order in ((1, 2) if two_pay else (1,)):
-            # у аванса «неоплаченных» больше: часть получит только основную выплату
-            extra = int(RNG.integers(0, 6)) if (two_pay and order == 1) else 0
-            unpaid_m = min(expect, observed + extra)
-            day_out = min(expect, unpaid_m + int(RNG.integers(0, 3)))
-            pay_dt = CUR_MONTH_END.replace(day=10 if order == 1 else 25)
-            rows.append({
-                "row_code": (f"{CUR_MONTH_END:%Y%m%d}_{ACT_DT:%Y%m%d}_"
-                             f"{int(r.gosb_id)}_{int(r.inn)}_{order}"),
-                "report_dt": CUR_MONTH_END.date(),
-                "act_dt": ACT_DT.date(),
-                "tb_id": int(r.tb_id),
-                "gosb_id": int(r.gosb_id),
-                "org_inn": int(r.inn),
-                "segment_name": SEG_SHORT[int(r.seg_code)],
-                "company_name": None,
-                "holding_name": None,
-                "is_security_force": False,
-                "saphr_id": (None if RNG.random() < 0.15
-                             else int(1_000_000 + int(r.inn) % 900_000)),
-                "salary_payment_dt": pay_dt.date(),
-                "payment_order_num": order,
-                "expect_fl_qty": expect,
-                "overflow_qty": 0,
-                "plan_fl_qty": expect,
-                "fl_day_qty": max(0, expect - day_out),
-                "fl_2_d_qty": max(0, expect - unpaid_m),
-                "fact_fl_qty": paid,
-                "outflow_unpaid_report_qty": day_out,
-                "outflow_unpaid_2_d_qty": unpaid_m,
-                "outflow_unpaid_m_qty": unpaid_m,
-                "outflow_day_perc": round(day_out / expect, 4),
-                "outflow_2_d_perc": round(unpaid_m / expect, 4),
-                "outflow_unpaid_m_perc": round(unpaid_m / expect, 4),
-                "overflow_other_inn_perc": 0.0,
-                "m_avg_salary_amt": round(sal, 2),
-                "prev_m_avg_salary_amt": round(sal * float(RNG.uniform(0.95, 1.05)), 2),
-                "next_m_avg_salary_amt": None,
-                "fl_crnt_m_qty": paid,
-                "fl_prev_m_qty": fl_prev,
-                "fl_next_m_qty": 0,
-                "is_d_outflow_task": bool(unpaid_m > 0 and RNG.random() < 0.3),
-                "client_communication_infopovod": None,
-                "is_oktmo": None,
-                "oktmo_subject_code": None,
-                "oktmo_subject_district_code": None,
-                "oktmo_subject_district_city_code": None,
-                "oktmo_code": None,
-                "inserted_dttm": pd.Timestamp.now(),
-                "author_login": "synth",
-            })
+    months = [(CUR_MONTH_END.to_period("M") - k).to_timestamp("M")
+              for k in range(DAY_OUTFLOW_MONTHS - 1, -1, -1)]
+    for month_end in months:
+        is_cur = month_end.to_period("M") == CUR_MONTH_END.to_period("M")
+        act = ACT_DT if is_cur else month_end
+        for r in o.itertuples():
+            fl_prev = int(r.current_fl_qty)
+            kind = r.kind if isinstance(r.kind, str) else "flat"
+            u = float(RNG.random())
+            if kind in ("persistent", "season_out"):
+                observed = (int(RNG.integers(0, 4)) if u < 0.45
+                            else int(round(fl_prev * RNG.uniform(0.05, 0.20))))
+            elif kind == "flat" and u > 0.85:
+                observed = int(round(fl_prev * RNG.uniform(0.15, 0.30)))
+            else:
+                observed = int(RNG.integers(0, 3))
+            observed = min(observed, fl_prev)
+            two_pay = bool(RNG.random() < 0.70)
+            paid = fl_prev - observed
+            if not two_pay:                      # прошёл только аванс — часть ещё в пути
+                paid = int(round(paid * RNG.uniform(0.80, 0.92)))
+            sal = float(r.avg_salary)
+            expect = max(1, fl_prev)
+            for order in ((1, 2) if two_pay else (1,)):
+                # у аванса «неоплаченных» больше: часть получит только основную выплату
+                extra = int(RNG.integers(0, 6)) if (two_pay and order == 1) else 0
+                unpaid_m = min(expect, observed + extra)
+                day_out = min(expect, unpaid_m + int(RNG.integers(0, 3)))
+                pay_dt = month_end.replace(day=10 if order == 1 else 25)
+                rows.append({
+                    "row_code": (f"{month_end:%Y%m%d}_{act:%Y%m%d}_"
+                                 f"{int(r.gosb_id)}_{int(r.inn)}_{order}"),
+                    "report_dt": month_end.date(),
+                    "act_dt": act.date(),
+                    "tb_id": int(r.tb_id),
+                    "gosb_id": int(r.gosb_id),
+                    "org_inn": int(r.inn),
+                    "segment_name": SEG_SHORT[int(r.seg_code)],
+                    "company_name": None,
+                    "holding_name": None,
+                    "is_security_force": False,
+                    "saphr_id": (None if RNG.random() < 0.15
+                                 else int(1_000_000 + int(r.inn) % 900_000)),
+                    "salary_payment_dt": pay_dt.date(),
+                    "payment_order_num": order,
+                    "expect_fl_qty": expect,
+                    "overflow_qty": 0,
+                    "plan_fl_qty": expect,
+                    "fl_day_qty": max(0, expect - day_out),
+                    "fl_2_d_qty": max(0, expect - unpaid_m),
+                    "fact_fl_qty": paid,
+                    "outflow_unpaid_report_qty": day_out,
+                    "outflow_unpaid_2_d_qty": unpaid_m,
+                    "outflow_unpaid_m_qty": unpaid_m,
+                    "outflow_day_perc": round(day_out / expect, 4),
+                    "outflow_2_d_perc": round(unpaid_m / expect, 4),
+                    "outflow_unpaid_m_perc": round(unpaid_m / expect, 4),
+                    "overflow_other_inn_perc": 0.0,
+                    "m_avg_salary_amt": round(sal, 2),
+                    "prev_m_avg_salary_amt": round(sal * float(RNG.uniform(0.95, 1.05)), 2),
+                    "next_m_avg_salary_amt": None,
+                    "fl_crnt_m_qty": paid,
+                    "fl_prev_m_qty": fl_prev,
+                    "fl_next_m_qty": 0,
+                    "is_d_outflow_task": bool(unpaid_m > 0 and RNG.random() < 0.3),
+                    "client_communication_infopovod": None,
+                    "is_oktmo": None,
+                    "oktmo_subject_code": None,
+                    "oktmo_subject_district_code": None,
+                    "oktmo_subject_district_city_code": None,
+                    "oktmo_code": None,
+                    "inserted_dttm": pd.Timestamp.now(),
+                    "author_login": "synth",
+                })
     return pd.DataFrame(rows)
 
 
