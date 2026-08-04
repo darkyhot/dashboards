@@ -168,6 +168,27 @@ td.heat { font-weight: 600; font-variant-numeric: tabular-nums; border-radius: 6
 .gcard:focus-visible { outline: 2px solid var(--good); outline-offset: 2px; }
 .g-more { margin-top: 10px; font-size: 12.5px; font-weight: 600; color: var(--good);
           letter-spacing: -0.004em; }
+/* Переход на уровень ниже (карточка ТБ в отчёте банка) — отдельное действие,
+   а не открытие оверлея, поэтому и выглядит как ссылка, а не как подпись */
+.g-drill { border-top: 1px solid var(--separator); padding-top: 8px; cursor: pointer; }
+.g-drill:hover { text-decoration: underline; }
+
+/* Вкладки уровней: СБ и каждый ТБ. Липкие — разбор длинный, а переключаться
+   между уровнями надо из любого места страницы. */
+.lvls { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 6px;
+        padding: 10px 0; margin: 0 0 8px; background: var(--bg);
+        border-bottom: 1px solid var(--separator); }
+.lvl-tab { border: 0; border-radius: 980px; padding: 6px 14px; cursor: pointer;
+           font-size: 13px; font-weight: 600; letter-spacing: -0.006em;
+           background: var(--separator); color: var(--text-2);
+           transition: background var(--spring), color var(--spring); }
+.lvl-tab:hover { color: var(--text); }
+.lvl-tab.on { background: var(--text); color: var(--bg); }
+.lvl-back { display: flex; align-items: center; gap: 12px; margin: 0 0 14px; }
+.lvl-back button { border: 0; background: var(--separator); color: var(--text);
+                   border-radius: 980px; padding: 5px 12px; cursor: pointer;
+                   font-size: 12.5px; font-weight: 600; }
+.lvl-back span { font-size: 13px; color: var(--text-2); }
 .gcard .g-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .gcard .g-head h3 { font-size: 17px; }
 .gcard .g-ex { font-variant-numeric: tabular-nums; font-weight: 680; font-size: 20px; letter-spacing: -0.02em; }
@@ -284,5 +305,6 @@ dialog.gd[open] { animation: gd-in 0.22s cubic-bezier(0.22, 1, 0.36, 1); }
   .gcard:hover { transform: none; }
   dialog.gd[open] { animation: none; }
   .gd-gt::before { transition: none; }
+  .lvl-tab { transition: none; }
 }
 """

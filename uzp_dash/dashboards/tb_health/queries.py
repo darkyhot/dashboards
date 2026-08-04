@@ -53,6 +53,14 @@ FROM {schema}.uzp_dim_gosb
 WHERE tb_short_name = :tb
 """
 
+# Все ТБ — их прогоняет отчёт уровня СБ
+TB_LIST = """
+SELECT DISTINCT tb_id, tb_short_name, tb_full_name
+FROM {schema}.uzp_dim_gosb
+WHERE tb_short_name IS NOT NULL
+ORDER BY tb_short_name
+"""
+
 # Вердикт по обеим метрикам за текущий месяц (:ref) + ранг ТБ среди всех (лучший = 1)
 TB_VERDICT = """
 WITH tb AS (SELECT DISTINCT tb_id, tb_short_name FROM {schema}.uzp_dim_gosb)
@@ -66,6 +74,62 @@ WHERE m.level_name='tb' AND m.period_type='m' AND COALESCE(m.extended_dim_1,1)=1
   AND m.end_dt = :ref AND m.metric_id IN (:m_fot, :m_rcp)
 """
 
+# Вердикт всего банка. Отдельного sb_id нет ни в одной таблице — уровень живёт
+# ТОЛЬКО в витрине метрик как level_name='sb', поэтому план и факт СБ читаются
+# отсюда, а НЕ складываются из ТБ (сумма ТБ витрине не равна — см. раздел 12
+# методологии). Ранга нет: сравнивать банк не с кем.
+SB_VERDICT = """
+SELECT m.metric_id, m.level_id, m.end_dt,
+       m.plan_amt, m.fact_amt, m.execution_percent
+FROM {schema}.uzp_dwh_metrics m
+WHERE m.level_name='sb' AND m.period_type='m' AND COALESCE(m.extended_dim_1,1)=1
+  AND m.end_dt = :ref AND m.metric_id IN (:m_fot, :m_rcp)
+"""
+
+# Диагностика: сколько разных level_id лежит под level_name='sb'. В профиле прома
+# у sb встречаются level_value 0/1/99, и если строк на метрику окажется больше одной,
+# вердикт СБ неоднозначен — про это надо сказать вслух, а не выбрать молча.
+SB_LEVELS = """
+SELECT m.level_id, m.level_value, count(*) AS n_rows
+FROM {schema}.uzp_dwh_metrics m
+WHERE m.level_name='sb' AND m.period_type='m' AND COALESCE(m.extended_dim_1,1)=1
+  AND m.end_dt = :ref AND m.metric_id = :m_rcp
+GROUP BY m.level_id, m.level_value
+ORDER BY n_rows DESC
+"""
+
+# Матрица ТБ×сегмент по получателям — аналог GOSB_SEG уровнем выше. Колонки названы
+# unit_id/unit_name, как и у ГОСБ-версии: агрегаторы forecast.build_* работают с
+# любой единицей разбора и о том, ГОСБ это или ТБ, не знают.
+TB_SEG = """
+WITH tb AS (SELECT DISTINCT tb_id, tb_short_name FROM {schema}.uzp_dim_gosb)
+SELECT m.level_id AS unit_id, tb.tb_short_name AS unit_name,
+       m.extended_dim_1 AS seg_id,
+       sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
+       sum(m.fact_amt) / NULLIF(sum(m.plan_amt), 0) AS execution_percent,
+       sum(m.plan_amt - m.fact_amt) AS nedobor
+FROM {schema}.uzp_dwh_metrics m
+JOIN tb ON tb.tb_id = m.level_id
+WHERE m.level_name='tb' AND m.period_type='m' AND m.metric_id=:m_rcp
+  AND m.end_dt = :ref AND m.extended_dim_1 <> 1
+GROUP BY m.level_id, tb.tb_short_name, m.extended_dim_1
+"""
+
+# Итоги по ТБ (все сегменты) — аналог GOSB_TOTALS уровнем выше
+TB_TOTALS = """
+WITH tb AS (SELECT DISTINCT tb_id, tb_short_name FROM {schema}.uzp_dim_gosb)
+SELECT m.level_id AS unit_id, tb.tb_short_name AS unit_name,
+       sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
+       sum(m.fact_amt) / NULLIF(sum(m.plan_amt), 0) AS execution_percent,
+       sum(m.plan_amt - m.fact_amt) AS nedobor
+FROM {schema}.uzp_dwh_metrics m
+JOIN tb ON tb.tb_id = m.level_id
+WHERE m.level_name='tb' AND m.period_type='m' AND m.metric_id=:m_rcp
+  AND m.end_dt = :ref AND COALESCE(m.extended_dim_1,1)=1
+GROUP BY m.level_id, tb.tb_short_name
+ORDER BY nedobor DESC
+"""
+
 # Грейн дэша по ГОСБ — new_gosb_id (реальный ГОСБ). Метрики лежат на old_gosb_id,
 # агрегируем old_gosb_id -> new_gosb_id (несколько old могут мапиться в один new).
 _GMAP = """SELECT old_gosb_id, min(tb_id) AS tb_id, min(new_gosb_id) AS new_gosb_id,
@@ -75,7 +139,7 @@ _GMAP = """SELECT old_gosb_id, min(tb_id) AS tb_id, min(new_gosb_id) AS new_gosb
 # Матрица ГОСБ×сегмент по получателям (макс. месяц), агрегат по new_gosb_id
 GOSB_SEG = """
 WITH gmap AS (""" + _GMAP + """)
-SELECT g.new_gosb_id, g.gosb_name,
+SELECT g.new_gosb_id AS unit_id, g.gosb_name AS unit_name,
        m.extended_dim_1 AS seg_id,
        sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
        sum(m.fact_amt) / NULLIF(sum(m.plan_amt), 0) AS execution_percent,
@@ -90,7 +154,7 @@ GROUP BY g.new_gosb_id, g.gosb_name, m.extended_dim_1
 # Итоги по ГОСБ (все сегменты, агрегат по new_gosb_id) — разрыв по ГОСБ
 GOSB_TOTALS = """
 WITH gmap AS (""" + _GMAP + """)
-SELECT g.new_gosb_id, g.gosb_name,
+SELECT g.new_gosb_id AS unit_id, g.gosb_name AS unit_name,
        sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
        sum(m.fact_amt) / NULLIF(sum(m.plan_amt), 0) AS execution_percent,
        sum(m.plan_amt - m.fact_amt) AS nedobor

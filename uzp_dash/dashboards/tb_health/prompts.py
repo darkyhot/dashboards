@@ -24,6 +24,15 @@ BATCH_STEPS = (30, 10, 3, 1)   # шаги деградации размера б
 PROMPT_CHAR_LIMIT = 40_000     # больше в один запрос не отправляем — делим заранее
 CALLS_BUDGET_FACTOR = 4        # максимум вызовов = фактор × число исходных батчей
 ZERO_STREAK_ABORT = 3          # столько пустых ответов подряд = LLM недоступна по смыслу
+# Шлюз не ответил ни разу за целый ТБ — значит лежит, и следующим ТБ отчёта по сети
+# аудит даже не начинаем. Сбрасывается вызовом reset_gateway() в начале генерации.
+_GATEWAY_DOWN = False
+
+
+def reset_gateway() -> None:
+    """Забыть про отказ шлюза — вызывается в начале каждой генерации отчёта."""
+    global _GATEWAY_DOWN
+    _GATEWAY_DOWN = False
 
 
 def notes_text(notes) -> str:
@@ -349,8 +358,16 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
     Возврат: ({(gosb_id, inn): {reason, action, verdict, can_influence, quality,
               contradiction, outflow_worked, attract_real, source}}, n_вызовов)
     """
+    global _GATEWAY_DOWN
     result: dict = {}
     if not items:
+        return result, 0
+    # Отчёт по всей сети — это 12 прогонов подряд. Если шлюз лежит, каждый ТБ честно
+    # потратит свои три вызова с таймаутом, и на пустую работу уйдут десятки минут.
+    # Защёлка про ОТКАЗ, а не про бюджет: потолок вызовов остаётся у каждого ТБ свой.
+    if _GATEWAY_DOWN:
+        progress.llm_error("текст", "шлюз LLM уже не ответил на предыдущем ТБ — "
+                                    "аудит пропущен, всё уходит в фолбэк на правила")
         return result, 0
 
     if max_calls is None:
@@ -386,9 +403,14 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
         zero_streak = 0 if got else zero_streak + 1
         if zero_streak >= ZERO_STREAK_ABORT:
             left = sum(len(c) for c in queue) + len(chunk)
+            # ни одного разобранного объекта за весь проход — это отказ шлюза,
+            # а не свойство данных этого ТБ: следующим ТБ пробовать незачем
+            _GATEWAY_DOWN = not result
             progress.llm_error("текст", f"{zero_streak} вызова подряд без единого ответа — "
                                         f"дальнейшие попытки прекращены, остаток {left} орг "
-                                        f"уйдёт в фолбэк на правила")
+                                        f"уйдёт в фолбэк на правила"
+                                        + (" · аудит следующих ТБ будет пропущен"
+                                           if _GATEWAY_DOWN else ""))
             break
 
         missing = [o for o in chunk if (o["gosb_id"], o["inn"]) not in got]
@@ -420,15 +442,17 @@ def section_narratives(ctx, a) -> dict:
     """
     v = a.verdict
     al = Aliases()
+    # единица разбора зависит от уровня отчёта: ГОСБ внутри ТБ, ТБ внутри СБ
+    unit = getattr(a, "unit_label", "ГОСБ")
     cells = "; ".join(
-        f"{al.alias('ГОСБ', r.gosb_name)}/{r.seg_name} "
+        f"{al.alias(unit, r.unit_name)}/{r.seg_name} "
         f"({r.execution_percent*100:.0f}%, −{r.nedobor:.0f})"
         for r in a.top_cells.head(5).itertuples()
     )
     sel = (a.to_work[(a.to_work.need_k > 0) & (a.to_work.need_k <= 1.0)]
            if "need_k" in a.to_work else a.to_work)
     bad_segs = "; ".join(
-        f'{al.alias("ГОСБ", c["gosb_name"])}: ' + ", ".join(
+        f'{al.alias(unit, c["gosb_name"])}: ' + ", ".join(
             f'{s["seg"]} ({s["exec"]*100:.0f}%, −{s["nedobor"]:.0f})' for s in c["segs"][:3])
         for c in getattr(a, "gosb_cards", [])[:6] if c["segs"])
     top_orgs = "; ".join(
@@ -554,7 +578,7 @@ def _fallback_blocks(a) -> dict:
     v = a.verdict
     wf = getattr(a, "wf", {}) or {}
     d = getattr(a, "dates", {}) or {}
-    cells = ", ".join(f'{r.gosb_name}/{r.seg_name} ({r.execution_percent*100:.0f}%)'
+    cells = ", ".join(f'{r.unit_name}/{r.seg_name} ({r.execution_percent*100:.0f}%)'
                       for r in a.top_cells.head(3).itertuples()) or "—"
     n_hold = int((a.to_work.lever == "Удержать").sum()) if len(a.to_work) else 0
     return {

@@ -78,6 +78,11 @@ class Analysis:
     fc_stats: dict = field(default_factory=dict)   # диагностика прогноза
     gosb_detail: dict = field(default_factory=dict)  # new_gosb_id -> разбор прогноза
     explorer_min_fl: float = EXPLORER_MIN_FL_DEFAULT  # порог эффекта для списка в файле
+    # Уровень отчёта. "tb" — область один ТБ, единица разбора ГОСБ; "sb" — область весь
+    # банк, единица ТБ. Всё остальное устройство отчёта от уровня не зависит.
+    level: str = "tb"
+    unit_label: str = "ГОСБ"
+    unit_src: str = "new_gosb_id"     # колонка грейна организаций = единица разбора
 
 
 def run(ctx, tb_short: str) -> Analysis:
@@ -154,8 +159,8 @@ def run(ctx, tb_short: str) -> Analysis:
         f["seg_name"] = f["seg_id"].map(segments.short)
     matrix, mstats = forecast.build_matrix(base_seg, plan_seg, orgs_fc)
     matrix = matrix.merge(
-        base_seg[["new_gosb_id", "seg_name", "gosb_name"]].drop_duplicates(),
-        on=["new_gosb_id", "seg_name"], how="left")
+        base_seg[["unit_id", "seg_name", "unit_name"]].drop_duplicates(),
+        on=["unit_id", "seg_name"], how="left")
     gosb_gap = forecast.build_totals(read_sql(e, Q.GOSB_TOTALS, {**p_cls, "tb_id": tb_id}),
                                      read_sql(e, Q.GOSB_TOTALS, {**p_cur, "tb_id": tb_id}),
                                      orgs_fc)
@@ -196,7 +201,7 @@ def run(ctx, tb_short: str) -> Analysis:
 
     # --- Разрывы на грейне (ГОСБ, сегмент): работаем именно с западающими ---
     matrix["is_failing"] = [_failing_seg(r.nedobor) for r in matrix.itertuples()]
-    seg_gaps = {(int(r.new_gosb_id), r.seg_name): float(r.nedobor)
+    seg_gaps = {(int(r.unit_id), r.seg_name): float(r.nedobor)
                 for r in matrix.itertuples() if r.is_failing}
     n_gosb_seg = len({nid for nid, _ in seg_gaps})
     progress.done(f"Западающих (ГОСБ, сегмент): {len(seg_gaps)} в {n_gosb_seg} ГОСБ")
@@ -217,9 +222,9 @@ def run(ctx, tb_short: str) -> Analysis:
                   f"потенциал западающих сегментов покрывает разрыв на "
                   f"{sim['coverage']*100:.0f}% · добор из других сегментов: {sim['filler_n']}")
     progress.step("Разрез по ГОСБ + детализация прогноза")
-    gosb_cards = _gosb_cards(gosb_gap, matrix, to_work, fagg, gosb_plan)
+    gosb_cards = _unit_cards(gosb_gap, matrix, to_work, fagg, gosb_plan)
     org_detail = read_sql(e, Q.ORG_DETAIL, {"tb_id": tb_id, "ref_closed": ref_closed})
-    gosb_detail = _gosb_detail(orgs_fc, org_detail, insights, to_work, no_point,
+    gosb_detail = _unit_detail(orgs_fc, org_detail, insights, to_work, no_point,
                                gosb_gap, fc_stats.get("conv_tb", 1.0),
                                fc_stats.get("conv", {}),
                                fc_stats.get("conv_by_gosb", {}), d)
@@ -244,7 +249,240 @@ def run(ctx, tb_short: str) -> Analysis:
                                              EXPLORER_MIN_FL_DEFAULT)),
     )
     a.gosb_cards = gosb_cards
+    # грейн организаций нужен своду СБ: он складывает прогнозные слагаемые из ТБ,
+    # а не пересчитывает их одним большим запросом
+    a.orgs_fc = orgs_fc
     return a
+
+
+def run_sb(ctx, per_tb: dict) -> Analysis:
+    """Уровень СБ: тот же отчёт, где единица разбора — ТБ, а область — весь банк.
+
+    План, факт и портфель-база берутся ОТДЕЛЬНОЙ строкой витрины (`level_name='sb'`),
+    а не складываются из ТБ: уровни витрины считаются независимо, и сумма ТБ ей
+    не равна — то же расхождение, что между ГОСБ и ТБ.
+
+    Прогнозные слагаемые (отток, приток, пайплайн) — наоборот, свод: это те же строки
+    грейна (ГОСБ, ИНН), уже посчитанные при прогоне каждого ТБ. Пересчитывать их одним
+    большим запросом незачем, а память на проме это бы не выдержало.
+
+    `per_tb` — {короткое имя ТБ: Analysis}, результат прогонов уровня ТБ.
+    """
+    e = ctx.engine
+    d = _dates(e, ctx.params)
+    ref_cur, ref_closed = d["ref_cur"], d["ref_closed"]
+    p_cur = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref_cur}
+    p_cls = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref_closed}
+
+    progress.step(f"Уровень СБ: вердикт банка за закрытый месяц {ref_closed}")
+    closed_verdict, _ = _sb_verdict(e, p_cls)
+    plan_cur, ref_date = _sb_verdict(e, p_cur)
+    progress.done(f"{ref_closed} закрыт: получатели {closed_verdict['rcp']['fact']:.0f} "
+                  f"из {closed_verdict['rcp']['plan']:.0f} "
+                  f"({(closed_verdict['rcp']['exec'] or 0) * 100:.0f}%) · "
+                  f"план на {ref_cur}: {plan_cur['rcp']['plan']:.0f}")
+    yoy = _sb_yoy(e, {**p_cls, "ref": d["ref_yoy"]}, closed_verdict, d)
+
+    # --- Свод грейна организаций по всем ТБ ---
+    progress.step("Уровень СБ: свод прогноза по всем ТБ")
+    fcs = [getattr(a, "orgs_fc", None) for a in per_tb.values()]
+    fcs = [f for f in fcs if f is not None and not f.empty]
+    orgs_fc = (pd.concat(fcs, ignore_index=True) if fcs
+               else pd.DataFrame(columns=["new_gosb_id", "inn", "tb_id"]))
+    n_raw = len(orgs_fc)
+    if n_raw:
+        # ГОСБ, числящиеся сразу под двумя tb_id (см. _GMAP), попадают в прогон обоих
+        # ТБ — без дедубликации их отток и пайплайн вошли бы в свод дважды
+        orgs_fc = orgs_fc.drop_duplicates(subset=["new_gosb_id", "inn"])
+    n_dup = n_raw - len(orgs_fc)
+    if n_dup:
+        progress.done(f"Дедубликация свода: убрано {n_dup} повторных пар (ГОСБ, ИНН) — "
+                      f"их ГОСБ числится сразу под двумя ТБ")
+
+    # --- Матрица ТБ × сегмент и разрыв по ТБ ---
+    base_seg = read_sql(e, Q.TB_SEG, p_cls)
+    plan_seg = read_sql(e, Q.TB_SEG, p_cur)
+    for f in (base_seg, plan_seg):
+        f["seg_name"] = f["seg_id"].map(segments.short)
+    matrix, mstats = forecast.build_matrix(base_seg, plan_seg, orgs_fc, unit_src="tb_id")
+    matrix = matrix.merge(base_seg[["unit_id", "seg_name", "unit_name"]].drop_duplicates(),
+                          on=["unit_id", "seg_name"], how="left")
+    tb_gap = forecast.build_totals(read_sql(e, Q.TB_TOTALS, p_cls),
+                                   read_sql(e, Q.TB_TOTALS, p_cur),
+                                   orgs_fc, unit_src="tb_id")
+
+    wf = forecast.waterfall(
+        base=closed_verdict["rcp"]["fact"], orgs_fc=orgs_fc,
+        plan=plan_cur["rcp"]["plan"],
+        base_fot=closed_verdict["fot"]["fact"], plan_fot=plan_cur["fot"]["plan"])
+    verdict = {
+        "rcp": {"plan": wf["plan"], "fact": wf["forecast"], "exec": wf["exec"],
+                "rank": None, "n_tb": None},
+        "fot": {"plan": wf["plan_fot"], "fact": wf["forecast_fot"], "exec": wf["exec_fot"],
+                "rank": None, "n_tb": None},
+    }
+    gap_rcp = max(0.0, verdict["rcp"]["plan"] - verdict["rcp"]["fact"])
+    gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
+    progress.done(
+        f"Прогноз банка на {ref_cur}: {wf['forecast']:.0f} из плана {wf['plan']:.0f} "
+        f"({(wf['exec'] or 0) * 100:.1f}%) = портфель {wf['base']:.0f} "
+        f"− отток {wf['out_exp']:.0f} + приток {wf['in_exp']:.0f} "
+        f"+ пайплайн {wf['pipe']:.0f} · организаций в своде {len(orgs_fc)}")
+
+    matrix["is_failing"] = [_failing_seg(r.nedobor) for r in matrix.itertuples()]
+    top_cells = (matrix[matrix.nedobor > 0]
+                 .sort_values("nedobor", ascending=False)
+                 .assign(share=lambda x: x.nedobor / max(gap_rcp, 1))
+                 .head(8))
+
+    # --- Карточки ТБ: план работы берётся из уже посчитанных отчётов ТБ ---
+    progress.step("Уровень СБ: карточки ТБ + детализация прогноза")
+    tb_plan = {a.tb_id: _tb_plan_row(a) for a in per_tb.values()}
+    cards = _unit_cards(tb_gap, matrix, pd.DataFrame(), pd.DataFrame(), tb_plan,
+                        unit_src="tb_id")
+    act = _sum_activity(per_tb)
+    for c in cards:
+        c["act"] = act.get(c["gosb_id"], {"act_n": 0, "success": 0.0, "worked_orgs": 0})
+
+    detail = _sb_org_detail(e, per_tb)
+    insights = {k: v for a in per_tb.values() for k, v in (a.insights or {}).items()}
+    to_work = _cat([a.to_work for a in per_tb.values()])
+    no_point = _cat([a.no_point for a in per_tb.values()])
+    conv_by_tb = {a.tb_id: float(a.fc_stats.get("conv_tb", 1.0)) for a in per_tb.values()}
+    unit_detail = _unit_detail(orgs_fc, detail, insights, to_work, no_point,
+                               tb_gap, 1.0, {}, conv_by_tb, d,
+                               unit_src="tb_id", unit_label="ТБ")
+
+    sim = _sum_sim(per_tb, gap_rcp, verdict["rcp"]["fact"], verdict["rcp"]["plan"])
+    a = Analysis(
+        tb_short="СБ", tb_id=0, tb_full="Сбербанк — все территориальные банки",
+        ref_date=ref_date,
+        verdict=verdict, gap_rcp=gap_rcp, gap_fot=gap_fot, gap_fot_mln=gap_fot / RUB_TO_MLN,
+        matrix=matrix, gosb_gap=tb_gap, top_cells=top_cells,
+        attract=pd.DataFrame(), retention=pd.DataFrame(), activity=_sum_activity_tot(per_tb),
+        to_work=pd.DataFrame(), no_point=pd.DataFrame(), sim=sim, gosb_plan=tb_plan,
+        insights={}, themes="—", llm_stats={},
+        dates=d, wf=wf, closed=closed_verdict, yoy=yoy,
+        fc_stats={"conv_tb": 1.0, "conv": {}, "conv_by_gosb": conv_by_tb},
+        gosb_detail=unit_detail,
+        level="sb", unit_label="ТБ", unit_src="tb_id",
+    )
+    a.gosb_cards = cards
+    a.orgs_fc = orgs_fc
+    return a
+
+
+def _cat(frames: list) -> pd.DataFrame:
+    """Склеить непустые кадры; пустой результат — пустой DataFrame, а не ошибка."""
+    fs = [f for f in frames if f is not None and not f.empty]
+    return pd.concat(fs, ignore_index=True) if fs else pd.DataFrame()
+
+
+def _tb_plan_row(a: Analysis) -> dict:
+    """Потребность ТБ под план — сумма его собственных ГОСБ.
+
+    Это ровно те числа, что стоят в отчёте этого ТБ: карточка ТБ на уровне СБ не
+    пересчитывает отбор организаций, а показывает уже принятое решение уровнем ниже.
+    """
+    segs: dict = {}
+    for p in (a.gosb_plan or {}).values():
+        for s in p.get("segs", []):
+            cur = segs.setdefault(s["seg"], {"seg": s["seg"], "gap": 0.0, "n_need": 0,
+                                             "fl_need": 0.0, "coverage": None,
+                                             "lack": 0.0, "n_avail": 0})
+            cur["gap"] += s["gap"]; cur["n_need"] += s["n_need"]
+            cur["fl_need"] += s["fl_need"]; cur["lack"] += s.get("lack", 0.0) or 0.0
+            cur["n_avail"] += s.get("n_avail", 0)
+    for s in segs.values():
+        s["coverage"] = (s["fl_need"] / s["gap"]) if s["gap"] > 0 else None
+    keys = ("gap_seg", "n_need", "fl_need", "fot_need", "n_attract", "fl_attract",
+            "n_return", "fl_return", "filler_n", "filler_fl", "n_total", "fl_total")
+    out = {k: sum(float(p.get(k, 0) or 0) for p in (a.gosb_plan or {}).values())
+           for k in keys}
+    for k in ("n_need", "n_attract", "n_return", "filler_n", "n_total"):
+        out[k] = int(out[k])
+    out["segs"] = sorted(segs.values(), key=lambda s: -s["gap"])
+    return out
+
+
+def _sum_activity(per_tb: dict) -> dict:
+    """Активности воронки по каждому ТБ — для строки «Активности 3 мес» в карточке."""
+    out = {}
+    for a in per_tb.values():
+        act = a.activity or {}
+        n = int(act.get("n", 0))
+        out[a.tb_id] = {"act_n": n, "success": float(act.get("success", 0.0) or 0.0),
+                        "worked_orgs": int(act.get("worked_orgs", 0) or 0)}
+    return out
+
+
+def _sum_activity_tot(per_tb: dict) -> dict:
+    """Активности всего банка: суммы по ТБ, успех — взвешенный по числу задач."""
+    n = sum(int((a.activity or {}).get("n", 0)) for a in per_tb.values())
+    ok = sum(int((a.activity or {}).get("n", 0)) * float((a.activity or {}).get("success", 0) or 0)
+             for a in per_tb.values())
+    tot = {"n": n, "success": (ok / n) if n else 0.0}
+    for k in ("by_type", "by_status"):
+        merged: dict = {}
+        for a in per_tb.values():
+            for name, val in ((a.activity or {}).get(k) or {}).items():
+                merged[name] = merged.get(name, 0) + val
+        tot[k] = merged
+    return tot
+
+
+def _sum_sim(per_tb: dict, gap: float, fact: float, plan: float) -> dict:
+    """Итог «что даст работа по всему банку» — сумма планов работы по ТБ.
+
+    Разрыв берётся СБ-шный (из вердикта банка), а закрываемая часть — сумма по ТБ:
+    это честно отвечает на вопрос «хватит ли того, что уже отобрано ниже».
+    """
+    def s(key, cast=float):
+        return cast(sum(float(a.sim.get(key, 0) or 0) for a in per_tb.values()))
+
+    gap_seg = s("gap_seg")
+    return {
+        "gap": gap, "gap_seg": gap_seg, "fact": fact, "plan": plan,
+        "k": s("k", int), "closable": s("closable"),
+        "attract": s("attract"), "retention": s("retention"),
+        "fot_mln": s("fot_mln"), "filler_n": s("filler_n", int),
+        # покрытие считается от суммы разрывов сегментов ТБ, как и на уровне ТБ:
+        # там оно тоже про сегментные разрывы, а не про общий разрыв области
+        "coverage": (s("closable") / gap_seg) if gap_seg > 0 else 0.0,
+        "total_potential": s("total_potential"),
+    }
+
+
+def _sb_org_detail(engine, per_tb: dict) -> pd.DataFrame:
+    """Имена организаций и годовой тренд для оверлеев ТБ — по всем ТБ сразу.
+
+    Запрос ORG_DETAIL уже выполнялся в каждом прогоне ТБ, но результат туда не
+    сохранялся; повторить его дешевле, чем тащить кадры через все уровни.
+    """
+    frames = []
+    for a in per_tb.values():
+        df = read_sql(engine, Q.ORG_DETAIL,
+                      {"tb_id": a.tb_id, "ref_closed": a.dates["ref_closed"]})
+        if not df.empty:
+            frames.append(df)
+    return _cat(frames)
+
+
+def _sb_yoy(engine, params: dict, closed: dict, d: dict) -> dict:
+    """Прирост банка год к году — тот же SB_VERDICT за месяц годом ранее."""
+    out: dict = {}
+    prev, _ = _sb_verdict(engine, params)
+    for key, label, scale in (("rcp", "получатели", 1.0), ("fot", "ФОТ млн ₽", RUB_TO_MLN)):
+        was = float(prev.get(key, {}).get("fact") or 0)
+        now = float(closed.get(key, {}).get("fact") or 0)
+        if was <= 0:
+            out[key] = None
+            continue
+        out[key] = {"fact": was, "delta": now - was, "pct": now / was - 1}
+        progress.done(f"Банк год к году ({label}): {d['closed_label']} {now / scale:,.0f} "
+                      f"против {was / scale:,.0f} год назад → {(now - was) / scale:+,.0f} "
+                      f"({(now / was - 1) * 100:+.1f}%)".replace(",", " "))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -400,6 +638,9 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
     fc["salary"] = sal
     fc["out_fot"] = fc["out_exp"] * fc["salary"]
     fc["in_fot"] = fc["in_exp"] * fc["salary"]
+    # ТБ пишем прямо в строку организации: своду СБ тогда не нужен обратный маппинг
+    # ГОСБ → ТБ, единица разбора там задаётся просто именем колонки
+    fc["tb_id"] = tb_id
 
     hd = pred.attrs.get("diag", {}) if not pred.empty else {}
     n_hist = int(hd.get("hist_months", 0))
@@ -677,6 +918,38 @@ def _activity(totals: pd.DataFrame, breakdown: pd.DataFrame) -> dict:
         "unrealized": int(t.unrealized or 0),
         "by_role": _dim("role"), "by_type": _dim("type"), "by_status": _dim("status"),
     }
+
+
+def _sb_verdict(engine, params: dict) -> tuple[dict, str]:
+    """План и факт ВСЕГО БАНКА — отдельной строкой витрины, а не суммой ТБ.
+
+    Уровень sb существует только в uzp_dwh_metrics; складывать ТБ нельзя по той же
+    причине, по которой сумма ГОСБ не равна итогу ТБ (раздел 12 методологии) —
+    уровни считаются независимо.
+
+    Если под level_name='sb' окажется несколько level_id (в профиле прома у sb
+    встречаются level_value 0/1/99), выбор неоднозначен — тогда говорим об этом
+    вслух и берём строку с наибольшим фактом. Молча угадывать нельзя.
+    """
+    v = read_sql(engine, Q.SB_VERDICT, params)
+    out: dict = {}
+    ref = ""
+    ids = sorted({int(x) for x in v.level_id.dropna()}) if not v.empty else []
+    if len(ids) > 1:
+        progress.done(f"ВНИМАНИЕ: под level_name='sb' несколько level_id {ids} — "
+                      f"вердикт банка неоднозначен, берётся строка с наибольшим фактом")
+    for key, mid in (("rcp", Q.METRIC_RECIPIENTS), ("fot", Q.METRIC_FOT)):
+        row = v[v.metric_id == mid].sort_values("fact_amt", ascending=False)
+        if row.empty:
+            out[key] = {"plan": 0, "fact": 0, "exec": None, "rank": None, "n_tb": None}
+            continue
+        r = row.iloc[0]; ref = str(r.end_dt)
+        ex = r.execution_percent
+        out[key] = {"plan": float(r.plan_amt), "fact": float(r.fact_amt),
+                    "exec": (float(ex) if pd.notna(ex) else None),
+                    # ранга нет: банк сравнивать не с кем
+                    "rank": None, "n_tb": None}
+    return out, ref
 
 
 def _verdict(v: pd.DataFrame, tb_id: int) -> tuple[dict, str]:
@@ -1357,14 +1630,18 @@ def _rest_row(gosb_row, segs: list, n_need_total: int) -> dict | None:
             "n_need": n_need}
 
 
-def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
+def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
                  to_work: pd.DataFrame, no_point: pd.DataFrame,
                  gosb_gap: pd.DataFrame, conv_tb: float,
                  conv_diag: dict | None = None,
-                 conv_by_gosb: dict | None = None, dates: dict | None = None) -> dict:
-    """Разбор прогноза по каждому ГОСБ — то, что открывается по клику на карточку.
+                 conv_by_gosb: dict | None = None, dates: dict | None = None,
+                 unit_src: str = "new_gosb_id", unit_label: str = "ГОСБ") -> dict:
+    """Разбор прогноза по каждой единице — то, что открывается по клику на карточку.
 
-    Отвечает на вопрос «почему прогноз такой»: водопад этого ГОСБ, затем отток по
+    Единица — ГОСБ в отчёте ТБ и ТБ в отчёте СБ; `unit_src` называет колонку грейна
+    организаций, по которой они группируются.
+
+    Отвечает на вопрос «почему прогноз такой»: водопад этой единицы, затем отток по
     причинам (см. `_out_groups`), крупнейшие организации в пайплайне и тренд портфеля
     год к году. Отток покрыт группами целиком; в пайплайне именами объясняется только
     материальная часть (см. `_material`), поэтому там показывается покрытие.
@@ -1392,14 +1669,14 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
         return ({(int(r.new_gosb_id), int(r.inn)) for r in df.itertuples()}
                 if df is not None and not df.empty else set())
     work, nopt = _keys(to_work), _keys(no_point)
-    totals = {int(r.new_gosb_id): r for r in gosb_gap.itertuples()}
+    totals = {int(r.unit_id): r for r in gosb_gap.itertuples()}
 
     skipped_no_base, group_mismatch = [], []
-    for nid, g in orgs_fc.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
+    for nid, g in orgs_fc.dropna(subset=[unit_src]).groupby(unit_src):
         nid = int(nid)
         t = totals.get(nid)
         if t is None:
-            # ГОСБ нет в витрине метрик этого ТБ — ни плана, ни базы. Такое бывает у
+            # единицы нет в витрине метрик — ни плана, ни базы. Такое бывает у
             # old_gosb_id, числящихся сразу под двумя tb_id (см. _GMAP): организации на
             # него мапятся, а метрики уходят в другой ТБ. Водопад без базы построить
             # нельзя, карточка для него всё равно не строится — пропускаем, но считаем.
@@ -1463,17 +1740,18 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
     return out
 
 
-def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame, to_work: pd.DataFrame,
-                fagg: pd.DataFrame, gosb_plan: dict) -> list:
-    """По каждому проблемному ГОСБ — что конкретно сделать, чтобы закрыть разрыв."""
+def _unit_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame, to_work: pd.DataFrame,
+                fagg: pd.DataFrame, gosb_plan: dict,
+                unit_src: str = "new_gosb_id") -> list:
+    """По каждой единице (ГОСБ или ТБ) — что конкретно сделать, чтобы закрыть разрыв."""
     fg = {}
-    if not fagg.empty:
-        for nid, g in fagg.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
+    if not fagg.empty and unit_src in fagg:
+        for nid, g in fagg.dropna(subset=[unit_src]).groupby(unit_src):
             n_tasks = int(g.n_tasks.sum())
             fg[int(nid)] = {"act_n": n_tasks,
                             "success": float(g.n_success.sum() / n_tasks) if n_tasks else 0.0,
                             "worked_orgs": int(g.inn.nunique())}
-    # Карточки строим по ВСЕМ ГОСБ, включая выполняющие план: управляющему нужно
+    # Карточки строим по ВСЕМ единицам, включая выполняющие план: управляющему нужно
     # видеть и за счёт чего план вытягивается, а не только где провал. Сортировка по
     # недобору оставляет проблемные сверху.
     is_fail = (matrix["is_failing"] if "is_failing" in matrix
@@ -1482,12 +1760,13 @@ def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame, to_work: pd.DataFr
 
     cards = []
     for r in order.itertuples():
-        nid = int(r.new_gosb_id); name = r.gosb_name
-        sub = to_work[to_work.new_gosb_id == nid] if not to_work.empty else to_work
+        nid = int(r.unit_id); name = r.unit_name
+        sub = (to_work[to_work[unit_src] == nid]
+               if not to_work.empty and unit_src in to_work else to_work)
         sel = sub[(sub.need_k > 0) & (sub.need_k <= 1.0)] if not sub.empty else sub
-        # ВСЕ сегменты ГОСБ: западающие первыми (по недобору), затем выполняющие
+        # ВСЕ сегменты единицы: западающие первыми (по недобору), затем выполняющие
         # без ведущего подчёркивания: itertuples переименовывает такие колонки
-        g_seg = matrix[matrix.new_gosb_id == nid].copy()
+        g_seg = matrix[matrix.unit_id == nid].copy()
         g_seg["fails"] = is_fail.reindex(g_seg.index).fillna(False)
         g_seg = g_seg.sort_values(["fails", "nedobor"], ascending=[False, False])
         p = gosb_plan.get(nid, {})
@@ -1506,6 +1785,8 @@ def _gosb_cards(gosb_gap: pd.DataFrame, matrix: pd.DataFrame, to_work: pd.DataFr
             })
         bad = [s for s in segs if s["failing"]]
         cards.append({
+            # имена ключей исторические (карточка родилась ГОСБ-центричной), но
+            # содержат единицу текущего уровня — ГОСБ или ТБ
             "gosb_id": nid,
             "gosb_name": name, "exec": float(r.execution_percent), "gap": float(r.nedobor),
             "plan": float(r.plan_amt), "forecast": float(r.fact_amt),

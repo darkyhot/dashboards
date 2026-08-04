@@ -62,6 +62,11 @@ DAY_OUTFLOW_MONTHS = 4
 # Частичная ЗП-ведомость текущего месяца: этот факт в дэше НЕ используется
 # (в этом и смысл прогноза), но в витрине он есть — как на проме.
 PARTIAL_FACT_SHARE = 0.62
+# Идентификатор уровня «весь банк» в uzp_dwh_metrics (level_name='sb'). Отдельного
+# sb_id нет ни в одной таблице — уровень живёт только в витрине метрик, поэтому здесь
+# это просто константа. На проме встречаются level_value 0/1/99, и дэш проверяет,
+# что строка на метрику одна (см. queries.SB_LEVELS).
+SB_LEVEL_ID = 1
 # Раскладка плана сделки по трём месяцам её жизни (пайплайн)
 PIPELINE_SPLIT = (0.2, 0.5, 0.3)
 # Месяц ПОСЛЕ опорного — для комментариев с ещё не наступившим сроком
@@ -211,14 +216,26 @@ def _metrics(gosb: pd.DataFrame):
         "gosb_id", "tb_id", "tb_short", "seg_id", "avg_salary", "plan_r", "fact_r",
         "texec"])
 
-    frames = [
-        _agg(tidy, "gosb_id", "gosb", by_segment=True),
-        _agg(tidy, "gosb_id", "gosb", by_segment=False),
-        _agg(tidy, "tb_id", "tb", by_segment=True),
-        _agg(tidy, "tb_id", "tb", by_segment=False),
-    ]
-    rows = pd.concat(frames, ignore_index=True)[OUT_COLS]
+    rows = pd.concat(_level_frames(tidy), ignore_index=True)[OUT_COLS]
     return rows, latest_df
+
+
+def _level_frames(tidy: pd.DataFrame) -> list:
+    """Свёртки одного и того же tidy на все три уровня витрины метрик.
+
+    Уровень sb получается агрегатом по всем ТБ, потому что отдельного sb_id нет ни
+    в одной таблице — в витрине метрик это просто строка с постоянным level_id.
+    """
+    t = tidy.copy()
+    t["sb_id"] = SB_LEVEL_ID
+    return [
+        _agg(t, "gosb_id", "gosb", by_segment=True),
+        _agg(t, "gosb_id", "gosb", by_segment=False),
+        _agg(t, "tb_id", "tb", by_segment=True),
+        _agg(t, "tb_id", "tb", by_segment=False),
+        _agg(t, "sb_id", "sb", by_segment=True),
+        _agg(t, "sb_id", "sb", by_segment=False),
+    ]
 
 
 def _agg(tidy: pd.DataFrame, level_field: str, level_name: str, by_segment: bool) -> pd.DataFrame:
@@ -826,13 +843,7 @@ def _metrics_current(orgs: pd.DataFrame, latest: pd.DataFrame, company: pd.DataF
             "fot_plan": plan_r * sal, "fot_fact": fc_fot * PARTIAL_FACT_SHARE,
         })
     tidy = pd.DataFrame(tidy)
-    frames = [
-        _agg(tidy, "gosb_id", "gosb", by_segment=True),
-        _agg(tidy, "gosb_id", "gosb", by_segment=False),
-        _agg(tidy, "tb_id", "tb", by_segment=True),
-        _agg(tidy, "tb_id", "tb", by_segment=False),
-    ]
-    return pd.concat(frames, ignore_index=True)[OUT_COLS]
+    return pd.concat(_level_frames(tidy), ignore_index=True)[OUT_COLS]
 
 
 def _dim_company(orgs: pd.DataFrame) -> pd.DataFrame:

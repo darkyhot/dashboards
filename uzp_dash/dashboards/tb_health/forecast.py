@@ -565,34 +565,40 @@ def _first_seg(*candidates):
 
 # --------------------------------------------------------------------------- #
 def build_matrix(base_seg: pd.DataFrame, plan_seg: pd.DataFrame,
-                 orgs_fc: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Матрица ГОСБ×сегмент по ПРОГНОЗУ: план текущего месяца против прогноза.
+                 orgs_fc: pd.DataFrame,
+                 unit_src: str = "new_gosb_id") -> tuple[pd.DataFrame, dict]:
+    """Матрица «единица × сегмент» по ПРОГНОЗУ: план текущего месяца против прогноза.
+
+    Единица разбора — ГОСБ в отчёте ТБ и ТБ в отчёте СБ; здесь она везде называется
+    `unit_id`, а `unit_src` говорит, по какой колонке грейна организаций её собирать
+    (`new_gosb_id` или `tb_id`). Сама логика от уровня не зависит.
 
     База — факт закрытого месяца из uzp_dwh_metrics (та же методика, что у плана),
     дельта — с грейна организаций. Дельта организаций, чей сегмент неизвестен или
-    отсутствует в плане этого ГОСБ, разносится по сегментам ГОСБ пропорционально
-    базовому факту: иначе сумма ячеек не сойдётся с итогом по ГОСБ.
+    отсутствует в плане этой единицы, разносится по её сегментам пропорционально
+    базовому факту: иначе сумма ячеек не сойдётся с итогом единицы.
     """
-    base = base_seg[["new_gosb_id", "seg_name", "fact_amt"]].copy() \
-        if not base_seg.empty else pd.DataFrame(columns=["new_gosb_id", "seg_name", "fact_amt"])
-    plan = plan_seg[["new_gosb_id", "seg_name", "plan_amt"]].copy() \
-        if not plan_seg.empty else pd.DataFrame(columns=["new_gosb_id", "seg_name", "plan_amt"])
+    base = base_seg[["unit_id", "seg_name", "fact_amt"]].copy() \
+        if not base_seg.empty else pd.DataFrame(columns=["unit_id", "seg_name", "fact_amt"])
+    plan = plan_seg[["unit_id", "seg_name", "plan_amt"]].copy() \
+        if not plan_seg.empty else pd.DataFrame(columns=["unit_id", "seg_name", "plan_amt"])
     for f in (base, plan):
         if not f.empty:
-            f["new_gosb_id"] = f["new_gosb_id"].astype("int64")
-    m = plan.merge(base, on=["new_gosb_id", "seg_name"], how="outer")
+            f["unit_id"] = f["unit_id"].astype("int64")
+    m = plan.merge(base, on=["unit_id", "seg_name"], how="outer")
     m["plan_amt"] = pd.to_numeric(m["plan_amt"], errors="coerce").fillna(0.0)
     m["fact_amt"] = pd.to_numeric(m["fact_amt"], errors="coerce").fillna(0.0)
 
-    known = {(int(r.new_gosb_id), r.seg_name) for r in m.itertuples()}
+    known = {(int(r.unit_id), r.seg_name) for r in m.itertuples()}
     agg: dict = {}
     resid: dict = {}
     stats = {"unattributed": 0.0, "matched": 0.0}
     if orgs_fc is not None and not orgs_fc.empty:
-        for r in orgs_fc.itertuples():
-            if pd.isna(r.new_gosb_id):
+        units = orgs_fc[unit_src]
+        for r, u in zip(orgs_fc.itertuples(), units):
+            if pd.isna(u):
                 continue
-            gid = int(r.new_gosb_id)
+            gid = int(u)
             d = (float(r.out_exp), float(r.in_exp), float(r.pipe_np), float(r.pipe_np_raw))
             if (gid, r.seg_name) in known:
                 cur = agg.setdefault((gid, r.seg_name), [0.0, 0.0, 0.0, 0.0])
@@ -603,12 +609,12 @@ def build_matrix(base_seg: pd.DataFrame, plan_seg: pd.DataFrame,
             for k in range(4):
                 cur[k] += d[k]
 
-    # разнос неатрибутированного остатка по сегментам ГОСБ (пропорционально базе)
+    # разнос неатрибутированного остатка по сегментам единицы (пропорционально базе)
     for gid, d in resid.items():
-        sub = m[m["new_gosb_id"] == gid]
+        sub = m[m["unit_id"] == gid]
         total = float(sub["fact_amt"].sum())
         if sub.empty:
-            # ГОСБ вообще нет в плановой матрице — разносить некуда; такую дельту
+            # единицы вообще нет в плановой матрице — разносить некуда; такую дельту
             # считаем потерянной и показываем в диагностике, а не гасим молча
             stats["lost_gosb"] = stats.get("lost_gosb", 0) + 1
             stats["lost_delta"] = stats.get("lost_delta", 0.0) + abs(d[2] + d[1] - d[0])
@@ -619,7 +625,7 @@ def build_matrix(base_seg: pd.DataFrame, plan_seg: pd.DataFrame,
             for k in range(4):
                 cur[k] += d[k] * share
 
-    vals = [agg.get((int(r.new_gosb_id), r.seg_name), [0.0, 0.0, 0.0, 0.0])
+    vals = [agg.get((int(r.unit_id), r.seg_name), [0.0, 0.0, 0.0, 0.0])
             for r in m.itertuples()]
     m["out_exp"] = [v[0] for v in vals]
     m["in_exp"] = [v[1] for v in vals]
@@ -673,31 +679,32 @@ def waterfall(base: float, orgs_fc: pd.DataFrame, plan: float,
 
 
 def build_totals(base_tot: pd.DataFrame, plan_tot: pd.DataFrame,
-                 orgs_fc: pd.DataFrame) -> pd.DataFrame:
-    """То же, что build_matrix, но на грейне ГОСБ (без сегмента).
+                 orgs_fc: pd.DataFrame,
+                 unit_src: str = "new_gosb_id") -> pd.DataFrame:
+    """То же, что build_matrix, но на грейне единицы (без сегмента).
 
-    Отдельная функция, а не свёртка матрицы: план по ГОСБ берётся из строки
+    Отдельная функция, а не свёртка матрицы: план единицы берётся из строки
     «все сегменты» витрины, а она не обязана в точности равняться сумме сегментов.
     """
-    base = (base_tot[["new_gosb_id", "gosb_name", "fact_amt"]].copy()
+    base = (base_tot[["unit_id", "unit_name", "fact_amt"]].copy()
             if base_tot is not None and not base_tot.empty
-            else pd.DataFrame(columns=["new_gosb_id", "gosb_name", "fact_amt"]))
-    plan = (plan_tot[["new_gosb_id", "gosb_name", "plan_amt"]].copy()
+            else pd.DataFrame(columns=["unit_id", "unit_name", "fact_amt"]))
+    plan = (plan_tot[["unit_id", "unit_name", "plan_amt"]].copy()
             if plan_tot is not None and not plan_tot.empty
-            else pd.DataFrame(columns=["new_gosb_id", "gosb_name", "plan_amt"]))
-    m = plan.merge(base.drop(columns=["gosb_name"]), on="new_gosb_id", how="outer")
+            else pd.DataFrame(columns=["unit_id", "unit_name", "plan_amt"]))
+    m = plan.merge(base.drop(columns=["unit_name"]), on="unit_id", how="outer")
     if m.empty:
-        return pd.DataFrame(columns=["new_gosb_id", "gosb_name", "plan_amt",
+        return pd.DataFrame(columns=["unit_id", "unit_name", "plan_amt",
                                      "fact_amt", "execution_percent", "nedobor"])
     m["plan_amt"] = pd.to_numeric(m["plan_amt"], errors="coerce").fillna(0.0)
     m["fact_amt"] = pd.to_numeric(m["fact_amt"], errors="coerce").fillna(0.0)
     delta = {}
     if orgs_fc is not None and not orgs_fc.empty:
-        g = orgs_fc.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id")
+        g = orgs_fc.dropna(subset=[unit_src]).groupby(unit_src)
         delta = (g["in_exp"].sum() + g["pipe_np"].sum() - g["out_exp"].sum()).to_dict()
     m["base_amt"] = m["fact_amt"]
     m["fact_amt"] = (m["base_amt"]
-                     + m["new_gosb_id"].map(lambda x: delta.get(x, 0.0))).clip(lower=0)
+                     + m["unit_id"].map(lambda x: delta.get(x, 0.0))).clip(lower=0)
     m["execution_percent"] = m["fact_amt"] / m["plan_amt"].replace(0, np.nan)
     m["nedobor"] = m["plan_amt"] - m["fact_amt"]
     return m.sort_values("nedobor", ascending=False).reset_index(drop=True)

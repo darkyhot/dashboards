@@ -1,8 +1,9 @@
 """Сборка apple-страницы дэша tb_health.
 
-Структура ГОСБ-центричная: сверху вердикт ТБ, затем — какие ГОСБ проблемные и
-что конкретно сделать по каждому, интерактивный список организаций к работе
-(поиск/фильтр/пагинация), симуляция и нарратив.
+Отчёт двухуровневый и живёт в одном файле: вкладка СБ (единица разбора — ТБ) и по
+вкладке на каждый ТБ (единица — ГОСБ). Структура уровня одна и та же: вердикт области,
+из чего сложился прогноз, матрица «единица × сегмент», карточки единиц с оверлеем
+разбора и — только на уровне ТБ — интерактивный список организаций к работе.
 """
 from __future__ import annotations
 
@@ -10,34 +11,105 @@ from ...registry import Context, dashboard
 from ...render import components as C
 from ...render import page
 from ... import progress
-from . import analyze, prompts, segments
+from . import analyze, prompts, queries as Q, segments
 
 SEG_ORDER = segments.ORDER   # короткие названия сегментов (КСБ, РГС, …)
 
 
 @dashboard("tb_health")
 def build(ctx: Context) -> str:
-    tb = ctx.params.get("tb", "ЮЗБ")
+    """Отчёт СБ → ТБ → ГОСБ одним файлом.
+
+    `tb="*"` — все ТБ плюс сводный уровень СБ; конкретное имя ТБ — один уровень,
+    как было раньше. Уровни живут в одном документе вкладками: разбор одного ТБ
+    и разбор банка нужны рядом, а не в разных файлах.
+    """
+    prompts.reset_gateway()
+    tb = str(ctx.params.get("tb", "ЮЗБ") or "").strip()
+    if tb in ("*", "все", "all"):
+        return _build_all(ctx)
+
     a = analyze.run(ctx, tb)          # включает разбор текста (правила + LLM)
     _log_llm_stats(a)
     progress.step("LLM: выводы по разделам")
     story = prompts.section_narratives(ctx, a)
     progress.step("Сборка HTML")
-
-    body = (
-        _hero(a)
-        + _kpis(a)
-        + _waterfall(a, story.get("forecast"))
-        + _matrix(a, story.get("matrix"))
-        + _problem_gosb(a, story.get("gosb"))
-        + _orgs(a, story.get("orgs"))
-    )
     d = a.dates or {}
     return page(
         title=f"Здоровье ТБ — {C.esc(a.tb_full)}",
         subtitle=f"Прогноз на {C.esc(d.get('label', a.ref_date))}",
-        body=body,
+        body=_level_body(a, story, 0) + _GD_JS,
     )
+
+
+def _build_all(ctx: Context) -> str:
+    """Все ТБ + свод по банку. Уровни — вкладки одного документа."""
+    from ...db import read_sql
+    tbs = read_sql(ctx.engine, Q.TB_LIST)
+    names = [str(r.tb_short_name) for r in tbs.itertuples()]
+    progress.done(f"Уровни отчёта: СБ + {len(names)} ТБ ({', '.join(names)})")
+
+    per, levels = {}, []
+    for i, name in enumerate(names, start=1):
+        progress.step(f"═══ ТБ {name} ({i} из {len(names)}) ═══")
+        a = analyze.run(ctx, name)
+        _log_llm_stats(a)
+        progress.step(f"LLM: выводы по разделам — {name}")
+        per[name] = a
+        levels.append((a, prompts.section_narratives(ctx, a)))
+
+    sb = analyze.run_sb(ctx, per)
+    # карточка ТБ на уровне банка знает номер вкладки своего разбора — по ней и
+    # устроен переход СБ → ТБ
+    lvl_of = {a.tb_id: i + 1 for i, a in enumerate(per.values())}
+    for c in sb.gosb_cards:
+        c["lvl"] = lvl_of.get(c["gosb_id"])
+    progress.step("LLM: выводы по разделам — СБ")
+    levels.insert(0, (sb, prompts.section_narratives(ctx, sb)))
+
+    progress.step("Сборка HTML")
+    bodies = "".join(
+        f'<div class="lvl" id="lvl-{i}"{"" if i == 0 else " hidden"}>'
+        f'{_level_body(a, story, i)}</div>'
+        for i, (a, story) in enumerate(levels))
+    d = sb.dates or {}
+    return page(
+        title="Здоровье сети — СБ и территориальные банки",
+        subtitle=f"Прогноз на {C.esc(d.get('label', sb.ref_date))}",
+        body=_tabs([a for a, _ in levels]) + bodies + _GD_JS + _LVL_JS,
+    )
+
+
+def _tabs(levels: list) -> str:
+    """Панель уровней. Липкая: при длинном разборе переход наверх не нужен."""
+    btns = "".join(
+        f'<button class="lvl-tab{" on" if i == 0 else ""}" data-lvl="{i}" '
+        f'onclick="lvlGo({i})">{C.esc(a.tb_short)}</button>'
+        for i, a in enumerate(levels))
+    return f'<nav class="lvls">{btns}</nav>'
+
+
+def _level_body(a: analyze.Analysis, story: dict, idx: int) -> str:
+    """Содержимое одного уровня. Одинаково для СБ и для ТБ — меняется единица разбора.
+
+    `idx` уходит в id элементов: в одном документе живут 13 отчётов, и повторяющийся
+    id сломал бы и оверлеи, и списки организаций (по id их находит скрипт).
+    """
+    back = ('<div class="lvl-back"><button onclick="lvlGo(0)">← К отчёту по банку</button>'
+            f'<span>{C.esc(a.tb_full)}</span></div>' if idx else "")
+    body = (
+        back
+        + _hero(a)
+        + _kpis(a)
+        + _waterfall(a, story.get("forecast"))
+        + _matrix(a, story.get("matrix"))
+        + _problem_gosb(a, story.get("gosb"), idx)
+    )
+    # список организаций живёт только на уровне ТБ: на уровне банка работают с ТБ,
+    # а имена — один переход вниз (и это сотни тысяч строк, которые никто не листает)
+    if a.level != "sb":
+        body += _orgs(a, story.get("orgs"), idx)
+    return body
 
 
 # --------------------------------------------------------------------------- #
@@ -49,10 +121,12 @@ def _hero(a: analyze.Analysis) -> str:
     st = C.status_of(r["exec"])
     word = {"good": "План выполняется", "warn": "План под угрозой",
             "bad": "План не выполняется"}[st]
-    rank = f'{r["rank"]}/{r["n_tb"]}' if r["rank"] else "—"
     # сами цифры закрытого месяца живут в KPI-карточках ниже (по каждой метрике),
-    # здесь остаётся только ранг: он один на ТБ и к отдельной метрике не привязан
-    closed_txt = f'ранг ТБ {rank} за закрытый месяц {C.esc(d.get("closed_label", ""))}'
+    # здесь остаётся только ранг: он один на ТБ и к отдельной метрике не привязан.
+    # У банка ранга нет — сравнивать не с кем, и строка про него не пишется вовсе.
+    closed_txt = (f'закрытый месяц {C.esc(d.get("closed_label", ""))}' if not r["rank"]
+                  else f'ранг ТБ {r["rank"]}/{r["n_tb"]} за закрытый месяц '
+                       f'{C.esc(d.get("closed_label", ""))}')
     inner = (
         f'<div class="eyebrow">Прогноз по получателям на {C.esc(d.get("label", ""))}</div>'
         f'<div class="verdict">{C.esc(word)} · '
@@ -189,13 +263,13 @@ def _matrix(a: analyze.Analysis, ai: str | None = None) -> str:
     if m.empty:
         return ""
     gg = a.gosb_gap.sort_values("nedobor", ascending=False)
-    present = set(m.new_gosb_id)
-    rows_id_label = [(int(r.new_gosb_id), (r.gosb_name or "")[:26])
-                     for r in gg.itertuples() if int(r.new_gosb_id) in present]
+    present = set(m.unit_id)
+    rows_id_label = [(int(r.unit_id), (r.unit_name or "")[:26])
+                     for r in gg.itertuples() if int(r.unit_id) in present]
     segs = [s for s in SEG_ORDER if s in set(m.seg_name)]
-    # Красная ячейка = западающий сегмент из карточек ГОСБ: тот же порог в одного
+    # Красная ячейка = западающий сегмент из карточек единицы: тот же порог в одного
     # получателя (недобор меньше человека — округление, показываем как выполнено).
-    cells = {(int(row.new_gosb_id), row.seg_name):
+    cells = {(int(row.unit_id), row.seg_name):
              (row.execution_percent if analyze._failing_seg(row.nedobor) else
               max(float(row.execution_percent or 0), 1.0), row.nedobor)
              for row in m.itertuples()}
@@ -204,13 +278,13 @@ def _matrix(a: analyze.Analysis, ai: str | None = None) -> str:
         '<p class="sub" style="font-size:14px;margin:-4px 0 12px">'
         'красное — сильнее отстаёт от плана ТЕКУЩЕГО месяца по прогнозу</p>'
         + C.heat_matrix(rows_id_label, segs, cells))
-    top = [(f'{r.gosb_name} · {r.seg_name}',
+    top = [(f'{r.unit_name} · {r.seg_name}',
             C.badge(f'{r.execution_percent*100:.0f}%', C.status_of(r.execution_percent)),
             C.fmt_num(r.nedobor), f'{r.share*100:.0f}%') for r in a.top_cells.itertuples()]
     top_tbl = C.card('<h3>Наибольший вклад в недобор</h3>'
                      + C.table(["Провальная зона", "Выполн.", "Недобор, чел", "Доля разрыва"],
                                top, num_cols=[2, 3]))
-    return C.section("Где провал — ГОСБ × сегмент",
+    return C.section(f"Где провал — {a.unit_label} × сегмент",
                      f'<div class="grid cols-2">{heat}{top_tbl}</div>' + _ai(ai),
                      eyebrow="Диагностика по прогнозу")
 
@@ -353,7 +427,7 @@ def _out_group(g: dict, open_: bool = False) -> str:
     )
 
 
-def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
+def _gosb_dialog(c: dict, det: dict, d: dict, uid: str, unit_label: str = "ГОСБ") -> str:
     """Оверлей «почему прогноз такой» по одному ГОСБ.
 
     Порядок блоков: водопад → отток по причинам → пайплайн → тренд портфеля →
@@ -364,9 +438,8 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
     if not det:
         return ""
     wf = det["wf"]
-    gid = c["gosb_id"]
     ex = wf.get("exec") or 0
-    # у ГОСБ свой коэффициент реализуемости и своя доля пройденного месяца
+    # у единицы свой коэффициент реализуемости и своя доля пройденного месяца
     wf_html = _wf_lines(wf, d, det["conv"], det.get("conv_diag"),
                         det.get("conv_is_tb", False))
     yoy = det["yoy_total"]
@@ -380,11 +453,11 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
                 f'<span style="color:{"var(--bad)" if yoy < 0 else "var(--good)"}">'
                 f'{"−" if yoy < 0 else "+"}{C.fmt_num(abs(yoy))} чел</span></h4>')
     return (
-        f'<dialog class="gd" id="gd-{gid}"><div class="gd-sheet">'
+        f'<dialog class="gd" id="gd-{uid}"><div class="gd-sheet">'
         f'<div class="gd-head"><div><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
         f'<div class="gd-note">прогноз {C.fmt_num(wf["forecast"])} из плана '
         f'{C.fmt_num(wf["plan"])} · {ex*100:.0f}%</div></div>'
-        f'<button class="gd-close" onclick="gdClose({gid})" '
+        f'<button class="gd-close" onclick="gdClose(\'{uid}\')" '
         f'aria-label="Закрыть">×</button></div>'
 
         f'<div class="gd-block"><h4>Из чего сложился прогноз</h4>{wf_html}</div>'
@@ -412,11 +485,18 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
     )
 
 
-def _problem_gosb(a: analyze.Analysis, ai: str | None = None) -> str:
+def _problem_gosb(a: analyze.Analysis, ai: str | None = None, idx: int = 0) -> str:
+    """Карточки единиц уровня: ГОСБ внутри ТБ, ТБ внутри банка.
+
+    `idx` — номер уровня в документе; из него собираются id оверлеев. В одном файле
+    лежат все 13 отчётов, и без префикса id оверлея ГОСБ мог бы совпасть с id
+    оверлея ТБ, а клик открывал бы чужую карточку.
+    """
     if not a.gosb_cards:
         return ""
     cards, dialogs = [], []
     d = a.dates or {}
+    unit = a.unit_label
     for c in a.gosb_cards:
         st = ("good" if c["healthy"] else
               "warn" if c["seg_only"] else
@@ -444,7 +524,8 @@ def _problem_gosb(a: analyze.Analysis, ai: str | None = None) -> str:
                   f'(+{C.fmt_num(c["filler_fl"])})' if c["filler_n"] else "")
         cover = (c["fl_need"] / c["gap_seg"]) if c["gap_seg"] > 0 else None
         short = (f' · этого хватает лишь на <b>{cover*100:.0f}%</b> разрыва — '
-                 f'потенциала в ГОСБ больше нет' if cover is not None and cover < 0.999 else "")
+                 f'потенциала в {unit} больше нет'
+                 if cover is not None and cover < 0.999 else "")
         do = (
             f'<div class="g-do">Итого под план: <b>{c["n_need"]}</b> организаций '
             f'(+{C.fmt_num(c["fl_need"])} чел, привлечь {c["n_attract"]} / '
@@ -456,26 +537,31 @@ def _problem_gosb(a: analyze.Analysis, ai: str | None = None) -> str:
             f'<b>{c["not_worked"]}</b></div>'
         )
         gid = c["gosb_id"]
+        uid = f"{idx}-{gid}"           # уникален в пределах документа со всеми уровнями
         det = (a.gosb_detail or {}).get(gid)
         more = ('<div class="g-more">Почему такой прогноз →</div>' if det else "")
+        # на уровне банка карточка ТБ ведёт ещё и в его собственный разбор — это и есть
+        # переход СБ → ТБ; onclick останавливаем, чтобы не открылся заодно оверлей
+        drill = (f'<div class="g-more g-drill" onclick="event.stopPropagation();'
+                 f'lvlGo({c["lvl"]})">Открыть разбор {C.esc(c["gosb_name"])} →</div>'
+                 if c.get("lvl") else "")
         inner = (
             f'<div class="g-head"><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
             f'<span class="g-ex" style="color:{_col(c["exec"])}">{c["exec"]*100:.0f}%</span></div>'
             + C.meter(c["exec"])
             + f'<div style="margin:2px 0 6px">{head_badge}</div>'
-            + f'{seg_html}{do}{more}'
+            + f'{seg_html}{do}{more}{drill}'
         )
         # карточка кликабельна целиком; role/tabindex — чтобы работала и с клавиатуры
-        attrs = (f' role="button" tabindex="0" onclick="gdOpen({gid})" '
+        attrs = (f' role="button" tabindex="0" onclick="gdOpen(\'{uid}\')" '
                  f'onkeydown="if(event.key===\'Enter\'||event.key===\' \')'
-                 f'{{event.preventDefault();gdOpen({gid});}}"' if det else "")
+                 f'{{event.preventDefault();gdOpen(\'{uid}\');}}"' if det else "")
         cards.append(f'<div class="card gcard {st}"{attrs}>{inner}</div>')
         if det:
-            dialogs.append(_gosb_dialog(c, det, d))
-    grid = (f'<div class="gcards">{"".join(cards)}</div>{"".join(dialogs)}'
-            + _GD_JS)
-    return C.section("ГОСБ — что сделать по каждому", grid + _ai(ai),
-                     eyebrow="Все ГОСБ · клик открывает разбор прогноза")
+            dialogs.append(_gosb_dialog(c, det, d, uid, unit))
+    grid = f'<div class="gcards">{"".join(cards)}</div>{"".join(dialogs)}'
+    return C.section(f"{unit} — что сделать по каждому", grid + _ai(ai),
+                     eyebrow=f"Все {unit} · клик открывает разбор прогноза")
 
 
 # Открытие/закрытие оверлея. Нативный <dialog>: Esc работает сам, фокус
@@ -490,8 +576,34 @@ document.querySelectorAll('dialog.gd').forEach(function(d){
 </script>
 """
 
+# Переключение уровней. Адрес страницы пишем в hash: тогда работает кнопка «назад»
+# браузера и на конкретный уровень можно дать ссылку. Открытый оверлей перед
+# переходом закрываем — иначе модалка одного уровня останется поверх другого.
+_LVL_JS = """
+<script>
+function lvlGo(i){
+  document.querySelectorAll('dialog.gd[open]').forEach(function(d){ d.close(); });
+  document.querySelectorAll('.lvl').forEach(function(el, k){ el.hidden = (k !== i); });
+  document.querySelectorAll('.lvl-tab').forEach(function(b){
+    b.classList.toggle('on', Number(b.dataset.lvl) === i); });
+  if (location.hash !== '#lvl-' + i) location.hash = '#lvl-' + i;
+  window.scrollTo({top: 0, behavior: 'instant'});
+}
+function lvlFromHash(){
+  var m = /^#lvl-(\\d+)$/.exec(location.hash || '');
+  var i = m ? Number(m[1]) : 0;
+  if (!document.getElementById('lvl-' + i)) i = 0;
+  document.querySelectorAll('.lvl').forEach(function(el, k){ el.hidden = (k !== i); });
+  document.querySelectorAll('.lvl-tab').forEach(function(b){
+    b.classList.toggle('on', Number(b.dataset.lvl) === i); });
+}
+window.addEventListener('hashchange', lvlFromHash);
+lvlFromHash();
+</script>
+"""
 
-def _orgs(a: analyze.Analysis, ai: str | None = None) -> str:
+
+def _orgs(a: analyze.Analysis, ai: str | None = None, idx: int = 0) -> str:
     """Список к отработке: по умолчанию — ровно те, кем закрывается план.
 
     Отбор считается в Python внутри западающих сегментов каждого ГОСБ, а строке
@@ -530,7 +642,9 @@ def _orgs(a: analyze.Analysis, ai: str | None = None) -> str:
     cut = min_fl > 0 and len(rows) < n_all
     all_label = (f"Все с эффектом от {C.fmt_num(min_fl)} чел" if cut
                  else "Все организации")
-    explorer = C.orgs_explorer("work", rows, gosb_opts, seg_options=seg_opts,
+    # свой id на каждый уровень: в одном документе живут списки всех ТБ, и общий
+    # префикс заставил бы скрипт одного уровня править таблицу другого
+    explorer = C.orgs_explorer(f"work{idx}", rows, gosb_opts, seg_options=seg_opts,
                                all_label=all_label)
     sim = a.sim
     # именно segs_bad: в segs теперь лежат ВСЕ сегменты ГОСБ, включая выполняющие
