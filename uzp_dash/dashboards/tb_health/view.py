@@ -498,9 +498,21 @@ def _orgs(a: analyze.Analysis, ai: str | None = None) -> str:
     проставляется need_k — минимальная цель, при которой организация нужна. Поэтому
     фильтр «Цель» в HTML просто сравнивает need_k с коэффициентом и работает поверх
     остальных фильтров.
+
+    В ФАЙЛ едут не все кандидаты: на проме их около 70 тыс., и хвост организаций по
+    одному-два человека давал 20 МБ HTML, не давая ничего для работы. Порог
+    `explorer_min_fl` отсекает этот хвост, но организации под план проходят всегда —
+    иначе заголовок «N организаций закрывают план» разошёлся бы с таблицей и с n_need
+    в карточках ГОСБ. Порог живёт ТОЛЬКО здесь, в представлении: ни план, ни sim,
+    ни карточки от него не зависят.
     """
-    rows = []
+    min_fl = float(a.explorer_min_fl or 0)
+    rows, n_all = [], 0
     for r in a.to_work.itertuples():
+        n_all += 1
+        if min_fl > 0 and float(r.impact_fl) < min_fl and \
+                not float(getattr(r, "need_k", 0.0)) > 0:
+            continue
         ins = a.insights.get((int(r.new_gosb_id), int(r.inn)), {})
         reason = ins.get("reason") or r.reason
         if bool(getattr(r, "filler", False)):
@@ -515,7 +527,11 @@ def _orgs(a: analyze.Analysis, ai: str | None = None) -> str:
         })
     gosb_opts = sorted({row["gosb"] for row in rows})
     seg_opts = [s for s in SEG_ORDER if s in {row["seg"] for row in rows}]
-    explorer = C.orgs_explorer("work", rows, gosb_opts, seg_options=seg_opts)
+    cut = min_fl > 0 and len(rows) < n_all
+    all_label = (f"Все с эффектом от {C.fmt_num(min_fl)} чел" if cut
+                 else "Все организации")
+    explorer = C.orgs_explorer("work", rows, gosb_opts, seg_options=seg_opts,
+                               all_label=all_label)
     sim = a.sim
     # именно segs_bad: в segs теперь лежат ВСЕ сегменты ГОСБ, включая выполняющие
     bad_segs = sorted({s["seg"] for c in a.gosb_cards for s in c["segs_bad"]},
@@ -523,12 +539,17 @@ def _orgs(a: analyze.Analysis, ai: str | None = None) -> str:
     n_hold = sum(1 for r in rows if r["lever"] == "Удержать")
     hold = (f' · из них «Удержать» — <b>{n_hold}</b>: оттекают прямо сейчас'
             if n_hold else "")
+    # хвост не прячем молча: сказано, сколько кандидатов есть всего и по какому
+    # правилу часть из них в файл не попала
+    cand = (f'в списке {C.fmt_num(len(rows))} из {C.fmt_num(n_all)} кандидатов — '
+            f'остальные не нужны под план и мельче {C.fmt_num(min_fl)} чел' if cut
+            else f'всего кандидатов {C.fmt_num(len(rows))}')
     head = (f'<h3>С кем работать — {sim["k"]} организаций закрывают план</h3>'
             f'<p class="sub" style="font-size:14px;margin:-4px 0 14px">'
             f'отбор идёт внутри ЗАПАДАЮЩИХ сегментов каждого ГОСБ '
             f'({C.esc(", ".join(bad_segs)) or "—"}), по величине эффекта, пока разрыв '
             f'сегмента не закрыт · переключатель «Цель» задаёт перевыполнение · '
-            f'всего кандидатов {len(rows)}{hold}</p>')
+            f'{cand}{hold}</p>')
     return C.section("Организации к работе", C.card(head + explorer) + _ai(ai),
                      eyebrow="Список к отработке")
 

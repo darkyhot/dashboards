@@ -31,6 +31,11 @@ LLM_BATCH_DEFAULT = 12      # пар (ГОСБ, ИНН) в одном запро
 LLM_MIN_IMPACT_DEFAULT = 1  # ниже этого эффекта (чел) в LLM не отправляем — только правила
 LLM_MAX_CALLS_DEFAULT = 80  # жёсткий потолок вызовов на весь ТБ; хвост уходит на правила
 PLAN_TARGETS = (1.0, 1.2, 1.5)   # цели в дэше: выполнить план / +20% / +50%
+# Порог эффекта для СПИСКА В ФАЙЛЕ: на проме кандидатов под 70 тыс., и хвост
+# организаций по одному-два человека раздувал HTML до 20 МБ, не давая ничего для
+# работы. Организации, нужные под план, попадают в список независимо от порога —
+# иначе заголовок «N организаций закрывают план» разошёлся бы с самой таблицей.
+EXPLORER_MIN_FL_DEFAULT = 5
 HIST_MONTHS = 24                 # глубина истории витрины под модель сезонности
 PIPE_MONTHS = 12                 # закрытых месяцев сделок для коэффициента реализуемости
 # Сегмент западает, если план не выполнен (exec < 1) — тот же признак, что даёт
@@ -72,6 +77,7 @@ class Analysis:
     yoy: dict = field(default_factory=dict)        # прирост закрытого месяца год к году
     fc_stats: dict = field(default_factory=dict)   # диагностика прогноза
     gosb_detail: dict = field(default_factory=dict)  # new_gosb_id -> разбор прогноза
+    explorer_min_fl: float = EXPLORER_MIN_FL_DEFAULT  # порог эффекта для списка в файле
 
 
 def run(ctx, tb_short: str) -> Analysis:
@@ -234,6 +240,8 @@ def run(ctx, tb_short: str) -> Analysis:
         insights=insights, themes=themes, llm_stats=llm_stats,
         dates=d, wf=wf, closed=closed_verdict, yoy=yoy, fc_stats=fc_stats,
         gosb_detail=gosb_detail,
+        explorer_min_fl=float(ctx.params.get("explorer_min_fl",
+                                             EXPLORER_MIN_FL_DEFAULT)),
     )
     a.gosb_cards = gosb_cards
     return a

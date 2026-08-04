@@ -185,18 +185,70 @@ def _bold(t: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
 
 
+# поля, которые повторяются из строки в строку: их выносим в словари
+# (первые буквы имён различны — они же ключи словаря в payload)
+_PACK_DICT = ("lever", "gosb", "seg", "reason", "action")
+
+
+def _pack(rows: list[dict]) -> str:
+    """Строки таблицы → JS-выражение, которое разворачивается в те же объекты.
+
+    Повторяющиеся строковые поля выносятся в словари, а сама строка становится
+    массивом индексов и чисел: имена ключей перестают повторяться в каждой записи.
+    `company` в словарь не идёт — уникальных названий почти столько же, сколько
+    строк, и словарь там только добавил бы индексы.
+
+    `needk` кодируется индексом в списке значений: их всего три-четыре, зато
+    исчезает риск, что 1.2 приедет в браузер с другим хвостом float.
+    """
+    import json
+
+    def js(v):
+        return json.dumps(v, ensure_ascii=False).replace("</", "<\\/")
+
+    if not rows:
+        return "[]"
+    dicts = {c: [] for c in _PACK_DICT}
+    idx = {c: {} for c in _PACK_DICT}
+    for c in _PACK_DICT:
+        for r in rows:
+            v = r.get(c) or ""
+            if v not in idx[c]:
+                idx[c][v] = len(dicts[c])
+                dicts[c].append(v)
+    ks = sorted({float(r.get("needk") or 0.0) for r in rows})
+    kidx = {v: i for i, v in enumerate(ks)}
+    packed = [[r["inn"], r.get("company") or "", idx["lever"][r.get("lever") or ""],
+               idx["gosb"][r.get("gosb") or ""], idx["seg"][r.get("seg") or ""],
+               r["fl"], r["fot"], idx["reason"][r.get("reason") or ""],
+               idx["action"][r.get("action") or ""],
+               kidx[float(r.get("needk") or 0.0)]] for r in rows]
+    d = ",".join(f'{c[0]}:{js(dicts[c])}' for c in _PACK_DICT)
+    return (f'(function(){{var D={{{d}}},K={js(ks)},R={js(packed)};'
+            f'return R.map(function(x){{return {{inn:x[0],company:x[1],'
+            f'lever:D.l[x[2]],gosb:D.g[x[3]],seg:D.s[x[4]],fl:x[5],fot:x[6],'
+            f'reason:D.r[x[7]],action:D.a[x[8]],needk:K[x[9]]}};}});}})()')
+
+
 def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
-                  seg_options: list[str] | None = None, page_size: int = 15) -> str:
+                  seg_options: list[str] | None = None, page_size: int = 15,
+                  all_label: str = "Все организации") -> str:
     """Интерактивная таблица организаций: цель по плану + поиск + фильтры (ГОСБ,
     сегмент, рычаг) + пагинация. Самодостаточный инлайн-JS (работает офлайн).
 
     rows: [{inn, lever, gosb, seg, fl, fot, reason, action, needk}, ...]
     Фильтр «Цель»: needk — минимальная цель (1.0/1.2/1.5), при которой организация
     нужна для закрытия разрыва её сегмента; 0 — не нужна ни при какой (видна только
-    при выборе «Все организации»).
+    при выборе «все с эффектом от порога»).
+
+    Строки уезжают в страницу СЛОВАРНОЙ УПАКОВКОЙ, а не списком JSON-объектов: на
+    проме их десятки тысяч, и объектная запись раздувала файл до 20 МБ. В каждой
+    строке повторялись имена ключей (треть объёма) и одни и те же значения —
+    название ГОСБ переписывалось целиком, хотя ГОСБ полтора десятка. Замер: −60%.
+    JS распаковывает payload обратно в ТЕ ЖЕ объекты, поэтому фильтрация, поиск и
+    отрисовка ниже не знают об упаковке вовсе.
     """
-    import json
-    data = json.dumps(rows, ensure_ascii=False).replace("</", "<\\/")
+    data = _pack(rows)
     gopts = "".join(f'<option value="{esc(g)}">{esc(g)}</option>' for g in gosb_options)
     sopts = "".join(f'<option value="{esc(s)}">{esc(s)}</option>' for s in (seg_options or []))
     tid = esc(table_id)
@@ -206,7 +258,7 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     <option value="1">Выполнить план</option>
     <option value="1.2">Перевыполнить на 20%</option>
     <option value="1.5">Перевыполнить на 50%</option>
-    <option value="0">Все организации</option>
+    <option value="0">{esc(all_label)}</option>
   </select>
   <input id="{tid}-q" placeholder="Поиск: номер, название, ГОСБ, сегмент, причина…">
   <select id="{tid}-g"><option value="">Все ГОСБ</option>{gopts}</select>
