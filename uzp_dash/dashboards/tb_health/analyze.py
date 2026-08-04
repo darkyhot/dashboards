@@ -217,14 +217,13 @@ def run(ctx, tb_short: str) -> Analysis:
                                gosb_gap, fc_stats.get("conv_tb", 1.0),
                                fc_stats.get("conv", {}),
                                fc_stats.get("conv_by_gosb", {}), d)
-    n_named = sum(len(v["top_out"]) + len(v["top_pipe"]) for v in gosb_detail.values())
-    covs = [v["out_cov"] for v in gosb_detail.values() if v.get("out_n_all")]
-    cov_txt = (f" · названные объясняют в среднем {sum(covs)/len(covs)*100:.0f}% оттока ГОСБ"
-               if covs else "")
+    n_named = sum(sum(len(g["rows"]) for g in v["out_groups"]) + len(v["top_pipe"])
+                  for v in gosb_detail.values())
+    n_grp = sum(len(v["out_groups"]) for v in gosb_detail.values())
     progress.done(f"Карточек ГОСБ: {len(gosb_cards)} (все, включая выполняющие план) · "
                   f"детализация по {len(gosb_detail)} ГОСБ, названо {n_named} организаций "
-                  f"(до {DETAIL_COVER*100:.0f}% блока, не мельче {DETAIL_MIN_FL} чел, "
-                  f"максимум {DETAIL_MAX_ROWS} строк){cov_txt}")
+                  f"(до {DETAIL_COVER*100:.0f}% блока, максимум {DETAIL_MAX_ROWS} строк) · "
+                  f"отток разложен на {n_grp} групп по причине — они покрывают его целиком")
 
     a = Analysis(
         tb_short=tb_short, tb_id=tb_id, tb_full=tb_full, ref_date=ref_date,
@@ -1251,7 +1250,8 @@ DETAIL_MIN_FL = 3         # но не показываем строки мель
 DETAIL_MAX_ROWS = 8       # потолок строк в блоке
 
 
-def _material(rows: list, key: str, cap: int = DETAIL_MAX_ROWS) -> tuple:
+def _material(rows: list, key: str, cap: int = DETAIL_MAX_ROWS,
+              min_fl: float = DETAIL_MIN_FL) -> tuple:
     """Материальные строки блока + честный хвост (сколько организаций и человек).
 
     Отбор идёт по НАКОПЛЕННОМУ ПОКРЫТИЮ, а не по доле каждой строки. Прежний порог
@@ -1260,8 +1260,10 @@ def _material(rows: list, key: str, cap: int = DETAIL_MAX_ROWS) -> tuple:
     вкладом» почти везде. Покрытие устойчиво к размеру блока: сколько бы строк ни
     было, крупнейшие набираются, пока не объяснят DETAIL_COVER блока.
 
-    Абсолютный пол DETAIL_MIN_FL остаётся: в мелком ГОСБ строки по одному человеку
-    покрытие бы набрали, но смысла в них нет.
+    Абсолютный пол `min_fl` остаётся: в мелком ГОСБ строки по одному человеку
+    покрытие бы набрали, но смысла в них нет. Внутри группы (см. `_out_groups`) пол
+    снижается до 1: там группа уже названа и посчитана, и пустое раскрытие выглядит
+    поломкой, а не экономией внимания.
 
     Возвращает (строки, число орг в хвосте, человек в хвосте, покрытие показанных).
     """
@@ -1271,12 +1273,63 @@ def _material(rows: list, key: str, cap: int = DETAIL_MAX_ROWS) -> tuple:
     ordered = sorted(rows, key=lambda r: -abs(r[key]))
     acc, n = 0.0, 0
     for r in ordered:
-        if n >= cap or acc >= DETAIL_COVER * total or abs(r[key]) < DETAIL_MIN_FL:
+        if n >= cap or acc >= DETAIL_COVER * total or abs(r[key]) < min_fl:
             break
         acc += abs(r[key])
         n += 1
     tail = ordered[n:]
     return ordered[:n], len(tail), float(sum(abs(r[key]) for r in tail)), acc / total
+
+
+def _out_groups(rows: list, closed_label: str) -> list:
+    """Организации в оттоке, разложенные по ПРИЧИНЕ — то, что раскрывается по клику.
+
+    Плоский список сортировался по вкладу, и рядом оказывались организации с
+    противоположным выводом: сезонная вернётся сама, устойчивая уходит насовсем.
+    Причина — единственная ось, которая меняет действие, поэтому группируем по ней.
+
+    Группы покрывают ВЕСЬ блок, а не только материальную часть: раньше названные
+    объясняли около 60% оттока, а остальное пряталось в одну строку «ещё N орг».
+    Теперь каждая организация лежит в своей группе, и хвост считается внутри группы —
+    то есть уже с известной причиной.
+
+    `fact` — не запасной вариант, а обязательная группа: `out_exp` берёт факт дня
+    нижней границей (см. forecast.reconcile), поэтому в блок попадают и организации
+    без истории оттока, у которых выплаты этого месяца уже пропущены.
+    """
+    kinds = [
+        ("persist", forecast.CLS_PERSIST, "Устойчивый отток",
+         "оттекают 2 закрытых месяца подряд — ядро потери"),
+        ("season", forecast.CLS_SEASON_OUT, "Сезонный спад",
+         "в этом месяце проседают обычно"),
+        ("one_off", forecast.CLS_ONE_OFF, "Разовый отток",
+         f"оттекли только в {closed_label} — проверить причину"),
+        ("fact", None, "Только факт этого месяца",
+         "истории оттока нет, но выплаты уже пропущены"),
+    ]
+    known = {k[1] for k in kinds if k[1]}
+    total = float(sum(r["out"] for r in rows)) or 1.0
+    groups = []
+    for key, cls, title, sub in kinds:
+        part = [r for r in rows if (r["cls"] == cls if cls else r["cls"] not in known)]
+        if not part:
+            continue
+        fl = float(sum(r["out"] for r in part))
+        work = [r for r in part if r["zone"] == "можно работать"]
+        # внутри группы пол в 3 человека отсекал бы целиком мелкие группы
+        top, tail_n, tail_fl, _ = _material(part, "out", min_fl=1)
+        if key == "season":
+            back = [r for r in part if r.get("recovered")]
+            if back:
+                sub += (f"; из них {len(back)} обычно возвращаются "
+                        f"({sum(r['out'] for r in back):.0f} чел)")
+        groups.append({
+            "key": key, "title": title, "sub": sub,
+            "n": len(part), "fl": fl, "share": fl / total,
+            "work_n": len(work), "work_fl": float(sum(r["out"] for r in work)),
+            "rows": top, "tail_n": tail_n, "tail_fl": tail_fl,
+        })
+    return sorted(groups, key=lambda g: -g["fl"])
 
 
 def _rest_row(gosb_row, segs: list, n_need_total: int) -> dict | None:
@@ -1303,10 +1356,11 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
                  conv_by_gosb: dict | None = None, dates: dict | None = None) -> dict:
     """Разбор прогноза по каждому ГОСБ — то, что открывается по клику на карточку.
 
-    Отвечает на вопрос «почему прогноз такой»: водопад этого ГОСБ, затем крупнейшие
-    организации в оттоке и в пайплайне и тренд портфеля год к году. Именами объясняется
-    только материальная часть (см. `_material`), поэтому у каждого именного блока
-    показывается покрытие. У строки остаётся признак `zone` (можно работать / влиять
+    Отвечает на вопрос «почему прогноз такой»: водопад этого ГОСБ, затем отток по
+    причинам (см. `_out_groups`), крупнейшие организации в пайплайне и тренд портфеля
+    год к году. Отток покрыт группами целиком; в пайплайне именами объясняется только
+    материальная часть (см. `_material`), поэтому там показывается покрытие.
+    У строки остаётся признак `zone` (можно работать / влиять
     нечем / вне эталонной базы) — он помечает организации, которые в список к работе не
     попадут, чтобы их не пытались распределять.
     """
@@ -1332,7 +1386,7 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
     work, nopt = _keys(to_work), _keys(no_point)
     totals = {int(r.new_gosb_id): r for r in gosb_gap.itertuples()}
 
-    skipped_no_base = []
+    skipped_no_base, group_mismatch = [], []
     for nid, g in orgs_fc.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
         nid = int(nid)
         t = totals.get(nid)
@@ -1353,9 +1407,10 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
                 "out": float(r.out_exp), "seen": float(r.out_observed),
                 "pipe": float(r.pipe_np_raw), "pipe_adj": float(r.pipe_np),
                 "cls": str(r.out_class or "—"), "note": str(r.note or ""),
+                "why": str(r.why or ""),
                 "action": ins.get("action", ""),
                 "yoy": yoy.get(k, 0.0), "cur": cur.get(k, 0.0),
-                "in_ref": ref.get(k, False),
+                "in_ref": ref.get(k, False), "recovered": bool(r.recovered),
                 "zone": ("можно работать" if k in work else
                          "влиять нечем" if k in nopt else "вне эталонной базы"),
             })
@@ -1363,7 +1418,14 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
         # в хвост, иначе «названные + хвост» не сойдутся с итогом блока
         out_rows = [r for r in rows if r["out"] > 0]
         pipe_rows = [r for r in rows if r["pipe"] > 0]
-        top_out, out_n, out_fl, out_cov = _material(out_rows, "out")
+        out_groups = _out_groups(out_rows, (dates or {}).get("closed_label", ""))
+        # группы обязаны покрывать блок целиком — иначе часть оттока показана без
+        # причины и не показана вовсе; расхождение значит, что класс потерялся в merge
+        g_fl = sum(g["fl"] for g in out_groups)
+        g_n = sum(g["n"] for g in out_groups)
+        blk_fl = sum(r["out"] for r in out_rows)
+        if abs(g_fl - blk_fl) > 0.5 or g_n != len(out_rows):
+            group_mismatch.append((nid, g_n, len(out_rows), g_fl, blk_fl))
         top_pipe, pipe_n, pipe_fl, pipe_cov = _material(pipe_rows, "pipe")
         up, *_ = _material([r for r in rows if r["yoy"] >= 1], "yoy", cap=5)
         down, *_ = _material([r for r in rows if r["yoy"] <= -1], "yoy", cap=5)
@@ -1374,8 +1436,7 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
             "conv_is_tb": nid not in (conv_by_gosb or {}),
             "conv_diag": conv_diag or {}, "month_elapsed": (dates or {}).get("month_elapsed", 0.0),
             "out_tot": float(sum(r["out"] for r in rows)),
-            "top_out": top_out, "out_tail_n": out_n, "out_tail_fl": out_fl,
-            "out_cov": out_cov, "out_n_all": len(out_rows),
+            "out_n_all": len(out_rows), "out_groups": out_groups,
             "top_pipe": top_pipe, "pipe_tail_n": pipe_n, "pipe_tail_fl": pipe_fl,
             "pipe_cov": pipe_cov, "pipe_n_all": len(pipe_rows),
             "yoy_total": float(yoy_tot.get(nid, 0.0)), "yoy_up": up, "yoy_down": down,
@@ -1385,6 +1446,12 @@ def _gosb_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
         progress.done(f"Пропущено ГОСБ без базы в витрине метрик: {len(skipped_no_base)} "
                       f"(отток {fl:.0f} чел) — их old_gosb_id числится под другим ТБ, "
                       f"карточки для них и так не строятся")
+    if group_mismatch:
+        nid, g_n, n_all, g_fl, blk_fl = group_mismatch[0]
+        progress.done(f"ВНИМАНИЕ: группы оттока не покрывают блок у "
+                      f"{len(group_mismatch)} ГОСБ (первый {nid}: {g_n} из {n_all} орг, "
+                      f"{g_fl:.0f} из {blk_fl:.0f} чел) — часть оттока показана "
+                      f"без причины")
     return out
 
 

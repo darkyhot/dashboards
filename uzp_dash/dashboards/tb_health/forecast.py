@@ -120,7 +120,7 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     Отрицательный `pred` = ожидаемый ПРИТОК (сезонный бизнес).
     """
     cols = ["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note",
-            "out_1", "out_2", "seas_ratio", "seas_src", "hist_months"]
+            "out_1", "out_2", "seas_ratio", "seas_src", "recovered", "hist_months"]
     if hist is None or hist.empty:
         return pd.DataFrame(columns=cols)
 
@@ -230,6 +230,10 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     res["out_2"] = out_2
     res["seas_ratio"] = seas_ratio
     res["seas_src"] = seas_src
+    # признак «год назад тоже оттекал, а потом восстановился» нужен не только внутри
+    # note: по нему в детализации ГОСБ считается, сколько сезонных клиентов вернётся.
+    # Отдельная колонка, а не поиск подстроки в тексте — формулировку note можно менять.
+    res["recovered"] = yoy_recovered
     res["out_class"] = [r[0] for r in rows]
     res["pred"] = [r[1] for r in rows]
     res["note"] = [r[2] for r in rows]
@@ -276,7 +280,7 @@ def reconcile(day: pd.DataFrame, pred: pd.DataFrame, month_elapsed: float) -> pd
     наблюдения не имеют — у них остаётся полный прогноз.
     """
     out_cols = ["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note",
-                "out_observed", "settled", "out_exp", "in_exp", "why",
+                "recovered", "out_observed", "settled", "out_exp", "in_exp", "why",
                 "seg_day", "avg_salary_m", "has_day"]
     p = pred if pred is not None and not pred.empty else pd.DataFrame(
         columns=["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note"])
@@ -299,6 +303,9 @@ def reconcile(day: pd.DataFrame, pred: pd.DataFrame, month_elapsed: float) -> pd
         m[c] = num(m, c)
     m["out_class"] = m.get("out_class").fillna(CLS_STABLE) if "out_class" in m else CLS_STABLE
     m["note"] = m.get("note").fillna("") if "note" in m else ""
+    # организации без истории в модели приходят из outer-merge с NaN — для флага это «нет»
+    m["recovered"] = (m["recovered"].fillna(False).astype(bool) if "recovered" in m
+                      else False)
     # база: закрытый месяц из витрины, фолбэк — ФЛ прошлого месяца из дневной
     m["base_fl"] = np.where(m["base_fl"] > 0, m["base_fl"], m["fl_prev_m"])
 
@@ -515,7 +522,7 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
     cols = ["new_gosb_id", "inn", "seg_name", "out_exp", "in_exp", "pipe_np",
             "pipe_np_raw", "pipe_fact_mtd", "pipe_rest", "pipe_expect",
             "pipe_fot", "pipe_fot_raw", "n_deals",
-            "out_observed", "pred", "out_class", "note", "why", "settled",
+            "out_observed", "pred", "out_class", "note", "recovered", "why", "settled",
             "avg_salary_m", "delta_fl"]
     base = rec if rec is not None and not rec.empty else pd.DataFrame(
         columns=["new_gosb_id", "inn"])
@@ -533,6 +540,8 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
     for c in ("out_class", "note", "why"):
         m[c] = m.get(c).fillna("") if c in m else ""
     m["out_class"] = m["out_class"].replace("", CLS_STABLE)
+    m["recovered"] = (m["recovered"].fillna(False).astype(bool) if "recovered" in m
+                      else False)
 
     seg_day = m.get("seg_day")
     seg_fun = m.get("seg_funnel")

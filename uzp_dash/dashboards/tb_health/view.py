@@ -305,8 +305,12 @@ def _why_out(r: dict) -> str:
     Пометка о зоне нужна именно здесь: в списке крупнейших неизбежно окажутся
     организации, с которыми работать нельзя (нет в эталонной базе) или нечем (объективный
     отток). Без пометки читатель начнёт распределять то, что не его.
+
+    У группы «только факт этого месяца» причины из модели нет вовсе (`note` пуст —
+    истории оттока не было), и строка осталась бы без единого пояснения. Для неё
+    подставляем `why` из стыковки: там сказано, что отток взят по факту дня.
     """
-    parts = [x for x in (r.get("note"), r.get("action")) if x]
+    parts = [x for x in (r.get("note") or r.get("why"), r.get("action")) if x]
     zone = r.get("zone")
     if zone and zone != "можно работать":
         parts.insert(0, zone)
@@ -323,12 +327,39 @@ def _why_size(r: dict) -> str:
     return f'сейчас {C.fmt_num(r["cur"])} чел'
 
 
+def _out_group(g: dict, open_: bool = False) -> str:
+    """Группа оттока: шапка с причиной и итогом, внутри — список организаций.
+
+    Нативный `<details>`: клик и клавиатура работают без JS, а печать раскрывает
+    содержимое сама. Шапка размечена теми же тремя колонками, что и строка
+    организации, — числа групп и числа организаций стоят в одной вертикали.
+
+    Покрытие внутри списка не подписываем: сколько организаций в группе и сколько
+    в них человек, уже сказано в шапке — повторять это строкой ниже незачем.
+    """
+    work = (f'можно работать: {g["work_n"]} орг (−{C.fmt_num(g["work_fl"])})'
+            if g["work_n"] else "работать не с кем — вне зоны влияния")
+    sub = f'{g["sub"]} · {g["share"] * 100:.0f}% блока · {work}'
+    return (
+        f'<details class="gd-grp"{" open" if open_ else ""} '
+        f'style="--share:{g["share"] * 100:.0f}%">'
+        f'<summary><span class="gd-gt">{C.esc(g["title"])}'
+        f'<i>{g["n"]} орг</i></span>'
+        f'<span>−{C.fmt_num(g["fl"])}</span>'
+        f'<span class="gd-sub">{C.esc(sub)}</span></summary>'
+        f'<div class="gd-rows">'
+        + _org_rows(g["rows"], "out", g["tail_n"], g["tail_fl"], "— хвост", why=_why_out)
+        + '</div></details>'
+    )
+
+
 def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
     """Оверлей «почему прогноз такой» по одному ГОСБ.
 
-    Порядок блоков: водопад → крупнейшие в оттоке → пайплайн → тренд портфеля →
-    разбор по сегментам. Имена показываются только материальные (топ-5 объясняют лишь
-    около трети оттока), поэтому у каждого именного блока стоит подпись о покрытии.
+    Порядок блоков: водопад → отток по причинам → пайплайн → тренд портфеля →
+    разбор по сегментам. Отток разложен на группы (см. `_out_group`) и покрыт целиком;
+    в остальных блоках имена показываются только материальные, поэтому у них стоит
+    подпись о покрытии.
     """
     if not det:
         return ""
@@ -339,6 +370,12 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
     wf_html = _wf_lines(wf, d, det["conv"], det.get("conv_diag"),
                         det.get("conv_is_tb", False))
     yoy = det["yoy_total"]
+    # отток разложен по причине: первая (крупнейшая) группа раскрыта, иначе оверлей
+    # встречает читателя четырьмя закрытыми строками без единого имени
+    groups = det.get("out_groups") or []
+    out_html = ("".join(_out_group(g, i == 0) for i, g in enumerate(groups)) if groups
+                else '<div class="gd-note">нет организаций с заметным вкладом</div>')
+    n_out = det.get("out_n_all", 0)
     yoy_head = (f'<h4>Портфель год к году: '
                 f'<span style="color:{"var(--bad)" if yoy < 0 else "var(--good)"}">'
                 f'{"−" if yoy < 0 else "+"}{C.fmt_num(abs(yoy))} чел</span></h4>')
@@ -352,11 +389,9 @@ def _gosb_dialog(c: dict, det: dict, d: dict) -> str:
 
         f'<div class="gd-block"><h4>Из чего сложился прогноз</h4>{wf_html}</div>'
 
-        f'<div class="gd-block"><h4>Крупнейшие в оттоке — всего '
-        f'{C.fmt_num(det["out_tot"])} чел</h4>'
-        + _org_rows(det["top_out"], "out", det["out_tail_n"], det["out_tail_fl"],
-                    "— хвост", why=_why_out, cover=det.get("out_cov", 0.0),
-                    n_all=det.get("out_n_all", 0))
+        f'<div class="gd-block"><h4>Отток по причинам — всего '
+        f'{C.fmt_num(det["out_tot"])} чел, {C.fmt_num(n_out)} орг</h4>'
+        + out_html
         + '</div>'
 
         f'<div class="gd-block"><h4>Пайплайн на месяц: заявлено '

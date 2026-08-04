@@ -222,6 +222,30 @@ dialog.gd[open] { animation: gd-in 0.22s cubic-bezier(0.22, 1, 0.36, 1); }
 .gd-row > span:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums;
                               font-weight: 620; }
 .gd-row .gd-why { color: var(--text-2); font-size: 12.5px; }
+
+/* Группы оттока по причине: нативный <details>, шапка в колонках строки организации */
+.gd-grp { border-top: 1px solid var(--separator); }
+.gd-grp:first-of-type { border-top: 0; }
+.gd-grp > summary { display: grid; grid-template-columns: 1fr 72px 1.35fr; gap: 10px;
+                    align-items: baseline; font-size: 13px; line-height: 1.45;
+                    padding: 7px 8px; margin: 0 -8px; cursor: pointer; border-radius: 8px;
+                    list-style: none;
+                    /* полоска доли блока — фон под шапкой, ширина из --share */
+                    background: linear-gradient(to right, var(--separator) var(--share),
+                                                transparent var(--share)); }
+.gd-grp > summary::-webkit-details-marker { display: none; }
+/* подсветка через inset-тень, а не background: иначе она стёрла бы полоску доли */
+.gd-grp > summary:hover { box-shadow: inset 0 0 0 999px rgba(127, 127, 127, 0.09); }
+.gd-grp > summary > span:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums;
+                                        font-weight: 620; }
+.gd-gt { font-weight: 620; letter-spacing: -0.006em; }
+.gd-gt::before { content: "›"; display: inline-block; width: 12px; color: var(--text-2);
+                 transition: transform 0.18s ease; }
+.gd-grp[open] > summary .gd-gt::before { transform: rotate(90deg); }
+.gd-gt i { font-style: normal; font-weight: 400; color: var(--text-2); margin-left: 8px;
+           font-variant-numeric: tabular-nums; }
+.gd-sub { color: var(--text-2); font-size: 12.5px; }
+.gd-rows { padding: 2px 0 8px 20px; }
 .g-do { font-size: 14px; line-height: 1.4; letter-spacing: -0.004em; margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--separator); }
 .g-do b { font-variant-numeric: tabular-nums; }
 .g-act { font-size: 12.5px; color: var(--text-2); margin-top: 8px; line-height: 1.35; }
@@ -259,5 +283,6 @@ dialog.gd[open] { animation: gd-in 0.22s cubic-bezier(0.22, 1, 0.36, 1); }
   .gcard { transition: none; }
   .gcard:hover { transform: none; }
   dialog.gd[open] { animation: none; }
+  .gd-gt::before { transition: none; }
 }
 """
