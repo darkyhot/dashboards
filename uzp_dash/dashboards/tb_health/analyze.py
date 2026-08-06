@@ -36,6 +36,10 @@ PLAN_TARGETS = (1.0, 1.2, 1.5)   # цели в дэше: выполнить пл
 # работы. Организации, нужные под план, попадают в список независимо от порога —
 # иначе заголовок «N организаций закрывают план» разошёлся бы с самой таблицей.
 EXPLORER_MIN_FL_DEFAULT = 5
+# Аппарат ТБ — не продающее подразделение, в разборе ему делать нечего. Опознаётся
+# по имени, но с обязательной оговоркой: если аппарат — ЕДИНСТВЕННОЕ подразделение
+# своего ТБ (Московский банк), исключать его нельзя, иначе ТБ обнулится.
+APPARAT_PREFIX = "аппарат"
 HIST_MONTHS = 24                 # глубина истории витрины под модель сезонности
 PIPE_MONTHS = 12                 # закрытых месяцев сделок для коэффициента реализуемости
 # Сегмент западает, если план не выполнен (exec < 1) — тот же признак, что даёт
@@ -122,7 +126,16 @@ def run(ctx, tb_short: str) -> Analysis:
 
     # --- Организации (только закреплённые в эталонной базе ИУП) ---
     progress.step("Витрина организаций (потенциал/отток)")
+    apparat = _apparat_ids(e)
     orgs = read_sql(e, Q.ORGS, {"tb_id": tb_id, "ref": ref_closed})
+    # аппараты убираем на входе: тогда они сами не попадут ни в прогноз, ни в список
+    # к работе, ни в карточки — фильтровать каждое место по отдельности не придётся
+    if apparat and not orgs.empty:
+        n0 = len(orgs)
+        orgs = orgs[~orgs["new_gosb_id"].isin(apparat)].reset_index(drop=True)
+        if n0 != len(orgs):
+            progress.done(f"Организации аппаратов исключены: {n0 - len(orgs)} пар "
+                          f"(ГОСБ, ИНН) из {n0}")
     rs = read_sql(e, Q.ORGS_REF_STATS, {"tb_id": tb_id, "ref": ref_closed})
     if not rs.empty:
         n_all = int(rs.n_all.iloc[0] or 0); n_ref = int(rs.n_ref.iloc[0] or 0)
@@ -155,15 +168,20 @@ def run(ctx, tb_short: str) -> Analysis:
     progress.step("Матрица ГОСБ × сегмент по ПРОГНОЗУ + разрыв по ГОСБ")
     base_seg = read_sql(e, Q.GOSB_SEG, {**p_cls, "tb_id": tb_id})
     plan_seg = read_sql(e, Q.GOSB_SEG, {**p_cur, "tb_id": tb_id})
+    base_tot = read_sql(e, Q.GOSB_TOTALS, {**p_cls, "tb_id": tb_id})
+    plan_tot = read_sql(e, Q.GOSB_TOTALS, {**p_cur, "tb_id": tb_id})
+    # Аппараты не продают — в разборе по подразделениям им делать нечего. Вердикт ТБ
+    # при этом остаётся из строки level_name='tb', как есть: сумма карточек ему не
+    # равна, и это нормально — уровни витрины и так считаются независимо (раздел 12).
+    base_seg, plan_seg, base_tot, plan_tot = (
+        _drop_apparat(f, apparat) for f in (base_seg, plan_seg, base_tot, plan_tot))
     for f in (base_seg, plan_seg):
         f["seg_name"] = f["seg_id"].map(segments.short)
     matrix, mstats = forecast.build_matrix(base_seg, plan_seg, orgs_fc)
     matrix = matrix.merge(
         base_seg[["unit_id", "seg_name", "unit_name"]].drop_duplicates(),
         on=["unit_id", "seg_name"], how="left")
-    gosb_gap = forecast.build_totals(read_sql(e, Q.GOSB_TOTALS, {**p_cls, "tb_id": tb_id}),
-                                     read_sql(e, Q.GOSB_TOTALS, {**p_cur, "tb_id": tb_id}),
-                                     orgs_fc)
+    gosb_gap = forecast.build_totals(base_tot, plan_tot, orgs_fc)
     fc_stats.update(mstats)
     if mstats.get("unattributed", 0) > 0:
         progress.done(f"Дельта без сегмента разнесена по сегментам ГОСБ "
@@ -224,10 +242,16 @@ def run(ctx, tb_short: str) -> Analysis:
     progress.step("Разрез по ГОСБ + детализация прогноза")
     gosb_cards = _unit_cards(gosb_gap, matrix, to_work, fagg, gosb_plan)
     org_detail = read_sql(e, Q.ORG_DETAIL, {"tb_id": tb_id, "ref_closed": ref_closed})
+    fmonths = read_sql(e, Q.FUNNEL_MONTHS,
+                       {"tb_id": tb_id, "months_from": d["months_from"],
+                        "ref_funnel": d["ref_funnel"]})
+    progress.done(f"Активности по месяцам с {d['months_from']}: {len(fmonths)} строк "
+                  f"(ГОСБ×организация×месяц) — по ним видно, отрабатывали ли отток тогда")
     gosb_detail = _unit_detail(orgs_fc, org_detail, insights, to_work, no_point,
                                gosb_gap, fc_stats.get("conv_tb", 1.0),
                                fc_stats.get("conv", {}),
-                               fc_stats.get("conv_by_gosb", {}), d)
+                               fc_stats.get("conv_by_gosb", {}), d,
+                               funnel_months=fmonths)
     n_named = sum(sum(len(g["rows"]) for g in v["out_groups"]) + len(v["top_pipe"])
                   for v in gosb_detail.values())
     n_grp = sum(len(v["out_groups"]) for v in gosb_detail.values())
@@ -300,16 +324,22 @@ def run_sb(ctx, per_tb: dict) -> Analysis:
                       f"их ГОСБ числится сразу под двумя ТБ")
 
     # --- Матрица ТБ × сегмент и разрыв по ТБ ---
-    base_seg = read_sql(e, Q.TB_SEG, p_cls)
-    plan_seg = read_sql(e, Q.TB_SEG, p_cur)
+    # Единицы уровня — ТБ, но собираются они из ГОСБ-метрик: аппараты надо исключить
+    # ДО свёртки, а в строках level_name='tb' они уже внутри и не отделяются.
+    apparat = _apparat_ids(e)
+    names = {a.tb_id: a.tb_short for a in per_tb.values()} if per_tb else {}
+    base_seg = _roll_to_tb(read_sql(e, Q.GOSB_SEG_ALL, p_cls), apparat, names, seg=True)
+    plan_seg = _roll_to_tb(read_sql(e, Q.GOSB_SEG_ALL, p_cur), apparat, names, seg=True)
+    base_tot_g = read_sql(e, Q.GOSB_TOTALS_ALL, p_cls)
+    plan_tot_g = read_sql(e, Q.GOSB_TOTALS_ALL, p_cur)
+    base_tot = _roll_to_tb(base_tot_g, apparat, names)
+    plan_tot = _roll_to_tb(plan_tot_g, apparat, names)
     for f in (base_seg, plan_seg):
         f["seg_name"] = f["seg_id"].map(segments.short)
     matrix, mstats = forecast.build_matrix(base_seg, plan_seg, orgs_fc, unit_src="tb_id")
     matrix = matrix.merge(base_seg[["unit_id", "seg_name", "unit_name"]].drop_duplicates(),
                           on=["unit_id", "seg_name"], how="left")
-    tb_gap = forecast.build_totals(read_sql(e, Q.TB_TOTALS, p_cls),
-                                   read_sql(e, Q.TB_TOTALS, p_cur),
-                                   orgs_fc, unit_src="tb_id")
+    tb_gap = forecast.build_totals(base_tot, plan_tot, orgs_fc, unit_src="tb_id")
 
     wf = forecast.waterfall(
         base=closed_verdict["rcp"]["fact"], orgs_fc=orgs_fc,
@@ -351,7 +381,8 @@ def run_sb(ctx, per_tb: dict) -> Analysis:
     conv_by_tb = {a.tb_id: float(a.fc_stats.get("conv_tb", 1.0)) for a in per_tb.values()}
     unit_detail = _unit_detail(orgs_fc, detail, insights, to_work, no_point,
                                tb_gap, 1.0, {}, conv_by_tb, d,
-                               unit_src="tb_id", unit_label="ТБ")
+                               unit_src="tb_id", unit_label="ТБ",
+                               funnel_months=_sb_funnel_months(e, per_tb, d))
 
     sim = _sum_sim(per_tb, gap_rcp, verdict["rcp"]["fact"], verdict["rcp"]["plan"])
     a = Analysis(
@@ -464,6 +495,25 @@ def _sb_org_detail(engine, per_tb: dict) -> pd.DataFrame:
         df = read_sql(engine, Q.ORG_DETAIL,
                       {"tb_id": a.tb_id, "ref_closed": a.dates["ref_closed"]})
         if not df.empty:
+            # единица разбора уровня — ТБ, и ключ детализации собирается по ней
+            df["tb_id"] = a.tb_id
+            frames.append(df)
+    return _cat(frames)
+
+
+def _sb_funnel_months(engine, per_tb: dict, d: dict) -> pd.DataFrame:
+    """Помесячные активности по всем ТБ — для блока годового тренда уровня СБ.
+
+    Единица разбора там ТБ, поэтому в каждый кусок дописывается `tb_id`: индекс
+    активностей собирается по той же колонке, что и всё остальное на уровне.
+    """
+    frames = []
+    for a in per_tb.values():
+        df = read_sql(engine, Q.FUNNEL_MONTHS,
+                      {"tb_id": a.tb_id, "months_from": d["months_from"],
+                       "ref_funnel": d["ref_funnel"]})
+        if not df.empty:
+            df["tb_id"] = a.tb_id
             frames.append(df)
     return _cat(frames)
 
@@ -540,6 +590,9 @@ def _dates(engine, params: dict) -> dict:
     # ещё не могли дать зачисления, по ним недоработку не считаем.
     fresh_from = (cur.to_period("M") - 1).to_timestamp().date()
     hist_from = (cur.to_period("M") - (HIST_MONTHS + 1)).to_timestamp("M").date()
+    # окно помесячных активностей под вопрос «отрабатывали ли отток тогда»: та же
+    # глубина, что у месяцев оттока в годовом тренде (forecast.YOY_DEPTH)
+    months_from = (cur.to_period("M") - forecast.YOY_DEPTH).to_timestamp().date()
     # тот же месяц год назад — для прироста «год к году» по закрытому месяцу
     ref_yoy = (cur.to_period("M") - 13).to_timestamp("M").date()
     # окно сделок для помесячного план/факт: PIPE_MONTHS закрытых месяцев + текущий.
@@ -578,6 +631,7 @@ def _dates(engine, params: dict) -> dict:
             "ref_yoy": ref_yoy,
             "ref_funnel": ref_funnel, "funnel_from": funnel_from,
             "fresh_from": fresh_from, "hist_from": hist_from, "plan_from": plan_from,
+            "months_from": months_from,
             "cur_month": int(cur.month), "month_elapsed": float(observed),
             "today": today, "days_left": int(days_left),
             "days_in_month": int(cur.day), "pipe_left": float(pipe_left), "src": src,
@@ -672,7 +726,7 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
 
     keep = ["new_gosb_id", "inn", "out_exp", "in_exp", "pipe_np", "pipe_np_raw",
             "pipe_fact_mtd", "pipe_fot", "out_observed", "pred", "out_class", "note",
-            "why", "settled", "n_deals"]
+            "why", "settled", "n_deals", "out_months"]
     merged = orgs.copy()
     merged["new_gosb_id"] = merged["new_gosb_id"].astype("Int64")
     if not fc.empty:
@@ -693,6 +747,11 @@ def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
     for c in ("out_class", "note", "why"):
         merged[c] = merged.get(c).fillna("") if c in merged else ""
     merged["out_class"] = merged["out_class"].replace("", forecast.CLS_STABLE)
+    # колонка-список: у организаций без истории после left join приезжает NaN, а он
+    # ПРОХОДИТ проверку `or []` (nan истинно) и роняет list() уже в детализации
+    merged["out_months"] = [v if isinstance(v, list) else []
+                            for v in merged.get("out_months", pd.Series(dtype=object))] \
+        if "out_months" in merged else [[] for _ in range(len(merged))]
     return merged, fc, stats
 
 
@@ -918,6 +977,65 @@ def _activity(totals: pd.DataFrame, breakdown: pd.DataFrame) -> dict:
         "unrealized": int(t.unrealized or 0),
         "by_role": _dim("role"), "by_type": _dim("type"), "by_status": _dim("status"),
     }
+
+
+def _apparat_ids(engine) -> set:
+    """Подразделения-аппараты, которые исключаются из разбора.
+
+    Правило: имя начинается на «Аппарат» И это не единственное подразделение своего ТБ.
+    Вторая половина обязательна — у Московского банка аппарат единственный, и без
+    оговорки этот ТБ остался бы вовсе без единиц разбора.
+
+    Состав печатается в прогресс: молча выкидывать подразделения из отчёта нельзя,
+    иначе расхождение с витриной будет выглядеть ошибкой расчёта.
+    """
+    flags = read_sql(engine, Q.GOSB_FLAGS)
+    if flags.empty:
+        return set()
+    out, kept = set(), []
+    for r in flags.itertuples():
+        name = str(r.gosb_name or "").strip()
+        if not name.lower().startswith(APPARAT_PREFIX):
+            continue
+        if int(r.n_gosb) <= 1:
+            kept.append(name)
+            continue
+        out.add(int(r.new_gosb_id))
+    if out:
+        progress.done(f"Из разбора исключены аппараты ТБ: {len(out)} подразделений — "
+                      f"они не продающие. Вердикт уровня берётся из витрины целиком, "
+                      f"поэтому сумма карточек ему не равна — так и задумано")
+    if kept:
+        progress.done(f"Оставлены как единственное подразделение своего ТБ: "
+                      f"{', '.join(kept)}")
+    return out
+
+
+def _drop_apparat(df: pd.DataFrame, apparat: set) -> pd.DataFrame:
+    """Убрать аппараты из выборки метрик по подразделениям."""
+    if df is None or df.empty or not apparat or "unit_id" not in df:
+        return df
+    return df[~df["unit_id"].isin(apparat)].reset_index(drop=True)
+
+
+def _roll_to_tb(df: pd.DataFrame, apparat: set, names: dict,
+                seg: bool = False) -> pd.DataFrame:
+    """ГОСБ-метрики без аппаратов → единицы уровня СБ (ТБ).
+
+    Свёртка делается здесь, а не в SQL, потому что правило аппарата зависит от числа
+    подразделений в ТБ и живёт в Python. Считать процент выполнения на этом шаге
+    незачем: build_matrix/build_totals пересчитают его от прогноза.
+    """
+    cols = ["unit_id", "unit_name", "plan_amt", "fact_amt", "nedobor"] + \
+           (["seg_id", "seg_name"] if seg else [])
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    d = _drop_apparat(df, apparat)
+    keys = ["tb_id"] + (["seg_id"] if seg else [])
+    agg = d.groupby(keys, as_index=False)[["plan_amt", "fact_amt", "nedobor"]].sum()
+    agg = agg.rename(columns={"tb_id": "unit_id"})
+    agg["unit_name"] = agg["unit_id"].map(lambda x: names.get(int(x), f"ТБ {int(x)}"))
+    return agg
 
 
 def _sb_verdict(engine, params: dict) -> tuple[dict, str]:
@@ -1562,7 +1680,7 @@ def _material(rows: list, key: str, cap: int = DETAIL_MAX_ROWS,
     return ordered[:n], len(tail), float(sum(abs(r[key]) for r in tail)), acc / total
 
 
-def _out_groups(rows: list, closed_label: str) -> list:
+def _out_groups(rows: list, closed_label: str, act_dt=None) -> list:
     """Организации в оттоке, разложенные по ПРИЧИНЕ — то, что раскрывается по клику.
 
     Плоский список сортировался по вкладу, и рядом оказывались организации с
@@ -1577,16 +1695,25 @@ def _out_groups(rows: list, closed_label: str) -> list:
     `fact` — не запасной вариант, а обязательная группа: `out_exp` берёт факт дня
     нижней границей (см. forecast.reconcile), поэтому в блок попадают и организации
     без истории оттока, у которых выплаты этого месяца уже пропущены.
+
+    В подписях НАЗВАН ИСТОЧНИК, потому что источников два и по названию группы их
+    не отличить: первые три класса посчитаны по истории витрины организаций
+    (`uzp_dwh_company_holding_metric`, закрытые месяцы), последняя — по ежедневной
+    витрине (`uzp_dwh_day_outflow`) на дату её актуальности в ПРОГНОЗНОМ месяце.
     """
+    day = (f"на {pd.Timestamp(act_dt).strftime('%d.%m.%Y')}" if act_dt
+           else "на дату актуальности")
     kinds = [
         ("persist", forecast.CLS_PERSIST, "Устойчивый отток",
          "оттекают 2 закрытых месяца подряд — ядро потери"),
         ("season", forecast.CLS_SEASON_OUT, "Сезонный спад",
          "в этом месяце проседают обычно"),
         ("one_off", forecast.CLS_ONE_OFF, "Разовый отток",
-         f"оттекли только в {closed_label} — проверить причину"),
-        ("fact", None, "Только факт этого месяца",
-         "истории оттока нет, но выплаты уже пропущены"),
+         f"фактический отток закрытого месяца {closed_label} "
+         f"(T−1 от прогнозного) — проверить причину"),
+        ("fact", None, "Ежедневный отток",
+         f"{day} — дату актуальности ежедневной витрины в прогнозном месяце; "
+         f"истории оттока нет, но выплаты уже пропущены"),
     ]
     known = {k[1] for k in kinds if k[1]}
     total = float(sum(r["out"] for r in rows)) or 1.0
@@ -1608,6 +1735,93 @@ def _out_groups(rows: list, closed_label: str) -> list:
             "key": key, "title": title, "sub": sub,
             "n": len(part), "fl": fl, "share": fl / total,
             "work_n": len(work), "work_fl": float(sum(r["out"] for r in work)),
+            "rows": top, "tail_n": tail_n, "tail_fl": tail_fl,
+        })
+    return sorted(groups, key=lambda g: -g["fl"])
+
+
+def _funnel_month_index(fm: pd.DataFrame | None, unit_src: str) -> tuple[dict, set]:
+    """Активности по месяцам → индекс {(единица, ИНН, «MM.YYYY»): агрегат} + окно месяцев.
+
+    Окно возвращается отдельно и намеренно: по нему отличается «задач не было» от
+    «месяц вне выборки, данных нет». Без него обе ситуации выглядели бы одинаково.
+
+    Единица разбора — ГОСБ или ТБ, поэтому ключ собирается по `unit_src`: у ТБ строки
+    воронки нескольких ГОСБ схлопываются в одну пару (ТБ, ИНН).
+    """
+    idx: dict = {}
+    window: set = set()
+    if fm is None or fm.empty:
+        return idx, window
+    src = unit_src if unit_src in fm else "new_gosb_id"
+    for r in fm.dropna(subset=[src, "ym"]).itertuples():
+        ym = pd.Timestamp(getattr(r, "ym"))
+        label = f"{ym.month:02d}.{ym.year}"
+        window.add(label)
+        key = (int(getattr(r, src)), int(r.inn), label)
+        cur = idx.setdefault(key, {"n_tasks": 0, "n_success": 0, "n_outflow": 0})
+        cur["n_tasks"] += int(r.n_tasks or 0)
+        cur["n_success"] += int(r.n_success or 0)
+        cur["n_outflow"] += int(getattr(r, "n_outflow", 0) or 0)
+    return idx, window
+
+
+def _yoy_groups(rows: list, nid: int, fmonths: dict, fwindow: set) -> list:
+    """Просевшие за год, разложенные по ОБЪЯСНЁННОСТИ падения.
+
+    Плоский список «просели за год» показывал дельту и больше ничего: по нему нельзя
+    было понять, потеряли людей разовым оттоком или штат таял месяцами, и работали ли
+    с организацией, когда это происходило. Ось группировки выбрана так, чтобы у каждой
+    группы было своё действие.
+
+    `fmonths` — {(ГОСБ, ИНН, «MM.YYYY»): агрегат задач за месяц}; `fwindow` — множество
+    месяцев, попавших в выборку воронки. Разница между «активностей не было» и
+    «неизвестно» держится именно на `fwindow`: если месяц оттока в окно не попал,
+    сказать про отработку нечего, и это пишется прямо. Молчаливое «не отрабатывали»
+    было бы утверждением о факте, которого у нас нет.
+    """
+    kinds = [
+        ("worked", "Отток был, отрабатывали",
+         "в месяцы оттока были задачи — смотреть качество отработки, а не охват"),
+        ("missed", "Отток был, активностей не было",
+         "в месяцы оттока задач не заводили — пропустили"),
+        ("unknown", "Отток был, отработка неизвестна",
+         "месяцы оттока старше окна воронки — по ним данных о задачах нет"),
+        ("melt", "Таяли постепенно",
+         "разовым оттоком не объясняется: штат уменьшался месяц за месяцем"),
+    ]
+    total = float(sum(abs(r["yoy"]) for r in rows)) or 1.0
+    for r in rows:
+        months = r.get("out_months") or []
+        known = [m for m in months if m in fwindow]
+        tasks = sum(int(fmonths.get((nid, r["inn"], m), {}).get("n_tasks", 0))
+                    for m in known)
+        r["yoy_tasks"] = tasks
+        r["yoy_months_known"] = known
+        if not months:
+            r["yoy_key"] = "melt"
+        elif not known:
+            r["yoy_key"] = "unknown"
+        elif tasks > 0:
+            r["yoy_key"] = "worked"
+        else:
+            r["yoy_key"] = "missed"
+
+    groups = []
+    for key, title, sub in kinds:
+        part = [r for r in rows if r["yoy_key"] == key]
+        if not part:
+            continue
+        fl = float(sum(abs(r["yoy"]) for r in part))
+        # внутри группы пол снижен до 1: группа уже названа, и пустое раскрытие
+        # выглядело бы поломкой (та же логика, что в _out_groups)
+        top, tail_n, tail_fl, _ = _material(part, "yoy", min_fl=1)
+        with_reason = sum(1 for r in part if r.get("reason"))
+        groups.append({
+            "key": key, "title": title, "sub": sub,
+            "n": len(part), "fl": fl, "share": fl / total,
+            "work_n": with_reason,
+            "work_fl": float(sum(abs(r["yoy"]) for r in part if r.get("reason"))),
             "rows": top, "tail_n": tail_n, "tail_fl": tail_fl,
         })
     return sorted(groups, key=lambda g: -g["fl"])
@@ -1635,7 +1849,8 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
                  gosb_gap: pd.DataFrame, conv_tb: float,
                  conv_diag: dict | None = None,
                  conv_by_gosb: dict | None = None, dates: dict | None = None,
-                 unit_src: str = "new_gosb_id", unit_label: str = "ГОСБ") -> dict:
+                 unit_src: str = "new_gosb_id", unit_label: str = "ГОСБ",
+                 funnel_months: pd.DataFrame | None = None) -> dict:
     """Разбор прогноза по каждой единице — то, что открывается по клику на карточку.
 
     Единица — ГОСБ в отчёте ТБ и ТБ в отчёте СБ; `unit_src` называет колонку грейна
@@ -1654,22 +1869,28 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
         return out
     names, yoy, ref, cur = {}, {}, {}, {}
     yoy_tot: dict = {}
+    # Справочник приходит на грейне ГОСБ, а ключ строки — ЕДИНИЦА УРОВНЯ. На уровне
+    # ТБ это одно и то же, на уровне СБ — нет, и ключ по ГОСБ там не нашёлся бы
+    # никогда: блок годового тренда молча оставался бы пустым.
+    dsrc = unit_src if (detail is not None and unit_src in detail) else "new_gosb_id"
     if detail is not None and not detail.empty:
-        for r in detail.itertuples():
-            if pd.isna(r.new_gosb_id):
-                continue
-            k = (int(r.new_gosb_id), int(r.inn))
+        for r in detail.dropna(subset=[dsrc]).itertuples():
+            k = (int(getattr(r, dsrc)), int(r.inn))
             names[k] = str(r.company_name or "").strip() or f"Орг. {int(r.inn)}"
-            yoy[k] = float(r.fl_yoy or 0)
-            cur[k] = float(r.current_fl_qty or 0)
-            ref[k] = bool(r.in_ref)
+            # одна организация может числиться в нескольких ГОСБ одного ТБ — на уровне
+            # СБ такие строки складываются, иначе часть тренда потеряется
+            yoy[k] = yoy.get(k, 0.0) + float(r.fl_yoy or 0)
+            cur[k] = cur.get(k, 0.0) + float(r.current_fl_qty or 0)
+            ref[k] = ref.get(k, False) or bool(r.in_ref)
             yoy_tot[k[0]] = yoy_tot.get(k[0], 0.0) + float(r.fl_yoy or 0)
 
     def _keys(df):
-        return ({(int(r.new_gosb_id), int(r.inn)) for r in df.itertuples()}
+        src = unit_src if (df is not None and unit_src in df) else "new_gosb_id"
+        return ({(int(getattr(r, src)), int(r.inn)) for r in df.dropna(subset=[src]).itertuples()}
                 if df is not None and not df.empty else set())
     work, nopt = _keys(to_work), _keys(no_point)
     totals = {int(r.unit_id): r for r in gosb_gap.itertuples()}
+    fmonths, fwindow = _funnel_month_index(funnel_months, unit_src)
 
     skipped_no_base, group_mismatch = [], []
     for nid, g in orgs_fc.dropna(subset=[unit_src]).groupby(unit_src):
@@ -1695,6 +1916,8 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
                 "why": str(r.why or ""),
                 "action": ins.get("action", ""),
                 "yoy": yoy.get(k, 0.0), "cur": cur.get(k, 0.0),
+                "out_months": list(getattr(r, "out_months", None) or []),
+                "reason": ins.get("reason", ""),
                 "in_ref": ref.get(k, False), "recovered": bool(r.recovered),
                 "zone": ("можно работать" if k in work else
                          "влиять нечем" if k in nopt else "вне эталонной базы"),
@@ -1703,7 +1926,8 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
         # в хвост, иначе «названные + хвост» не сойдутся с итогом блока
         out_rows = [r for r in rows if r["out"] > 0]
         pipe_rows = [r for r in rows if r["pipe"] > 0]
-        out_groups = _out_groups(out_rows, (dates or {}).get("closed_label", ""))
+        out_groups = _out_groups(out_rows, (dates or {}).get("closed_label", ""),
+                                 (dates or {}).get("act_dt"))
         # группы обязаны покрывать блок целиком — иначе часть оттока показана без
         # причины и не показана вовсе; расхождение значит, что класс потерялся в merge
         g_fl = sum(g["fl"] for g in out_groups)
@@ -1712,8 +1936,9 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
         if abs(g_fl - blk_fl) > 0.5 or g_n != len(out_rows):
             group_mismatch.append((nid, g_n, len(out_rows), g_fl, blk_fl))
         top_pipe, pipe_n, pipe_fl, pipe_cov = _material(pipe_rows, "pipe")
-        up, *_ = _material([r for r in rows if r["yoy"] >= 1], "yoy", cap=5)
-        down, *_ = _material([r for r in rows if r["yoy"] <= -1], "yoy", cap=5)
+        # выросшие за год не показываем: блок отвечает на «почему просели»
+        yoy_rows = [r for r in rows if r["yoy"] <= -1]
+        yoy_groups = _yoy_groups(yoy_rows, nid, fmonths, fwindow)
         out[nid] = {
             # коэффициент ИМЕННО ЭТОГО ГОСБ; если своей истории мало, он ушёл на
             # коэффициент ТБ — тогда это подписывается в карточке явно
@@ -1724,7 +1949,9 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
             "out_n_all": len(out_rows), "out_groups": out_groups,
             "top_pipe": top_pipe, "pipe_tail_n": pipe_n, "pipe_tail_fl": pipe_fl,
             "pipe_cov": pipe_cov, "pipe_n_all": len(pipe_rows),
-            "yoy_total": float(yoy_tot.get(nid, 0.0)), "yoy_up": up, "yoy_down": down,
+            "yoy_total": float(yoy_tot.get(nid, 0.0)), "yoy_groups": yoy_groups,
+            "yoy_n_all": len(yoy_rows),
+            "yoy_down_tot": float(sum(r["yoy"] for r in yoy_rows)),
         }
     if skipped_no_base:
         fl = sum(x[1] for x in skipped_no_base)

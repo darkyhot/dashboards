@@ -393,12 +393,32 @@ def _why_out(r: dict) -> str:
 
 def _why_pipe(r: dict) -> str:
     """Пояснение к строке пайплайна: сколько из заявленного дошло до прогноза."""
-    return f'в прогнозе {C.fmt_num(r["pipe_adj"])} — с поправкой на реализуемость'
+    return f'в прогнозе {C.fmt_num(r["pipe_adj"], "фл")} — с поправкой на реализуемость'
 
 
 def _why_size(r: dict) -> str:
-    """Пояснение к строке годового тренда: текущий размер организации."""
-    return f'сейчас {C.fmt_num(r["cur"])} чел'
+    """Пояснение к строке годового тренда: когда оттекали, работали ли тогда, причина.
+
+    Про отработку говорим ровно то, что знаем: «задач не заводили» — это факт из
+    выборки, «отработка неизвестна» — месяц оттока в окно воронки не попал. Подменять
+    второе первым нельзя, это разные утверждения.
+    """
+    parts = [f'сейчас {C.fmt_num(r["cur"])} чел']
+    months = r.get("out_months") or []
+    if months:
+        shown = ", ".join(months[:3])
+        more = f" и ещё {len(months) - 3}" if len(months) > 3 else ""
+        parts.append(f"отток: {shown}{more}")
+        if r.get("yoy_key") == "unknown":
+            parts.append("отработка за те месяцы неизвестна")
+        elif r.get("yoy_tasks"):
+            parts.append(f'задач в те месяцы: {r["yoy_tasks"]}')
+        else:
+            parts.append("задач в те месяцы не заводили")
+    else:
+        parts.append("разовых оттоков в витрине нет")
+    parts.append(f'причина: {r["reason"]}' if r.get("reason") else "причина не зафиксирована")
+    return " · ".join(parts)
 
 
 def _out_group(g: dict, open_: bool = False) -> str:
@@ -413,6 +433,28 @@ def _out_group(g: dict, open_: bool = False) -> str:
     """
     work = (f'можно работать: {g["work_n"]} орг (−{C.fmt_num(g["work_fl"])})'
             if g["work_n"] else "работать не с кем — вне зоны влияния")
+    return _group_html(g, open_, work, "out", _why_out)
+
+
+def _yoy_group(g: dict, open_: bool = False) -> str:
+    """Группа годового тренда. Тот же рендер, что у оттока, — меняется только то,
+    что стоит в третьей строке шапки: у оттока это зона влияния, здесь — сколько
+    организаций группы имеют зафиксированную причину."""
+    work = (f'причина зафиксирована у {g["work_n"]} орг (−{C.fmt_num(g["work_fl"])})'
+            if g["work_n"] else "причина не зафиксирована ни у одной")
+    return _group_html(g, open_, work, "yoy", _why_size)
+
+
+def _group_html(g: dict, open_: bool, work: str, key: str, why) -> str:
+    """Группа: шапка с причиной и итогом, внутри — список организаций.
+
+    Нативный `<details>`: клик и клавиатура работают без JS, а печать раскрывает
+    содержимое сама. Шапка размечена теми же тремя колонками, что и строка
+    организации, — числа групп и числа организаций стоят в одной вертикали.
+
+    Покрытие внутри списка не подписываем: сколько организаций в группе и сколько
+    в них человек, уже сказано в шапке — повторять это строкой ниже незачем.
+    """
     sub = f'{g["sub"]} · {g["share"] * 100:.0f}% блока · {work}'
     return (
         f'<details class="gd-grp"{" open" if open_ else ""} '
@@ -422,7 +464,7 @@ def _out_group(g: dict, open_: bool = False) -> str:
         f'<span>−{C.fmt_num(g["fl"])}</span>'
         f'<span class="gd-sub">{C.esc(sub)}</span></summary>'
         f'<div class="gd-rows">'
-        + _org_rows(g["rows"], "out", g["tail_n"], g["tail_fl"], "— хвост", why=_why_out)
+        + _org_rows(g["rows"], key, g["tail_n"], g["tail_fl"], "— хвост", why=why)
         + '</div></details>'
     )
 
@@ -449,9 +491,17 @@ def _gosb_dialog(c: dict, det: dict, d: dict, uid: str, unit_label: str = "ГО�
     out_html = ("".join(_out_group(g, i == 0) for i, g in enumerate(groups)) if groups
                 else '<div class="gd-note">нет организаций с заметным вкладом</div>')
     n_out = det.get("out_n_all", 0)
+    # в блоке только просевшие: он отвечает на «почему потеряли», и выросшие
+    # организации ответа на этот вопрос не содержат
+    yoy_groups = det.get("yoy_groups") or []
+    yoy_html = ("".join(_yoy_group(g, i == 0) for i, g in enumerate(yoy_groups))
+                if yoy_groups else
+                '<div class="gd-note">просевших за год организаций нет</div>')
     yoy_head = (f'<h4>Портфель год к году: '
                 f'<span style="color:{"var(--bad)" if yoy < 0 else "var(--good)"}">'
-                f'{"−" if yoy < 0 else "+"}{C.fmt_num(abs(yoy))} чел</span></h4>')
+                f'{"−" if yoy < 0 else "+"}{C.fmt_num(abs(yoy))} чел</span>'
+                f' · просели {C.fmt_num(det.get("yoy_n_all", 0))} орг на '
+                f'−{C.fmt_num(abs(det.get("yoy_down_tot", 0)))}</h4>')
     return (
         f'<dialog class="gd" id="gd-{uid}"><div class="gd-sheet">'
         f'<div class="gd-head"><div><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
@@ -474,11 +524,7 @@ def _gosb_dialog(c: dict, det: dict, d: dict, uid: str, unit_label: str = "ГО�
                     n_all=det.get("pipe_n_all", 0))
         + '</div>'
 
-        f'<div class="gd-block">{yoy_head}'
-        f'<div class="gd-note">просели за год:</div>'
-        f'{_org_rows(det["yoy_down"], "yoy", 0, 0, "", -1, _why_size)}'
-        f'<div class="gd-note" style="margin-top:10px">выросли за год:</div>'
-        f'{_org_rows(det["yoy_up"], "yoy", 0, 0, "", 1, _why_size)}</div>'
+        f'<div class="gd-block">{yoy_head}{yoy_html}</div>'
 
         f'<div class="gd-block"><h4>Разбор по сегментам</h4>{_gosb_table(c, wide=True)}</div>'
         f'</div></dialog>'

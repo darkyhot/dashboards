@@ -104,6 +104,29 @@ def seasonal_depth_needed(ref_cur) -> int:
 
 
 # --------------------------------------------------------------------------- #
+YOY_DEPTH = 13          # месяцев истории под вопрос «в каком месяце был отток»
+
+
+def _out_months(out: pd.DataFrame, periods: list, p_closed) -> list:
+    """Месяцы, в которых у организации был отток, — свежие первыми.
+
+    Годовое падение портфеля объясняется конкретными месяцами, и без них в блоке
+    «Портфель год к году» остаётся одна дельта без всякой зацепки. Сводная таблица
+    «месяц × организация» здесь уже построена, так что новых запросов не нужно.
+
+    Глубина — YOY_DEPTH месяцев: ровно тот горизонт, за который спрашивается годовой
+    тренд; более старый отток к падению «год к году» уже не относится.
+    """
+    window = [p for p in periods if p_closed - YOY_DEPTH < p <= p_closed]
+    if not window:
+        return [[] for _ in range(len(out))]
+    sub = out.reindex(columns=window)
+    vals = sub.to_numpy(dtype="float64")
+    labels = [_m(p) for p in window]
+    order = list(range(len(window)))[::-1]        # свежие месяцы первыми
+    return [[labels[j] for j in order if vals[i, j] > 0] for i in range(len(vals))]
+
+
 def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     """Прогноз оттока на месяц :ref_cur по истории витрины. Грейн (ГОСБ, ИНН).
 
@@ -120,7 +143,8 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     Отрицательный `pred` = ожидаемый ПРИТОК (сезонный бизнес).
     """
     cols = ["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note",
-            "out_1", "out_2", "seas_ratio", "seas_src", "recovered", "hist_months"]
+            "out_1", "out_2", "seas_ratio", "seas_src", "recovered", "hist_months",
+            "out_months"]
     if hist is None or hist.empty:
         return pd.DataFrame(columns=cols)
 
@@ -238,6 +262,7 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     res["pred"] = [r[1] for r in rows]
     res["note"] = [r[2] for r in rows]
     res["hist_months"] = hist_months
+    res["out_months"] = _out_months(out, periods, p_closed)
     # Диагностика: без неё молчаливый сбой (нет базового месяца в истории →
     # col() вернёт нули → всё «стабильно») выглядит как нормальный результат.
     res.attrs["diag"] = {
@@ -281,9 +306,10 @@ def reconcile(day: pd.DataFrame, pred: pd.DataFrame, month_elapsed: float) -> pd
     """
     out_cols = ["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note",
                 "recovered", "out_observed", "settled", "out_exp", "in_exp", "why",
-                "seg_day", "avg_salary_m", "has_day"]
+                "seg_day", "avg_salary_m", "has_day", "out_months"]
     p = pred if pred is not None and not pred.empty else pd.DataFrame(
-        columns=["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note"])
+        columns=["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note",
+                 "out_months"])
     d = day if day is not None and not day.empty else pd.DataFrame(
         columns=["new_gosb_id", "inn", "seg_day", "out_observed", "paid_mtd",
                  "fl_prev_m", "avg_salary_m"])
@@ -306,6 +332,9 @@ def reconcile(day: pd.DataFrame, pred: pd.DataFrame, month_elapsed: float) -> pd
     # организации без истории в модели приходят из outer-merge с NaN — для флага это «нет»
     m["recovered"] = (m["recovered"].fillna(False).astype(bool) if "recovered" in m
                       else False)
+    # то же для колонки-списка: NaN нельзя оставлять, он проходит проверку `or []`
+    m["out_months"] = ([v if isinstance(v, list) else [] for v in m["out_months"]]
+                       if "out_months" in m else [[] for _ in range(len(m))])
     # база: закрытый месяц из витрины, фолбэк — ФЛ прошлого месяца из дневной
     m["base_fl"] = np.where(m["base_fl"] > 0, m["base_fl"], m["fl_prev_m"])
 
@@ -523,7 +552,7 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
             "pipe_np_raw", "pipe_fact_mtd", "pipe_rest", "pipe_expect",
             "pipe_fot", "pipe_fot_raw", "n_deals",
             "out_observed", "pred", "out_class", "note", "recovered", "why", "settled",
-            "avg_salary_m", "delta_fl"]
+            "avg_salary_m", "delta_fl", "out_months"]
     base = rec if rec is not None and not rec.empty else pd.DataFrame(
         columns=["new_gosb_id", "inn"])
     p = pipe if pipe is not None and not pipe.empty else pd.DataFrame(
@@ -542,6 +571,10 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
     m["out_class"] = m["out_class"].replace("", CLS_STABLE)
     m["recovered"] = (m["recovered"].fillna(False).astype(bool) if "recovered" in m
                       else False)
+    # колонка-список переживает outer-merge только с явной нормализацией: NaN здесь
+    # истинно и молча просочился бы в детализацию
+    m["out_months"] = ([v if isinstance(v, list) else [] for v in m["out_months"]]
+                       if "out_months" in m else [[] for _ in range(len(m))])
 
     seg_day = m.get("seg_day")
     seg_fun = m.get("seg_funnel")

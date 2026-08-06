@@ -136,6 +136,19 @@ _GMAP = """SELECT old_gosb_id, min(tb_id) AS tb_id, min(new_gosb_id) AS new_gosb
                   min(new_gosb_name) AS gosb_name
            FROM {schema}.uzp_dim_gosb GROUP BY old_gosb_id"""
 
+# Состав подразделений: к какому ТБ относится и сколько их всего в этом ТБ.
+# Число нужно для правила аппарата: аппарат исключается из разбора, НО если он
+# единственное подразделение своего ТБ (Московский банк), исключать нельзя — ТБ
+# обнулился бы. Считаем в SQL, чтобы правило не зависело от того, какие ТБ грузятся.
+GOSB_FLAGS = """
+WITH gmap AS (""" + _GMAP + """),
+u AS (SELECT new_gosb_id, min(tb_id) AS tb_id, min(gosb_name) AS gosb_name
+      FROM gmap GROUP BY new_gosb_id)
+SELECT u.new_gosb_id, u.tb_id, u.gosb_name,
+       count(*) OVER (PARTITION BY u.tb_id) AS n_gosb
+FROM u
+"""
+
 # Матрица ГОСБ×сегмент по получателям (макс. месяц), агрегат по new_gosb_id
 GOSB_SEG = """
 WITH gmap AS (""" + _GMAP + """)
@@ -164,6 +177,34 @@ WHERE m.level_name='gosb' AND m.period_type='m' AND m.metric_id=:m_rcp
   AND m.end_dt = :ref AND g.tb_id=:tb_id AND COALESCE(m.extended_dim_1,1)=1
 GROUP BY g.new_gosb_id, g.gosb_name
 ORDER BY nedobor DESC
+"""
+
+# Те же две выборки, но по ВСЕМ ТБ и с колонкой tb_id. Нужны уровню СБ: единицы там —
+# ТБ, но собираются они из ГОСБ-метрик, потому что аппараты надо исключить ДО свёртки.
+# Строки level_name='tb' для этого не годятся — аппарат внутри них уже учтён.
+GOSB_SEG_ALL = """
+WITH gmap AS (""" + _GMAP + """)
+SELECT g.new_gosb_id AS unit_id, g.gosb_name AS unit_name, g.tb_id,
+       m.extended_dim_1 AS seg_id,
+       sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
+       sum(m.plan_amt - m.fact_amt) AS nedobor
+FROM {schema}.uzp_dwh_metrics m
+JOIN gmap g ON g.old_gosb_id=m.level_id
+WHERE m.level_name='gosb' AND m.period_type='m' AND m.metric_id=:m_rcp
+  AND m.end_dt = :ref AND m.extended_dim_1 <> 1
+GROUP BY g.new_gosb_id, g.gosb_name, g.tb_id, m.extended_dim_1
+"""
+
+GOSB_TOTALS_ALL = """
+WITH gmap AS (""" + _GMAP + """)
+SELECT g.new_gosb_id AS unit_id, g.gosb_name AS unit_name, g.tb_id,
+       sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
+       sum(m.plan_amt - m.fact_amt) AS nedobor
+FROM {schema}.uzp_dwh_metrics m
+JOIN gmap g ON g.old_gosb_id=m.level_id
+WHERE m.level_name='gosb' AND m.period_type='m' AND m.metric_id=:m_rcp
+  AND m.end_dt = :ref AND COALESCE(m.extended_dim_1,1)=1
+GROUP BY g.new_gosb_id, g.gosb_name, g.tb_id
 """
 
 # Организации ТБ (витрина) с сегментом и средней ЗП
@@ -240,6 +281,33 @@ base AS (
     AND f.task_create_dt >= CAST(:funnel_from AS date)
     AND f.task_create_dt <= CAST(:ref_funnel  AS date)
 )"""
+
+# Активности ПО МЕСЯЦАМ за длинный горизонт — под вопрос «отрабатывали ли отток
+# тогда, когда он случился». Основное окно воронки (FUNNEL_AGG) — 3 месяца, а годовое
+# падение портфеля обычно относится к оттоку 6–12 месяцев назад: по трёхмесячной
+# выборке про него нельзя сказать ничего, и молчаливое «не отрабатывали» было бы
+# неправдой, а не незнанием.
+#
+# Запрос намеренно лёгкий: агрегация в БД, тексты не тянем (только флаг), строки
+# появляются лишь там, где задачи БЫЛИ, — выборка разрежённая. Отдельный запрос, а не
+# расширение окна FUNNEL_AGG: тот тянет полтора десятка колонок, включая суммы по
+# сделкам, и растягивать его на 13 месяцев незачем.
+FUNNEL_MONTHS = """
+WITH gmap AS (""" + _GMAP + """)
+SELECT g.new_gosb_id, f.inn,
+       CAST(date_trunc('month', f.task_create_dt) AS date)          AS ym,
+       count(*)                                                     AS n_tasks,
+       sum(CASE WHEN f.is_task_closed_success THEN 1 ELSE 0 END)    AS n_success,
+       sum(CASE WHEN f.task_type='Отток' THEN 1 ELSE 0 END)         AS n_outflow,
+       bool_or(COALESCE(btrim(f.task_comment), '') <> ''
+               OR COALESCE(btrim(f.task_questionnaire), '') <> '')  AS has_text
+FROM {schema}.uzp_dwh_sale_funnel_task f
+LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
+WHERE f.tb_id = :tb_id
+  AND f.task_create_dt >= CAST(:months_from AS date)
+  AND f.task_create_dt <= CAST(:ref_funnel AS date)
+GROUP BY g.new_gosb_id, f.inn, CAST(date_trunc('month', f.task_create_dt) AS date)
+"""
 
 # Агрегат по (ГОСБ, ИНН) — по ВСЕМ активностям за 3 мес (не по последней задаче).
 # Тяжёлые тексты не тянем: только флаг has_text.
