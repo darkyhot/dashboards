@@ -126,13 +126,13 @@
 
 **Единицы уровня СБ считаются из ГОСБ-метрик**, а не из строк `level_name='tb'`:
 аппарат надо исключить ДО свёртки в ТБ, а в строке `tb` он уже растворён и не
-отделяется. Поэтому для карточек СБ берутся `GOSB_SEG_ALL` / `GOSB_TOTALS_ALL` и
-сворачиваются до `tb_id` после фильтра.
+отделяется. Поэтому для карточек СБ берутся те же `UNIT_SEG` / `UNIT_TOTALS` (они
+читаются по всему банку сразу) и сворачиваются до `tb_id` после фильтра.
 
-**Код:** `analyze.run` (уровень ТБ), `analyze.run_sb` (свод), `analyze._apparat_ids`,
-`analyze._drop_apparat`, `analyze._roll_to_tb`, `view._build_all`.
-**SQL:** `SB_VERDICT`, `SB_LEVELS`, `GOSB_FLAGS`, `GOSB_SEG_ALL`, `GOSB_TOTALS_ALL`,
-`TB_VERDICT`, `TB_LIST`.
+**Код:** `bank.load` (единственный проход в БД), `bank._apparat`, `analyze.prepare`
+(уровень ТБ), `analyze.build_sb` (свод), `analyze._assemble` (общая часть уровня),
+`analyze._drop_apparat`, `analyze._roll_to_tb`, `view.build`.
+**SQL:** `METRICS_VERDICT`, `GOSB_FLAGS`, `UNIT_SEG`, `UNIT_TOTALS`, `TB_LIST`.
 
 ---
 
@@ -170,7 +170,8 @@
 Если ежедневной витрины нет вовсе, дэш откатывается на прежнюю логику
 (`max(report_dt)` из витрины организаций `+ 1 месяц`) и пишет об этом в прогрессе.
 
-**Код:** `analyze._dates`. **SQL:** `REF_CUR`, `ACT_DT_FOR`, фолбэк `REF_DATE`.
+**Код:** `bank.dates` (считаются один раз на отчёт). **SQL:** `REF_CUR`, `ACT_DT_FOR`,
+фолбэк `REF_DATE`.
 
 **Пример (ЮЗБ, синтетика):**
 ```
@@ -244,7 +245,8 @@ pipe_left     = 1 / 31 = 0.0323
 метрике, показываются единственные не-прогнозные числа страницы: факт закрытого месяца,
 его выполнение плана и прирост год к году. Прирост считается как **факт закрытого месяца
 против того же месяца годом ранее** — сравниваются два ФАКТА, поэтому цифра не зависит от
-точности прогноза. Источник — тот же `TB_VERDICT`, только с `ref = ref_closed − 12 мес`.
+точности прогноза. Источник — тот же `METRICS_VERDICT`, строка за `ref_yoy`
+(`ref_closed − 12 мес`): все три месяца читаются одним запросом.
 Если этого месяца в витрине нет, в карточке стоит «—» и сообщение в прогрессе: показать
 вместо него ноль нельзя — его не отличить от настоящего нулевого прироста.
 
@@ -334,7 +336,20 @@ seas_ratio = idx_cur / idx_closed          — если ОБА индекса е
 **цикл, а не потеря**: сезонный бизнес, отпуска, вахта. Прогноз оттока по таким режется
 в 2.5 раза, и в дэше рядом пишется «год назад тоже оттекал и восстановился к MM.YYYY».
 
-**Код:** `forecast.outflow_model`. **SQL:** `OUTFLOW_HISTORY`.
+**Код:** `forecast.outflow_model`. **SQL:** `OUTFLOW_HIST_AGG`.
+
+**Где считаются признаки.** Историю сворачивает БД: на грейн (ГОСБ, ИНН) возвращается
+ОДНА строка с готовыми `base_fl`, `out_1`, `out_2`, средними по календарным месяцам,
+срезом «год назад» и списком месяцев с оттоком. По всему банку сырая история — порядка
+17 млн месячных строк, а модели из них нужны только агрегаты. Та же свёртка в pandas
+живёт в `forecast.aggregate_history` — она нужна генератору синтетики и служит
+эталоном для сверки «SQL против pandas».
+
+Сезонное отношение считается ПРЯМО: `avg(ФЛ за прогнозный месяц) / avg(ФЛ за базовый)`.
+Раньше это были два деления через годовое среднее (индекс месяца, потом индекс к
+индексу); годовое среднее в отношении сокращается, а лишние деления давали на точной
+границе `0.90` значение `0.8999999999999999` и переводили пару в «сезонный отток»
+из-за округления.
 
 **Примеры (ЮЗБ, синтетика):**
 
@@ -526,6 +541,12 @@ pipe_np = факт + rest × conv(ГОСБ) × pipe_left
 В дэше показываются оба числа: с поправкой (базовый прогноз) и заявленное
 («если пайплайн отработают на 100%» — потолок месяца).
 
+**Коэффициент считается сразу на ТРЁХ уровнях** — ГОСБ, ТБ и банк, потому что отчёт
+строится по всему банку и у каждого уровня он свой: у ГОСБ с малым объёмом плана
+(`< CONV_MIN_PLAN`) берётся коэффициент ЕГО ТБ, а водопад уровня СБ считает свой,
+банковский (суммарный факт/план по закрытым месяцам). Раньше уровню СБ подставлялась
+жёсткая единица, и в его водопаде всегда стояло «коэф. 1.00».
+
 **Код:** `forecast.conversion_by_month`, `forecast.pipeline_current`, `forecast.deal_due`.
 **SQL:** `PIPELINE_PLAN_M`, `PIPELINE_FACT_M`, `PIPELINE_PLAN_STATS`, `PIPELINE_FACT_STATS`.
 
@@ -591,7 +612,8 @@ pipe_np = факт + rest × conv(ГОСБ) × pipe_left
 (0.5%) плана ГОСБ. После перехода на показ ВСЕХ сегментов она остаётся в основном для
 известного расхождения уровней `tb`/`gosb` (раздел 12).
 
-**Код:** `forecast.build_matrix`, `forecast.build_totals`. **SQL:** `GOSB_SEG`, `GOSB_TOTALS`.
+**Код:** `forecast.build_matrix`, `forecast.build_totals`. **SQL:** `UNIT_SEG`,
+`UNIT_TOTALS` (по всему банку и сразу за оба опорных месяца).
 
 **Пример — Калмыцкое ГОСБ № 8579 × ММБ (ЮЗБ, синтетика):**
 ```
@@ -889,9 +911,24 @@ JSON-объектов: имена ключей повторялись в каж�
 Фраза «нет организаций с заметным вкладом» остаётся только для пустого блока или когда
 все вклады мельче абсолютного пола.
 
-**Код:** `analyze._unit_detail`, `analyze._out_groups`, `analyze._yoy_groups`,
-`analyze._funnel_month_index`, `analyze._material`, `forecast._out_months`.
-**SQL:** `ORG_DETAIL`, `FUNNEL_MONTHS`.
+**Источник блока «Портфель год к году» — СТРОКИ ВИТРИНЫ, а не прогноз.** Блок
+отвечает на вопрос «на сколько просел портфель за год», и его итог обязан сходиться с
+витриной. Организации берутся на грейне ЕДИНИЦЫ уровня: у ТБ — строки `level_name='gosb'`,
+у банка — строки `level_name='tb'` (там годовая дельта уже свёрнута витриной). Если
+собирать блок из строк прогноза, в него не попадают организации, которых в прогнозе нет
+(например, обслуживаемые только аппаратом), а на уровне СБ одна организация повторялась
+бы столько раз, в скольких ГОСБ она обслуживается, — с ПОЛНОЙ дельтой по ТБ в каждой
+строке.
+
+**Окно поиска задач — месяц оттока И СЛЕДУЮЩИЙ ЗА НИМ.** Задачу на отток заводят и
+внутри месяца, и следующим отчётным месяцем: витрина закрывает отток позже, чем он
+случился. По одному только месяцу оттока нормально отработанные организации попадали в
+группу «активностей не было».
+
+**Код:** `analyze._unit_detail`, `analyze._unit_grain`, `analyze._yoy_rows`,
+`analyze._out_groups`, `analyze._yoy_groups`, `analyze._funnel_month_index`,
+`analyze._material`, `forecast._out_months`.
+**SQL:** `ORGS_ALL`, `ORGS_TB`, `FUNNEL_MONTHS`.
 
 **Пример — Калмыцкое ГОСБ № 8579**, отток 407 чел по 60 организациям:
 
@@ -969,7 +1006,7 @@ WHERE r.ref_cur IS NOT NULL
 ```
 
 ### Ежедневный отток — `DAY_OUTFLOW`
-Параметры: `:tb_id`, `:ref_cur`, `:act_dt`.
+Параметры: `:ref_cur`, `:act_dt`.
 ```sql
 WITH gmap AS (...)
 SELECT g.new_gosb_id, d.org_inn AS inn,
@@ -981,26 +1018,51 @@ SELECT g.new_gosb_id, d.org_inn AS inn,
        count(DISTINCT d.payment_order_num) AS n_payments
 FROM {schema}.uzp_dwh_day_outflow d
 LEFT JOIN gmap g ON g.old_gosb_id = d.gosb_id
-WHERE d.report_dt = :ref_cur AND d.act_dt = :act_dt AND d.tb_id = :tb_id
+WHERE d.report_dt = :ref_cur AND d.act_dt = :act_dt
 GROUP BY g.new_gosb_id, d.org_inn
 ```
 
-### История для модели оттока — `OUTFLOW_HISTORY`
-Параметры: `:tb_id`, `:hist_from`, `:ref_closed`.
+### История для модели оттока — `OUTFLOW_HIST_AGG`
+Параметры: `:hist_from`, `:ref_closed` и опорные месяцы свёртки (`:m_closed`, `:m_prev`,
+`:mon_cur`, `:mon_cls`, `:m_yoy`, `:m_yoy_prev`, `:m_y1…:m_y3`, `:m_out_from`).
 ```sql
-WITH gmap AS (...)
-SELECT g.new_gosb_id, c.org_id AS inn, c.report_dt,
-       COALESCE(c.fl_outflow_qty, 0) AS fl_outflow_qty,
-       COALESCE(c.current_fl_qty, 0) AS current_fl_qty
-FROM {schema}.uzp_dwh_company_holding_metric c
-JOIN gmap g ON g.old_gosb_id = c.level_id
-WHERE g.tb_id = :tb_id AND c.org_type = 'inn'
-  AND c.report_dt >  CAST(:hist_from  AS date)
-  AND c.report_dt <= CAST(:ref_closed AS date)
+WITH gmap AS (...),
+h AS (   -- один месяц = одна строка на пару (ГОСБ, ИНН)
+  SELECT g.new_gosb_id, c.org_id AS inn,
+         CAST(date_trunc('month', c.report_dt) AS date) AS ym,
+         sum(COALESCE(c.current_fl_qty, 0)) AS fl,
+         sum(COALESCE(c.fl_outflow_qty, 0)) AS out_q
+  FROM {schema}.uzp_dwh_company_holding_metric c
+  JOIN gmap g ON g.old_gosb_id = c.level_id
+  WHERE c.level_name = 'gosb' AND c.org_type = 'inn'
+    AND c.report_dt >  CAST(:hist_from  AS date)
+    AND c.report_dt <= CAST(:ref_closed AS date)
+  GROUP BY 1, 2, 3
+)
+SELECT new_gosb_id, inn,
+       count(*) AS n_months, min(ym) AS ym_min, max(ym) AS ym_max,
+       max(fl)    FILTER (WHERE ym = :m_closed)                  AS base_fl,
+       max(out_q) FILTER (WHERE ym = :m_closed)                  AS out_1,
+       max(out_q) FILTER (WHERE ym = :m_prev)                    AS out_2,
+       avg(fl)                                                   AS fl_avg_all,
+       avg(fl)  FILTER (WHERE EXTRACT(MONTH FROM ym) = :mon_cur) AS fl_avg_mcur,
+       count(*) FILTER (WHERE EXTRACT(MONTH FROM ym) = :mon_cur) AS n_mcur,
+       avg(fl)  FILTER (WHERE EXTRACT(MONTH FROM ym) = :mon_cls) AS fl_avg_mcls,
+       count(*) FILTER (WHERE EXTRACT(MONTH FROM ym) = :mon_cls) AS n_mcls,
+       max(out_q) FILTER (WHERE ym = :m_yoy)                     AS yoy_out,
+       max(fl)    FILTER (WHERE ym = :m_yoy)                     AS fl_yoy,
+       max(fl)    FILTER (WHERE ym = :m_yoy_prev)                AS fl_before,
+       max(fl)    FILTER (WHERE ym IN (:m_y1, :m_y2, :m_y3))     AS fl_after,
+       string_agg(to_char(ym, 'YYYY-MM'), ',')
+              FILTER (WHERE out_q > 0 AND ym >= :m_out_from)     AS out_months
+FROM h GROUP BY new_gosb_id, inn
 ```
 
+Порядок месяцев внутри `string_agg` намеренно не задан: упорядоченные агрегаты в
+Greenplum ненадёжны, а отсортировать десяток меток в pandas стоит ничего.
+
 ### План пайплайна по месяцам — `PIPELINE_PLAN_M`
-Параметры: `:tb_id`, `:plan_from`, `:ref_funnel`. Грейн — (ГОСБ, ИНН, СОТРУДНИК, месяц):
+Параметры: `:plan_from`, `:ref_funnel`. Грейн — (ГОСБ, ИНН, СОТРУДНИК, месяц):
 именно он складывает планы нескольких сделок одного месяца в одно число.
 ```sql
 WITH gmap AS (...),
@@ -1014,7 +1076,7 @@ codes AS (
                                           CAST(f.task_create_dt AS timestamp)))) AS m0
   FROM {schema}.uzp_dwh_sale_funnel_task f
   LEFT JOIN gmap g ON g.old_gosb_id = f.gosb_id
-  WHERE f.tb_id = :tb_id
+  WHERE f.inn IS NOT NULL
     AND f.task_create_dt >= CAST(:plan_from AS date)
     AND f.task_create_dt <= CAST(:ref_funnel AS date)
     AND COALESCE(f.deal_code, f.task_code) IS NOT NULL
@@ -1043,7 +1105,7 @@ GROUP BY new_gosb_id, inn, saphr_id, plan_month
 ```
 
 ### Факт привлечения по месяцам — `PIPELINE_FACT_M`
-Параметры: `:tb_id`, `:plan_from`, `:ref_cur`, `:m_np` (1000636), `:counted` («учтено»).
+Параметры: `:plan_from`, `:ref_cur`, `:m_np` (1000636), `:counted` («учтено»).
 ```sql
 WITH gmap AS (...)
 SELECT g.new_gosb_id, m.inn, m.saphr_id,
@@ -1052,8 +1114,7 @@ SELECT g.new_gosb_id, m.inn, m.saphr_id,
        sum(COALESCE(m.sales_amt, 0)) AS fact_np
 FROM {schema}.uzp_data_mzp_motivation_detail_corr m
 LEFT JOIN gmap g ON g.old_gosb_id = m.gosb_id
-WHERE m.tb_id = :tb_id
-  AND m.metric_id = :m_np
+WHERE m.metric_id = :m_np
   AND m.product_cmnt = :counted
   AND m.report_dt >= CAST(:plan_from AS date)
   AND m.report_dt <= CAST(:ref_cur   AS date)
@@ -1065,17 +1126,19 @@ GROUP BY g.new_gosb_id, m.inn, m.saphr_id, 4
 отсекает фильтр «учтено». Обе доли печатаются в прогресс.
 
 ### План и факт метрик
-* `TB_VERDICT` — обе метрики уровня `tb` за `:ref` + ранг ТБ (window-функция).
-  Вызывается ДВАЖДЫ: за `ref_closed` (портфель-база и ранг) и за `ref_cur` (план).
-* `GOSB_SEG` — (ГОСБ, сегмент), `extended_dim_1 <> 1`. Тоже дважды.
-* `GOSB_TOTALS` — итог по ГОСБ, `COALESCE(extended_dim_1, 1) = 1`.
+* `METRICS_VERDICT` — обе метрики уровней `tb` и `sb` за ВСЕ три опорных месяца
+  (`ref_cur`, `ref_closed`, `ref_yoy`) одним запросом, плюс ранг ТБ (window-функция).
+* `UNIT_SEG` — (ГОСБ, сегмент), `extended_dim_1 <> 1`, обе даты, все ТБ.
+* `UNIT_TOTALS` — итог по ГОСБ, `COALESCE(extended_dim_1, 1) = 1`, обе даты, все ТБ.
 
 ### Организации
-* `ORGS` — витрина организаций за `:ref_closed` с фильтром эталонной базы
-  (`EXISTS`, без условий на `actual_dt`).
-* `ORG_DETAIL` — то же БЕЗ фильтра эталонной базы, плюс `fl_y_1_diff_qty` (тренд год к
-  году) и флаг `in_ref`: имена нужны и для организаций вне базы, иначе часть оттока
+* `ORGS_ALL` — витрина организаций за `:ref_closed` по всему банку, свёрнутая до
+  грейна (ГОСБ, ИНН), с годовой дельтой и флагом `in_ref` (`EXISTS`, без условий на
+  `actual_dt`). Фильтр эталонной базы применяется уже в pandas: работать можно только с
+  закреплёнными парами, но в детализацию прогноза нужны и остальные, иначе часть оттока
   окажется безымянной.
+* `ORGS_TB` — те же организации строками уровня `level_name='tb'`: годовой тренд уровня
+  СБ считается по ним, а не суммированием ГОСБ.
 * `FUNNEL_AGG` / `FUNNEL_TEXT` / `ACTIVITY_*` — агрегаты и свободный текст воронки.
 
 ---
@@ -1088,7 +1151,8 @@ GROUP BY g.new_gosb_id, m.inn, m.saphr_id, 4
 docker compose up -d                      # Postgres на порту 55433
 python -c "import synth; print(synth.build('postgresql+psycopg2://uzp:uzp@localhost:55433/uzp'))"
 ```
-затем в `run.ipynb` — контур `open`, `tb = "ЮЗБ"`, `date = "2026-07-31"`.
+затем в `run.ipynb` — контур `open`, `REPORT_MONTH = "2026-07"`. Отчёт строится по
+всему банку сразу: уровень СБ плюс вкладка на каждый ТБ.
 
 **Как устроена синтетика** (`synth/generate.py`), чтобы числа были объяснимы:
 

@@ -15,6 +15,9 @@
 
 Рекомендации разрешаются в порядке: чек-лист (причина оттока) -> ключевые слова ->
 LLM (только там, где есть содержательный текст и правила не сработали) -> правило.
+
+В БД этот модуль НЕ ходит: все данные читает `bank.load` одним проходом по банку,
+а уровни отчёта (СБ и каждый ТБ) собираются здесь из готовых кадров.
 """
 from __future__ import annotations
 
@@ -23,8 +26,8 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from ... import progress
-from ...db import read_sql
 from . import forecast, prompts, queries as Q, segments, text_rules
+from .bank import Bank
 
 RUB_TO_MLN = 1e6
 LLM_BATCH_DEFAULT = 12      # пар (ГОСБ, ИНН) в одном запросе к LLM (один глубокий проход)
@@ -36,12 +39,6 @@ PLAN_TARGETS = (1.0, 1.2, 1.5)   # цели в дэше: выполнить пл
 # работы. Организации, нужные под план, попадают в список независимо от порога —
 # иначе заголовок «N организаций закрывают план» разошёлся бы с самой таблицей.
 EXPLORER_MIN_FL_DEFAULT = 5
-# Аппарат ТБ — не продающее подразделение, в разборе ему делать нечего. Опознаётся
-# по имени, но с обязательной оговоркой: если аппарат — ЕДИНСТВЕННОЕ подразделение
-# своего ТБ (Московский банк), исключать его нельзя, иначе ТБ обнулится.
-APPARAT_PREFIX = "аппарат"
-HIST_MONTHS = 24                 # глубина истории витрины под модель сезонности
-PIPE_MONTHS = 12                 # закрытых месяцев сделок для коэффициента реализуемости
 # Сегмент западает, если план не выполнен (exec < 1) — тот же признак, что даёт
 # красную ячейку в тепловой карте (render.components.heat_bg). Порог в одного
 # получателя отсекает только шум округления.
@@ -65,8 +62,6 @@ class Analysis:
     matrix: pd.DataFrame
     gosb_gap: pd.DataFrame
     top_cells: pd.DataFrame
-    attract: pd.DataFrame
-    retention: pd.DataFrame
     activity: dict
     to_work: pd.DataFrame
     no_point: pd.DataFrame
@@ -87,107 +82,216 @@ class Analysis:
     level: str = "tb"
     unit_label: str = "ГОСБ"
     unit_src: str = "new_gosb_id"     # колонка грейна организаций = единица разбора
+    gosb_cards: list = field(default_factory=list)   # карточки единиц уровня
+    # Рабочие кадры уровня. Живут в объекте, потому что уровень собирается в два
+    # шага: `prepare` (без БД и LLM) и `finish` (разбор текста) — между ними одним
+    # запросом читаются тексты воронки сразу по всем уровням.
+    orgs: pd.DataFrame | None = None      # закреплённые пары — с ними работают
+    orgs_fc: pd.DataFrame | None = None   # прогноз на грейне (ГОСБ, ИНН)
+    detail: pd.DataFrame | None = None    # справка по организациям единицы уровня
+    pool: pd.DataFrame | None = None      # пул аудита отработки
+    seg_gaps: dict = field(default_factory=dict)     # (единица, сегмент) -> недобор
 
 
-def run(ctx, tb_short: str) -> Analysis:
-    e = ctx.engine
-    batch = int(ctx.params.get("llm_batch", LLM_BATCH_DEFAULT))
-    min_impact = float(ctx.params.get("llm_min_impact", LLM_MIN_IMPACT_DEFAULT))
-    max_calls = int(ctx.params.get("llm_max_calls", LLM_MAX_CALLS_DEFAULT))
+def prepare(b: Bank, tb_id: int, tb_short: str, tb_full: str) -> Analysis:
+    """Уровень ТБ — всё, что считается БЕЗ обращения к БД и без LLM.
 
-    progress.step(f"Резолв ТБ «{tb_short}»")
-    tb = read_sql(e, Q.TB_RESOLVE, {"tb": tb_short})
-    if tb.empty:
-        raise ValueError(f"ТБ '{tb_short}' не найден в справочнике")
-    tb_id = int(tb.tb_id.iloc[0]); tb_full = str(tb.tb_full_name.iloc[0])
-
-    # --- Опорные даты: прогнозный месяц, закрытый месяц-база, окно воронки ---
-    d = _dates(e, ctx.params)
-    ref_cur, ref_closed, act_dt = d["ref_cur"], d["ref_closed"], d["act_dt"]
-    ref_funnel, funnel_from, fresh_from = d["ref_funnel"], d["funnel_from"], d["fresh_from"]
-    p_cur = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref_cur}
-    p_cls = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref_closed}
-    pf = {"tb_id": tb_id, "ref_funnel": ref_funnel, "funnel_from": funnel_from,
-          "fresh_from": fresh_from}
-
-    # --- Закрытый месяц: база прогноза и ранг ТБ ---
-    # Ранг берём именно отсюда: в текущем месяце факт витрины частичный, ранжировать
-    # по нему нельзя, а прогноз по всем 12 ТБ здесь не считается.
-    progress.step(f"Портфель-база прогноза: закрытый месяц {ref_closed}")
-    v_cls = read_sql(e, Q.TB_VERDICT, p_cls)
-    closed_verdict, _ = _verdict(v_cls, tb_id)
-    v_cur = read_sql(e, Q.TB_VERDICT, p_cur)
-    plan_cur, ref_date = _verdict(v_cur, tb_id)
-    progress.done(f"{ref_closed} закрыт: получатели {closed_verdict['rcp']['fact']:.0f} "
+    Данные уже прочитаны одним проходом по банку (`bank.load`), здесь остаются срезы
+    и арифметика. Разбор текста вынесен в `finish` намеренно: пул аудита каждого ТБ
+    известен только после классификации, а тексты воронки читаются ОДНИМ запросом на
+    весь отчёт — сначала считаются все уровни, потом один запрос, потом LLM.
+    """
+    d = b.dates
+    closed_verdict, _ = _verdict(b.verdict, "tb", d["ref_closed"], tb_id)
+    plan_cur, ref_date = _verdict(b.verdict, "tb", d["ref_cur"], tb_id)
+    prev_yoy, _ = _verdict(b.verdict, "tb", d["ref_yoy"], tb_id)
+    progress.done(f"{d['ref_closed']} закрыт: получатели {closed_verdict['rcp']['fact']:.0f} "
                   f"из {closed_verdict['rcp']['plan']:.0f} "
                   f"({(closed_verdict['rcp']['exec'] or 0) * 100:.0f}%) · "
-                  f"план на {ref_cur}: {plan_cur['rcp']['plan']:.0f}")
-    yoy = _yoy(e, {**p_cls, "ref": d["ref_yoy"]}, tb_id, closed_verdict, d)
+                  f"план на {d['ref_cur']}: {plan_cur['rcp']['plan']:.0f}")
+    yoy = _yoy(prev_yoy, closed_verdict, d)
 
-    # --- Организации (только закреплённые в эталонной базе ИУП) ---
-    progress.step("Витрина организаций (потенциал/отток)")
-    apparat = _apparat_ids(e)
-    orgs = read_sql(e, Q.ORGS, {"tb_id": tb_id, "ref": ref_closed})
-    # аппараты убираем на входе: тогда они сами не попадут ни в прогноз, ни в список
-    # к работе, ни в карточки — фильтровать каждое место по отдельности не придётся
-    if apparat and not orgs.empty:
-        n0 = len(orgs)
-        orgs = orgs[~orgs["new_gosb_id"].isin(apparat)].reset_index(drop=True)
-        if n0 != len(orgs):
-            progress.done(f"Организации аппаратов исключены: {n0 - len(orgs)} пар "
-                          f"(ГОСБ, ИНН) из {n0}")
-    rs = read_sql(e, Q.ORGS_REF_STATS, {"tb_id": tb_id, "ref": ref_closed})
-    if not rs.empty:
-        n_all = int(rs.n_all.iloc[0] or 0); n_ref = int(rs.n_ref.iloc[0] or 0)
-        progress.done(f"Эталонная база: закреплено {n_ref} из {n_all} пар (ГОСБ, ИНН) — "
-                      f"остальные {n_all - n_ref} исключены из отбора")
+    # Рабочий набор — только закреплённые в эталонной базе: работать можно с ними.
+    # Полный срез (`detail`) нужен детализации прогноза: в ожидаемый отток входят и
+    # организации вне базы, и без них блок не сойдётся с водопадом.
+    detail = b.orgs[b.orgs["tb_id"] == tb_id]
+    orgs = detail[detail["in_ref"]].reset_index(drop=True)
+    orgs_fc = b.orgs_fc[b.orgs_fc["tb_id"] == tb_id]
+    fc_stats = dict(b.fc_stats)
+    fc_stats.update({"conv_tb": b.conv["by_tb"].get(tb_id, b.conv["sb"]),
+                     "conv": b.conv["diag_tb"].get(tb_id, b.conv["diag_sb"]),
+                     "conv_by_gosb": b.conv["by_gosb"]})
 
-    # --- Активности: агрегат по (ГОСБ, ИНН) по ВСЕМ задачам за 3 мес ---
-    progress.step("Активности воронки за 3 мес: агрегат по (ГОСБ, ИНН)")
-    fagg = read_sql(e, Q.FUNNEL_AGG, pf)
-    activity = _activity(read_sql(e, Q.ACTIVITY_TOTALS, pf),
-                         read_sql(e, Q.ACTIVITY_BREAKDOWN, pf))
-    progress.done(f"задач {activity.get('n', 0)} → пар (ГОСБ,ИНН) {len(fagg)}"
-                  f" · из них с текстом {int(fagg['any_text'].sum()) if len(fagg) else 0}")
+    base_seg = _units(b.unit_seg, d["ref_closed"], b.apparat, tb_id, seg=True)
+    plan_seg = _units(b.unit_seg, d["ref_cur"], b.apparat, tb_id, seg=True)
+    base_tot = _units(b.unit_tot, d["ref_closed"], b.apparat, tb_id)
+    plan_tot = _units(b.unit_tot, d["ref_cur"], b.apparat, tb_id)
+    a = _assemble(b, tb_short, tb_id, tb_full, ref_date, closed_verdict, plan_cur, yoy,
+                  orgs, orgs_fc, detail, base_seg, plan_seg, base_tot, plan_tot,
+                  fc_stats, _activity(b.act_tot[b.act_tot.tb_id == tb_id],
+                                      b.act_brk[b.act_brk.tb_id == tb_id]))
 
-    orgs = _merge_funnel(orgs, fagg)
-    orgs["fot_potential_mln"] = orgs["fot_potential_amt"] / RUB_TO_MLN
-    orgs["fot_outflow_mln"] = orgs["fot_outflow_amt"] / RUB_TO_MLN
-    orgs["seg_name"] = orgs["segment_big"].map(segments.short_of_big).fillna("—")
-    orgs["company_name"] = orgs["company_name"].fillna("")
+    # --- Классификация по агрегатам (все активности) ---
+    progress.step(f"{tb_short}: классификация (ГОСБ,ИНН) — работать / нет смысла")
+    cand = _candidates(orgs, d["days_left"])
+    a.to_work, a.no_point = _classify(cand)
+    n_gosb_seg = len({nid for nid, _ in a.seg_gaps})
+    progress.done(f"Западающих (ГОСБ, сегмент): {len(a.seg_gaps)} в {n_gosb_seg} ГОСБ")
+    a.pool = _audit_pool(a.to_work, a.seg_gaps,
+                         float(b.params.get("llm_min_impact", LLM_MIN_IMPACT_DEFAULT)))
+    return a
 
-    # --- Прогноз на текущий месяц по (ГОСБ, ИНН) ---
-    orgs, orgs_fc, fc_stats = _forecast_orgs(e, orgs, d, tb_id)
 
-    attract = (orgs[orgs.emp_potential_qty >= 1]
-               .sort_values("emp_potential_qty", ascending=False).head(15).copy())
-    retention = (orgs[orgs.fl_outflow_qty >= 1]
-                 .sort_values("fl_outflow_qty", ascending=False).head(15).copy())
+def build_sb(b: Bank, per_tb: list) -> Analysis:
+    """Уровень СБ: тот же отчёт, где единица разбора — ТБ, а область — весь банк.
 
-    # --- Прогнозная матрица ГОСБ×сегмент и разрыв по ГОСБ ---
-    progress.step("Матрица ГОСБ × сегмент по ПРОГНОЗУ + разрыв по ГОСБ")
-    base_seg = read_sql(e, Q.GOSB_SEG, {**p_cls, "tb_id": tb_id})
-    plan_seg = read_sql(e, Q.GOSB_SEG, {**p_cur, "tb_id": tb_id})
-    base_tot = read_sql(e, Q.GOSB_TOTALS, {**p_cls, "tb_id": tb_id})
-    plan_tot = read_sql(e, Q.GOSB_TOTALS, {**p_cur, "tb_id": tb_id})
-    # Аппараты не продают — в разборе по подразделениям им делать нечего. Вердикт ТБ
-    # при этом остаётся из строки level_name='tb', как есть: сумма карточек ему не
-    # равна, и это нормально — уровни витрины и так считаются независимо (раздел 12).
-    base_seg, plan_seg, base_tot, plan_tot = (
-        _drop_apparat(f, apparat) for f in (base_seg, plan_seg, base_tot, plan_tot))
-    for f in (base_seg, plan_seg):
-        f["seg_name"] = f["seg_id"].map(segments.short)
-    matrix, mstats = forecast.build_matrix(base_seg, plan_seg, orgs_fc)
+    План, факт и портфель-база берутся ОТДЕЛЬНОЙ строкой витрины (`level_name='sb'`),
+    а не складываются из ТБ: уровни витрины считаются независимо, и сумма ТБ ей
+    не равна — то же расхождение, что между ГОСБ и ТБ.
+
+    Прогнозные слагаемые (отток, приток, пайплайн) — наоборот, свод грейна
+    (ГОСБ, ИНН) целиком: он посчитан один раз на весь банк, и дедуплицировать его не
+    нужно — каждый ГОСБ принадлежит ровно одному ТБ (см. `bank._prepare_orgs`).
+    """
+    d = b.dates
+    progress.step(f"Уровень СБ: вердикт банка за закрытый месяц {d['ref_closed']}")
+    closed_verdict, _ = _verdict(b.verdict, "sb", d["ref_closed"])
+    plan_cur, ref_date = _verdict(b.verdict, "sb", d["ref_cur"])
+    prev_yoy, _ = _verdict(b.verdict, "sb", d["ref_yoy"])
+    progress.done(f"{d['ref_closed']} закрыт: получатели {closed_verdict['rcp']['fact']:.0f} "
+                  f"из {closed_verdict['rcp']['plan']:.0f} "
+                  f"({(closed_verdict['rcp']['exec'] or 0) * 100:.0f}%) · "
+                  f"план на {d['ref_cur']}: {plan_cur['rcp']['plan']:.0f}")
+    yoy = _yoy(prev_yoy, closed_verdict, d, area="Банк")
+
+    # Единицы уровня — ТБ, но собираются они из ГОСБ-метрик: аппараты надо исключить
+    # ДО свёртки, а в строках level_name='tb' они уже внутри и не отделяются.
+    names = {a.tb_id: a.tb_short for a in per_tb}
+    base_seg = _units_sb(b.unit_seg, d["ref_closed"], b.apparat, names, seg=True)
+    plan_seg = _units_sb(b.unit_seg, d["ref_cur"], b.apparat, names, seg=True)
+    base_tot = _units_sb(b.unit_tot, d["ref_closed"], b.apparat, names)
+    plan_tot = _units_sb(b.unit_tot, d["ref_cur"], b.apparat, names)
+
+    fc_stats = dict(b.fc_stats)
+    fc_stats.update({"conv_tb": b.conv["sb"], "conv": b.conv["diag_sb"],
+                     "conv_by_gosb": b.conv["by_tb"]})
+    a = _assemble(b, "СБ", 0, "Сбербанк — все территориальные банки", ref_date,
+                  closed_verdict, plan_cur, yoy,
+                  pd.DataFrame(), b.orgs_fc, b.orgs_tb,
+                  base_seg, plan_seg, base_tot, plan_tot, fc_stats,
+                  _activity(b.act_tot, b.act_brk),
+                  unit_src="tb_id", unit_label="ТБ", level="sb")
+
+    # Список к работе и причины НЕ пересчитываются: отбор организаций — решение
+    # уровня ТБ, и карточка банка показывает уже принятое решение, а не своё.
+    a.to_work = _cat([x.to_work for x in per_tb])
+    a.no_point = _cat([x.no_point for x in per_tb])
+    a.gosb_plan = {x.tb_id: _tb_plan_row(x) for x in per_tb}
+    a.sim = _sum_sim(per_tb, a.gap_rcp, a.verdict["rcp"]["fact"], a.verdict["rcp"]["plan"])
+    # причины с уровня ТБ ключуются по (ГОСБ, ИНН), а строки этого уровня — по
+    # (ТБ, ИНН): перекладываем, иначе блок годового тренда банка остался бы без
+    # единой зафиксированной причины
+    a.insights = _insights_by_tb(per_tb, b.tb_of)
+
+    progress.step("Уровень СБ: карточки ТБ + детализация прогноза")
+    a.gosb_cards = _unit_cards(a.gosb_gap, a.matrix, pd.DataFrame(), pd.DataFrame(),
+                               a.gosb_plan, unit_src="tb_id")
+    act = {int(r.tb_id): {"act_n": int(r.n or 0),
+                          "success": (float(r.n_success or 0) / int(r.n)) if int(r.n or 0) else 0.0,
+                          "worked_orgs": int(r.orgs or 0)}
+           for r in b.act_tot.itertuples()}
+    for c in a.gosb_cards:
+        c["act"] = act.get(c["gosb_id"], {"act_n": 0, "success": 0.0, "worked_orgs": 0})
+    a.gosb_detail = _unit_detail(a.orgs_fc, a.detail, a.insights, a.to_work, a.no_point,
+                                 a.gosb_gap, fc_stats["conv_tb"], fc_stats["conv"],
+                                 fc_stats["conv_by_gosb"], d,
+                                 unit_src="tb_id", unit_label="ТБ",
+                                 funnel_months=b.fmonths)
+    return a
+
+
+def audit_inns(preps: list) -> list:
+    """ИНН всех аудиторских пулов сразу — под ОДИН запрос текстов воронки.
+
+    Раньше тексты читались по одному запросу на ТБ: двенадцать проходов по самой
+    большой таблице ради выборок, которые отлично объединяются в одну.
+    """
+    inns: set = set()
+    for a in preps:
+        if a.pool is not None and not a.pool.empty:
+            inns.update(int(x) for x in a.pool["inn"])
+    return sorted(inns)
+
+
+def finish(ctx, b: Bank, a: Analysis, text_df) -> Analysis:
+    """Разбор текста моделью, отбор под план и детализация — по одному уровню ТБ."""
+    d = b.dates
+    batch = int(ctx.params.get("llm_batch", LLM_BATCH_DEFAULT))
+    max_calls = int(ctx.params.get("llm_max_calls", LLM_MAX_CALLS_DEFAULT))
+    # Опорный месяц задач = конец окна воронки: относительно него решаем, назван ли
+    # в тексте срок В БУДУЩЕМ (тогда спрашивать результат ещё рано).
+    ref_ym = (pd.Timestamp(d["ref_funnel"]).year, pd.Timestamp(d["ref_funnel"]).month)
+    insights, to_work, no_point, themes, llm_stats = _resolve(
+        ctx, a.pool, a.to_work, a.no_point, text_df, batch, max_calls, ref_ym,
+        min_impact=float(ctx.params.get("llm_min_impact", LLM_MIN_IMPACT_DEFAULT)))
+
+    progress.step(f"{a.tb_short}: отбор организаций под план по (ГОСБ, сегмент)")
+    to_work, gosb_plan = _select(to_work, a.seg_gaps)
+    sim = _plan_summary(to_work, gosb_plan, a.gap_rcp,
+                        a.verdict["rcp"]["fact"], a.verdict["rcp"]["plan"])
+    progress.done(f"Под план нужно {sim['k']} организаций (+{sim['closable']:.0f} чел); "
+                  f"потенциал западающих сегментов покрывает разрыв на "
+                  f"{sim['coverage']*100:.0f}% · добор из других сегментов: {sim['filler_n']}")
+
+    gosb_ids = set(a.gosb_gap["unit_id"].astype("int64")) if not a.gosb_gap.empty else set()
+    fagg = b.fagg[b.fagg["new_gosb_id"].isin(gosb_ids)] if not b.fagg.empty else b.fagg
+    fmonths = (b.fmonths[b.fmonths["tb_id"] == a.tb_id]
+               if "tb_id" in b.fmonths else b.fmonths)
+    a.insights, a.to_work, a.no_point = insights, to_work, no_point
+    a.themes, a.llm_stats, a.sim, a.gosb_plan = themes, llm_stats, sim, gosb_plan
+    a.gosb_cards = _unit_cards(a.gosb_gap, a.matrix, to_work, fagg, gosb_plan)
+    a.gosb_detail = _unit_detail(a.orgs_fc, a.detail, insights, to_work, no_point,
+                                 a.gosb_gap, a.fc_stats.get("conv_tb", 1.0),
+                                 a.fc_stats.get("conv", {}),
+                                 a.fc_stats.get("conv_by_gosb", {}), d,
+                                 funnel_months=fmonths)
+    n_named = sum(sum(len(g["rows"]) for g in v["out_groups"]) + len(v["top_pipe"])
+                  for v in a.gosb_detail.values())
+    n_grp = sum(len(v["out_groups"]) for v in a.gosb_detail.values())
+    progress.done(f"Карточек ГОСБ: {len(a.gosb_cards)} (все, включая выполняющие план) · "
+                  f"детализация по {len(a.gosb_detail)} ГОСБ, названо {n_named} организаций "
+                  f"(до {DETAIL_COVER*100:.0f}% блока, максимум {DETAIL_MAX_ROWS} строк) · "
+                  f"отток разложен на {n_grp} групп по причине — они покрывают его целиком")
+    return a
+
+
+# --------------------------------------------------------------------------- #
+def _assemble(b: Bank, tb_short: str, tb_id: int, tb_full: str, ref_date: str,
+              closed_verdict: dict, plan_cur: dict, yoy: dict,
+              orgs: pd.DataFrame, orgs_fc: pd.DataFrame, detail: pd.DataFrame,
+              base_seg: pd.DataFrame, plan_seg: pd.DataFrame,
+              base_tot: pd.DataFrame, plan_tot: pd.DataFrame,
+              fc_stats: dict, activity: dict,
+              unit_src: str = "new_gosb_id", unit_label: str = "ГОСБ",
+              level: str = "tb") -> Analysis:
+    """Общая часть любого уровня: матрица, разрыв по единицам и водопад прогноза.
+
+    Уровни отличаются только тем, ЧТО является единицей разбора (ГОСБ или ТБ) и
+    откуда взята строка вердикта; вся арифметика между ними одинакова, поэтому она
+    живёт здесь, а не в двух почти одинаковых функциях.
+    """
+    d = b.dates
+    progress.step(f"{tb_short}: матрица {unit_label} × сегмент по ПРОГНОЗУ + разрыв")
+    matrix, mstats = forecast.build_matrix(base_seg, plan_seg, orgs_fc, unit_src=unit_src)
     matrix = matrix.merge(
         base_seg[["unit_id", "seg_name", "unit_name"]].drop_duplicates(),
         on=["unit_id", "seg_name"], how="left")
-    gosb_gap = forecast.build_totals(base_tot, plan_tot, orgs_fc)
+    gosb_gap = forecast.build_totals(base_tot, plan_tot, orgs_fc, unit_src=unit_src)
     fc_stats.update(mstats)
     if mstats.get("unattributed", 0) > 0:
-        progress.done(f"Дельта без сегмента разнесена по сегментам ГОСБ "
+        progress.done(f"Дельта без сегмента разнесена по сегментам {unit_label} "
                       f"пропорционально базе: {mstats['unattributed']:.0f} чел")
 
-    # --- Вердикт ТБ: план текущего месяца против прогноза ---
     wf = forecast.waterfall(
         base=closed_verdict["rcp"]["fact"], orgs_fc=orgs_fc,
         plan=plan_cur["rcp"]["plan"],
@@ -201,206 +305,161 @@ def run(ctx, tb_short: str) -> Analysis:
     gap_rcp = max(0.0, verdict["rcp"]["plan"] - verdict["rcp"]["fact"])
     gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
     progress.done(
-        f"Прогноз на {ref_cur}: {wf['forecast']:.0f} из плана {wf['plan']:.0f} "
+        f"Прогноз на {d['ref_cur']}: {wf['forecast']:.0f} из плана {wf['plan']:.0f} "
         f"({(wf['exec'] or 0) * 100:.1f}%) = портфель {wf['base']:.0f} "
         f"− отток {wf['out_exp']:.0f} (факт {wf['observed']:.0f} + риск {wf['risk']:.0f}) "
         f"+ приток {wf['in_exp']:.0f} + пайплайн {wf['pipe']:.0f}")
     _check_waterfall(wf, matrix, fc_stats)
 
+    matrix["is_failing"] = [_failing_seg(r.nedobor) for r in matrix.itertuples()]
     top_cells = (matrix[matrix.nedobor > 0]
                  .sort_values("nedobor", ascending=False)
                  .assign(share=lambda x: x.nedobor / max(gap_rcp, 1))
                  .head(8))
-
-    # --- Классификация по агрегатам (все активности) ---
-    progress.step("Классификация (ГОСБ,ИНН): работать / нет смысла")
-    cand = _candidates(orgs, d["days_left"])
-    to_work, no_point = _classify(cand)
-
-    # --- Разрывы на грейне (ГОСБ, сегмент): работаем именно с западающими ---
-    matrix["is_failing"] = [_failing_seg(r.nedobor) for r in matrix.itertuples()]
     seg_gaps = {(int(r.unit_id), r.seg_name): float(r.nedobor)
                 for r in matrix.itertuples() if r.is_failing}
-    n_gosb_seg = len({nid for nid, _ in seg_gaps})
-    progress.done(f"Западающих (ГОСБ, сегмент): {len(seg_gaps)} в {n_gosb_seg} ГОСБ")
-
-    # --- Рекомендации: чек-лист -> ключевые слова -> LLM (аудит отработки) ---
-    # Опорный месяц задач = конец окна воронки: относительно него решаем, назван ли
-    # в тексте срок В БУДУЩЕМ (тогда спрашивать результат ещё рано).
-    ref_ym = (pd.Timestamp(ref_funnel).year, pd.Timestamp(ref_funnel).month)
-    insights, to_work, no_point, themes, llm_stats = _resolve(
-        ctx, e, pf, to_work, no_point, seg_gaps, batch, min_impact, max_calls, ref_ym)
-
-    # --- Отбор «ровно под план»: закрываем разрыв КАЖДОГО западающего сегмента ---
-    progress.step("Отбор организаций под план по (ГОСБ, сегмент)")
-    to_work, gosb_plan = _select(to_work, seg_gaps)
-    sim = _plan_summary(to_work, gosb_plan, gap_rcp,
-                        verdict["rcp"]["fact"], verdict["rcp"]["plan"])
-    progress.done(f"Под план нужно {sim['k']} организаций (+{sim['closable']:.0f} чел); "
-                  f"потенциал западающих сегментов покрывает разрыв на "
-                  f"{sim['coverage']*100:.0f}% · добор из других сегментов: {sim['filler_n']}")
-    progress.step("Разрез по ГОСБ + детализация прогноза")
-    gosb_cards = _unit_cards(gosb_gap, matrix, to_work, fagg, gosb_plan)
-    org_detail = read_sql(e, Q.ORG_DETAIL, {"tb_id": tb_id, "ref_closed": ref_closed})
-    fmonths = read_sql(e, Q.FUNNEL_MONTHS,
-                       {"tb_id": tb_id, "months_from": d["months_from"],
-                        "ref_funnel": d["ref_funnel"]})
-    progress.done(f"Активности по месяцам с {d['months_from']}: {len(fmonths)} строк "
-                  f"(ГОСБ×организация×месяц) — по ним видно, отрабатывали ли отток тогда")
-    gosb_detail = _unit_detail(orgs_fc, org_detail, insights, to_work, no_point,
-                               gosb_gap, fc_stats.get("conv_tb", 1.0),
-                               fc_stats.get("conv", {}),
-                               fc_stats.get("conv_by_gosb", {}), d,
-                               funnel_months=fmonths)
-    n_named = sum(sum(len(g["rows"]) for g in v["out_groups"]) + len(v["top_pipe"])
-                  for v in gosb_detail.values())
-    n_grp = sum(len(v["out_groups"]) for v in gosb_detail.values())
-    progress.done(f"Карточек ГОСБ: {len(gosb_cards)} (все, включая выполняющие план) · "
-                  f"детализация по {len(gosb_detail)} ГОСБ, названо {n_named} организаций "
-                  f"(до {DETAIL_COVER*100:.0f}% блока, максимум {DETAIL_MAX_ROWS} строк) · "
-                  f"отток разложен на {n_grp} групп по причине — они покрывают его целиком")
 
     a = Analysis(
         tb_short=tb_short, tb_id=tb_id, tb_full=tb_full, ref_date=ref_date,
         verdict=verdict, gap_rcp=gap_rcp, gap_fot=gap_fot, gap_fot_mln=gap_fot / RUB_TO_MLN,
-        matrix=matrix, gosb_gap=gosb_gap, top_cells=top_cells,
-        attract=attract, retention=retention, activity=activity,
-        to_work=to_work, no_point=no_point, sim=sim, gosb_plan=gosb_plan,
-        insights=insights, themes=themes, llm_stats=llm_stats,
+        matrix=matrix, gosb_gap=gosb_gap, top_cells=top_cells, activity=activity,
+        to_work=pd.DataFrame(), no_point=pd.DataFrame(), sim={},
         dates=d, wf=wf, closed=closed_verdict, yoy=yoy, fc_stats=fc_stats,
-        gosb_detail=gosb_detail,
-        explorer_min_fl=float(ctx.params.get("explorer_min_fl",
-                                             EXPLORER_MIN_FL_DEFAULT)),
+        explorer_min_fl=float(b.params.get("explorer_min_fl", EXPLORER_MIN_FL_DEFAULT)),
+        level=level, unit_label=unit_label, unit_src=unit_src,
     )
-    a.gosb_cards = gosb_cards
-    # грейн организаций нужен своду СБ: он складывает прогнозные слагаемые из ТБ,
-    # а не пересчитывает их одним большим запросом
-    a.orgs_fc = orgs_fc
+    a.orgs, a.orgs_fc, a.detail, a.seg_gaps = orgs, orgs_fc, detail, seg_gaps
     return a
 
 
-def run_sb(ctx, per_tb: dict) -> Analysis:
-    """Уровень СБ: тот же отчёт, где единица разбора — ТБ, а область — весь банк.
+def _units(df: pd.DataFrame, end_dt, apparat: set, tb_id: int,
+           seg: bool = False) -> pd.DataFrame:
+    """Срез метрик единиц: свой ТБ, нужный месяц, без аппаратов.
 
-    План, факт и портфель-база берутся ОТДЕЛЬНОЙ строкой витрины (`level_name='sb'`),
-    а не складываются из ТБ: уровни витрины считаются независимо, и сумма ТБ ей
-    не равна — то же расхождение, что между ГОСБ и ТБ.
-
-    Прогнозные слагаемые (отток, приток, пайплайн) — наоборот, свод: это те же строки
-    грейна (ГОСБ, ИНН), уже посчитанные при прогоне каждого ТБ. Пересчитывать их одним
-    большим запросом незачем, а память на проме это бы не выдержало.
-
-    `per_tb` — {короткое имя ТБ: Analysis}, результат прогонов уровня ТБ.
+    Аппараты не продают — в разборе по подразделениям им делать нечего. Вердикт ТБ
+    при этом остаётся из строки level_name='tb', как есть: сумма карточек ему не
+    равна, и это нормально — уровни витрины и так считаются независимо (раздел 12).
     """
-    e = ctx.engine
-    d = _dates(e, ctx.params)
-    ref_cur, ref_closed = d["ref_cur"], d["ref_closed"]
-    p_cur = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref_cur}
-    p_cls = {"m_fot": Q.METRIC_FOT, "m_rcp": Q.METRIC_RECIPIENTS, "ref": ref_closed}
-
-    progress.step(f"Уровень СБ: вердикт банка за закрытый месяц {ref_closed}")
-    closed_verdict, _ = _sb_verdict(e, p_cls)
-    plan_cur, ref_date = _sb_verdict(e, p_cur)
-    progress.done(f"{ref_closed} закрыт: получатели {closed_verdict['rcp']['fact']:.0f} "
-                  f"из {closed_verdict['rcp']['plan']:.0f} "
-                  f"({(closed_verdict['rcp']['exec'] or 0) * 100:.0f}%) · "
-                  f"план на {ref_cur}: {plan_cur['rcp']['plan']:.0f}")
-    yoy = _sb_yoy(e, {**p_cls, "ref": d["ref_yoy"]}, closed_verdict, d)
-
-    # --- Свод грейна организаций по всем ТБ ---
-    progress.step("Уровень СБ: свод прогноза по всем ТБ")
-    fcs = [getattr(a, "orgs_fc", None) for a in per_tb.values()]
-    fcs = [f for f in fcs if f is not None and not f.empty]
-    orgs_fc = (pd.concat(fcs, ignore_index=True) if fcs
-               else pd.DataFrame(columns=["new_gosb_id", "inn", "tb_id"]))
-    n_raw = len(orgs_fc)
-    if n_raw:
-        # ГОСБ, числящиеся сразу под двумя tb_id (см. _GMAP), попадают в прогон обоих
-        # ТБ — без дедубликации их отток и пайплайн вошли бы в свод дважды
-        orgs_fc = orgs_fc.drop_duplicates(subset=["new_gosb_id", "inn"])
-    n_dup = n_raw - len(orgs_fc)
-    if n_dup:
-        progress.done(f"Дедубликация свода: убрано {n_dup} повторных пар (ГОСБ, ИНН) — "
-                      f"их ГОСБ числится сразу под двумя ТБ")
-
-    # --- Матрица ТБ × сегмент и разрыв по ТБ ---
-    # Единицы уровня — ТБ, но собираются они из ГОСБ-метрик: аппараты надо исключить
-    # ДО свёртки, а в строках level_name='tb' они уже внутри и не отделяются.
-    apparat = _apparat_ids(e)
-    names = {a.tb_id: a.tb_short for a in per_tb.values()} if per_tb else {}
-    base_seg = _roll_to_tb(read_sql(e, Q.GOSB_SEG_ALL, p_cls), apparat, names, seg=True)
-    plan_seg = _roll_to_tb(read_sql(e, Q.GOSB_SEG_ALL, p_cur), apparat, names, seg=True)
-    base_tot_g = read_sql(e, Q.GOSB_TOTALS_ALL, p_cls)
-    plan_tot_g = read_sql(e, Q.GOSB_TOTALS_ALL, p_cur)
-    base_tot = _roll_to_tb(base_tot_g, apparat, names)
-    plan_tot = _roll_to_tb(plan_tot_g, apparat, names)
-    for f in (base_seg, plan_seg):
+    f = df[(df["tb_id"] == tb_id) & (df["end_dt"] == end_dt)]
+    f = _drop_apparat(f, apparat).copy()
+    if seg and not f.empty:
         f["seg_name"] = f["seg_id"].map(segments.short)
-    matrix, mstats = forecast.build_matrix(base_seg, plan_seg, orgs_fc, unit_src="tb_id")
-    matrix = matrix.merge(base_seg[["unit_id", "seg_name", "unit_name"]].drop_duplicates(),
-                          on=["unit_id", "seg_name"], how="left")
-    tb_gap = forecast.build_totals(base_tot, plan_tot, orgs_fc, unit_src="tb_id")
+    return f
 
-    wf = forecast.waterfall(
-        base=closed_verdict["rcp"]["fact"], orgs_fc=orgs_fc,
-        plan=plan_cur["rcp"]["plan"],
-        base_fot=closed_verdict["fot"]["fact"], plan_fot=plan_cur["fot"]["plan"])
-    verdict = {
-        "rcp": {"plan": wf["plan"], "fact": wf["forecast"], "exec": wf["exec"],
-                "rank": None, "n_tb": None},
-        "fot": {"plan": wf["plan_fot"], "fact": wf["forecast_fot"], "exec": wf["exec_fot"],
-                "rank": None, "n_tb": None},
+
+def _units_sb(df: pd.DataFrame, end_dt, apparat: set, names: dict,
+              seg: bool = False) -> pd.DataFrame:
+    """То же, но единица — ТБ: ГОСБ-метрики нужного месяца, свёрнутые по ТБ."""
+    f = _roll_to_tb(df[df["end_dt"] == end_dt], apparat, names, seg=seg)
+    if seg and not f.empty:
+        f["seg_name"] = f["seg_id"].map(segments.short)
+    return f
+
+
+def _insights_by_tb(per_tb: list, tb_of: dict) -> dict:
+    """Причины уровня ТБ, переложенные на ключ (ТБ, ИНН).
+
+    Одна организация может обслуживаться в нескольких ГОСБ, и причина у каждой пары
+    своя; для уровня банка берём первую зафиксированную — блок годового тренда там
+    отвечает на вопрос «известна ли причина вообще», а не «какая именно в каком ГОСБ».
+    """
+    out: dict = {}
+    for a in per_tb:
+        for (gid, inn), v in (a.insights or {}).items():
+            key = (tb_of.get(int(gid), a.tb_id), int(inn))
+            # пустая причина не должна вытеснять уже найденную содержательную
+            if key not in out or (v.get("reason") and not out[key].get("reason")):
+                out[key] = v
+    return out
+
+
+def _verdict(v: pd.DataFrame, level: str, end_dt, level_id: int | None = None
+             ) -> tuple[dict, str]:
+    """План и факт уровня за месяц — строкой витрины, а не суммой нижнего уровня.
+
+    Уровни витрины считаются независимо: сумма ТБ не равна строке банка ровно так же,
+    как сумма ГОСБ не равна строке ТБ (раздел 12 методологии). Ранг есть только у ТБ —
+    банк сравнивать не с кем.
+    """
+    out: dict = {}
+    ref = ""
+    sub = v[(v["level_name"] == level) & (v["end_dt"] == end_dt)] if not v.empty else v
+    if level_id is not None and not sub.empty:
+        sub = sub[sub["level_id"] == level_id]
+    for key, mid in (("rcp", Q.METRIC_RECIPIENTS), ("fot", Q.METRIC_FOT)):
+        row = sub[sub["metric_id"] == mid] if not sub.empty else sub
+        if row.empty:
+            out[key] = {"plan": 0, "fact": 0, "exec": None, "rank": None, "n_tb": None}
+            continue
+        # если под уровнем оказалось несколько level_id (у банка в профиле прома
+        # встречаются level_value 0/1/99), берём строку с наибольшим фактом —
+        # про саму неоднозначность уже сказано вслух в bank.load
+        r = row.sort_values("fact_amt", ascending=False).iloc[0]
+        ref = str(r.end_dt)
+        ex = r.execution_percent
+        out[key] = {"plan": float(r.plan_amt), "fact": float(r.fact_amt),
+                    "exec": (float(ex) if pd.notna(ex) else None),
+                    "rank": (int(r.rnk) if level == "tb" else None),
+                    "n_tb": (int(r.n_tb) if level == "tb" else None)}
+    return out, ref
+
+
+def _yoy(prev: dict, closed: dict, d: dict, area: str = "Год к году") -> dict:
+    """Прирост год к году по ЗАКРЫТОМУ месяцу: два факта, а не факт против прогноза.
+
+    Если строки за месяц годом ранее в витрине нет (на проме витрина метрик может не
+    уходить так глубоко), возвращаем пустой результат — в карточке будет «—». Показать
+    вместо этого ноль нельзя: его не отличить от настоящего нулевого прироста.
+    """
+    out: dict = {}
+    for key, label, scale in (("rcp", "получатели", 1.0),
+                              ("fot", "ФОТ млн ₽", RUB_TO_MLN)):
+        was = float(prev.get(key, {}).get("fact") or 0)
+        now = float(closed.get(key, {}).get("fact") or 0)
+        if was <= 0:
+            out[key] = None
+            continue
+        out[key] = {"fact": was, "delta": now - was, "pct": now / was - 1}
+        progress.done(f"{area} ({label}): {d['closed_label']} {now / scale:,.0f} против "
+                      f"{was / scale:,.0f} год назад → {(now - was) / scale:+,.0f} "
+                      f"({(now / was - 1) * 100:+.1f}%)".replace(",", " "))
+    if all(x is None for x in out.values()):
+        progress.done(f"{area} НЕ рассчитан: в витрине метрик нет месяца "
+                      f"{d['ref_yoy']} — в карточках будет «—»")
+    return out
+
+
+def _activity(totals: pd.DataFrame, breakdown: pd.DataFrame) -> dict:
+    """Активности области: сумма строк ТБ (у банка — всех, у ТБ — своей одной).
+
+    `orgs` на уровне банка складывается по ТБ и потому слегка завышен: организация,
+    обслуживаемая в двух ТБ, посчитана дважды. Точная величина потребовала бы
+    отдельного прохода по воронке, а строка отвечает на вопрос «сколько организаций
+    в работе», где эта разница несущественна.
+    """
+    if totals is None or totals.empty:
+        return {"n": 0}
+    n = int(pd.to_numeric(totals["n"], errors="coerce").fillna(0).sum())
+    if not n:
+        return {"n": 0}
+
+    def s(col):
+        return int(pd.to_numeric(totals[col], errors="coerce").fillna(0).sum())
+
+    def _dim(name):
+        if breakdown is None or breakdown.empty:
+            return {}
+        d = breakdown[breakdown.dim == name]
+        return {str(k): int(g["n"].sum()) for k, g in d.groupby("k")}
+
+    return {
+        "n": n, "orgs": s("orgs"),
+        "calls": s("calls"), "meetings": s("meetings"),
+        "success_rate": s("n_success") / n, "overdue": s("overdue"),
+        "plan_deal": s("plan_deal"), "fact_deal": s("fact_deal"),
+        "unrealized": s("unrealized"),
+        "by_role": _dim("role"), "by_type": _dim("type"), "by_status": _dim("status"),
     }
-    gap_rcp = max(0.0, verdict["rcp"]["plan"] - verdict["rcp"]["fact"])
-    gap_fot = max(0.0, verdict["fot"]["plan"] - verdict["fot"]["fact"])
-    progress.done(
-        f"Прогноз банка на {ref_cur}: {wf['forecast']:.0f} из плана {wf['plan']:.0f} "
-        f"({(wf['exec'] or 0) * 100:.1f}%) = портфель {wf['base']:.0f} "
-        f"− отток {wf['out_exp']:.0f} + приток {wf['in_exp']:.0f} "
-        f"+ пайплайн {wf['pipe']:.0f} · организаций в своде {len(orgs_fc)}")
-
-    matrix["is_failing"] = [_failing_seg(r.nedobor) for r in matrix.itertuples()]
-    top_cells = (matrix[matrix.nedobor > 0]
-                 .sort_values("nedobor", ascending=False)
-                 .assign(share=lambda x: x.nedobor / max(gap_rcp, 1))
-                 .head(8))
-
-    # --- Карточки ТБ: план работы берётся из уже посчитанных отчётов ТБ ---
-    progress.step("Уровень СБ: карточки ТБ + детализация прогноза")
-    tb_plan = {a.tb_id: _tb_plan_row(a) for a in per_tb.values()}
-    cards = _unit_cards(tb_gap, matrix, pd.DataFrame(), pd.DataFrame(), tb_plan,
-                        unit_src="tb_id")
-    act = _sum_activity(per_tb)
-    for c in cards:
-        c["act"] = act.get(c["gosb_id"], {"act_n": 0, "success": 0.0, "worked_orgs": 0})
-
-    detail = _sb_org_detail(e, per_tb)
-    insights = {k: v for a in per_tb.values() for k, v in (a.insights or {}).items()}
-    to_work = _cat([a.to_work for a in per_tb.values()])
-    no_point = _cat([a.no_point for a in per_tb.values()])
-    conv_by_tb = {a.tb_id: float(a.fc_stats.get("conv_tb", 1.0)) for a in per_tb.values()}
-    unit_detail = _unit_detail(orgs_fc, detail, insights, to_work, no_point,
-                               tb_gap, 1.0, {}, conv_by_tb, d,
-                               unit_src="tb_id", unit_label="ТБ",
-                               funnel_months=_sb_funnel_months(e, per_tb, d))
-
-    sim = _sum_sim(per_tb, gap_rcp, verdict["rcp"]["fact"], verdict["rcp"]["plan"])
-    a = Analysis(
-        tb_short="СБ", tb_id=0, tb_full="Сбербанк — все территориальные банки",
-        ref_date=ref_date,
-        verdict=verdict, gap_rcp=gap_rcp, gap_fot=gap_fot, gap_fot_mln=gap_fot / RUB_TO_MLN,
-        matrix=matrix, gosb_gap=tb_gap, top_cells=top_cells,
-        attract=pd.DataFrame(), retention=pd.DataFrame(), activity=_sum_activity_tot(per_tb),
-        to_work=pd.DataFrame(), no_point=pd.DataFrame(), sim=sim, gosb_plan=tb_plan,
-        insights={}, themes="—", llm_stats={},
-        dates=d, wf=wf, closed=closed_verdict, yoy=yoy,
-        fc_stats={"conv_tb": 1.0, "conv": {}, "conv_by_gosb": conv_by_tb},
-        gosb_detail=unit_detail,
-        level="sb", unit_label="ТБ", unit_src="tb_id",
-    )
-    a.gosb_cards = cards
-    a.orgs_fc = orgs_fc
-    return a
 
 
 def _cat(frames: list) -> pd.DataFrame:
@@ -436,40 +495,14 @@ def _tb_plan_row(a: Analysis) -> dict:
     return out
 
 
-def _sum_activity(per_tb: dict) -> dict:
-    """Активности воронки по каждому ТБ — для строки «Активности 3 мес» в карточке."""
-    out = {}
-    for a in per_tb.values():
-        act = a.activity or {}
-        n = int(act.get("n", 0))
-        out[a.tb_id] = {"act_n": n, "success": float(act.get("success", 0.0) or 0.0),
-                        "worked_orgs": int(act.get("worked_orgs", 0) or 0)}
-    return out
-
-
-def _sum_activity_tot(per_tb: dict) -> dict:
-    """Активности всего банка: суммы по ТБ, успех — взвешенный по числу задач."""
-    n = sum(int((a.activity or {}).get("n", 0)) for a in per_tb.values())
-    ok = sum(int((a.activity or {}).get("n", 0)) * float((a.activity or {}).get("success", 0) or 0)
-             for a in per_tb.values())
-    tot = {"n": n, "success": (ok / n) if n else 0.0}
-    for k in ("by_type", "by_status"):
-        merged: dict = {}
-        for a in per_tb.values():
-            for name, val in ((a.activity or {}).get(k) or {}).items():
-                merged[name] = merged.get(name, 0) + val
-        tot[k] = merged
-    return tot
-
-
-def _sum_sim(per_tb: dict, gap: float, fact: float, plan: float) -> dict:
+def _sum_sim(per_tb: list, gap: float, fact: float, plan: float) -> dict:
     """Итог «что даст работа по всему банку» — сумма планов работы по ТБ.
 
     Разрыв берётся СБ-шный (из вердикта банка), а закрываемая часть — сумма по ТБ:
     это честно отвечает на вопрос «хватит ли того, что уже отобрано ниже».
     """
     def s(key, cast=float):
-        return cast(sum(float(a.sim.get(key, 0) or 0) for a in per_tb.values()))
+        return cast(sum(float(a.sim.get(key, 0) or 0) for a in per_tb))
 
     gap_seg = s("gap_seg")
     return {
@@ -484,379 +517,7 @@ def _sum_sim(per_tb: dict, gap: float, fact: float, plan: float) -> dict:
     }
 
 
-def _sb_org_detail(engine, per_tb: dict) -> pd.DataFrame:
-    """Имена организаций и годовой тренд для оверлеев ТБ — по всем ТБ сразу.
-
-    Запрос ORG_DETAIL уже выполнялся в каждом прогоне ТБ, но результат туда не
-    сохранялся; повторить его дешевле, чем тащить кадры через все уровни.
-    """
-    frames = []
-    for a in per_tb.values():
-        df = read_sql(engine, Q.ORG_DETAIL,
-                      {"tb_id": a.tb_id, "ref_closed": a.dates["ref_closed"]})
-        if not df.empty:
-            # единица разбора уровня — ТБ, и ключ детализации собирается по ней
-            df["tb_id"] = a.tb_id
-            frames.append(df)
-    return _cat(frames)
-
-
-def _sb_funnel_months(engine, per_tb: dict, d: dict) -> pd.DataFrame:
-    """Помесячные активности по всем ТБ — для блока годового тренда уровня СБ.
-
-    Единица разбора там ТБ, поэтому в каждый кусок дописывается `tb_id`: индекс
-    активностей собирается по той же колонке, что и всё остальное на уровне.
-    """
-    frames = []
-    for a in per_tb.values():
-        df = read_sql(engine, Q.FUNNEL_MONTHS,
-                      {"tb_id": a.tb_id, "months_from": d["months_from"],
-                       "ref_funnel": d["ref_funnel"]})
-        if not df.empty:
-            df["tb_id"] = a.tb_id
-            frames.append(df)
-    return _cat(frames)
-
-
-def _sb_yoy(engine, params: dict, closed: dict, d: dict) -> dict:
-    """Прирост банка год к году — тот же SB_VERDICT за месяц годом ранее."""
-    out: dict = {}
-    prev, _ = _sb_verdict(engine, params)
-    for key, label, scale in (("rcp", "получатели", 1.0), ("fot", "ФОТ млн ₽", RUB_TO_MLN)):
-        was = float(prev.get(key, {}).get("fact") or 0)
-        now = float(closed.get(key, {}).get("fact") or 0)
-        if was <= 0:
-            out[key] = None
-            continue
-        out[key] = {"fact": was, "delta": now - was, "pct": now / was - 1}
-        progress.done(f"Банк год к году ({label}): {d['closed_label']} {now / scale:,.0f} "
-                      f"против {was / scale:,.0f} год назад → {(now - was) / scale:+,.0f} "
-                      f"({(now / was - 1) * 100:+.1f}%)".replace(",", " "))
-    return out
-
-
 # --------------------------------------------------------------------------- #
-def _dates(engine, params: dict) -> dict:
-    """Опорные даты дэша.
-
-    ПРОГНОЗНЫЙ месяц задаётся параметром `report_month` (синоним — устаревший `date`).
-    Если он не задан, берётся самый свежий месяц ежедневной витрины оттока. Витрина
-    хранит ВСЕ месяцы, поэтому отчёт можно пересобрать и за прошлый период — но тогда
-    дату актуальности надо брать ИМЕННО ЗА ЭТОТ месяц (`ACT_DT_FOR`), а не за
-    последний: иначе весь расчёт «сколько выплат уже увидели» считается по чужому
-    периоду. Если витрины нет вовсе — откат на закрытый месяц company_holding + 1.
-    """
-    ref_cur = act_dt = None
-    src = ""
-    asked = params.get("report_month") or params.get("date")
-    if asked:
-        ref_cur = (pd.to_datetime(asked) + pd.offsets.MonthEnd(0)).date()
-        src = "задан параметром report_month"
-    row = read_sql(engine, Q.REF_CUR)
-    if not row.empty and pd.notna(row.ref_cur.iloc[0]):
-        d_cur = pd.to_datetime(row.ref_cur.iloc[0]).date()
-        d_act = (pd.to_datetime(row.act_dt.iloc[0]).date()
-                 if pd.notna(row.act_dt.iloc[0]) else d_cur)
-        if ref_cur is None:
-            ref_cur, act_dt, src = d_cur, d_act, "последний месяц ежедневной витрины"
-        elif d_cur == ref_cur:
-            act_dt = d_act
-        else:
-            # заданный месяц не последний — берём дату актуальности ЭТОГО месяца
-            a = read_sql(engine, Q.ACT_DT_FOR, {"ref_cur": ref_cur})
-            n_rows = int(a.n_rows.iloc[0] or 0) if not a.empty else 0
-            if n_rows and pd.notna(a.act_dt.iloc[0]):
-                act_dt = pd.to_datetime(a.act_dt.iloc[0]).date()
-                progress.done(f"Месяц отчёта {ref_cur} — не последний в витрине "
-                              f"(там {d_cur}); дата актуальности взята за этот месяц: "
-                              f"{act_dt}, строк {n_rows}")
-            else:
-                progress.done(f"ВНИМАНИЕ: за {ref_cur} в ежедневной витрине нет строк "
-                              f"(последний месяц там {d_cur}) — наблюдаемого оттока не "
-                              f"будет, отток посчитается только по модели истории")
-    if ref_cur is None:
-        closed = pd.to_datetime(read_sql(engine, Q.REF_DATE).iloc[0, 0]).date()
-        ref_cur = (pd.Timestamp(closed) + pd.offsets.MonthEnd(1)).date()
-        src = "ФОЛБЭК: ежедневной витрины нет — закрытый месяц витрины + 1"
-    if act_dt is None:
-        act_dt = ref_cur
-    cur = pd.Timestamp(ref_cur)
-    ref_closed = (cur.to_period("M") - 1).to_timestamp("M").date()
-    # Окно воронки — 3 календарных месяца, заканчивая ПРОГНОЗНЫМ: задачи по метрикам
-    # идут месяцем позже метрик, поэтому конец окна и есть текущий месяц.
-    ref_funnel = ref_cur
-    funnel_from = (cur.to_period("M") - 2).to_timestamp().date()
-    # Сделки судим по дате СОЗДАНИЯ СДЕЛКИ: заведённые в двух последних месяцах окна
-    # ещё не могли дать зачисления, по ним недоработку не считаем.
-    fresh_from = (cur.to_period("M") - 1).to_timestamp().date()
-    hist_from = (cur.to_period("M") - (HIST_MONTHS + 1)).to_timestamp("M").date()
-    # окно помесячных активностей под вопрос «отрабатывали ли отток тогда»: та же
-    # глубина, что у месяцев оттока в годовом тренде (forecast.YOY_DEPTH)
-    months_from = (cur.to_period("M") - forecast.YOY_DEPTH).to_timestamp().date()
-    # тот же месяц год назад — для прироста «год к году» по закрытому месяцу
-    ref_yoy = (cur.to_period("M") - 13).to_timestamp("M").date()
-    # окно сделок для помесячного план/факт: PIPE_MONTHS закрытых месяцев + текущий.
-    # Шире окна активностей: коэффициент реализуемости считается по закрытым месяцам.
-    plan_from = (cur.to_period("M") - PIPE_MONTHS).to_timestamp().date()
-    # ДВЕ РАЗНЫЕ величины, их нельзя путать:
-    #  * observed — какую долю выплатных событий месяца мы уже УВИДЕЛИ. Меряется по
-    #    act_dt (дата актуальности витрины оттока) и отвечает за то, сколько риска
-    #    оттока уже отыграно;
-    #  * days_left — сколько КАЛЕНДАРНОГО времени осталось, чтобы привлечения по
-    #    сделкам успели дойти. Меряется по РЕАЛЬНОЙ текущей дате: витрина оттока про
-    #    будущие дни ничего не знает, и её act_dt тут ни при чём.
-    observed = min(1.0, pd.Timestamp(act_dt).day / cur.day)
-    today = params.get("today")
-    today = (pd.Timestamp(today).date() if today
-             else pd.Timestamp.now().date())
-    if today > cur.date():
-        days_left = 0                      # месяц уже закончился
-    elif today < cur.replace(day=1).date():
-        days_left = int(cur.day)           # месяц ещё не начался
-    else:
-        # сегодняшний день ещё в игре: 31-е из 31 — это 1 оставшийся день, а не 0
-        days_left = int(cur.day) - today.day + 1
-    pipe_left = days_left / float(cur.day)
-
-    progress.done(f"Прогнозный месяц: {ref_cur} ({src}) · факт зачислений по {act_dt} "
-                  f"(выплат месяца отыграно {observed * 100:.0f}%)")
-    progress.done(f"Сегодня {today}: до конца месяца {days_left} из {cur.day} дн. "
-                  f"({pipe_left * 100:.0f}%) — столько времени осталось у пайплайна")
-    progress.done(f"Портфель-база прогноза — закрытый месяц {ref_closed}; "
-                  f"история витрины с {hist_from} ({HIST_MONTHS} мес)")
-    months = ", ".join((cur.to_period("M") - k).strftime("%m.%Y") for k in (2, 1, 0))
-    progress.done(f"Окно задач воронки: {funnel_from} … {ref_funnel} ({months}) · "
-                  f"сделки с {fresh_from} — свежие")
-    return {"ref_cur": ref_cur, "ref_closed": ref_closed, "act_dt": act_dt,
-            "ref_yoy": ref_yoy,
-            "ref_funnel": ref_funnel, "funnel_from": funnel_from,
-            "fresh_from": fresh_from, "hist_from": hist_from, "plan_from": plan_from,
-            "months_from": months_from,
-            "cur_month": int(cur.month), "month_elapsed": float(observed),
-            "today": today, "days_left": int(days_left),
-            "days_in_month": int(cur.day), "pipe_left": float(pipe_left), "src": src,
-            "label": f"{cur.month:02d}.{cur.year}",
-            "closed_label": f"{pd.Timestamp(ref_closed).month:02d}."
-                            f"{pd.Timestamp(ref_closed).year}"}
-
-
-def _forecast_orgs(engine, orgs: pd.DataFrame, d: dict, tb_id: int):
-    """Прогноз по (ГОСБ, ИНН): ожидаемый отток + приход из пайплайна.
-
-    Возвращает (orgs с приклеенным прогнозом, кадр прогноза, диагностика).
-    Отдельно считается ФОТ-эффект: отток пересчитывается по средней ЗП
-    организации, а по пайплайну план ФОТа есть свой.
-    """
-    progress.step(f"Прогноз на {d['ref_cur']}: отток по истории + ежедневный + пайплайн")
-    day = read_sql(engine, Q.DAY_OUTFLOW,
-                   {"tb_id": tb_id, "ref_cur": d["ref_cur"], "act_dt": d["act_dt"]})
-    hist = read_sql(engine, Q.OUTFLOW_HISTORY,
-                    {"tb_id": tb_id, "hist_from": d["hist_from"],
-                     "ref_closed": d["ref_closed"]})
-    # План и ФАКТ пайплайна помесячно на грейне (ГОСБ, ИНН, сотрудник): именно на нём
-    # план двух сделок одного месяца складывается в одно число, с которым и сравнивается
-    # пришедший факт.
-    pp = {"tb_id": tb_id, "plan_from": d["plan_from"], "ref_funnel": d["ref_funnel"]}
-    plan_m = read_sql(engine, Q.PIPELINE_PLAN_M, pp)
-    fact_m = read_sql(engine, Q.PIPELINE_FACT_M,
-                      {"tb_id": tb_id, "plan_from": d["plan_from"], "ref_cur": d["ref_cur"],
-                       "m_np": Q.METRIC_NEW_RECIPIENTS_B2B, "counted": Q.MOTIV_COUNTED})
-    fstat = read_sql(engine, Q.PIPELINE_FACT_STATS,
-                     {"tb_id": tb_id, "plan_from": d["plan_from"], "ref_cur": d["ref_cur"],
-                      "m_np": Q.METRIC_NEW_RECIPIENTS_B2B, "counted": Q.MOTIV_COUNTED})
-    pstat = read_sql(engine, Q.PIPELINE_PLAN_STATS, pp)
-
-    pred = forecast.outflow_model(hist, d["ref_cur"])
-    rec = forecast.reconcile(day, pred, d["month_elapsed"])
-    by_gosb, tb_k, conv_diag = forecast.conversion_by_month(plan_m, fact_m, d["ref_cur"])
-    # у пайплайна своя мера времени — сколько КАЛЕНДАРНЫХ дней осталось до конца
-    # месяца (от реальной даты), а не сколько выплат мы увидели в витрине оттока
-    pipe_fc = forecast.pipeline_current(plan_m, fact_m, d["ref_cur"], by_gosb, tb_k,
-                                        d["pipe_left"])
-    due = forecast.deal_due(plan_m, fact_m, d["ref_cur"])
-    _log_pipeline(fstat, pstat, conv_diag, d)
-    # сегмент из воронки приходит БОЛЬШИМ именем — приводим к короткому,
-    # иначе он не совпадёт с сегментами матрицы
-    if not pipe_fc.empty:
-        short = pipe_fc["seg_funnel"].map(segments.short_of_big)
-        pipe_fc["seg_funnel"] = short.fillna(pipe_fc["seg_funnel"])
-    seg_of = {int(r.inn): r.seg_name for r in orgs.itertuples()
-              if r.seg_name and r.seg_name != "—"}
-    fc = forecast.org_forecast(rec, pipe_fc, seg_of)
-
-    # ФОТ-эффект: средняя ЗП из ежедневной витрины, фолбэк — из витрины организаций
-    sal_of = {(int(r.new_gosb_id), int(r.inn)): float(r.avg_salary or 0)
-              for r in orgs.itertuples() if pd.notna(r.new_gosb_id)}
-    sal = [float(s) if float(s or 0) > 0 else sal_of.get((int(g), int(i)), 0.0)
-           for s, g, i in zip(fc["avg_salary_m"], fc["new_gosb_id"], fc["inn"])]
-    fc["salary"] = sal
-    fc["out_fot"] = fc["out_exp"] * fc["salary"]
-    fc["in_fot"] = fc["in_exp"] * fc["salary"]
-    # ТБ пишем прямо в строку организации: своду СБ тогда не нужен обратный маппинг
-    # ГОСБ → ТБ, единица разбора там задаётся просто именем колонки
-    fc["tb_id"] = tb_id
-
-    hd = pred.attrs.get("diag", {}) if not pred.empty else {}
-    n_hist = int(hd.get("hist_months", 0))
-    classes = fc["out_class"].value_counts().to_dict() if not fc.empty else {}
-    stats = {"n_day": len(day), "n_hist_orgs": len(pred), "hist_months": n_hist,
-             "n_pipe": len(pipe_fc), "conv_tb": tb_k, "conv_by_gosb": by_gosb,
-             "classes": classes, "hist": hd, "conv": conv_diag,
-             "pipe_np": float(fc["pipe_np"].sum()) if not fc.empty else 0.0,
-             "pipe_np_raw": float(fc["pipe_np_raw"].sum()) if not fc.empty else 0.0}
-    raw = conv_diag.get("tb_raw")
-    conv_txt = (f"коэф. ТБ {raw:.2f} → поднят до пола {tb_k:.2f}"
-                if conv_diag.get("tb_clipped") else f"коэф. ТБ {tb_k:.2f}")
-    progress.done(f"История: {n_hist} мес ({hd.get('hist_from','—')}…"
-                  f"{hd.get('hist_to','—')}) по {len(pred)} парам · ежедневная витрина: "
-                  f"{len(day)} пар · пайплайн на {d['label']}: {len(pipe_fc)} орг, "
-                  f"{stats['pipe_np_raw']:.0f} чел заявлено → {stats['pipe_np']:.0f} "
-                  f"с поправкой на реализуемость ({conv_txt})")
-    if conv_diag.get("n_gosb_clipped"):
-        progress.done(f"Коэффициент реализуемости упёрся в границы "
-                      f"[{forecast.CONV_MIN}, {forecast.CONV_MAX}] у "
-                      f"{conv_diag['n_gosb_clipped']} из {conv_diag.get('n_gosb', 0)} ГОСБ — "
-                      f"по ним вклад пайплайна в прогноз завышен")
-    _log_history(hd, d)
-    if classes:
-        n_all = sum(classes.values()) or 1
-        progress.done("Классы оттока: " + " · ".join(
-            f"{k} {v} ({v / n_all * 100:.1f}%)"
-            for k, v in sorted(classes.items(), key=lambda x: -x[1])))
-
-    keep = ["new_gosb_id", "inn", "out_exp", "in_exp", "pipe_np", "pipe_np_raw",
-            "pipe_fact_mtd", "pipe_fot", "out_observed", "pred", "out_class", "note",
-            "why", "settled", "n_deals", "out_months"]
-    merged = orgs.copy()
-    merged["new_gosb_id"] = merged["new_gosb_id"].astype("Int64")
-    if not fc.empty:
-        f = fc[keep].copy()
-        f["new_gosb_id"] = f["new_gosb_id"].astype("Int64")
-        f["inn"] = f["inn"].astype("int64")
-        merged = merged.merge(f, on=["new_gosb_id", "inn"], how="left")
-    # план/факт по сделкам за ЗАКРЫТЫЕ месяцы — на них опирается аудит отработки
-    if due is not None and not due.empty:
-        dd = due.copy()
-        dd["new_gosb_id"] = dd["new_gosb_id"].astype("Int64")
-        dd["inn"] = dd["inn"].astype("int64")
-        merged = merged.merge(dd, on=["new_gosb_id", "inn"], how="left")
-    for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd", "pipe_fot",
-              "out_observed", "pred", "settled", "n_deals",
-              "plan_np_due", "fact_np_due", "due_months"):
-        merged[c] = forecast.num(merged, c)
-    for c in ("out_class", "note", "why"):
-        merged[c] = merged.get(c).fillna("") if c in merged else ""
-    merged["out_class"] = merged["out_class"].replace("", forecast.CLS_STABLE)
-    # колонка-список: у организаций без истории после left join приезжает NaN, а он
-    # ПРОХОДИТ проверку `or []` (nan истинно) и роняет list() уже в детализации
-    merged["out_months"] = [v if isinstance(v, list) else []
-                            for v in merged.get("out_months", pd.Series(dtype=object))] \
-        if "out_months" in merged else [[] for _ in range(len(merged))]
-    return merged, fc, stats
-
-
-def _yoy(engine, params: dict, tb_id: int, closed: dict, d: dict) -> dict:
-    """Прирост год к году по ЗАКРЫТОМУ месяцу: два факта, а не факт против прогноза.
-
-    Берём тот же TB_VERDICT, только за месяц годом ранее. Если строки за этот месяц в
-    витрине нет (на проме витрина метрик может не уходить так глубоко), возвращаем
-    пустой результат — в карточке будет «—». Показать вместо этого ноль нельзя: его не
-    отличить от настоящего нулевого прироста.
-    """
-    out: dict = {}
-    v = read_sql(engine, Q.TB_VERDICT, params)
-    prev, _ = _verdict(v, tb_id)
-    for key, label, scale in (("rcp", "получатели", 1.0), ("fot", "ФОТ млн ₽", RUB_TO_MLN)):
-        was = float(prev.get(key, {}).get("fact") or 0)
-        now = float(closed.get(key, {}).get("fact") or 0)
-        if was <= 0:
-            out[key] = None
-            continue
-        out[key] = {"fact": was, "delta": now - was, "pct": now / was - 1}
-        progress.done(f"Год к году ({label}): {d['closed_label']} {now / scale:,.0f} против "
-                      f"{was / scale:,.0f} год назад → {(now - was) / scale:+,.0f} "
-                      f"({(now / was - 1) * 100:+.1f}%)".replace(",", " "))
-    if all(v is None for v in out.values()):
-        progress.done(f"Год к году НЕ рассчитан: в витрине метрик нет месяца "
-                      f"{params['ref']} — в карточках будет «—»")
-    return out
-
-
-def _log_pipeline(fstat: pd.DataFrame, pstat: pd.DataFrame, conv: dict, d: dict) -> None:
-    """Диагностика пайплайна: что отсеяли фильтрами и на чём стоит коэффициент.
-
-    Обе доли важны для доверия к цифре: фильтр «учтено» убирает фрод, а строки с
-    неразрешимым месяцем плана вообще не участвуют в расчёте.
-    """
-    if fstat is not None and not fstat.empty:
-        r = fstat.iloc[0]
-        n_all = int(r.n_all or 0)
-        if n_all:
-            drop = n_all - int(r.n_counted or 0)
-            amt_all = float(r.amt_all or 0)
-            amt_drop = amt_all - float(r.amt_counted or 0)
-            progress.done(
-                f"Факт по сделкам: {int(r.n_counted or 0)} из {n_all} строк «учтено» "
-                f"(отсеяно {drop}, {drop / n_all * 100:.0f}%) · "
-                f"{float(r.amt_counted or 0):.0f} НП из {amt_all:.0f} "
-                f"(не в учёте {amt_drop:.0f})")
-    if pstat is not None and not pstat.empty:
-        r = pstat.iloc[0]
-        n_all, n_bad = int(r.n_all or 0), int(r.n_bad or 0)
-        if n_bad:
-            progress.done(f"Пайплайн: у {n_bad} из {n_all} строк ({n_bad / max(n_all,1)*100:.1f}%) "
-                          f"месяц плана вне 3 месяцев жизни сделки — год не восстановить, "
-                          f"в расчёт не идут")
-    if conv.get("months"):
-        progress.done(f"Реализуемость: план {conv['plan']:.0f} → факт {conv['fact']:.0f} "
-                      f"по {conv['months']} закрытым месяцам, {conv['n_gosb']} ГОСБ "
-                      f"(окно с {d['plan_from']})")
-        if conv["months"] < 3:
-            progress.done(f"Коэффициент стоит всего на {conv['months']} закрытых мес — "
-                          f"мало для устойчивой оценки: в окне нет сделок постарше")
-    else:
-        progress.done("Реализуемость НЕ рассчитана: закрытых месяцев с планом нет — "
-                      "пайплайн войдёт в прогноз без поправки (коэф. 1.0)")
-
-
-def _log_history(hd: dict, d: dict) -> None:
-    """Диагностика истории витрины: хватает ли её модели и что вообще посчиталось.
-
-    Раньше здесь стоял чек `n_hist < 13`, и он был неверен дважды: при ровно 13
-    месяцах не срабатывал, а 13 месяцев и не хватает — у ПРОГНОЗНОГО месяца второе
-    наблюдение появляется только на 24-м месяце (`forecast.seasonal_depth_needed`).
-    Поэтому вместо порога печатаем факт: чем посчитана сезонность и у скольких пар.
-    """
-    if not hd:
-        return
-    # молчаливый сбой: если базового месяца нет в истории, отток закрытого месяца
-    # везде окажется нулём, и ВСЁ уедет в класс «стабильно» без единой жалобы
-    if not hd.get("base_present"):
-        progress.done(f"ВНИМАНИЕ: базового месяца {hd.get('base_month')} НЕТ в истории "
-                      f"витрины — отток закрытого месяца везде будет нулевым, "
-                      f"модель оттока фактически отключена")
-    n_pairs = max(int(hd.get("n_pairs", 0)), 1)
-    n_out = int(hd.get("n_with_outflow", 0))
-    progress.done(f"Отток в закрытом месяце есть у {n_out} из {n_pairs} пар "
-                  f"({n_out / n_pairs * 100:.1f}%) — остальные попадут в «стабильно»")
-    src = hd.get("seas_src", {})
-    need, have = int(hd.get("need_months", 0)), int(hd.get("hist_months", 0))
-    n_idx = int(src.get(forecast.SRC_INDEX, 0))
-    n_yoy = int(src.get(forecast.SRC_YOY, 0))
-    if n_idx:
-        progress.done(f"Сезонность: индекс по ≥{forecast.MIN_SEASON_OBS} наблюдениям "
-                      f"у {n_idx} пар, переход год назад у {n_yoy}, без сигнала "
-                      f"{int(src.get(forecast.SRC_NONE, 0))}")
-    elif n_yoy:
-        progress.done(f"Сезонность: индекса нет (для месяца {d.get('label','')} нужно "
-                      f"{need} мес истории, есть {have}) → считаем по переходу год "
-                      f"назад, сигнал у {n_yoy} пар из {n_pairs}")
-    else:
-        progress.done(f"Сезонность НЕ рассчитана: для месяца {d.get('label','')} нужно "
-                      f"{need} мес истории (есть {have}), а перехода год назад нет — "
-                      f"работает только модель двух закрытых месяцев")
-
-
 def _check_waterfall(wf: dict, matrix: pd.DataFrame, stats: dict) -> None:
     """Две проверки сходимости, обе пишутся в прогресс.
 
@@ -936,81 +597,6 @@ def _candidates(orgs: pd.DataFrame, days_left: int = 0) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
-def _merge_funnel(orgs: pd.DataFrame, fagg: pd.DataFrame) -> pd.DataFrame:
-    """Приклеить агрегат воронки на грейне (ГОСБ, ИНН)."""
-    num_cols = ["n_tasks", "n_calls", "n_meetings", "n_success", "n_overdue", "n_outflow",
-                "n_in_progress", "n_closed",
-                "plan_deal", "fact_deal", "plan_deal_old", "fact_deal_old", "unrealized"]
-    bool_cols = ["any_success", "any_text", "has_fresh_deal", "deal_expected"]
-    if fagg.empty:
-        for c in num_cols:
-            orgs[c] = 0
-        for c in bool_cols:
-            orgs[c] = False
-        orgs["fresh_deal_dt"] = pd.NaT
-        orgs["worked"] = False
-        return orgs
-    fagg = fagg.copy()
-    fagg["new_gosb_id"] = fagg["new_gosb_id"].astype("Int64")
-    orgs["new_gosb_id"] = orgs["new_gosb_id"].astype("Int64")
-    orgs = orgs.merge(fagg, on=["new_gosb_id", "inn"], how="left")
-    orgs["worked"] = orgs["n_tasks"].notna() & (orgs["n_tasks"].fillna(0) > 0)
-    for c in num_cols:
-        orgs[c] = orgs[c].fillna(0).astype(int)
-    for c in bool_cols:
-        orgs[c] = orgs[c].fillna(False).astype(bool)
-    return orgs
-
-
-def _activity(totals: pd.DataFrame, breakdown: pd.DataFrame) -> dict:
-    if totals.empty or not int(totals.n.iloc[0] or 0):
-        return {"n": 0}
-    t = totals.iloc[0]
-    def _dim(name):
-        d = breakdown[breakdown.dim == name]
-        return {str(r.k): int(r.n) for r in d.itertuples()}
-    return {
-        "n": int(t.n), "orgs": int(t.orgs),
-        "calls": int(t.calls or 0), "meetings": int(t.meetings or 0),
-        "success_rate": float(t.success_rate or 0), "overdue": int(t.overdue or 0),
-        "plan_deal": int(t.plan_deal or 0), "fact_deal": int(t.fact_deal or 0),
-        "unrealized": int(t.unrealized or 0),
-        "by_role": _dim("role"), "by_type": _dim("type"), "by_status": _dim("status"),
-    }
-
-
-def _apparat_ids(engine) -> set:
-    """Подразделения-аппараты, которые исключаются из разбора.
-
-    Правило: имя начинается на «Аппарат» И это не единственное подразделение своего ТБ.
-    Вторая половина обязательна — у Московского банка аппарат единственный, и без
-    оговорки этот ТБ остался бы вовсе без единиц разбора.
-
-    Состав печатается в прогресс: молча выкидывать подразделения из отчёта нельзя,
-    иначе расхождение с витриной будет выглядеть ошибкой расчёта.
-    """
-    flags = read_sql(engine, Q.GOSB_FLAGS)
-    if flags.empty:
-        return set()
-    out, kept = set(), []
-    for r in flags.itertuples():
-        name = str(r.gosb_name or "").strip()
-        if not name.lower().startswith(APPARAT_PREFIX):
-            continue
-        if int(r.n_gosb) <= 1:
-            kept.append(name)
-            continue
-        out.add(int(r.new_gosb_id))
-    if out:
-        progress.done(f"Из разбора исключены аппараты ТБ: {len(out)} подразделений — "
-                      f"они не продающие. Вердикт уровня берётся из витрины целиком, "
-                      f"поэтому сумма карточек ему не равна — так и задумано")
-    if kept:
-        progress.done(f"Оставлены как единственное подразделение своего ТБ: "
-                      f"{', '.join(kept)}")
-    return out
-
-
 def _drop_apparat(df: pd.DataFrame, apparat: set) -> pd.DataFrame:
     """Убрать аппараты из выборки метрик по подразделениям."""
     if df is None or df.empty or not apparat or "unit_id" not in df:
@@ -1036,52 +622,6 @@ def _roll_to_tb(df: pd.DataFrame, apparat: set, names: dict,
     agg = agg.rename(columns={"tb_id": "unit_id"})
     agg["unit_name"] = agg["unit_id"].map(lambda x: names.get(int(x), f"ТБ {int(x)}"))
     return agg
-
-
-def _sb_verdict(engine, params: dict) -> tuple[dict, str]:
-    """План и факт ВСЕГО БАНКА — отдельной строкой витрины, а не суммой ТБ.
-
-    Уровень sb существует только в uzp_dwh_metrics; складывать ТБ нельзя по той же
-    причине, по которой сумма ГОСБ не равна итогу ТБ (раздел 12 методологии) —
-    уровни считаются независимо.
-
-    Если под level_name='sb' окажется несколько level_id (в профиле прома у sb
-    встречаются level_value 0/1/99), выбор неоднозначен — тогда говорим об этом
-    вслух и берём строку с наибольшим фактом. Молча угадывать нельзя.
-    """
-    v = read_sql(engine, Q.SB_VERDICT, params)
-    out: dict = {}
-    ref = ""
-    ids = sorted({int(x) for x in v.level_id.dropna()}) if not v.empty else []
-    if len(ids) > 1:
-        progress.done(f"ВНИМАНИЕ: под level_name='sb' несколько level_id {ids} — "
-                      f"вердикт банка неоднозначен, берётся строка с наибольшим фактом")
-    for key, mid in (("rcp", Q.METRIC_RECIPIENTS), ("fot", Q.METRIC_FOT)):
-        row = v[v.metric_id == mid].sort_values("fact_amt", ascending=False)
-        if row.empty:
-            out[key] = {"plan": 0, "fact": 0, "exec": None, "rank": None, "n_tb": None}
-            continue
-        r = row.iloc[0]; ref = str(r.end_dt)
-        ex = r.execution_percent
-        out[key] = {"plan": float(r.plan_amt), "fact": float(r.fact_amt),
-                    "exec": (float(ex) if pd.notna(ex) else None),
-                    # ранга нет: банк сравнивать не с кем
-                    "rank": None, "n_tb": None}
-    return out, ref
-
-
-def _verdict(v: pd.DataFrame, tb_id: int) -> tuple[dict, str]:
-    out = {}; ref = ""
-    for key, mid in (("rcp", Q.METRIC_RECIPIENTS), ("fot", Q.METRIC_FOT)):
-        row = v[(v.metric_id == mid) & (v.tb_id == tb_id)]
-        if row.empty:
-            out[key] = {"plan": 0, "fact": 0, "exec": None, "rank": None, "n_tb": None}
-            continue
-        r = row.iloc[0]; ref = str(r.end_dt)
-        out[key] = {"plan": float(r.plan_amt), "fact": float(r.fact_amt),
-                    "exec": float(r.execution_percent), "rank": int(r.rnk),
-                    "n_tb": int(r.n_tb)}
-    return out, ref
 
 
 def _classify(cand: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1149,34 +689,31 @@ _POSITIVE_REASONS = {"Получено согласие", "Планируетс�
 
 
 # --------------------------------------------------------------------------- #
-def _resolve(ctx, engine, pf: dict, to_work: pd.DataFrame, no_point: pd.DataFrame,
-             seg_gaps: dict, batch: int, min_impact: float, max_calls: int,
-             ref_ym: tuple[int, int]):
+def _resolve(ctx, pool: pd.DataFrame, to_work: pd.DataFrame, no_point: pd.DataFrame,
+             text_df: pd.DataFrame, batch: int, max_calls: int,
+             ref_ym: tuple[int, int], min_impact: float = 0.0):
     """Аудит отработки по (ГОСБ, ИНН): один проход по всему пулу западающих сегментов.
 
-    Пул — `_audit_pool`: ВСЕ организации западающих сегментов их ГОСБ + доборные из
-    других сегментов ГОСБ (не «топ» и не «минимум под план»). Разрешение: чек-лист ->
-    названный в тексте будущий срок -> ключевые слова (кроме needs_llm и пар с ≥2
-    авторами) -> LLM с фактами и хронологией -> фолбэк на правила для того, что не
-    влезло в бюджет вызовов.
+    Пул считается заранее (`_audit_pool` в `prepare`): ВСЕ организации западающих
+    сегментов их ГОСБ + доборные из других сегментов ГОСБ (не «топ» и не «минимум под
+    план»). Тексты воронки тоже прочитаны заранее — одним запросом на весь отчёт;
+    `_collect_notes` берёт из них только строки своего пула.
+
+    Разрешение: чек-лист -> названный в тексте будущий срок -> ключевые слова (кроме
+    needs_llm и пар с ≥2 авторами) -> LLM с фактами и хронологией -> фолбэк на правила
+    для того, что не влезло в бюджет вызовов.
     """
     stats = {"batch": batch, "min_impact": min_impact, "max_calls": max_calls,
              "pool": 0, "checklist": 0, "keyword": 0, "llm": 0, "no_text": 0,
              "fallback": 0, "batches": 0, "capped": 0, "deadline": 0, "no_influence": 0}
-    if to_work.empty:
+    if to_work.empty or pool is None or pool.empty:
         return {}, to_work, no_point, "—", stats
-
-    pool = _audit_pool(to_work, seg_gaps, min_impact)
     stats["pool"] = len(pool)
-    if pool.empty:
-        return {}, to_work, no_point, "—", stats
     progress.step(f"Аудит отработки: пул {len(pool)} пар (ГОСБ,ИНН) — все организации "
                   f"западающих сегментов + добор, эффект ≥ {min_impact:g} чел")
 
     insights: dict = {}
     all_texts: list[str] = []
-    inns = sorted({int(x) for x in pool["inn"]})
-    text_df = read_sql(engine, Q.FUNNEL_TEXT, {**pf, "inns": inns})
     notes = _collect_notes(text_df, pool, all_texts)
 
     need_llm = []
@@ -1740,6 +1277,89 @@ def _out_groups(rows: list, closed_label: str, act_dt=None) -> list:
     return sorted(groups, key=lambda g: -g["fl"])
 
 
+def _yoy_rows(nid: int, inns, rows: list, names: dict, yoy: dict, cur: dict, ref: dict,
+              insights: dict, work: set, nopt: set) -> list:
+    """Просевшие за год организации единицы — ПО СТРОКАМ ВИТРИНЫ, а не по прогнозу.
+
+    Источник принципиален. Блок отвечает на вопрос «на сколько просел портфель за год»,
+    и его итог обязан сходиться с витриной. Если собирать блок из строк прогноза
+    (грейн (ГОСБ, ИНН)), в него не попадают организации, которых в прогнозе нет вовсе —
+    например, обслуживаемые только аппаратом, исключённым из разбора, — и сумма блока
+    оказывалась меньше витрины.
+
+    Всё, что известно про отток и отработку, подмешивается из прогноза, если строка
+    там есть; если нет — месяцев оттока мы не знаем, и организация уходит в группу
+    «отработка неизвестна», а не в «таяли постепенно».
+    """
+    known = {r["inn"]: r for r in rows}
+    out = []
+    for inn in inns:
+        k = (nid, int(inn))
+        delta = yoy.get(k, 0.0)
+        if delta > -1:
+            continue
+        base = known.get(int(inn), {})
+        ins = insights.get(k, {})
+        out.append({
+            "inn": int(inn), "name": names.get(k, f"Орг. {int(inn)}"),
+            "yoy": delta, "cur": cur.get(k, 0.0),
+            "out": base.get("out", 0.0), "pipe": base.get("pipe", 0.0),
+            "out_months": list(base.get("out_months") or []),
+            "has_hist": bool(base.get("has_hist", False)),
+            "reason": ins.get("reason", ""), "action": ins.get("action", ""),
+            "in_ref": ref.get(k, False),
+            "zone": ("можно работать" if k in work else
+                     "влиять нечем" if k in nopt else "вне эталонной базы"),
+        })
+    return out
+
+
+def _next_month(label: str) -> str:
+    """«MM.YYYY» → следующий месяц. Метки месяцев в блоках — строки, а не даты."""
+    try:
+        mm, yy = label.split(".")
+        m, y = int(mm), int(yy)
+    except (ValueError, AttributeError):
+        return label
+    return f"01.{y + 1}" if m == 12 else f"{m + 1:02d}.{y}"
+
+
+def _unit_grain(orgs_fc: pd.DataFrame, unit_src: str):
+    """Прогноз, сведённый к грейну ЕДИНИЦЫ уровня: (единица, организация).
+
+    На уровне ТБ единица — ГОСБ, и свёртка не нужна: грейн прогноза уже такой. На
+    уровне СБ единица — ТБ, а грейн прогноза остаётся (ГОСБ, ИНН), и организация,
+    обслуживаемая в трёх ГОСБ одного ТБ, давала в блоках ТРИ строки. В блоке
+    «Портфель год к году» каждой из них приписывалась ПОЛНАЯ годовая дельта
+    организации по ТБ (она берётся по ключу (ТБ, ИНН)) — одна и та же цифра
+    повторялась, а итог блока оказывался кратно больше витрины.
+
+    Отдаёт пары (единица, кадр), готовые к groupby-обходу.
+    """
+    f = orgs_fc.dropna(subset=[unit_src]).copy() if orgs_fc is not None else None
+    if f is None or f.empty:
+        return []
+    f[unit_src] = f[unit_src].astype("int64")
+    f["inn"] = f["inn"].astype("int64")
+    if unit_src == "new_gosb_id":
+        return list(f.groupby(unit_src))
+    num = ["out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd", "out_observed"]
+    agg = f.groupby([unit_src, "inn"], as_index=False).agg(
+        **{c: (c, "sum") for c in num if c in f},
+        recovered=("recovered", "max"), has_hist=("has_hist", "max"))
+    # класс и текст причины берём у САМОЙ КРУПНОЙ по оттоку строки: именно она
+    # объясняет вклад организации, а складывать формулировки бессмысленно
+    top = (f.sort_values("out_exp", ascending=False)
+            .drop_duplicates(subset=[unit_src, "inn"])
+            [[unit_src, "inn", "out_class", "note", "why"]])
+    agg = agg.merge(top, on=[unit_src, "inn"], how="left")
+    months = (f.groupby([unit_src, "inn"])["out_months"]
+               .apply(lambda s: sorted({m for v in s for m in (v or [])}, reverse=True))
+               .rename("out_months").reset_index())
+    agg = agg.merge(months, on=[unit_src, "inn"], how="left")
+    return list(agg.groupby(unit_src))
+
+
 def _funnel_month_index(fm: pd.DataFrame | None, unit_src: str) -> tuple[dict, set]:
     """Активности по месяцам → индекс {(единица, ИНН, «MM.YYYY»): агрегат} + окно месяцев.
 
@@ -1782,24 +1402,34 @@ def _yoy_groups(rows: list, nid: int, fmonths: dict, fwindow: set) -> list:
     """
     kinds = [
         ("worked", "Отток был, отрабатывали",
-         "в месяцы оттока были задачи — смотреть качество отработки, а не охват"),
+         "в месяцы оттока (и в следующий за ними) были задачи — смотреть качество "
+         "отработки, а не охват"),
         ("missed", "Отток был, активностей не было",
-         "в месяцы оттока задач не заводили — пропустили"),
-        ("unknown", "Отток был, отработка неизвестна",
-         "месяцы оттока старше окна воронки — по ним данных о задачах нет"),
+         "ни в месяц оттока, ни в следующий задач не заводили — пропустили"),
+        ("unknown", "Отработка неизвестна",
+         "месяцы оттока старше окна воронки либо истории по паре в витрине нет — "
+         "данных о задачах по ним не существует"),
         ("melt", "Таяли постепенно",
          "разовым оттоком не объясняется: штат уменьшался месяц за месяцем"),
     ]
     total = float(sum(abs(r["yoy"]) for r in rows)) or 1.0
     for r in rows:
         months = r.get("out_months") or []
-        known = [m for m in months if m in fwindow]
-        tasks = sum(int(fmonths.get((nid, r["inn"], m), {}).get("n_tasks", 0))
-                    for m in known)
+        # Задачу на отток ставят и ВНУТРИ месяца, и следующим отчётным месяцем:
+        # витрина оттока закрывается позже, чем он случился. Поэтому по каждому месяцу
+        # оттока M смотрим задачи и в M, и в M+1 — иначе нормально отработанный отток
+        # выглядел бы пропущенным.
+        look = {m: [m, _next_month(m)] for m in months}
+        known = [m for m, ms in look.items() if any(x in fwindow for x in ms)]
+        tasks = sum(int(fmonths.get((nid, r["inn"], x), {}).get("n_tasks", 0))
+                    for m in known for x in look[m] if x in fwindow)
         r["yoy_tasks"] = tasks
         r["yoy_months_known"] = known
         if not months:
-            r["yoy_key"] = "melt"
+            # «месяцев с оттоком нет» бывает по двум причинам, и путать их нельзя:
+            # штат действительно таял ровно — или витрина об этой паре вообще ничего
+            # не знает, и тогда сказать про причину нечего
+            r["yoy_key"] = "melt" if r.get("has_hist") else "unknown"
         elif not known:
             r["yoy_key"] = "unknown"
         elif tasks > 0:
@@ -1869,20 +1499,22 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
         return out
     names, yoy, ref, cur = {}, {}, {}, {}
     yoy_tot: dict = {}
-    # Справочник приходит на грейне ГОСБ, а ключ строки — ЕДИНИЦА УРОВНЯ. На уровне
-    # ТБ это одно и то же, на уровне СБ — нет, и ключ по ГОСБ там не нашёлся бы
-    # никогда: блок годового тренда молча оставался бы пустым.
+    det_by_unit: dict = {}
+    # Справочник приходит на грейне ЕДИНИЦЫ УРОВНЯ: у ТБ это строки витрины уровня
+    # gosb, у банка — строки уровня tb. Ключ по ГОСБ на уровне СБ не нашёлся бы
+    # никогда, и блок годового тренда молча оставался бы пустым.
     dsrc = unit_src if (detail is not None and unit_src in detail) else "new_gosb_id"
     if detail is not None and not detail.empty:
         for r in detail.dropna(subset=[dsrc]).itertuples():
             k = (int(getattr(r, dsrc)), int(r.inn))
             names[k] = str(r.company_name or "").strip() or f"Орг. {int(r.inn)}"
-            # одна организация может числиться в нескольких ГОСБ одного ТБ — на уровне
-            # СБ такие строки складываются, иначе часть тренда потеряется
             yoy[k] = yoy.get(k, 0.0) + float(r.fl_yoy or 0)
             cur[k] = cur.get(k, 0.0) + float(r.current_fl_qty or 0)
             ref[k] = ref.get(k, False) or bool(r.in_ref)
             yoy_tot[k[0]] = yoy_tot.get(k[0], 0.0) + float(r.fl_yoy or 0)
+            # dict как упорядоченное множество: если справочник вдруг придёт с
+            # повторами пары, организация не должна попасть в блок дважды
+            det_by_unit.setdefault(k[0], {})[k[1]] = None
 
     def _keys(df):
         src = unit_src if (df is not None and unit_src in df) else "new_gosb_id"
@@ -1891,6 +1523,10 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
     work, nopt = _keys(to_work), _keys(no_point)
     totals = {int(r.unit_id): r for r in gosb_gap.itertuples()}
     fmonths, fwindow = _funnel_month_index(funnel_months, unit_src)
+    # строки блоков собираются на грейне ЕДИНИЦЫ, а водопад — по сырым строкам
+    # прогноза: слагаемые водопада суммируются, а вот `observed` считается по каждой
+    # паре отдельно (min от факта и прогноза), и свёртка сдвинула бы его
+    by_unit = {int(k): v for k, v in _unit_grain(orgs_fc, unit_src)}
 
     skipped_no_base, group_mismatch = [], []
     for nid, g in orgs_fc.dropna(subset=[unit_src]).groupby(unit_src):
@@ -1905,7 +1541,7 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
             continue
         wf = forecast.waterfall(float(t.base_amt), g, float(t.plan_amt))
         rows = []
-        for r in g.itertuples():
+        for r in by_unit.get(nid, g.iloc[:0]).itertuples():
             k = (nid, int(r.inn))
             ins = insights.get(k, {})
             rows.append({
@@ -1919,6 +1555,9 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
                 "out_months": list(getattr(r, "out_months", None) or []),
                 "reason": ins.get("reason", ""),
                 "in_ref": ref.get(k, False), "recovered": bool(r.recovered),
+                # истории по паре может не быть вовсе — тогда «месяцев с оттоком нет»
+                # означает незнание, а не ровный штат (см. `_yoy_groups`)
+                "has_hist": bool(getattr(r, "has_hist", False)),
                 "zone": ("можно работать" if k in work else
                          "влиять нечем" if k in nopt else "вне эталонной базы"),
             })
@@ -1937,7 +1576,8 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
             group_mismatch.append((nid, g_n, len(out_rows), g_fl, blk_fl))
         top_pipe, pipe_n, pipe_fl, pipe_cov = _material(pipe_rows, "pipe")
         # выросшие за год не показываем: блок отвечает на «почему просели»
-        yoy_rows = [r for r in rows if r["yoy"] <= -1]
+        yoy_rows = _yoy_rows(nid, det_by_unit.get(nid, ()), rows, names, yoy, cur, ref,
+                             insights, work, nopt)
         yoy_groups = _yoy_groups(yoy_rows, nid, fmonths, fwindow)
         out[nid] = {
             # коэффициент ИМЕННО ЭТОГО ГОСБ; если своей истории мало, он ушёл на

@@ -66,24 +66,69 @@ def _m(p: pd.Period) -> str:
     return f"{p.month:02d}.{p.year}"
 
 
-# --- Безопасные агрегаты по строкам с пропусками ---------------------------- #
-# На проме пара (ГОСБ, организация) присутствует НЕ во всех месяцах истории,
-# поэтому строка может целиком состоять из NaN. Прямые np.nanmean/np.nanmax на
-# таком срезе печатают RuntimeWarning («Mean of empty slice»), и лог выглядит как
-# сбой. Считаем маску «есть хотя бы одно значение» явно: результат тот же (NaN),
-# но без предупреждений и видно, что случай обработан осознанно.
-def _row_mean(vals: np.ndarray) -> np.ndarray:
-    n = np.count_nonzero(~np.isnan(vals), axis=1)
-    s = np.nansum(vals, axis=1)
-    return np.where(n > 0, s / np.maximum(n, 1), np.nan)
+def aggregate_history(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
+    """Свернуть СЫРУЮ историю витрины в признаки модели — то же, что делает SQL.
 
+    Дэш эту функцию не вызывает: по всему банку историю сворачивает БД
+    (`queries.OUTFLOW_HIST_AGG`), и тянуть в память 17 млн месячных строк незачем.
+    Нужна она там, где сырая история УЖЕ в памяти: генератору синтетики (он строит
+    план текущего месяца согласованным с прогнозом) и сверке «SQL против pandas».
 
-def _row_max(vals: np.ndarray) -> np.ndarray:
-    if vals.size == 0:
-        return np.full(vals.shape[0], np.nan)
-    any_val = np.any(~np.isnan(vals), axis=1)
-    filled = np.where(np.isnan(vals), -np.inf, vals)
-    return np.where(any_val, filled.max(axis=1), np.nan)
+    Держать её рядом с моделью обязательно: это единственное место, где записано,
+    ЧТО именно должен посчитать SQL, и разъехаться они молча не смогут.
+    """
+    cols = ["new_gosb_id", "inn", "n_months", "ym_min", "ym_max", "base_fl",
+            "out_1", "out_2", "fl_avg_all", "fl_avg_mcur", "n_mcur",
+            "fl_avg_mcls", "n_mcls", "yoy_out", "fl_yoy", "fl_before", "fl_after",
+            "out_months"]
+    if hist is None or hist.empty:
+        return pd.DataFrame(columns=cols)
+    h = hist.dropna(subset=["new_gosb_id"]).copy()
+    h["new_gosb_id"] = h["new_gosb_id"].astype("int64")
+    h["inn"] = h["inn"].astype("int64")
+    h["ym"] = pd.to_datetime(h["report_dt"]).dt.to_period("M")
+    # несколько old_gosb_id сворачиваются в один new_gosb_id — суммируем, как SQL
+    # и как матрица метрик: два бывших отделения одного ГОСБ обслуживают разных людей
+    m = (h.groupby(["new_gosb_id", "inn", "ym"], as_index=False)
+          .agg(fl=("current_fl_qty", "sum"), out_q=("fl_outflow_qty", "sum")))
+    m[["fl", "out_q"]] = m[["fl", "out_q"]].fillna(0)
+    m["ym"] = m["ym"].astype("period[M]")
+
+    p_cur = pd.Period(pd.Timestamp(ref_cur), freq="M")
+    p_closed, p_yoy = p_cur - 1, p_cur - 12
+    out_from = p_closed - (YOY_DEPTH - 1)
+
+    def at(p, col):
+        s = m[m["ym"] == p].set_index(["new_gosb_id", "inn"])[col]
+        return s[~s.index.duplicated()]
+
+    after_p = [p_yoy + k for k in (1, 2, 3)]
+    g = m.groupby(["new_gosb_id", "inn"])
+    res = g.agg(n_months=("ym", "size"), ym_min=("ym", "min"), ym_max=("ym", "max"),
+                fl_avg_all=("fl", "mean"))
+    for name, month in (("mcur", p_cur.month), ("mcls", p_closed.month)):
+        sub = m[m["ym"].dt.month == month].groupby(["new_gosb_id", "inn"])
+        res[f"fl_avg_{name}"] = sub["fl"].mean()
+        res[f"n_{name}"] = sub["fl"].size()
+    res["base_fl"] = at(p_closed, "fl")
+    res["out_1"] = at(p_closed, "out_q")
+    res["out_2"] = at(p_closed - 1, "out_q")
+    res["yoy_out"] = at(p_yoy, "out_q")
+    res["fl_yoy"] = at(p_yoy, "fl")
+    res["fl_before"] = at(p_yoy - 1, "fl")
+    aft = m[m["ym"].isin(after_p)].groupby(["new_gosb_id", "inn"])["fl"].max()
+    res["fl_after"] = aft
+    om = (m[(m["out_q"] > 0) & (m["ym"] >= out_from) & (m["ym"] <= p_closed)]
+          .assign(lbl=lambda x: x["ym"].astype(str))
+          .groupby(["new_gosb_id", "inn"])["lbl"].apply(lambda s: ",".join(s)))
+    res["out_months"] = om
+    res = res.reset_index()
+    # начало месяца — как date_trunc('month') в SQL
+    for c in ("ym_min", "ym_max"):
+        res[c] = res[c].apply(lambda p: p.to_timestamp().date())
+    res["n_mcur"] = res["n_mcur"].fillna(0)
+    res["n_mcls"] = res["n_mcls"].fillna(0)
+    return res[cols]
 
 
 def seasonal_depth_needed(ref_cur) -> int:
@@ -107,36 +152,42 @@ def seasonal_depth_needed(ref_cur) -> int:
 YOY_DEPTH = 13          # месяцев истории под вопрос «в каком месяце был отток»
 
 
-def _out_months(out: pd.DataFrame, periods: list, p_closed) -> list:
+def _out_months(col) -> list:
     """Месяцы, в которых у организации был отток, — свежие первыми.
 
     Годовое падение портфеля объясняется конкретными месяцами, и без них в блоке
-    «Портфель год к году» остаётся одна дельта без всякой зацепки. Сводная таблица
-    «месяц × организация» здесь уже построена, так что новых запросов не нужно.
+    «Портфель год к году» остаётся одна дельта без всякой зацепки. Окно (YOY_DEPTH
+    месяцев) отбирает SQL, здесь остаётся разобрать строку «YYYY-MM,YYYY-MM,…» и
+    отсортировать: порядок в string_agg не задан намеренно — упорядоченные агрегаты
+    в Greenplum ненадёжны, а сортировка десятка меток стоит ничего.
 
-    Глубина — YOY_DEPTH месяцев: ровно тот горизонт, за который спрашивается годовой
-    тренд; более старый отток к падению «год к году» уже не относится.
+    Наружу метки идут в том же виде «MM.YYYY», что и раньше: по ним блок годового
+    тренда сходится с индексом активностей по месяцам.
     """
-    window = [p for p in periods if p_closed - YOY_DEPTH < p <= p_closed]
-    if not window:
-        return [[] for _ in range(len(out))]
-    sub = out.reindex(columns=window)
-    vals = sub.to_numpy(dtype="float64")
-    labels = [_m(p) for p in window]
-    order = list(range(len(window)))[::-1]        # свежие месяцы первыми
-    return [[labels[j] for j in order if vals[i, j] > 0] for i in range(len(vals))]
+    if col is None:
+        return []
+    out = []
+    for v in col:
+        if not isinstance(v, str) or not v.strip():
+            out.append([])
+            continue
+        months = sorted({m.strip() for m in v.split(",") if m.strip()}, reverse=True)
+        out.append([f"{m[5:7]}.{m[0:4]}" for m in months])
+    return out
 
 
-def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
+def outflow_model(agg: pd.DataFrame, ref_cur) -> pd.DataFrame:
     """Прогноз оттока на месяц :ref_cur по истории витрины. Грейн (ГОСБ, ИНН).
 
-    Признаки:
+    На вход идёт УЖЕ СВЁРНУТАЯ история (`queries.OUTFLOW_HIST_AGG`): одна строка на
+    пару вместо 24 месячных. Сворачивает БД, потому что по всему банку сырая история —
+    порядка 17 млн строк, а модели из них нужны только агрегаты. Признаки те же:
       out_1/out_2 — отток за два последних ЗАКРЫТЫХ месяца;
       base_fl     — получателей в закрытом месяце (база прогноза);
-      seas_ratio  — сезонность прогнозного месяца ОТНОСИТЕЛЬНО базового
-                    (индексы обоих месяцев к своему годовому среднему). Именно
-                    отношение, а не индекс: если база и прогноз в одной фазе
-                    сезона, сезонной дельты нет;
+      seas_ratio  — сезонность прогнозного месяца ОТНОСИТЕЛЬНО базового. Раньше это
+                    было отношение двух индексов (среднее месяца к годовому среднему);
+                    годовое среднее в отношении сокращается, поэтому достаточно
+                    отношения средних по двум календарным месяцам;
       yoy_*       — что было в этом же календарном месяце год назад и вернулся
                     ли клиент после того оттока.
 
@@ -144,57 +195,43 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     """
     cols = ["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note",
             "out_1", "out_2", "seas_ratio", "seas_src", "recovered", "hist_months",
-            "out_months"]
-    if hist is None or hist.empty:
+            "out_months", "has_hist"]
+    if agg is None or agg.empty:
         return pd.DataFrame(columns=cols)
 
-    h = hist.dropna(subset=["new_gosb_id"]).copy()
+    h = agg.dropna(subset=["new_gosb_id"]).copy()
     h["new_gosb_id"] = h["new_gosb_id"].astype("int64")
     h["inn"] = h["inn"].astype("int64")
-    h["ym"] = pd.PeriodIndex(pd.to_datetime(h["report_dt"]), freq="M")
 
     p_cur = pd.Period(pd.Timestamp(ref_cur), freq="M")
     p_closed = p_cur - 1
 
-    fl = h.pivot_table(index=["new_gosb_id", "inn"], columns="ym",
-                       values="current_fl_qty", aggfunc="max")
-    out = h.pivot_table(index=["new_gosb_id", "inn"], columns="ym",
-                        values="fl_outflow_qty", aggfunc="max")
-    out = out.reindex(index=fl.index, columns=fl.columns)
-    periods = list(fl.columns)
+    def num_col(name):
+        return pd.to_numeric(h.get(name), errors="coerce").to_numpy(dtype="float64")
 
-    def col(frame, p):
-        return (frame[p].to_numpy(dtype="float64") if p in frame.columns
-                else np.zeros(len(frame)))
+    base_fl = np.nan_to_num(num_col("base_fl"))
+    out_1 = np.nan_to_num(num_col("out_1"))
+    out_2 = np.nan_to_num(num_col("out_2"))
 
-    base_fl = np.nan_to_num(col(fl, p_closed))
-    out_1 = np.nan_to_num(col(out, p_closed))
-    out_2 = np.nan_to_num(col(out, p_closed - 1))
-
-    # --- сезонные индексы: среднее по календарному месяцу / среднее за всё --- #
-    vals = fl.to_numpy(dtype="float64")
-    overall = _row_mean(vals)
-    overall = np.where((overall > 0) & np.isfinite(overall), overall, np.nan)
-
-    def month_idx(month: int):
-        cols_m = [i for i, p in enumerate(periods) if p.month == month]
-        if len(cols_m) < MIN_SEASON_OBS:
-            return np.full(len(fl), np.nan)
-        with np.errstate(invalid="ignore"):
-            return _row_mean(vals[:, cols_m]) / overall
-
-    idx_cur, idx_closed = month_idx(p_cur.month), month_idx(p_closed.month)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        ratio_idx = np.where(idx_closed > 0, idx_cur / idx_closed, np.nan)
+    # --- сезонность: среднее по календарному месяцу прогнозного к базовому --- #
+    # Порог MIN_SEASON_OBS проверяется ГЛОБАЛЬНО — хватает ли ГЛУБИНЫ истории, чтобы
+    # календарный месяц вообще встречался дважды. Глобальное число наблюдений месяца
+    # равно максимуму по парам: пара не может видеть месяцев больше, чем их есть.
+    n_cur_global = int(np.nan_to_num(num_col("n_mcur")).max()) if len(h) else 0
+    n_cls_global = int(np.nan_to_num(num_col("n_mcls")).max()) if len(h) else 0
+    avg_cur, avg_cls = num_col("fl_avg_mcur"), num_col("fl_avg_mcls")
+    if n_cur_global < MIN_SEASON_OBS or n_cls_global < MIN_SEASON_OBS:
+        ratio_idx = np.full(len(h), np.nan)
+    else:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratio_idx = np.where(avg_cls > 0, avg_cur / avg_cls, np.nan)
 
     # --- год назад: был ли отток в этом месяце и вернулся ли клиент --------- #
     p_yoy = p_cur - 12
-    yoy_out = np.nan_to_num(col(out, p_yoy))
-    fl_yoy = col(fl, p_yoy)                      # прогнозный месяц год назад
-    before = np.nan_to_num(col(fl, p_yoy - 1))   # базовый месяц год назад
-    after_cols = [p_yoy + k for k in (1, 2, 3) if (p_yoy + k) in fl.columns]
-    after = (_row_max(np.column_stack([col(fl, p) for p in after_cols]))
-             if after_cols else np.full(len(fl), np.nan))
+    yoy_out = np.nan_to_num(num_col("yoy_out"))
+    fl_yoy = num_col("fl_yoy")                   # прогнозный месяц год назад
+    before = np.nan_to_num(num_col("fl_before"))  # базовый месяц год назад
+    after = num_col("fl_after")                  # максимум за 3 месяца после
     yoy_recovered = (yoy_out > 0) & (before > 0) & (np.nan_to_num(after) >= 0.95 * before)
 
     # --- ФОЛБЭК сезонности: тот же переход «база → прогноз», но год назад ---- #
@@ -209,10 +246,11 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     seas_src = np.where(use_idx, SRC_INDEX,
                         np.where(np.isfinite(ratio_yoy), SRC_YOY, SRC_NONE))
 
-    hist_months = int(len(periods))
-    keys = fl.index.to_frame(index=False)
+    # Глубина истории — максимум по парам: у пары месяцев не больше, чем их в витрине
+    hist_months = int(np.nan_to_num(num_col("n_months")).max()) if len(h) else 0
+    keys = h[["new_gosb_id", "inn"]].reset_index(drop=True)
     rows = []
-    for i in range(len(fl)):
+    for i in range(len(h)):
         b, o1, o2 = float(base_fl[i]), float(out_1[i]), float(out_2[i])
         ratio = float(seas_ratio[i]) if np.isfinite(seas_ratio[i]) else None
         persist = (o1 + o2) / 2 if (o1 > 0 and o2 > 0) else 0.0
@@ -262,24 +300,39 @@ def outflow_model(hist: pd.DataFrame, ref_cur) -> pd.DataFrame:
     res["pred"] = [r[1] for r in rows]
     res["note"] = [r[2] for r in rows]
     res["hist_months"] = hist_months
-    res["out_months"] = _out_months(out, periods, p_closed)
+    res["out_months"] = _out_months(h.get("out_months"))
+    # признак «история по паре ЕСТЬ»: после left join к организациям он становится
+    # False там, где витрина о паре вообще ничего не знает. Без него «месяцев с
+    # оттоком нет» не отличить от «истории нет», и в блоке годового тренда вторые
+    # молча уезжали бы в группу «таяли постепенно»
+    res["has_hist"] = True
     # Диагностика: без неё молчаливый сбой (нет базового месяца в истории →
-    # col() вернёт нули → всё «стабильно») выглядит как нормальный результат.
+    # все признаки нулевые → всё «стабильно») выглядит как нормальный результат.
+    ym_min, ym_max = h.get("ym_min"), h.get("ym_max")
     res.attrs["diag"] = {
         "hist_months": hist_months,
-        "hist_from": str(periods[0]) if periods else "—",
-        "hist_to": str(periods[-1]) if periods else "—",
+        "hist_from": _ym_str(ym_min, "min"),
+        "hist_to": _ym_str(ym_max, "max"),
         "base_month": str(p_closed),
-        "base_present": bool(p_closed in fl.columns),
-        "prev_present": bool((p_closed - 1) in fl.columns),
-        "yoy_present": bool(p_yoy in fl.columns),
+        "base_present": bool(h["base_fl"].notna().any()) if "base_fl" in h else False,
+        "prev_present": bool(h["out_2"].notna().any()) if "out_2" in h else False,
+        "yoy_present": bool(h["fl_yoy"].notna().any()) if "fl_yoy" in h else False,
         "need_months": seasonal_depth_needed(ref_cur),
-        "n_pairs": int(len(fl)),
+        "n_pairs": int(len(h)),
         "n_with_outflow": int((out_1 > 0).sum()),
         "seas_src": {k: int(v) for k, v in
                      pd.Series(seas_src).value_counts().to_dict().items()},
     }
     return res[cols]
+
+
+def _ym_str(col, how: str) -> str:
+    """Край окна истории строкой «YYYY-MM» — для диагностики в прогрессе."""
+    if col is None or col.empty:
+        return "—"
+    v = pd.to_datetime(col, errors="coerce")
+    v = v.min() if how == "min" else v.max()
+    return str(pd.Period(v, freq="M")) if pd.notna(v) else "—"
 
 
 # --------------------------------------------------------------------------- #
@@ -306,10 +359,10 @@ def reconcile(day: pd.DataFrame, pred: pd.DataFrame, month_elapsed: float) -> pd
     """
     out_cols = ["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note",
                 "recovered", "out_observed", "settled", "out_exp", "in_exp", "why",
-                "seg_day", "avg_salary_m", "has_day", "out_months"]
+                "seg_day", "avg_salary_m", "has_day", "out_months", "has_hist"]
     p = pred if pred is not None and not pred.empty else pd.DataFrame(
         columns=["new_gosb_id", "inn", "base_fl", "pred", "out_class", "note",
-                 "out_months"])
+                 "out_months", "has_hist"])
     d = day if day is not None and not day.empty else pd.DataFrame(
         columns=["new_gosb_id", "inn", "seg_day", "out_observed", "paid_mtd",
                  "fl_prev_m", "avg_salary_m"])
@@ -332,6 +385,10 @@ def reconcile(day: pd.DataFrame, pred: pd.DataFrame, month_elapsed: float) -> pd
     # организации без истории в модели приходят из outer-merge с NaN — для флага это «нет»
     m["recovered"] = (m["recovered"].fillna(False).astype(bool) if "recovered" in m
                       else False)
+    # тот же случай, но про сам факт наличия истории: у пары, которой в витрине не
+    # было ни одного месяца, «месяцев с оттоком нет» означает незнание, а не ровный штат
+    m["has_hist"] = (m["has_hist"].fillna(False).astype(bool) if "has_hist" in m
+                     else False)
     # то же для колонки-списка: NaN нельзя оставлять, он проходит проверку `or []`
     m["out_months"] = ([v if isinstance(v, list) else [] for v in m["out_months"]]
                        if "out_months" in m else [[] for _ in range(len(m))])
@@ -400,8 +457,15 @@ def _as_period(df: pd.DataFrame, col: str = "plan_month") -> pd.DataFrame:
     return out
 
 
-def conversion_by_month(plan_m: pd.DataFrame, fact_m: pd.DataFrame,
-                        ref_cur) -> tuple[dict, float, dict]:
+def _conv_k(plan: float, fact: float) -> tuple[float, float | None, bool]:
+    """Коэффициент реализуемости по паре (план, факт): значение, сырое, упёрся ли."""
+    raw = (fact / plan) if plan > 0 else None
+    k = float(np.clip(raw if raw is not None else 1.0, CONV_MIN, CONV_MAX))
+    return k, raw, raw is not None and not (CONV_MIN <= raw <= CONV_MAX)
+
+
+def conversion_by_month(plan_m: pd.DataFrame, fact_m: pd.DataFrame, ref_cur,
+                        tb_of: dict | None = None) -> dict:
     """Реализуемость пайплайна: ФАКТ продаж против плана по ЗАКРЫТЫМ месяцам.
 
     Грейн сравнения — (месяц, ГОСБ, ИНН, сотрудник). Это принципиально: сотрудник мог
@@ -409,22 +473,34 @@ def conversion_by_month(plan_m: pd.DataFrame, fact_m: pd.DataFrame,
     и пришедшие люди относятся к их СУММЕ (25), а не к каждой сделке по отдельности.
     Группировку даёт запрос, здесь остаётся свернуть по ГОСБ.
 
+    Считается сразу на ТРЁХ уровнях, потому что отчёт строится по всему банку и у
+    каждого уровня свой коэффициент: у ГОСБ — свой, у ТБ — свой (он же фолбэк для
+    ГОСБ с малым объёмом), у банка — свой. Раньше уровень СБ получал жёсткую
+    единицу, и в водопаде банка всегда стояло «коэф. 1.00».
+
     Текущий месяц исключён: он не отработан, его неполный факт занизил бы коэффициент.
 
     Диагностика возвращает СЫРОЕ значение до клипа: если реальная конверсия ниже
     CONV_MIN, клип поднимает её до пола и тем самым ЗАВЫШАЕТ вклад пайплайна. Молчать
     об этом нельзя — иначе в логе видно ровно «0.20» и непонятно, это настоящая
     конверсия или сработавшая граница.
+
+    `tb_of` — соответствие ГОСБ → ТБ (единственный источник — queries.GOSB_FLAGS).
     """
-    diag = {"months": 0, "plan": 0.0, "fact": 0.0, "tb_raw": None, "tb_clipped": False,
-            "n_gosb": 0, "n_gosb_clipped": 0, "n_gosb_fallback": 0}
+    empty_diag = {"months": 0, "plan": 0.0, "fact": 0.0, "tb_raw": None,
+                  "tb_clipped": False, "n_gosb": 0, "n_gosb_clipped": 0,
+                  "n_gosb_fallback": 0}
+    out = {"by_gosb": {}, "by_tb": {}, "of_gosb": {}, "sb": 1.0,
+           "diag_tb": {}, "diag_sb": dict(empty_diag)}
     if plan_m is None or plan_m.empty:
-        return {}, 1.0, diag
+        return out
+    tb_of = tb_of or {}
     cur = pd.Period(pd.Timestamp(ref_cur), freq="M")
     p = _as_period(plan_m)
+    all_gosb = {int(g) for g in p["new_gosb_id"].dropna()}
     p = p[p["per"] < cur]                       # только закрытые месяцы
     if p.empty:
-        return {}, 1.0, diag
+        return out
 
     keys = ["new_gosb_id", "inn", "saphr_id", "per"]
     if fact_m is not None and not fact_m.empty:
@@ -432,30 +508,62 @@ def conversion_by_month(plan_m: pd.DataFrame, fact_m: pd.DataFrame,
         p = p.merge(f[keys + ["fact_np"]], on=keys, how="left")
     p["fact_np"] = num(p, "fact_np")
     p["plan_np"] = pd.to_numeric(p["plan_np"], errors="coerce").fillna(0.0)
-    diag.update({"months": int(p["per"].nunique()),
-                 "plan": float(p["plan_np"].sum()), "fact": float(p["fact_np"].sum())})
+    p = p.dropna(subset=["new_gosb_id"]).copy()
+    p["tb_id"] = [tb_of.get(int(g)) for g in p["new_gosb_id"]]
 
-    by_gosb, n_clipped, n_fallback = {}, 0, 0
-    for gid, g in p.dropna(subset=["new_gosb_id"]).groupby("new_gosb_id"):
+    # --- ГОСБ: свой коэффициент только при достаточном объёме плана --------- #
+    by_gosb, gosb_clipped, gosb_fallback = {}, {}, {}
+    for gid, g in p.groupby("new_gosb_id"):
+        tb = tb_of.get(int(gid))
         pl = float(g["plan_np"].sum())
         if pl < CONV_MIN_PLAN:
             # объёма мало — свой коэффициент был бы шумом, ГОСБ уйдёт на коэффициент ТБ
-            n_fallback += 1
+            gosb_fallback[tb] = gosb_fallback.get(tb, 0) + 1
             continue
-        raw = float(g["fact_np"].sum()) / pl
-        by_gosb[int(gid)] = float(np.clip(raw, CONV_MIN, CONV_MAX))
-        if not (CONV_MIN <= raw <= CONV_MAX):
-            n_clipped += 1
-    tb_raw = (diag["fact"] / diag["plan"]) if diag["plan"] > 0 else None
-    diag.update({"tb_raw": tb_raw, "n_gosb": len(by_gosb), "n_gosb_clipped": n_clipped,
-                 "n_gosb_fallback": n_fallback,
-                 "tb_clipped": tb_raw is not None and not (CONV_MIN <= tb_raw <= CONV_MAX)})
-    return by_gosb, float(np.clip(tb_raw if tb_raw is not None else 1.0,
-                                  CONV_MIN, CONV_MAX)), diag
+        k, raw, clipped = _conv_k(pl, float(g["fact_np"].sum()))
+        by_gosb[int(gid)] = k
+        if clipped:
+            gosb_clipped[tb] = gosb_clipped.get(tb, 0) + 1
+
+    # --- ТБ: коэффициент всего ТБ, он же фолбэк его ГОСБ -------------------- #
+    n_own = {}
+    for gid in by_gosb:
+        tb = tb_of.get(int(gid))
+        n_own[tb] = n_own.get(tb, 0) + 1
+    for tb, g in p.dropna(subset=["tb_id"]).groupby("tb_id"):
+        tb = int(tb)
+        pl, fc = float(g["plan_np"].sum()), float(g["fact_np"].sum())
+        k, raw, clipped = _conv_k(pl, fc)
+        out["by_tb"][tb] = k
+        out["diag_tb"][tb] = {
+            "months": int(g["per"].nunique()), "plan": pl, "fact": fc,
+            "tb_raw": raw, "tb_clipped": clipped,
+            "n_gosb": n_own.get(tb, 0), "n_gosb_clipped": gosb_clipped.get(tb, 0),
+            "n_gosb_fallback": gosb_fallback.get(tb, 0)}
+
+    # --- Банк: тот же расчёт по всем строкам сразу -------------------------- #
+    pl, fc = float(p["plan_np"].sum()), float(p["fact_np"].sum())
+    k_sb, raw_sb, clipped_sb = _conv_k(pl, fc)
+    n_tb_clipped = sum(1 for d in out["diag_tb"].values() if d["tb_clipped"])
+    out["sb"] = k_sb
+    out["diag_sb"] = {
+        "months": int(p["per"].nunique()), "plan": pl, "fact": fc,
+        "tb_raw": raw_sb, "tb_clipped": clipped_sb,
+        # единица уровня СБ — ТБ, поэтому и «сколько единиц упёрлось» считается по ТБ
+        "n_gosb": len(out["by_tb"]), "n_gosb_clipped": n_tb_clipped,
+        "n_gosb_fallback": sum(gosb_fallback.values())}
+
+    # Готовый коэффициент КАЖДОГО ГОСБ: свой, иначе своего ТБ, иначе банковский.
+    # Собирается здесь, чтобы прогноз пайплайна не знал про иерархию вовсе.
+    out["by_gosb"] = by_gosb
+    out["of_gosb"] = {gid: by_gosb.get(gid, out["by_tb"].get(tb_of.get(gid), k_sb))
+                      for gid in all_gosb}
+    return out
 
 
 def pipeline_current(plan_m: pd.DataFrame, fact_m: pd.DataFrame, ref_cur,
-                     by_gosb: dict, tb_k: float, time_left: float = 1.0) -> pd.DataFrame:
+                     conv_of: dict, default_k: float = 1.0,
+                     time_left: float = 1.0) -> pd.DataFrame:
     """Пайплайн ТЕКУЩЕГО месяца по (ГОСБ, ИНН): план, уже пришедший факт, прогноз.
 
     В витрине премирования есть факт и за текущий месяц, поэтому известно, сколько НП
@@ -503,7 +611,9 @@ def pipeline_current(plan_m: pd.DataFrame, fact_m: pd.DataFrame, ref_cur,
     agg["pipe_fact_mtd"] = num(agg, "pipe_fact_mtd")
     for c in ("pipe_np_raw", "pipe_fot_raw"):
         agg[c] = pd.to_numeric(agg[c], errors="coerce").fillna(0.0)
-    agg["conv"] = [by_gosb.get(int(g), tb_k) for g in agg["new_gosb_id"]]
+    # `conv_of` уже разрешён по иерархии (свой ГОСБ → его ТБ → банк) в
+    # conversion_by_month: здесь про уровни знать незачем
+    agg["conv"] = [conv_of.get(int(g), default_k) for g in agg["new_gosb_id"]]
     left = float(np.clip(time_left, 0.0, 1.0))
     agg["pipe_rest"] = (agg["pipe_np_raw"] - agg["pipe_fact_mtd"]).clip(lower=0)
     agg["pipe_expect"] = agg["pipe_rest"] * agg["conv"] * left
@@ -552,7 +662,7 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
             "pipe_np_raw", "pipe_fact_mtd", "pipe_rest", "pipe_expect",
             "pipe_fot", "pipe_fot_raw", "n_deals",
             "out_observed", "pred", "out_class", "note", "recovered", "why", "settled",
-            "avg_salary_m", "delta_fl", "out_months"]
+            "avg_salary_m", "delta_fl", "out_months", "has_hist"]
     base = rec if rec is not None and not rec.empty else pd.DataFrame(
         columns=["new_gosb_id", "inn"])
     p = pipe if pipe is not None and not pipe.empty else pd.DataFrame(
@@ -571,6 +681,8 @@ def org_forecast(rec: pd.DataFrame, pipe: pd.DataFrame, seg_of: dict) -> pd.Data
     m["out_class"] = m["out_class"].replace("", CLS_STABLE)
     m["recovered"] = (m["recovered"].fillna(False).astype(bool) if "recovered" in m
                       else False)
+    m["has_hist"] = (m["has_hist"].fillna(False).astype(bool) if "has_hist" in m
+                     else False)
     # колонка-список переживает outer-merge только с явной нормализацией: NaN здесь
     # истинно и молча просочился бы в детализацию
     m["out_months"] = ([v if isinstance(v, list) else [] for v in m["out_months"]]

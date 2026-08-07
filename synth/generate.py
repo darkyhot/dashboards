@@ -62,10 +62,10 @@ DAY_OUTFLOW_MONTHS = 4
 # Частичная ЗП-ведомость текущего месяца: этот факт в дэше НЕ используется
 # (в этом и смысл прогноза), но в витрине он есть — как на проме.
 PARTIAL_FACT_SHARE = 0.62
-# Идентификатор уровня «весь банк» в uzp_dwh_metrics (level_name='sb'). Отдельного
-# sb_id нет ни в одной таблице — уровень живёт только в витрине метрик, поэтому здесь
-# это просто константа. На проме встречаются level_value 0/1/99, и дэш проверяет,
-# что строка на метрику одна (см. queries.SB_LEVELS).
+# Идентификатор уровня «весь банк» (level_name='sb') в витринах метрик и
+# организаций. Отдельного sb_id нет ни в одном справочнике — уровень живёт только
+# внутри витрин, поэтому здесь это просто константа. На проме встречаются
+# level_value 0/1/99, и дэш проверяет, что строка на метрику одна.
 SB_LEVEL_ID = 1
 # Раскладка плана сделки по трём месяцам её жизни (пайплайн)
 PIPELINE_SPLIT = (0.2, 0.5, 0.3)
@@ -485,6 +485,31 @@ def _company_holding(orgs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     df["new_fl_cnt"] = RNG.integers(0, 20, len(df))
     df["np_cnt"] = RNG.integers(0, 10, len(df))
 
+    # --- Строки уровней ТБ и СБ: та же организация, свёрнутая уровнем выше ---
+    # На проме витрина хранит все три уровня в ОДНОЙ таблице (level_name =
+    # 'gosb' / 'tb' / 'sb', level_id — номер соответствующей единицы, у банка 1).
+    # Воспроизводим это здесь, потому что номера ТБ пересекаются со значениями
+    # old_gosb_id: без фильтра по level_name join по old_gosb_id = level_id
+    # затягивает агрегатные строки уровня ТБ в разбор обычного ГОСБ. Ошибка
+    # воспроизводимая, и синтетика обязана её показывать.
+    df["tb_id"] = o["tb_id"].to_numpy()[idx].astype(int)
+    sum_cols = ["ul_outflow_qty", "fl_outflow_qty", "fot_outflow_amt", "current_fot_amt",
+                "fot_y_1_diff_amt", "current_fl_qty", "fl_y_1_diff_qty",
+                "emp_potential_qty", "fot_potential_amt", "total_emp_qty",
+                "new_fl_cnt", "np_cnt"]
+    upper = []
+    for level_name, level_key in (("tb", "tb_id"), ("sb", None)):
+        keys = ["report_dt", "org_id"] + ([level_key] if level_key else [])
+        a = df.groupby(keys, as_index=False)[sum_cols].sum()
+        a["level_name"] = level_name
+        a["level_id"] = a.pop(level_key) if level_key else SB_LEVEL_ID
+        a["org_type"] = "inn"
+        a["zp_fl_perc"] = (a["current_fl_qty"] /
+                           a["total_emp_qty"].clip(lower=1)).round(4)
+        a["modified_dttm"] = pd.Timestamp.now()
+        upper.append(a)
+    df = df.drop(columns=["tb_id"])
+
     # Строки уровня holding / head_holding (в отчёте фильтруются: org_type='inn').
     # org_id у них — id холдинга, а не ИНН; значения крупнее (агрегаты).
     # Достаточно последнего месяца: история по холдингам нигде не читается.
@@ -503,7 +528,7 @@ def _company_holding(orgs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         "inn": o["inn"].astype("int64"), "gosb_id": o["gosb_id"].astype(int),
         "kind": kind, "base_fl": base_fl.astype(int),
     })
-    return pd.concat([df, samp], ignore_index=True), profiles
+    return pd.concat([df, samp] + upper, ignore_index=True), profiles
 
 
 def _day_outflow(orgs: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
@@ -769,7 +794,10 @@ def _forecast_delta(orgs: pd.DataFrame, company: pd.DataFrame, funnel: pd.DataFr
     """
     from uzp_dash.dashboards.tb_health import forecast
 
-    hist = (company[company["org_type"] == "inn"]
+    # level_name='gosb' обязателен: в витрине лежат ещё строки уровней ТБ и СБ, и без
+    # фильтра агрегаты уровня ТБ вошли бы в историю как обычный ГОСБ (номера ТБ
+    # встречаются среди old_gosb_id) — ровно та ошибка, от которой защищается дэш
+    hist = (company[(company["org_type"] == "inn") & (company["level_name"] == "gosb")]
             .rename(columns={"level_id": "new_gosb_id", "org_id": "inn"})
             [["new_gosb_id", "inn", "report_dt", "fl_outflow_qty", "current_fl_qty"]])
 
@@ -795,10 +823,15 @@ def _forecast_delta(orgs: pd.DataFrame, company: pd.DataFrame, funnel: pd.DataFr
               .agg(fact_np=("sales_amt", "sum"))
               .rename(columns={"report_dt": "plan_month"}))
 
-    by_gosb, tb_k, _ = forecast.conversion_by_month(plan_m, fact_m, CUR_MONTH_END)
-    pred = forecast.outflow_model(hist, CUR_MONTH_END)
+    tb_of = {int(r.gosb_id): int(r.tb_id) for r in orgs.itertuples()}
+    conv = forecast.conversion_by_month(plan_m, fact_m, CUR_MONTH_END, tb_of)
+    # дэшу историю сворачивает БД; здесь она уже в памяти — сворачиваем той же
+    # функцией, которая описывает, что именно должен посчитать SQL
+    pred = forecast.outflow_model(
+        forecast.aggregate_history(hist, CUR_MONTH_END), CUR_MONTH_END)
     rec = forecast.reconcile(day, pred, MONTH_ELAPSED)
-    pipe_fc = forecast.pipeline_current(plan_m, fact_m, CUR_MONTH_END, by_gosb, tb_k)
+    pipe_fc = forecast.pipeline_current(plan_m, fact_m, CUR_MONTH_END,
+                                        conv["of_gosb"], conv["sb"])
     ofc = forecast.org_forecast(rec, pipe_fc, seg_of={})
 
     code_of = {v: k for k, v in SEG_SHORT.items()}

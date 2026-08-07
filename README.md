@@ -57,7 +57,9 @@ docker compose up -d                   # Postgres на 55433
 python3 -m synth                        # собрать синтетическую БД (из data/*.csv)
 ```
 Затем в `run.ipynb` раскомментировать блок открытого контура (или вызвать
-`generate_dashboard("tb_health", conn=..., contour="open", params={"tb":"ЮЗБ"})`).
+`generate_dashboard("tb_health", conn=..., contour="open",
+params={"report_month": "2026-07"})`). Отчёт всегда строится по всему банку: уровень
+СБ плюс вкладка на каждый ТБ.
 
 ## Перенос в закрытый контур
 

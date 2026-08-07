@@ -11,7 +11,7 @@ from ...registry import Context, dashboard
 from ...render import components as C
 from ...render import page
 from ... import progress
-from . import analyze, prompts, queries as Q, segments
+from . import analyze, bank, prompts, segments
 
 SEG_ORDER = segments.ORDER   # короткие названия сегментов (КСБ, РГС, …)
 
@@ -20,48 +20,40 @@ SEG_ORDER = segments.ORDER   # короткие названия сегмент�
 def build(ctx: Context) -> str:
     """Отчёт СБ → ТБ → ГОСБ одним файлом.
 
-    `tb="*"` — все ТБ плюс сводный уровень СБ; конкретное имя ТБ — один уровень,
-    как было раньше. Уровни живут в одном документе вкладками: разбор одного ТБ
-    и разбор банка нужны рядом, а не в разных файлах.
+    Отчёт всегда строится по ВСЕМУ банку: вкладка СБ (единица разбора — ТБ) и по
+    вкладке на каждый ТБ (единица — ГОСБ). Разбор одного ТБ и разбор банка нужны
+    рядом, а не в разных файлах, поэтому уровни живут вкладками одного документа.
+
+    Порядок шагов задан ценой запросов, а не удобством чтения: сначала ОДИН проход в
+    БД по всему банку (`bank.load`), затем все уровни считаются без БД (`prepare`),
+    затем ОДИН запрос текстов активностей сразу по всем аудиторским пулам, и только
+    потом идёт LLM. Раньше каждый из 13 уровней ходил в БД сам, и одни и те же
+    таблицы читались по 12 раз.
     """
     prompts.reset_gateway()
-    tb = str(ctx.params.get("tb", "ЮЗБ") or "").strip()
-    if tb in ("*", "все", "all"):
-        return _build_all(ctx)
+    b = bank.load(ctx)
 
-    a = analyze.run(ctx, tb)          # включает разбор текста (правила + LLM)
-    _log_llm_stats(a)
-    progress.step("LLM: выводы по разделам")
-    story = prompts.section_narratives(ctx, a)
-    progress.step("Сборка HTML")
-    d = a.dates or {}
-    return page(
-        title=f"Здоровье ТБ — {C.esc(a.tb_full)}",
-        subtitle=f"Прогноз на {C.esc(d.get('label', a.ref_date))}",
-        body=_level_body(a, story, 0) + _GD_JS,
-    )
+    levels_tb = [(int(r.tb_id), str(r.tb_short_name), str(r.tb_full_name))
+                 for r in b.tbs.itertuples()]
+    preps = []
+    for i, (tb_id, short, full) in enumerate(levels_tb, start=1):
+        progress.step(f"═══ ТБ {short} ({i} из {len(levels_tb)}) ═══")
+        preps.append(analyze.prepare(b, tb_id, short, full))
 
+    text_df = bank.audit_texts(ctx.engine, b, analyze.audit_inns(preps))
 
-def _build_all(ctx: Context) -> str:
-    """Все ТБ + свод по банку. Уровни — вкладки одного документа."""
-    from ...db import read_sql
-    tbs = read_sql(ctx.engine, Q.TB_LIST)
-    names = [str(r.tb_short_name) for r in tbs.itertuples()]
-    progress.done(f"Уровни отчёта: СБ + {len(names)} ТБ ({', '.join(names)})")
-
-    per, levels = {}, []
-    for i, name in enumerate(names, start=1):
-        progress.step(f"═══ ТБ {name} ({i} из {len(names)}) ═══")
-        a = analyze.run(ctx, name)
+    levels = []
+    for a in preps:
+        progress.step(f"═══ ТБ {a.tb_short}: разбор отработки ═══")
+        analyze.finish(ctx, b, a, text_df)
         _log_llm_stats(a)
-        progress.step(f"LLM: выводы по разделам — {name}")
-        per[name] = a
+        progress.step(f"LLM: выводы по разделам — {a.tb_short}")
         levels.append((a, prompts.section_narratives(ctx, a)))
 
-    sb = analyze.run_sb(ctx, per)
+    sb = analyze.build_sb(b, preps)
     # карточка ТБ на уровне банка знает номер вкладки своего разбора — по ней и
     # устроен переход СБ → ТБ
-    lvl_of = {a.tb_id: i + 1 for i, a in enumerate(per.values())}
+    lvl_of = {a.tb_id: i + 1 for i, a in enumerate(preps)}
     for c in sb.gosb_cards:
         c["lvl"] = lvl_of.get(c["gosb_id"])
     progress.step("LLM: выводы по разделам — СБ")
@@ -412,11 +404,15 @@ def _why_size(r: dict) -> str:
         if r.get("yoy_key") == "unknown":
             parts.append("отработка за те месяцы неизвестна")
         elif r.get("yoy_tasks"):
-            parts.append(f'задач в те месяцы: {r["yoy_tasks"]}')
+            # задачи считаются и в самом месяце оттока, и в следующем: витрина
+            # закрывает отток позже, чем он случился, и задачу заводят обоими
+            parts.append(f'задач в те месяцы и следующие за ними: {r["yoy_tasks"]}')
         else:
-            parts.append("задач в те месяцы не заводили")
-    else:
+            parts.append("задач ни в те месяцы, ни в следующие не заводили")
+    elif r.get("has_hist"):
         parts.append("разовых оттоков в витрине нет")
+    else:
+        parts.append("истории по паре в витрине нет")
     parts.append(f'причина: {r["reason"]}' if r.get("reason") else "причина не зафиксирована")
     return " · ".join(parts)
 
