@@ -63,7 +63,13 @@ def load(ctx) -> Bank:
 
     tbs = read_sql(e, Q.TB_LIST)
     names = [str(r.tb_short_name) for r in tbs.itertuples()]
+    tb_ids = {int(x) for x in tbs["tb_id"]}
     progress.done(f"Уровни отчёта: СБ + {len(names)} ТБ ({', '.join(names)})")
+    if Q.EXCLUDE_TB:
+        progress.done(f"Не считаются территориальными банками и в отчёт не входят: "
+                      f"{', '.join(Q.EXCLUDE_TB)} — это не продающая сеть, плана по ФОТ "
+                      f"на них нет. Вердикт банка при этом берётся строкой витрины "
+                      f"level_name='sb', где они внутри")
 
     flags = read_sql(e, Q.GOSB_FLAGS)
     apparat, tb_of, gosb_name = _apparat(flags)
@@ -92,7 +98,8 @@ def load(ctx) -> Bank:
 
     progress.step("Витрина организаций по всему банку (потенциал/отток/год к году)")
     orgs = read_sql(e, Q.ORGS_ALL, {"ref_closed": d["ref_closed"]})
-    orgs_tb = read_sql(e, Q.ORGS_TB, {"ref_closed": d["ref_closed"]})
+    orgs_tb = _only_known_tb(read_sql(e, Q.ORGS_TB, {"ref_closed": d["ref_closed"]}),
+                             tb_ids, "строк витрины уровня ТБ")
     orgs = _prepare_orgs(orgs, apparat, tb_of)
     orgs_tb = _prepare_orgs_tb(orgs_tb, orgs)
     _log_orgs(orgs, orgs_tb)
@@ -101,14 +108,20 @@ def load(ctx) -> Bank:
     pf = {"ref_funnel": d["ref_funnel"], "funnel_from": d["funnel_from"],
           "fresh_from": d["fresh_from"]}
     fagg = read_sql(e, Q.FUNNEL_AGG, pf)
-    act_tot = read_sql(e, Q.ACTIVITY_TOTALS, pf)
-    act_brk = read_sql(e, Q.ACTIVITY_BREAKDOWN, pf)
+    # Активности группируются по СОБСТВЕННОМУ tb_id воронки, а не по справочнику
+    # ГОСБ, поэтому фильтр _GMAP их не касается: отсекаем по списку известных ТБ.
+    act_tot = _only_known_tb(read_sql(e, Q.ACTIVITY_TOTALS, pf), tb_ids,
+                             "строк итогов активностей")
+    act_brk = _only_known_tb(read_sql(e, Q.ACTIVITY_BREAKDOWN, pf), tb_ids,
+                             "строк разрезов активностей")
     inn_stats = read_sql(e, Q.FUNNEL_INN_STATS,
                          {"plan_from": d["plan_from"], "ref_funnel": d["ref_funnel"]})
     _log_funnel(fagg, act_tot, inn_stats)
 
-    fmonths = read_sql(e, Q.FUNNEL_MONTHS, {"months_from": d["months_from"],
-                                            "ref_funnel": d["ref_funnel"]})
+    fmonths = _only_known_tb(
+        read_sql(e, Q.FUNNEL_MONTHS, {"months_from": d["months_from"],
+                                      "ref_funnel": d["ref_funnel"]}),
+        tb_ids, "строк помесячных активностей")
     progress.done(f"Активности по месяцам с {d['months_from']}: {len(fmonths)} строк "
                   f"(ГОСБ×организация×месяц) — по ним видно, отрабатывали ли отток тогда")
 
@@ -262,6 +275,24 @@ def dates(engine, params: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+def _only_known_tb(df: pd.DataFrame, tb_ids: set, what: str) -> pd.DataFrame:
+    """Оставить строки только тех ТБ, которые есть в отчёте.
+
+    Нужно там, где `tb_id` приходит ИЗ САМОЙ ТАБЛИЦЫ (воронка, витрина уровня ТБ), а
+    не из справочника ГОСБ: фильтр общего CTE `gmap` такие колонки не затрагивает, и
+    без этой отсечки в свод банка попали бы и ЦА, и любой посторонний номер, которого
+    в справочнике нет вовсе. Сколько строк убрано — в прогресс.
+    """
+    if df is None or df.empty or "tb_id" not in df:
+        return df
+    keep = df["tb_id"].isin(tb_ids)
+    n_drop = int((~keep).sum())
+    if n_drop:
+        dropped = sorted({int(x) for x in df.loc[~keep, "tb_id"].dropna()})
+        progress.done(f"Отброшено {n_drop} {what}: ТБ {dropped} не входят в отчёт")
+    return df[keep].reset_index(drop=True)
+
+
 def _apparat(flags: pd.DataFrame) -> tuple[set, dict, dict]:
     """Аппараты, соответствие ГОСБ → ТБ и имена ГОСБ — из одного справочника.
 

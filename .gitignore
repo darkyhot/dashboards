@@ -2,4 +2,6 @@
 __pycache__/
 *.pyc
 output/*.html
+# Логи запросов/ответов LLM: в них попадают данные прома, в репозитории им не место
+output/llm_logs/
 .ipynb_checkpoints/

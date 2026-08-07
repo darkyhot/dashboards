@@ -30,6 +30,15 @@ METRIC_NEW_RECIPIENTS_B2B = 1000636
 # участвует в расчёте kpi», реального привлечения они не означают
 MOTIV_COUNTED = "учтено"
 
+# Центральный аппарат — не территориальный банк и не продающая единица сети: плана
+# по ФОТ на него не ставят, и как единица разбора он смысла не имеет. Исключается
+# ЕДИНОЖДЫ здесь, во всех запросах, которые перечисляют ТБ и подразделения, — тогда
+# про него не знают ни список вкладок, ни ранг ТБ, ни свод уровня СБ, ни карточки.
+# Вердикт банка при этом по-прежнему берётся строкой level_name='sb', где ЦА внутри:
+# уровни витрины считаются независимо, и сумма единиц ей и так не равна (раздел 12).
+EXCLUDE_TB = ("ЦА",)
+_NO_CA = "tb_short_name NOT IN (" + ", ".join(f"'{t}'" for t in EXCLUDE_TB) + ")"
+
 # Закрытый месяц: последний день месяца из report_dt операционных витрин.
 # Используется как ФОЛБЭК опорной даты, если ежедневная витрина пуста.
 REF_DATE = """
@@ -61,7 +70,7 @@ WHERE report_dt = :ref_cur
 TB_LIST = """
 SELECT DISTINCT tb_id, tb_short_name, tb_full_name
 FROM {schema}.uzp_dim_gosb
-WHERE tb_short_name IS NOT NULL
+WHERE tb_short_name IS NOT NULL AND """ + _NO_CA + """
 ORDER BY tb_short_name
 """
 
@@ -79,7 +88,7 @@ ORDER BY tb_short_name
 # JOIN, и без него в ранг попали бы строки уровня tb с чужим level_id.
 METRICS_VERDICT = """
 WITH tb AS (SELECT DISTINCT tb_id, tb_short_name FROM {schema}.uzp_dim_gosb
-            WHERE tb_short_name IS NOT NULL)
+            WHERE tb_short_name IS NOT NULL AND """ + _NO_CA + """)
 SELECT m.level_name, m.metric_id, m.level_id, tb.tb_short_name, m.end_dt,
        m.plan_amt, m.fact_amt, m.execution_percent,
        rank() OVER (PARTITION BY m.metric_id, m.end_dt, m.level_name
@@ -97,9 +106,14 @@ WHERE m.period_type='m' AND COALESCE(m.extended_dim_1,1)=1
 
 # Грейн дэша по ГОСБ — new_gosb_id (реальный ГОСБ). Метрики лежат на old_gosb_id,
 # агрегируем old_gosb_id -> new_gosb_id (несколько old могут мапиться в один new).
+#
+# Здесь же отсекается ЦА — и этого достаточно на весь отчёт: общий CTE используют
+# почти все запросы, и подразделения ЦА просто перестают существовать в грейне.
+# Строки с пустым tb_short_name фильтр не затрагивает: их в справочнике нет.
 _GMAP = """SELECT old_gosb_id, min(tb_id) AS tb_id, min(new_gosb_id) AS new_gosb_id,
                   min(new_gosb_name) AS gosb_name
-           FROM {schema}.uzp_dim_gosb GROUP BY old_gosb_id"""
+           FROM {schema}.uzp_dim_gosb WHERE """ + _NO_CA + """
+           GROUP BY old_gosb_id"""
 
 # Состав подразделений: к какому ТБ относится и сколько их всего в этом ТБ.
 # Число нужно для правила аппарата: аппарат исключается из разбора, НО если он
