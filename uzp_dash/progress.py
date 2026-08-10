@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import re
 import sys
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,10 +19,6 @@ SHOW_LLM = False
 LOG_DIR: Path | None = None
 _t0 = None
 _seq = 0
-# Выводы по разделам считаются в несколько потоков (view._narratives). Замок нужен
-# двум местам: нумерации файлов логов (иначе два вызова получат один номер и один
-# файл затрёт другой) и многострочной печати (иначе блоки перемешиваются построчно).
-_lock = threading.Lock()
 
 HEAD_TAIL = 1500      # сколько симв. промпта печатать в тетрадку при show_llm
 RAW_HEAD = 500        # сколько симв. сырого ответа печатать при сбое
@@ -68,19 +63,13 @@ def sql(query: str, params: dict | None = None) -> None:
     if not (ENABLED and SHOW_SQL):
         return
     lines = [ln for ln in query.strip("\n").splitlines() if ln.strip()]
-    with _lock:
-        print("        ┌─ SQL" + (f"  params={params}" if params else ""), flush=True)
-        for ln in lines:
-            print("        │ " + ln.rstrip(), flush=True)
-        print("        └─", flush=True)
+    print("        ┌─ SQL" + (f"  params={params}" if params else ""), flush=True)
+    for ln in lines:
+        print("        │ " + ln.rstrip(), flush=True)
+    print("        └─", flush=True)
 
 
 def _block(title: str, body: str) -> None:
-    with _lock:
-        _print_block(title, body)
-
-
-def _print_block(title: str, body: str) -> None:
     print(f"        ┌─ {title}", flush=True)
     for ln in str(body).splitlines() or [""]:
         print("        │ " + ln, flush=True)
@@ -101,9 +90,8 @@ def llm_dump(label: str, prompt: str, response: str, meta: dict | None = None) -
     if LOG_DIR is None:
         return None
     global _seq
-    with _lock:
-        _seq += 1
-        seq = _seq
+    _seq += 1
+    seq = _seq
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r"[^\w.-]+", "_", label)[:60]

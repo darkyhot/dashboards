@@ -7,8 +7,6 @@
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-
 import pandas as pd
 
 from ...registry import Context, dashboard
@@ -65,9 +63,14 @@ def build(ctx: Context) -> str:
     for c in sb.gosb_cards:
         c["lvl"] = lvl_of.get(c["gosb_id"])
 
-    # Выводы по разделам — 12 независимых вызовов LLM, они и есть основное время
-    # отчёта. Считаются пачкой, при `llm_workers > 1` — параллельно.
-    levels = _narratives(ctx, [sb] + preps)
+    # Выводы по разделам — по вызову LLM на уровень, и это основное время отчёта.
+    # ПОСЛЕДОВАТЕЛЬНО: параллельный вариант пробовали, корпоративный шлюз отвечает на
+    # него 429 и после ретраев роняет запрос — из 12 уровней доходил один, остальные
+    # получали фолбэк вместо выводов модели.
+    levels = []
+    for a in [sb] + preps:
+        progress.step(f"LLM: выводы по разделам — {a.tb_short}")
+        levels.append((a, prompts.section_narratives(ctx, a)))
 
     progress.step("Сборка HTML")
     bodies = "".join(
@@ -80,33 +83,6 @@ def build(ctx: Context) -> str:
         subtitle=f"Прогноз на {C.esc(d.get('label', sb.ref_date))}",
         body=_tabs([a for a, _ in levels]) + bodies + _GD_JS + _LVL_JS,
     )
-
-
-LLM_WORKERS_DEFAULT = 4          # параллельных вызовов LLM за выводами по разделам
-
-
-def _narratives(ctx: Context, levels: list) -> list:
-    """Выводы по разделам для всех уровней → [(Analysis, story), …] в том же порядке.
-
-    Вызовы независимы: каждый уровень описывает сам себя, общего состояния нет. При
-    последовательном прогоне 12 вызовов по ~35 с давали 7 минут на ровном месте.
-    `llm_workers=1` возвращает прежнее последовательное поведение — на случай, если
-    корпоративный шлюз не переносит параллельных запросов.
-    """
-    n = max(1, int(ctx.params.get("llm_workers", LLM_WORKERS_DEFAULT)))
-    if n == 1 or len(levels) < 2:
-        out = []
-        for a in levels:
-            progress.step(f"LLM: выводы по разделам — {a.tb_short}")
-            out.append((a, prompts.section_narratives(ctx, a)))
-        return out
-
-    progress.step(f"LLM: выводы по разделам — {len(levels)} уровней, "
-                  f"{n} параллельных запросов")
-    with ThreadPoolExecutor(max_workers=n) as pool:
-        # порядок вкладок задаёт сам список, а не порядок ответов шлюза
-        stories = list(pool.map(lambda a: prompts.section_narratives(ctx, a), levels))
-    return list(zip(levels, stories))
 
 
 def _tabs(levels: list) -> str:

@@ -246,13 +246,13 @@ def _ask(ctx, chunk: list[dict], label: str, ref_label: str = "") -> dict:
     """Один вызов LLM по чанку. Возвращает {(gosb_id, inn): insight}."""
     prompt = _prompt(chunk, ref_label)
     progress.llm_request(label, prompt, note=f"орг {len(chunk)}")
-    llm_mod.reset_meta()
+    llm_mod.LAST_META = {}
     raw, meta = "", {}
     try:
         raw = ctx.llm(prompt, temperature=0.1)
-        meta = llm_mod.last_meta()
+        meta = dict(llm_mod.LAST_META)
     except Exception as ex:
-        meta = llm_mod.last_meta()
+        meta = dict(llm_mod.LAST_META)
         progress.llm_error(label, f"{type(ex).__name__}: {ex}")
         progress.llm_dump(label, prompt, f"<ошибка> {ex}", meta)
         return {}
@@ -532,11 +532,11 @@ def section_narratives(ctx, a) -> dict:
         + ctx_txt
     )
     progress.llm_request("выводы", prompt, note=f"псевдонимов {len(al)}")
-    llm_mod.reset_meta()
+    llm_mod.LAST_META = {}
     fb = _fallback_blocks(a)
     try:
         resp = ctx.llm(prompt, temperature=0.2)
-        meta = llm_mod.last_meta()
+        meta = dict(llm_mod.LAST_META)
         progress.llm_response("выводы", resp, meta, ok=bool(resp and resp.strip()))
         progress.llm_dump("выводы", prompt, resp, meta)
         got = _parse_blocks(resp)
@@ -560,7 +560,7 @@ def section_narratives(ctx, a) -> dict:
         return out
     except Exception as ex:
         progress.llm_error("выводы", f"{type(ex).__name__}: {ex}")
-        progress.llm_dump("выводы", prompt, f"<ошибка> {ex}", llm_mod.last_meta())
+        progress.llm_dump("выводы", prompt, f"<ошибка> {ex}", dict(llm_mod.LAST_META))
         return fb
 
 
