@@ -132,36 +132,54 @@ SELECT u.new_gosb_id, u.tb_id, u.gosb_name,
 FROM u
 """
 
-# Матрица ГОСБ×сегмент по получателям и итоги ГОСБ — ПО ВСЕМУ БАНКУ и СРАЗУ ЗА ОБА
-# месяца (:ref_closed — база, :ref_cur — план). Месяц остаётся колонкой end_dt:
-# раньше это были четыре отдельных запроса на каждый ТБ.
+# Матрица «единица × сегмент» по получателям и итоги единиц — ПО ВСЕМУ БАНКУ, СРАЗУ
+# ЗА ОБА месяца (:ref_closed — база, :ref_cur — план) и СРАЗУ ЗА ОБА УРОВНЯ.
+# Месяц и уровень остаются колонками (end_dt, level_name): раньше это были четыре
+# отдельных запроса на каждый ТБ.
 #
-# Единица уровня СБ — ТБ, но собирается она из этих же ГОСБ-метрик: аппараты надо
-# исключить ДО свёртки, а в строках level_name='tb' они уже внутри и не отделяются.
-UNIT_SEG = """
-WITH gmap AS (""" + _GMAP + """)
-SELECT g.new_gosb_id AS unit_id, g.gosb_name AS unit_name, g.tb_id, m.end_dt,
-       m.extended_dim_1 AS seg_id,
+# ДВА УРОВНЯ В ОДНОМ ЗАПРОСЕ, и это принципиально:
+#   * level_name='gosb' — единицы отчёта по ТБ. Здесь аппараты из разбора убираются
+#     (карточки им не строятся), поэтому сумма карточек итогу ТБ не равна;
+#   * level_name='tb'   — единицы отчёта по банку. Берутся КАК ЕСТЬ, вместе с
+#     аппаратом: план сегмента нередко стоит именно на аппарате ТБ, и свёртка
+#     ГОСБ-строк без него теряла до 90% плана — выполнение улетало в тысячи процентов.
+#     Уровни витрины считаются независимо, и складывать ГОСБ ради ТБ незачем: строка
+#     ТБ в витрине уже есть.
+#
+# Имя единицы для уровня ТБ берётся из справочника (tb_short_name), для ГОСБ — из
+# gmap. ЦА отсекается в обоих случаях: у ГОСБ через gmap, у ТБ через тот же _NO_CA.
+_UNITS = """
+WITH gmap AS (""" + _GMAP + """),
+tb AS (SELECT DISTINCT tb_id, tb_short_name FROM {schema}.uzp_dim_gosb
+       WHERE tb_short_name IS NOT NULL AND """ + _NO_CA + """)
+SELECT 'gosb' AS level_name, g.new_gosb_id AS unit_id, g.gosb_name AS unit_name,
+       g.tb_id, m.end_dt, {seg_col}
        sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
        sum(m.plan_amt - m.fact_amt) AS nedobor
 FROM {schema}.uzp_dwh_metrics m
 JOIN gmap g ON g.old_gosb_id=m.level_id
 WHERE m.level_name='gosb' AND m.period_type='m' AND m.metric_id=:m_rcp
-  AND m.end_dt IN (:ref_cur, :ref_closed) AND m.extended_dim_1 <> 1
-GROUP BY g.new_gosb_id, g.gosb_name, g.tb_id, m.end_dt, m.extended_dim_1
+  AND m.end_dt IN (:ref_cur, :ref_closed) AND {seg_filter}
+GROUP BY g.new_gosb_id, g.gosb_name, g.tb_id, m.end_dt{seg_group}
+UNION ALL
+SELECT 'tb' AS level_name, m.level_id AS unit_id, tb.tb_short_name AS unit_name,
+       m.level_id AS tb_id, m.end_dt, {seg_col}
+       sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
+       sum(m.plan_amt - m.fact_amt) AS nedobor
+FROM {schema}.uzp_dwh_metrics m
+JOIN tb ON tb.tb_id = m.level_id
+WHERE m.level_name='tb' AND m.period_type='m' AND m.metric_id=:m_rcp
+  AND m.end_dt IN (:ref_cur, :ref_closed) AND {seg_filter}
+GROUP BY m.level_id, tb.tb_short_name, m.end_dt{seg_group}
 """
 
-UNIT_TOTALS = """
-WITH gmap AS (""" + _GMAP + """)
-SELECT g.new_gosb_id AS unit_id, g.gosb_name AS unit_name, g.tb_id, m.end_dt,
-       sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
-       sum(m.plan_amt - m.fact_amt) AS nedobor
-FROM {schema}.uzp_dwh_metrics m
-JOIN gmap g ON g.old_gosb_id=m.level_id
-WHERE m.level_name='gosb' AND m.period_type='m' AND m.metric_id=:m_rcp
-  AND m.end_dt IN (:ref_cur, :ref_closed) AND COALESCE(m.extended_dim_1,1)=1
-GROUP BY g.new_gosb_id, g.gosb_name, g.tb_id, m.end_dt
-"""
+UNIT_SEG = _UNITS.replace("{seg_col}", "m.extended_dim_1 AS seg_id,") \
+                 .replace("{seg_filter}", "m.extended_dim_1 <> 1") \
+                 .replace("{seg_group}", ", m.extended_dim_1")
+
+UNIT_TOTALS = _UNITS.replace("{seg_col}", "") \
+                    .replace("{seg_filter}", "COALESCE(m.extended_dim_1,1)=1") \
+                    .replace("{seg_group}", "")
 
 # Организации ПО ВСЕМУ БАНКУ на грейне (ГОСБ, ИНН): витринные метрики, сегмент,
 # средняя ЗП, годовой тренд и признак «закреплена в эталонной базе».

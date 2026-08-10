@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 
 import requests
@@ -48,7 +49,23 @@ OPTIONS: dict = {
 }
 
 # Метаданные последнего вызова — для логов в тетрадке.
+#
+# Хранятся ДВАЖДЫ: в глобальной LAST_META (её читает тетрадка и диагностика) и в
+# потоко-локальном хранилище. Второе обязательно: выводы по разделам идут в несколько
+# потоков, и глобальная переменная успевала перезаписаться чужим вызовом — в лог
+# уровня попадала мета соседнего ТБ.
 LAST_META: dict = {}
+_LOCAL = threading.local()
+
+
+def last_meta() -> dict:
+    """Мета последнего вызова ЭТОГО потока (фолбэк — глобальная, для одиночных вызовов)."""
+    return dict(getattr(_LOCAL, "meta", None) or LAST_META)
+
+
+def reset_meta() -> None:
+    """Забыть мету предыдущего вызова в этом потоке — перед новым запросом."""
+    _LOCAL.meta = {}
 
 
 def configure(max_tokens: int | None = None, extra: dict | None = None,
@@ -154,7 +171,7 @@ def _extract(data: dict, meta: dict) -> str:
         content = ch.get("text") or ""
     usage = data.get("usage") or {}
 
-    LAST_META = {
+    LAST_META = _LOCAL.meta = {
         **meta,
         "model": data.get("model"),
         "finish_reason": ch.get("finish_reason"),

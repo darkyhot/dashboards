@@ -342,15 +342,17 @@ def _prepare_orgs(orgs: pd.DataFrame, apparat: set, tb_of: dict) -> pd.DataFrame
     o["inn"] = o["inn"].astype("int64")
     o["tb_id"] = [tb_of.get(int(g)) for g in o["new_gosb_id"]]
     o = o.dropna(subset=["tb_id"])
-    o["tb_id"] = o["tb_id"].astype("int64")
-    # аппараты убираем на входе: тогда они сами не попадут ни в прогноз, ни в список
-    # к работе, ни в карточки — фильтровать каждое место по отдельности не придётся
+    # Организации аппаратов ОСТАЮТСЯ в грейне прогноза. База и план уровня ТБ берутся
+    # строкой витрины level_name='tb', а аппарат в ней уже учтён, — значит его отток и
+    # пайплайн обязаны входить в прогноз, иначе прогноз завышен ровно на них.
+    # Из разбора аппараты уходят там, где это действительно нужно: карточки и матрица
+    # ГОСБ (`analyze._units`), список к работе и отбор под план (`analyze._candidates`).
     if apparat:
-        n0 = len(o)
-        o = o[~o["new_gosb_id"].isin(apparat)]
-        if n0 != len(o):
-            progress.done(f"Организации аппаратов исключены: {n0 - len(o)} пар "
-                          f"(ГОСБ, ИНН) из {n0}")
+        n_app = int(o["new_gosb_id"].isin(apparat).sum())
+        if n_app:
+            progress.done(f"Организации аппаратов: {n_app} пар (ГОСБ, ИНН) из {len(o)} "
+                          f"остаются в прогнозе (они внутри строки ТБ в витрине), но в "
+                          f"карточки ГОСБ и в список к работе не попадут")
     o = o.reset_index(drop=True)
     o["fot_potential_mln"] = o["fot_potential_amt"] / RUB_TO_MLN
     o["fot_outflow_mln"] = o["fot_outflow_amt"] / RUB_TO_MLN

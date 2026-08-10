@@ -246,13 +246,13 @@ def _ask(ctx, chunk: list[dict], label: str, ref_label: str = "") -> dict:
     """Один вызов LLM по чанку. Возвращает {(gosb_id, inn): insight}."""
     prompt = _prompt(chunk, ref_label)
     progress.llm_request(label, prompt, note=f"орг {len(chunk)}")
-    llm_mod.LAST_META = {}
+    llm_mod.reset_meta()
     raw, meta = "", {}
     try:
         raw = ctx.llm(prompt, temperature=0.1)
-        meta = dict(llm_mod.LAST_META)
+        meta = llm_mod.last_meta()
     except Exception as ex:
-        meta = dict(llm_mod.LAST_META)
+        meta = llm_mod.last_meta()
         progress.llm_error(label, f"{type(ex).__name__}: {ex}")
         progress.llm_dump(label, prompt, f"<ошибка> {ex}", meta)
         return {}
@@ -444,6 +444,12 @@ def section_narratives(ctx, a) -> dict:
     al = Aliases()
     # единица разбора зависит от уровня отчёта: ГОСБ внутри ТБ, ТБ внутри СБ
     unit = getattr(a, "unit_label", "ГОСБ")
+    # Псевдонимы заводятся на ВСЕ единицы уровня заранее, а не только на попавшие
+    # в промпт. Модель охотно называет соседние номера («ГОСБ-04 и ГОСБ-05», хотя
+    # в тексте было три), и без полного словаря такой токен вернуть неоткуда —
+    # он утекал в отчёт как есть.
+    for c in getattr(a, "gosb_cards", []):
+        al.alias(unit, c["gosb_name"])
     cells = "; ".join(
         f"{al.alias(unit, r.unit_name)}/{r.seg_name} "
         f"({r.execution_percent*100:.0f}%, −{r.nedobor:.0f})"
@@ -526,11 +532,11 @@ def section_narratives(ctx, a) -> dict:
         + ctx_txt
     )
     progress.llm_request("выводы", prompt, note=f"псевдонимов {len(al)}")
-    llm_mod.LAST_META = {}
+    llm_mod.reset_meta()
     fb = _fallback_blocks(a)
     try:
         resp = ctx.llm(prompt, temperature=0.2)
-        meta = dict(llm_mod.LAST_META)
+        meta = llm_mod.last_meta()
         progress.llm_response("выводы", resp, meta, ok=bool(resp and resp.strip()))
         progress.llm_dump("выводы", prompt, resp, meta)
         got = _parse_blocks(resp)
@@ -542,10 +548,19 @@ def section_narratives(ctx, a) -> dict:
             progress.llm_error("выводы", f"не вернулись блоки: {', '.join(miss)} — "
                                          f"по ним фолбэк")
         # каждый блок восстанавливаем отдельно: сбой одного не рушит остальные
-        return {k: (al.restore(got[k]) if k in got else fb[k]) for k in NARRATIVE_BLOCKS}
+        out, leaked = {}, 0
+        for k in NARRATIVE_BLOCKS:
+            out[k] = al.restore(got[k]) if k in got else fb[k]
+            leaked += al.leaked
+        # молча обезличивать нельзя: это значит, что модель назвала единицу, которой
+        # в промпте не было, и вместо имени в отчёте стоит общая формулировка
+        if leaked:
+            progress.llm_error("выводы", f"модель назвала {leaked} несуществующих "
+                                         f"псевдонимов — заменены общей формулировкой")
+        return out
     except Exception as ex:
         progress.llm_error("выводы", f"{type(ex).__name__}: {ex}")
-        progress.llm_dump("выводы", prompt, f"<ошибка> {ex}", dict(llm_mod.LAST_META))
+        progress.llm_dump("выводы", prompt, f"<ошибка> {ex}", llm_mod.last_meta())
         return fb
 
 

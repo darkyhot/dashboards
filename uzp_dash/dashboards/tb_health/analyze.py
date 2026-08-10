@@ -137,7 +137,7 @@ def prepare(b: Bank, tb_id: int, tb_short: str, tb_full: str) -> Analysis:
 
     # --- Классификация по агрегатам (все активности) ---
     progress.step(f"{tb_short}: классификация (ГОСБ,ИНН) — работать / нет смысла")
-    cand = _candidates(orgs, d["days_left"])
+    cand = _candidates(orgs, d["days_left"], b.apparat)
     a.to_work, a.no_point = _classify(cand)
     n_gosb_seg = len({nid for nid, _ in a.seg_gaps})
     progress.done(f"Западающих (ГОСБ, сегмент): {len(a.seg_gaps)} в {n_gosb_seg} ГОСБ")
@@ -168,13 +168,12 @@ def build_sb(b: Bank, per_tb: list) -> Analysis:
                   f"план на {d['ref_cur']}: {plan_cur['rcp']['plan']:.0f}")
     yoy = _yoy(prev_yoy, closed_verdict, d, area="Банк")
 
-    # Единицы уровня — ТБ, но собираются они из ГОСБ-метрик: аппараты надо исключить
-    # ДО свёртки, а в строках level_name='tb' они уже внутри и не отделяются.
-    names = {a.tb_id: a.tb_short for a in per_tb}
-    base_seg = _units_sb(b.unit_seg, d["ref_closed"], b.apparat, names, seg=True)
-    plan_seg = _units_sb(b.unit_seg, d["ref_cur"], b.apparat, names, seg=True)
-    base_tot = _units_sb(b.unit_tot, d["ref_closed"], b.apparat, names)
-    plan_tot = _units_sb(b.unit_tot, d["ref_cur"], b.apparat, names)
+    # Единицы уровня — ТБ, и берутся они строками level_name='tb' КАК ЕСТЬ, вместе
+    # с аппаратом: см. `_units_sb`.
+    base_seg = _units_sb(b.unit_seg, d["ref_closed"], seg=True)
+    plan_seg = _units_sb(b.unit_seg, d["ref_cur"], seg=True)
+    base_tot = _units_sb(b.unit_tot, d["ref_closed"])
+    plan_tot = _units_sb(b.unit_tot, d["ref_cur"])
 
     fc_stats = dict(b.fc_stats)
     fc_stats.update({"conv_tb": b.conv["sb"], "conv": b.conv["diag_sb"],
@@ -225,6 +224,15 @@ def audit_inns(preps: list) -> list:
         if a.pool is not None and not a.pool.empty:
             inns.update(int(x) for x in a.pool["inn"])
     return sorted(inns)
+
+
+def audit_enabled(ctx) -> bool:
+    """Нужен ли аудит отработки моделью. Бюджет 0 — выключен целиком.
+
+    Спрашивается ДО чтения текстов активностей: этот запрос нужен только аудиту и на
+    проме стоит десятки секунд, а при выключенном аудите не нужен вовсе.
+    """
+    return int(ctx.params.get("llm_max_calls", LLM_MAX_CALLS_DEFAULT)) > 0
 
 
 def finish(ctx, b: Bank, a: Analysis, text_df) -> Analysis:
@@ -338,23 +346,32 @@ def _assemble(b: Bank, tb_short: str, tb_id: int, tb_full: str, ref_date: str,
 
 def _units(df: pd.DataFrame, end_dt, apparat: set, tb_id: int,
            seg: bool = False) -> pd.DataFrame:
-    """Срез метрик единиц: свой ТБ, нужный месяц, без аппаратов.
+    """Срез метрик единиц отчёта по ТБ: строки уровня ГОСБ, свой ТБ, нужный месяц.
 
-    Аппараты не продают — в разборе по подразделениям им делать нечего. Вердикт ТБ
-    при этом остаётся из строки level_name='tb', как есть: сумма карточек ему не
-    равна, и это нормально — уровни витрины и так считаются независимо (раздел 12).
+    Аппараты не продают — в разборе по подразделениям им делать нечего, карточки для
+    них не строятся. Вердикт ТБ при этом остаётся из строки level_name='tb', как есть:
+    сумма карточек ему не равна, и это нормально — уровни витрины считаются
+    независимо (раздел 12).
     """
-    f = df[(df["tb_id"] == tb_id) & (df["end_dt"] == end_dt)]
+    f = df[(df["level_name"] == "gosb") & (df["tb_id"] == tb_id)
+           & (df["end_dt"] == end_dt)]
     f = _drop_apparat(f, apparat).copy()
     if seg and not f.empty:
         f["seg_name"] = f["seg_id"].map(segments.short)
     return f
 
 
-def _units_sb(df: pd.DataFrame, end_dt, apparat: set, names: dict,
-              seg: bool = False) -> pd.DataFrame:
-    """То же, но единица — ТБ: ГОСБ-метрики нужного месяца, свёрнутые по ТБ."""
-    f = _roll_to_tb(df[df["end_dt"] == end_dt], apparat, names, seg=seg)
+def _units_sb(df: pd.DataFrame, end_dt, seg: bool = False) -> pd.DataFrame:
+    """Срез метрик единиц отчёта по банку: строки уровня ТБ — КАК ЕСТЬ.
+
+    Складывать ГОСБ ради ТБ нельзя, и аппарат из ТБ не вычитается. План сегмента
+    нередко стоит именно на аппарате ТБ (у СЗБ в сегменте СКМ это ~94% плана), и
+    свёртка ГОСБ-строк без аппарата теряла его целиком: план падал с 125 383 до
+    7 859, а выполнение показывало 1455%. Строка ТБ в витрине уже есть — её и берём.
+
+    Аппараты не показываются только уровнем ниже, когда единица разбора — ГОСБ.
+    """
+    f = df[(df["level_name"] == "tb") & (df["end_dt"] == end_dt)].copy()
     if seg and not f.empty:
         f["seg_name"] = f["seg_id"].map(segments.short)
     return f
@@ -554,8 +571,13 @@ def _check_waterfall(wf: dict, matrix: pd.DataFrame, stats: dict) -> None:
                       f"не разнесена: этих ГОСБ нет в плановой матрице")
 
 
-def _candidates(orgs: pd.DataFrame, days_left: int = 0) -> pd.DataFrame:
+def _candidates(orgs: pd.DataFrame, days_left: int = 0,
+                apparat: set | None = None) -> pd.DataFrame:
     """Кандидаты к работе и рычаг: Привлечь / Вернуть / Удержать.
+
+    Организации аппаратов в кандидаты не идут: аппарат не продающее подразделение,
+    работать по нему некому и карточки у него нет. В ПРОГНОЗЕ они при этом остаются —
+    строка ТБ в витрине их уже содержит (см. `bank._prepare_orgs`).
 
     Рычагов теперь три, и «Удержать» — новый: пока месяц не закончился, ожидаемый
     отток ТЕКУЩЕГО месяца ещё можно не допустить. Эффект удержания — весь `out_exp`,
@@ -571,6 +593,13 @@ def _candidates(orgs: pd.DataFrame, days_left: int = 0) -> pd.DataFrame:
     бы дважды (в прогнозе и в списке «что добавит план»).
     """
     o = orgs.copy()
+    if apparat and not o.empty:
+        n0 = len(o)
+        o = o[~o["new_gosb_id"].isin(apparat)]
+        if n0 != len(o):
+            progress.done(f"Из кандидатов исключены организации аппаратов: "
+                          f"{n0 - len(o)} пар (ГОСБ, ИНН) — работать по ним некому. "
+                          f"В прогнозе они остаются")
     o["impact_attract"] = (o["emp_potential_qty"] - o["pipe_np"]).clip(lower=0)
     o["impact_return"] = o["fl_outflow_qty"]
     o["impact_retain"] = o["out_exp"].clip(lower=0) if days_left > 0 else 0.0
@@ -606,26 +635,6 @@ def _drop_apparat(df: pd.DataFrame, apparat: set) -> pd.DataFrame:
     if df is None or df.empty or not apparat or "unit_id" not in df:
         return df
     return df[~df["unit_id"].isin(apparat)].reset_index(drop=True)
-
-
-def _roll_to_tb(df: pd.DataFrame, apparat: set, names: dict,
-                seg: bool = False) -> pd.DataFrame:
-    """ГОСБ-метрики без аппаратов → единицы уровня СБ (ТБ).
-
-    Свёртка делается здесь, а не в SQL, потому что правило аппарата зависит от числа
-    подразделений в ТБ и живёт в Python. Считать процент выполнения на этом шаге
-    незачем: build_matrix/build_totals пересчитают его от прогноза.
-    """
-    cols = ["unit_id", "unit_name", "plan_amt", "fact_amt", "nedobor"] + \
-           (["seg_id", "seg_name"] if seg else [])
-    if df is None or df.empty:
-        return pd.DataFrame(columns=cols)
-    d = _drop_apparat(df, apparat)
-    keys = ["tb_id"] + (["seg_id"] if seg else [])
-    agg = d.groupby(keys, as_index=False)[["plan_amt", "fact_amt", "nedobor"]].sum()
-    agg = agg.rename(columns={"tb_id": "unit_id"})
-    agg["unit_name"] = agg["unit_id"].map(lambda x: names.get(int(x), f"ТБ {int(x)}"))
-    return agg
 
 
 def _classify(cand: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -711,6 +720,13 @@ def _resolve(ctx, pool: pd.DataFrame, to_work: pd.DataFrame, no_point: pd.DataFr
              "pool": 0, "checklist": 0, "keyword": 0, "llm": 0, "no_text": 0,
              "fallback": 0, "batches": 0, "capped": 0, "deadline": 0, "no_influence": 0}
     if to_work.empty or pool is None or pool.empty:
+        return {}, to_work, no_point, "—", stats
+    # Бюджет 0 — аудит выключен сознательно. Раньше пул всё равно резался на батчи и
+    # собирались промпты, а в лог падала «ОШИБКА: исчерпан бюджет»: выключенная
+    # функция не должна выглядеть сбоем и тратить время.
+    if max_calls <= 0:
+        progress.done(f"{'Аудит отработки отключён (llm_max_calls=0)'}: пул "
+                      f"{len(pool)} пар не разбирается, причины берутся из правил")
         return {}, to_work, no_point, "—", stats
     stats["pool"] = len(pool)
     progress.step(f"Аудит отработки: пул {len(pool)} пар (ГОСБ,ИНН) — все организации "
