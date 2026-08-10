@@ -655,17 +655,24 @@ def _orgs(a: analyze.Analysis, ai: str | None = None, idx: int = 0) -> str:
 
     В ФАЙЛ едут не все кандидаты: на проме их около 70 тыс., и хвост организаций по
     одному-два человека давал 20 МБ HTML, не давая ничего для работы. Порог
-    `explorer_min_fl` отсекает этот хвост, но организации под план проходят всегда —
-    иначе заголовок «N организаций закрывают план» разошёлся бы с таблицей и с n_need
-    в карточках ГОСБ. Порог живёт ТОЛЬКО здесь, в представлении: ни план, ни sim,
-    ни карточки от него не зависят.
+    `explorer_min_fl` отсекает строки мельче него — ВСЕ, включая нужные под план.
+
+    Порог живёт ТОЛЬКО здесь, в представлении: ни отбор, ни sim, ни карточки ГОСБ от
+    него не зависят, и это принципиально. Разрыв сегмента считается по прогнозу, а не
+    по составу кандидатов; убери мелкие организации из отбора — сегменту искусственно
+    «не хватит» своих, и включится добор из другого сегмента там, где своих хватало.
+
+    Поэтому заголовок «N организаций закрывают план» считается по полному набору и
+    заведомо больше числа показанных строк. Молчать об этом нельзя — расхождение
+    подписывается явно.
     """
     min_fl = float(a.explorer_min_fl or 0)
-    rows, n_all = [], 0
+    rows, n_all, n_hidden_plan = [], 0, 0
     for r in a.to_work.itertuples():
         n_all += 1
-        if min_fl > 0 and float(r.impact_fl) < min_fl and \
-                not float(getattr(r, "need_k", 0.0)) > 0:
+        if min_fl > 0 and float(r.impact_fl) < min_fl:
+            if float(getattr(r, "need_k", 0.0)) > 0:
+                n_hidden_plan += 1
             continue
         ins = a.insights.get((int(r.new_gosb_id), int(r.inn)), {})
         reason = ins.get("reason") or r.reason
@@ -682,6 +689,11 @@ def _orgs(a: analyze.Analysis, ai: str | None = None, idx: int = 0) -> str:
     gosb_opts = sorted({row["gosb"] for row in rows})
     seg_opts = [s for s in SEG_ORDER if s in {row["seg"] for row in rows}]
     cut = min_fl > 0 and len(rows) < n_all
+    if cut:
+        progress.done(f"{a.tb_short}: порог списка {min_fl:.0f} чел — в файл не попали "
+                      f"{n_all - len(rows)} кандидатов из {n_all}, из них нужных под "
+                      f"план {n_hidden_plan}. На отбор, n_need и покрытие порог не "
+                      f"влияет — он только про видимость строк")
     all_label = (f"Все с эффектом от {C.fmt_num(min_fl)} чел" if cut
                  else "Все организации")
     # свой id на каждый уровень: в одном документе живут списки всех ТБ, и общий
@@ -695,10 +707,13 @@ def _orgs(a: analyze.Analysis, ai: str | None = None, idx: int = 0) -> str:
     n_hold = sum(1 for r in rows if r["lever"] == "Удержать")
     hold = (f' · из них «Удержать» — <b>{n_hold}</b>: оттекают прямо сейчас'
             if n_hold else "")
-    # хвост не прячем молча: сказано, сколько кандидатов есть всего и по какому
-    # правилу часть из них в файл не попала
+    # хвост не прячем молча: сказано, сколько кандидатов есть всего, по какому правилу
+    # часть из них в файл не попала и сколько среди скрытых нужных под план — иначе
+    # заголовок «N закрывают план» выглядел бы расходящимся с таблицей без объяснения
+    plan_hidden = (f' · из них нужных под план — {C.fmt_num(n_hidden_plan)}: '
+                   f'на отбор и на карточки ГОСБ порог не влияет' if n_hidden_plan else "")
     cand = (f'в списке {C.fmt_num(len(rows))} из {C.fmt_num(n_all)} кандидатов — '
-            f'остальные не нужны под план и мельче {C.fmt_num(min_fl)} чел' if cut
+            f'остальные мельче {C.fmt_num(min_fl)} чел{plan_hidden}' if cut
             else f'всего кандидатов {C.fmt_num(len(rows))}')
     head = (f'<h3>С кем работать — {sim["k"]} организаций закрывают план</h3>'
             f'<p class="sub" style="font-size:14px;margin:-4px 0 14px">'
