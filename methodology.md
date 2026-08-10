@@ -407,14 +407,33 @@ yoy_recovered = да → pred = 104.03 × 0.4 = 41.61
 **Наблюдаемый отток.** Берётся как
 
 ```sql
-min(outflow_unpaid_m_qty)  -- при act_dt = max(act_dt)
-group by tb_id, gosb_id, org_inn
+-- строка ПОСЛЕДНЕЙ прошедшей выплаты, и только если по ней выставлена задача
+row_number() over (partition by gosb_id, org_inn order by payment_order_num desc) = 1
+  and salary_payment_dt <= :act_dt
+  and is_d_outflow_task is true
 ```
 
-`min`, а не `sum`, потому что у организации в месяце обычно **две выплаты** (аванс и
-основная), и отток надо считать ПО ИТОГУ обеих: если сотрудник получил хотя бы на одну
-из дат, он не отток. Строка с авансом показывает больше неоплаченных, поэтому минимум
-из двух строк и есть итоговый отток.
+**Почему последняя выплата, а не свёртка по обеим.** У организации в месяце обычно
+две выплаты (аванс и основная), но `outflow_unpaid_m_qty` — величина НАКОПИТЕЛЬНАЯ,
+«с начала месяца по отчётную дату»: строка последней прошедшей выплаты уже содержит
+итог обеих. Раньше здесь стоял `min()` по всем строкам — обходной путь вокруг ещё не
+наступившей второй выплаты; теперь ненаступившие выплаты отсекаются прямо по
+`salary_payment_dt`, и брать минимум незачем.
+
+**Граница — `:act_dt`, а не `current_date`.** Отчёт умеет пересобираться за прошлый
+месяц, и сегодняшняя дата дала бы отток по всем выплатам того месяца вместо картины
+на отчётную дату. Для текущего месяца `act_dt` и есть «сегодня» витрины.
+
+**Фильтр `is_d_outflow_task`.** В отток идут только те строки, по которым витрина
+выставляет задачу. Пара, у которой последняя прошедшая выплата без признака, из
+выборки уходит ЦЕЛИКОМ — вместе с `paid_mtd`, а значит `settled = 0`, и её модельный
+риск войдёт в прогноз полностью. Это сознательное решение, а не побочный эффект;
+сколько пар отсеяно — печатается в прогресс (`bank._log_day_outflow`).
+
+**Ноль строк — штатная ситуация.** В начале месяца выплатные даты ещё не наступили
+(или задачи не заведены), и запрос вернёт пусто. Тогда наблюдаемого оттока нет вовсе,
+и отток считается только по модели истории. От «среза за месяц нет в витрине» это
+отличается знаменателем — числом пар в ведомости, и в прогрессе это разные строки.
 
 **Доля отыгранного риска** — какая часть месячного риска уже определилась:
 
@@ -1038,21 +1057,34 @@ WHERE r.ref_cur IS NOT NULL
 ```
 
 ### Ежедневный отток — `DAY_OUTFLOW`
-Параметры: `:ref_cur`, `:act_dt`.
+Параметры: `:ref_cur`, `:act_dt`. Окно `row_number()` — по СТАРОМУ `gosb_id` (грейн
+витрины), свёртка old → new остаётся внешнему `GROUP BY`; количества людей при этом
+суммируются, средняя ЗП — ставка, у неё `max`.
 ```sql
-WITH gmap AS (...)
-SELECT g.new_gosb_id, d.org_inn AS inn,
-       max(d.segment_name)                 AS seg_day,
-       min(d.outflow_unpaid_m_qty)         AS out_observed,
-       max(d.fact_fl_qty)                  AS paid_mtd,
-       max(d.fl_prev_m_qty)                AS fl_prev_m,
-       max(d.m_avg_salary_amt)             AS avg_salary_m,
-       count(DISTINCT d.payment_order_num) AS n_payments
-FROM {schema}.uzp_dwh_day_outflow d
-LEFT JOIN gmap g ON g.old_gosb_id = d.gosb_id
-WHERE d.report_dt = :ref_cur AND d.act_dt = :act_dt
-GROUP BY g.new_gosb_id, d.org_inn
+WITH gmap AS (...),
+d AS (
+  SELECT g.new_gosb_id, o.org_inn AS inn, o.segment_name, o.outflow_unpaid_m_qty,
+         o.fact_fl_qty, o.fl_prev_m_qty, o.m_avg_salary_amt, o.is_d_outflow_task,
+         row_number() OVER (PARTITION BY o.gosb_id, o.org_inn
+                            ORDER BY o.payment_order_num DESC) AS rn
+  FROM {schema}.uzp_dwh_day_outflow o
+  JOIN gmap g ON g.old_gosb_id = o.gosb_id
+  WHERE o.report_dt = :ref_cur AND o.act_dt = :act_dt
+    AND o.salary_payment_dt <= CAST(:act_dt AS date)
+)
+SELECT new_gosb_id, inn,
+       max(segment_name)         AS seg_day,
+       sum(outflow_unpaid_m_qty) AS out_observed,
+       sum(fact_fl_qty)          AS paid_mtd,
+       sum(fl_prev_m_qty)        AS fl_prev_m,
+       max(m_avg_salary_amt)     AS avg_salary_m
+FROM d
+WHERE rn = 1 AND is_d_outflow_task IS TRUE
+GROUP BY new_gosb_id, inn
 ```
+Рядом идёт `DAY_OUTFLOW_STATS` — то же окно без фильтра признака: он даёт знаменатель
+«сколько пар вообще есть в ведомости», без которого «ноль строк» не отличить от
+«ведомости нет».
 
 ### История для модели оттока — `OUTFLOW_HIST_AGG`
 Параметры: `:hist_from`, `:ref_closed` и опорные месяцы свёртки (`:m_closed`, `:m_prev`,

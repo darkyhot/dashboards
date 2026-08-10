@@ -411,27 +411,76 @@ ORDER BY f.inn, g.new_gosb_id, f.last_active_dttm DESC NULLS LAST
 # Ежедневный отток: сколько получателей прошлого месяца ещё НЕ зачислились, хотя
 # их выплатная дата уже прошла. Грейн (ГОСБ, ИНН).
 #
-# min(outflow_unpaid_m_qty) — по требованию бизнеса: у организации в месяце
-# обычно две выплаты (аванс + основная), и отток надо брать ПО ИТОГУ обеих: если
-# сотрудник получил хотя бы на одну из дат, он не отток.
+# ТРИ правила, и все три существенны.
+#
+# 1. ПОСЛЕДНЯЯ ПРОШЕДШАЯ ВЫПЛАТА, а не свёртка по обеим. У организации в месяце
+#    обычно две выплаты (аванс + основная), но outflow_unpaid_m_qty — величина
+#    НАКОПИТЕЛЬНАЯ, «с начала месяца по отчётную дату»: строка последней прошедшей
+#    выплаты уже содержит итог обеих. Поэтому берём её (rn = 1 при сортировке по
+#    payment_order_num DESC), а не min() по всем строкам, как было раньше.
+# 2. ГРАНИЦА ПО ВЫПЛАТНОЙ ДАТЕ: salary_payment_dt <= :act_dt. Выплата, дата которой
+#    ещё не наступила, оттоком быть не может — по ней просто ещё не платили.
+#    Граница — дата актуальности витрины, а НЕ current_date: отчёт умеет собираться
+#    за прошлый месяц, и тогда сегодняшняя дата дала бы картину не того периода.
+# 3. ФИЛЬТР is_d_outflow_task: в отток идут только строки, по которым витрина
+#    выставляет задачу. Пара, у которой последняя прошедшая выплата без признака,
+#    из выборки уходит ЦЕЛИКОМ — так решено сознательно. Следствие: у неё нет и
+#    paid_mtd, значит has_day=False и settled=0 (см. forecast.reconcile), и её
+#    модельный риск войдёт в прогноз целиком. Сколько таких пар — в прогрессе.
+#
+# Разбиение окна — по СТАРОМУ gosb_id (грейн витрины), свёртка old -> new остаётся
+# внешнему GROUP BY. Количества людей при этом СУММИРУЮТСЯ: несколько старых ГОСБ
+# сворачиваются в один новый, и это разные бывшие отделения с разными людьми — та же
+# свёртка, что в ORGS_ALL и OUTFLOW_HIST_AGG. Средняя ЗП не количество, а ставка,
+# поэтому у неё max.
 #
 # paid_mtd / fl_prev_m нужны для стыковки с прогнозным оттоком: доля уже
 # зачислившихся показывает, сколько риска месяца уже отыграно (см. forecast.reconcile).
 # segment_name здесь КОРОТКИЙ (ММБ/КСБ/…) — это основной источник сегмента
 # организации, справочник uzp_dim_company идёт фолбэком.
 DAY_OUTFLOW = """
-WITH gmap AS (""" + _GMAP + """)
-SELECT g.new_gosb_id, d.org_inn AS inn,
-       max(d.segment_name)                        AS seg_day,
-       min(d.outflow_unpaid_m_qty)                AS out_observed,
-       max(d.fact_fl_qty)                         AS paid_mtd,
-       max(d.fl_prev_m_qty)                       AS fl_prev_m,
-       max(d.m_avg_salary_amt)                    AS avg_salary_m,
-       count(DISTINCT d.payment_order_num)        AS n_payments
-FROM {schema}.uzp_dwh_day_outflow d
-LEFT JOIN gmap g ON g.old_gosb_id = d.gosb_id
-WHERE d.report_dt = :ref_cur AND d.act_dt = :act_dt
-GROUP BY g.new_gosb_id, d.org_inn
+WITH gmap AS (""" + _GMAP + """),
+d AS (
+  -- JOIN, а не LEFT JOIN: подразделение вне справочника (в т.ч. ЦА) отсекается прямо
+  -- здесь. При LEFT JOIN оно давало группу с new_gosb_id = NULL, которую всё равно
+  -- молча выбрасывал reconcile, — лучше отсечь в SQL, как в ORGS_ALL.
+  SELECT g.new_gosb_id, o.org_inn AS inn, o.segment_name, o.outflow_unpaid_m_qty,
+         o.fact_fl_qty, o.fl_prev_m_qty, o.m_avg_salary_amt, o.is_d_outflow_task,
+         row_number() OVER (PARTITION BY o.gosb_id, o.org_inn
+                            ORDER BY o.payment_order_num DESC) AS rn
+  FROM {schema}.uzp_dwh_day_outflow o
+  JOIN gmap g ON g.old_gosb_id = o.gosb_id
+  WHERE o.report_dt = :ref_cur AND o.act_dt = :act_dt
+    AND o.salary_payment_dt <= CAST(:act_dt AS date)
+)
+SELECT new_gosb_id, inn,
+       max(segment_name)         AS seg_day,
+       sum(outflow_unpaid_m_qty) AS out_observed,
+       sum(fact_fl_qty)          AS paid_mtd,
+       sum(fl_prev_m_qty)        AS fl_prev_m,
+       max(m_avg_salary_amt)     AS avg_salary_m
+FROM d
+WHERE rn = 1 AND is_d_outflow_task IS TRUE
+GROUP BY new_gosb_id, inn
+"""
+
+# Сколько пар (ГОСБ, ИНН) вообще есть в ведомости на эту дату — знаменатель к
+# DAY_OUTFLOW. Без него нельзя отличить «задач на отток нет» от «ведомости нет
+# вовсе»: обе ситуации дают ноль строк, но означают разное.
+DAY_OUTFLOW_STATS = """
+WITH gmap AS (""" + _GMAP + """),
+d AS (
+  SELECT o.gosb_id, o.org_inn, o.is_d_outflow_task,
+         row_number() OVER (PARTITION BY o.gosb_id, o.org_inn
+                            ORDER BY o.payment_order_num DESC) AS rn
+  FROM {schema}.uzp_dwh_day_outflow o
+  JOIN gmap g ON g.old_gosb_id = o.gosb_id
+  WHERE o.report_dt = :ref_cur AND o.act_dt = :act_dt
+    AND o.salary_payment_dt <= CAST(:act_dt AS date)
+)
+SELECT count(*) AS n_pairs,
+       count(*) FILTER (WHERE is_d_outflow_task) AS n_task
+FROM d WHERE rn = 1
 """
 
 # История витрины под модель оттока: устойчивый отток два закрытых месяца подряд,

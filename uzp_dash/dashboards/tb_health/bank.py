@@ -455,8 +455,9 @@ def forecast_bank(engine, orgs: pd.DataFrame, d: dict, tb_of: dict):
     а по пайплайну план ФОТа есть свой.
     """
     progress.step(f"Прогноз на {d['ref_cur']}: отток по истории + ежедневный + пайплайн")
-    day = read_sql(engine, Q.DAY_OUTFLOW,
-                   {"ref_cur": d["ref_cur"], "act_dt": d["act_dt"]})
+    dp = {"ref_cur": d["ref_cur"], "act_dt": d["act_dt"]}
+    day = read_sql(engine, Q.DAY_OUTFLOW, dp)
+    _log_day_outflow(read_sql(engine, Q.DAY_OUTFLOW_STATS, dp), day, d)
     hist = read_sql(engine, Q.OUTFLOW_HIST_AGG,
                     {"hist_from": d["hist_from"], "ref_closed": d["ref_closed"],
                      **{k: d[k] for k in ("m_closed", "m_prev", "mon_cur", "mon_cls",
@@ -566,6 +567,32 @@ def forecast_bank(engine, orgs: pd.DataFrame, d: dict, tb_of: dict):
     merged["has_hist"] = (merged["has_hist"].fillna(False).astype(bool)
                           if "has_hist" in merged else False)
     return merged, fc, conv, stats
+
+
+def _log_day_outflow(stats: pd.DataFrame, day: pd.DataFrame, d: dict) -> None:
+    """Что дала ежедневная ведомость: сколько пар в ней есть и у скольких задача.
+
+    Ноль строк — ШТАТНАЯ ситуация начала месяца: выплатные даты ещё не наступили либо
+    задачи на отток пока не завели. Говорим об этом спокойно и отдельной строкой,
+    иначе «0 пар» читается как сбой. От «ведомости за месяц нет вовсе» это отличается
+    знаменателем: там нет и самих пар, и про это предупреждает `dates()`.
+    """
+    n_pairs = int(stats.n_pairs.iloc[0] or 0) if stats is not None and not stats.empty else 0
+    n_task = len(day)
+    if not n_pairs:
+        progress.done(f"Ежедневная ведомость на {d['act_dt']}: выплатных дат ещё не "
+                      f"наступило — наблюдаемого оттока нет, отток пойдёт только по "
+                      f"модели истории. Для начала месяца это нормально")
+        return
+    if not n_task:
+        progress.done(f"Ежедневная ведомость на {d['act_dt']}: {n_pairs} пар "
+                      f"(ГОСБ, ИНН), задач на отток НИ ОДНОЙ — наблюдаемого оттока нет, "
+                      f"отток пойдёт только по модели истории")
+        return
+    progress.done(f"Ежедневный отток на {d['act_dt']}: задача выставлена у {n_task} пар "
+                  f"из {n_pairs} в ведомости (по последней прошедшей выплате). "
+                  f"У остальных {n_pairs - n_task} наблюдения нет — их риск месяца "
+                  f"не гасится и войдёт в прогноз по модели целиком")
 
 
 def _log_pipeline(fstat: pd.DataFrame, pstat: pd.DataFrame, conv: dict, d: dict) -> None:
