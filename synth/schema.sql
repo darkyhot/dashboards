@@ -248,6 +248,39 @@ CREATE TABLE uzp_dwh_day_outflow (
   author_login                     text
 );
 
+-- ============ Месячный факт оттока (отдельная витрина) ============
+-- Дэш tb_health её не использует: модель оттока он строит по
+-- uzp_dwh_company_holding_metric. Синтетика её всё равно наполняет, потому что
+-- forecast_lab перебирает и варианты модели ПО ЭТОЙ витрине, а непроверенных
+-- веток алгоритма быть не должно.
+-- Ключевая особенность прома, которую воспроизводим: здесь отток заполнен ГУЩЕ,
+-- чем fl_outflow_qty в company_holding_metric.
+
+CREATE TABLE uzp_dwh_fact_outflow (
+  report_dt            date,
+  tb_id                integer,
+  gosb_id              integer,
+  inn                  bigint,
+  segment_name         varchar,
+  is_force             boolean,
+  mzp_fio              varchar,
+  saphr_id             bigint,
+  calc_fl_qty          integer,   -- расчётная численность за период
+  prev_m_overflow_qty  integer,
+  plan_payee_qty       integer,   -- плановое количество получателей
+  fact_payee_qty       integer,   -- фактическое количество получателей
+  outflow_qty          integer,   -- перестали быть ЗП-клиентами
+  outflow_perc         numeric,
+  other_inn_emp_perc   numeric,
+  m_avg_salary_amt     numeric,
+  prev_m_avg_salary_amt numeric,
+  next_m_avg_salary_amt numeric,   -- смотрит ВПЕРЁД: forecast_lab её не читает
+  prev_m_fl_val        integer,
+  next_m_fl_val        integer,    -- смотрит ВПЕРЁД: forecast_lab её не читает
+  is_task              boolean,
+  inserted_dttm        timestamp
+);
+
 -- ============ Пайплайн: помесячная раскладка плана привлечения ============
 -- Схема ОТДЕЛЬНАЯ (__SCHEMA_T__), как на проме.
 -- В uzp_dwh_sale_funnel_task.plan_staff_deal_qty план размазан на все 3 месяца

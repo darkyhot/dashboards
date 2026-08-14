@@ -100,6 +100,8 @@ def generate_all(engine: Engine) -> dict[str, int]:
     counts["uzp_dim_mzp_reference_base"] = _bulk(engine, ref_base, "uzp_dim_mzp_reference_base")
     counts["uzp_dwh_metrics"] = _bulk(engine, metrics, "uzp_dwh_metrics")
     counts["uzp_dwh_company_holding_metric"] = _bulk(engine, company, "uzp_dwh_company_holding_metric")
+    counts["uzp_dwh_fact_outflow"] = _bulk(engine, _fact_outflow(company, orgs),
+                                           "uzp_dwh_fact_outflow")
     counts["uzp_dwh_sale_funnel_task"] = _bulk(engine, funnel, "uzp_dwh_sale_funnel_task")
     counts["uzp_dwh_day_outflow"] = _bulk(engine, day_outflow, "uzp_dwh_day_outflow")
     counts["yva_pl_task_deal_code"] = _bulk(engine, pipeline, "yva_pl_task_deal_code",
@@ -399,6 +401,55 @@ def _archetypes(orgs: pd.DataFrame) -> np.ndarray:
         np.where(r < 0.75, "flat", "season_in"),
     )
     return kind.astype(object)
+
+
+def _fact_outflow(company: pd.DataFrame, orgs: pd.DataFrame) -> pd.DataFrame:
+    """Месячный факт оттока — ОТДЕЛЬНАЯ витрина, дэшем не используемая.
+
+    Нужна forecast_lab: он перебирает и модель оттока, построенную по ней.
+
+    Воспроизводится главное свойство прома: здесь отток заполнен ГУЩЕ, чем
+    `fl_outflow_qty` в company_holding_metric (там он есть менее чем у процента
+    пар, и модель истории из-за этого почти не работает). Поэтому к строкам с
+    нулевым оттоком добавляется небольшая фоновая убыль — и лаборатория получает
+    ветку, где эта витрина реально сильнее.
+    """
+    c = company[(company["level_name"] == "gosb")
+                & (company["org_type"] == "inn")].copy()
+    seg_of = dict(zip(orgs["inn"].astype("int64"), orgs["segment_name"]))
+    tb_of = dict(zip(orgs["gosb_id"].astype(int), orgs["tb_id"].astype(int)))
+    fl = c["current_fl_qty"].to_numpy(dtype=float)
+    out = c["fl_outflow_qty"].to_numpy(dtype=float)
+    # фоновая убыль там, где основная витрина показывает ноль
+    extra = np.where(out > 0, 0.0,
+                     np.rint(fl * RNG.uniform(0, 0.02, len(c))))
+    out_full = np.minimum(out + extra, fl)
+    prev = np.maximum(fl + out_full, fl)
+    return pd.DataFrame({
+        "report_dt": c["report_dt"].to_numpy(),
+        "tb_id": [tb_of.get(int(g), 0) for g in c["level_id"]],
+        "gosb_id": c["level_id"].astype(int).to_numpy(),
+        "inn": c["org_id"].astype("int64").to_numpy(),
+        "segment_name": [seg_of.get(int(i), "Микро") for i in c["org_id"]],
+        "is_force": False,
+        "mzp_fio": None,
+        "saphr_id": None,
+        "calc_fl_qty": fl.astype(int),
+        "prev_m_overflow_qty": 0,
+        "plan_payee_qty": prev.astype(int),
+        "fact_payee_qty": (prev - out_full).astype(int),
+        "outflow_qty": out_full.astype(int),
+        "outflow_perc": (out_full / np.maximum(prev, 1)).round(4),
+        "other_inn_emp_perc": 0.0,
+        "m_avg_salary_amt": (c["current_fot_amt"].to_numpy(dtype=float)
+                             / np.maximum(fl, 1)).round(2),
+        "prev_m_avg_salary_amt": None,
+        "next_m_avg_salary_amt": None,
+        "prev_m_fl_val": prev.astype(int),
+        "next_m_fl_val": None,
+        "is_task": out_full > 0,
+        "inserted_dttm": pd.Timestamp.now(),
+    })
 
 
 def _company_holding(orgs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:

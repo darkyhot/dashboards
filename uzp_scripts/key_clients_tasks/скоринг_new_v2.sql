@@ -59,23 +59,26 @@ where
     --- Активна / Реорганизация / На стадии ликвидации
     and key_client.inn_status_name in ('Активна', 'Реорганизация', 'На стадии ликвидации')
     --- Решение заказчика: роль ЗУПР КИБ исключена из выгрузки (в БТ её нет,
-    --- хотя тексты под неё в Excel есть — строки 6-9)
+    --- хотя тексты под неё в Excel есть — строки 6-9).
+    --- Отдельная проверка на NULL не нужна: по трёхзначной логике этот предикат
+    --- отбрасывает и строки без закреплённой роли.
     and key_client.gosb_inn_role <> 'ЗУПР КИБ'
-    and key_client.gosb_inn_role is not null
     --- на стратегии вне трёх известных модель коэффициента не даёт (Модель, C3)
     and lower(key_client.inn_strategy_name) in ('привлечение', 'удержание', 'отток')
 distributed by (inn);
 
 
 /* ============================================================================
-   Блок 2. Контактная политика — БТ п.3
-   Периодичность контактов по ролям (БТ п.3 + Модель, J9-J15):
-       Упр      1/6 мес
-       все прочие роли  1/3 мес
+   Блок 2. Контактная политика: последний контакт по ИНН+ГОСБ+роль — БТ п.3
+
    «Контактная политика проверяет факт выставления И ОТРАБОТКИ задачи по роли
    по ИНН+ГОСБ. Если задачу выставили, но исполнитель не взял её в работу,
    то такой факт зачесть нельзя» — поэтому засчитываем задачу, только если она
    взята в работу или закрыта, а не просто создана.
+
+   Здесь только даты последнего контакта в разрезе role_code. Само окно
+   (Упр 1/6 мес, все прочие роли 1/3 — БТ п.3 + Модель, J9-J15) применяется
+   в блоке 6, где уже известна эффективная роль.
    ============================================================================ */
 drop table if exists tmp_kk_contact cascade;
 create temp table tmp_kk_contact as
@@ -125,7 +128,84 @@ distributed by (inn);
 
 
 /* ============================================================================
-   Блок 4. ФИО МКК ЦА — для финальной фразы текста задачи
+   Блок 4. Маршрутизация: кому реально уйдёт задача — БТ п.5
+
+   Считается ДО контактной политики и скоринга, потому что задача уходит на
+   эффективную роль (eff_role), а не на закреплённую: по ней проверяется
+   контактная политика (блок 6) и по ней же группируется скоринг.
+   Сама eff_role зависит только от фактов и стратегии, цикла нет.
+
+     а) привлечение
+        КМ+МЗП : Доля ЗП < 90% И Потенциал >= 30 ФЛ -> КМ+МЗП, иначе ТОЛЬКО МЗП
+        Упр / ЗУпр РБ : Потенциал >= 30 ФЛ -> сама роль,
+                        иначе НУ ГОСБ вместо Упр, НО ЗП вместо ЗУпр РБ
+     b) удержание, c) отток
+        КМ+МЗП : Портфель >= 30 ФЛ -> КМ+МЗП, иначе ТОЛЬКО МЗП
+        Упр / ЗУпр РБ : Потенциал >= 30 ФЛ ИЛИ Портфель >= 30 ФЛ -> сама роль,
+                        иначе НУ ГОСБ / НО ЗП
+   ============================================================================ */
+drop table if exists tmp_kk_route cascade;
+create temp table tmp_kk_route as
+with joined as (
+    select
+        base.*,
+        coalesce(metric.fl_outflow_qty, 0)    as outflow_fl,
+        coalesce(metric.fot_outflow_amt, 0)   as outflow_fot,
+        coalesce(metric.current_fot_amt, 0)   as current_fot_amt,
+        coalesce(metric.current_fl_qty, 0)    as current_fl_qty,
+        coalesce(metric.fl_potential_qty, 0)  as fl_potential_qty,
+        coalesce(metric.fot_potential_qty, 0) as fot_potential_qty,
+        metric.zp_fl_perc,
+        --- Модель, критерий 3 «Фактический отток (50+ ФЛ или >Х% от текущего
+        --- объема)», B10. Порог Х = 10% — по решению заказчика.
+        --- Доля считается по ФЛ: отток ФЛ к текущему портфелю ФЛ.
+        case
+            when coalesce(metric.fl_outflow_qty, 0) >= 50 then 1
+            when coalesce(metric.fl_outflow_qty, 0)::numeric
+                 / nullif(metric.current_fl_qty, 0) > 0.10 then 1
+            else 0
+        end as outflow_flag,
+        --- Модель, C3 / K2-K4
+        case
+            when base.inn_in_gosb_strategy = 'привлечение' then 1.2
+            when base.inn_in_gosb_strategy = 'удержание'   then 1.15
+            when base.inn_in_gosb_strategy = 'отток'       then 1.18
+        end as strategy_coef
+    from
+        tmp_kk_base base
+    left join
+        tmp_kk_metric metric
+            on metric.gosb_id = base.gosb_id
+            and metric.inn = base.inn
+)
+select
+    joined.*,
+    --- эффективная роль после подмены/сужения по БТ п.5
+    case
+        when org_fixed_role = 'УПР' and inn_in_gosb_strategy = 'привлечение'
+            then case when fl_potential_qty >= 30 then 'УПР' else 'НУ ГОСБ' end
+        when org_fixed_role = 'УПР'
+            then case when fl_potential_qty >= 30 or current_fl_qty >= 30
+                      then 'УПР' else 'НУ ГОСБ' end
+        when org_fixed_role = 'ЗУПР РБ' and inn_in_gosb_strategy = 'привлечение'
+            then case when fl_potential_qty >= 30 then 'ЗУПР РБ' else 'НО ЗП' end
+        when org_fixed_role = 'ЗУПР РБ'
+            then case when fl_potential_qty >= 30 or current_fl_qty >= 30
+                      then 'ЗУПР РБ' else 'НО ЗП' end
+        --- zp_fl_perc — доля 0..1, порог «менее 90%» = < 0.90
+        when org_fixed_role = 'КМ+МЗП' and inn_in_gosb_strategy = 'привлечение'
+            then case when zp_fl_perc < 0.90 and fl_potential_qty >= 30
+                      then 'КМ+МЗП' else 'МЗП' end
+        when org_fixed_role = 'КМ+МЗП'
+            then case when current_fl_qty >= 30 then 'КМ+МЗП' else 'МЗП' end
+        else org_fixed_role
+    end as eff_role
+from joined
+distributed by (inn);
+
+
+/* ============================================================================
+   Блок 5. ФИО МКК ЦА — для финальной фразы текста задачи
    Витрина SAP не профилирована; используются только report_dt, saphr_id, fio.
    ============================================================================ */
 drop table if exists tmp_sap_fio cascade;
@@ -148,101 +228,66 @@ distributed by (saphr_id);
 
 
 /* ============================================================================
-   Блок 5. Скоринг — Модель 29.01.26 (3).xlsx, Лист1
+   Блок 6. Скоринг — Модель 29.01.26 (3).xlsx, Лист1
 
    Итог по ИНН (C19/C36/C53) = SUM(пять коэффициентов) * коэффициент стратегии.
    Каждый коэффициент (G4/G7/G10/G13/G16):
        флаг * ((вес - 1) / (5 - 1)) * (доля_ФОТ + доля_ФЛ)
-   Доли считаются внутри группы «ГОСБ + закреплённая роль» — в модели это
-   SUM(E5, E22, E39) по трём ИНН одного управляющего.
+   Доли считаются внутри группы «ГОСБ + ЭФФЕКТИВНАЯ роль» — в модели это
+   SUM(E5, E22, E39) по трём ИНН одного управляющего. Берём eff_role, а не
+   закреплённую роль: клиент, ушедший по БТ п.5 с Упр на НУ ГОСБ, относится
+   к списку НУ ГОСБ и не должен влиять на доли клиентов, оставшихся у Упр.
 
    Веса: 4.9 риск оттока | 4.8 расширение | 2.5 факт. отток
          1.4 портфель+контакт | 1.5 потенциал+контакт
    Коэффициенты стратегии (K2-K4): отток 1.18, удержание 1.15, привлечение 1.2
+
+   Контактная политика (БТ п.3) — тоже по eff_role: проверяется история той
+   роли, которой достанется задача, и её окно (Упр 1/6, остальные 1/3).
+   Отсева по contact_flag НЕТ: в БТ такого требования нет (п.2 про статус ИНН
+   формулирует исключение прямо, п.3 — нет), флаг только питает критерии 1.4/1.5.
    ============================================================================ */
 drop table if exists tmp_kk_scoring cascade;
 create temp table tmp_kk_scoring as
 with src as (
     select
-        base.report_dt,
-        base.tb_id,
-        base.gosb_id,
-        base.inn,
-        base.company_name,
-        base.desk_nm,
-        base.inn_status_name,
-        base.mkk_ca_saphr_id,
-        base.inn_in_gosb_strategy,
-        base.org_fixed_role,
-        base.outflow_risk_flag,
-        base.outflow_risk_fot,
-        base.outflow_risk_fl,
-        base.extension_flag,
-        base.extension_fot,
-        base.extension_fl,
-        coalesce(metric.fl_outflow_qty, 0)    as outflow_fl,
-        coalesce(metric.fot_outflow_amt, 0)   as outflow_fot,
-        coalesce(metric.current_fot_amt, 0)   as current_fot_amt,
-        coalesce(metric.current_fl_qty, 0)    as current_fl_qty,
-        coalesce(metric.fl_potential_qty, 0)  as fl_potential_qty,
-        coalesce(metric.fot_potential_qty, 0) as fot_potential_qty,
-        metric.zp_fl_perc,
+        route.*,
         contact.last_contact_dttm,
-        --- БТ п.3: 1 — контакта в положенный срок не было, задачу формируем
+        --- БТ п.3: 1 — контакта по роли в положенный срок не было
         case
             when contact.last_contact_dttm is null then 1
-            when base.org_fixed_role = 'УПР'
+            when route.eff_role = 'УПР'
                 then case when contact.last_contact_dttm < current_date - interval '6 month'
                           then 1 else 0 end
             else case when contact.last_contact_dttm < current_date - interval '3 month'
                       then 1 else 0 end
-        end as contact_flag,
-        --- Модель, критерий 3 «Фактический отток (50+ ФЛ или >Х% от текущего
-        --- объема)», B10. Порог Х = 10% — по решению заказчика.
-        --- Доля считается по ФЛ: отток ФЛ к текущему портфелю ФЛ.
-        case
-            when coalesce(metric.fl_outflow_qty, 0) >= 50 then 1
-            when coalesce(metric.fl_outflow_qty, 0)::numeric
-                 / nullif(metric.current_fl_qty, 0) > 0.10 then 1
-            else 0
-        end as outflow_flag,
-        --- Модель, C3 / K2-K4
-        case
-            when base.inn_in_gosb_strategy = 'привлечение' then 1.2
-            when base.inn_in_gosb_strategy = 'удержание'   then 1.15
-            when base.inn_in_gosb_strategy = 'отток'       then 1.18
-        end as strategy_coef
+        end as contact_flag
     from
-        tmp_kk_base base
-    left join
-        tmp_kk_metric metric
-            on metric.gosb_id = base.gosb_id
-            and metric.inn = base.inn
+        tmp_kk_route route
     left join
         tmp_kk_contact contact
-            on contact.gosb_id = base.gosb_id
-            and contact.inn = base.inn
+            on contact.gosb_id = route.gosb_id
+            and contact.inn = route.inn
             --- в воронке задач роль КМ+МЗП представлена кодом МЗП;
-            --- по ролям, которых в role_code нет, контакт не найдётся и
-            --- contact_flag = 1 — задача формируется (поведение сохранено)
-            and contact.role_code = case when base.org_fixed_role = 'КМ+МЗП'
-                                         then 'МЗП' else base.org_fixed_role end
+            --- регистр role_code на проме не гарантирован — сравниваем через upper()
+            and upper(contact.role_code) = upper(case when route.eff_role = 'КМ+МЗП'
+                                                      then 'МЗП' else route.eff_role end)
 ),
---- знаменатели долей: сумма по группе «ГОСБ + закреплённая роль»
+--- знаменатели долей: сумма по группе «ГОСБ + эффективная роль»
 --- (в модели — SUM по трём ИНН одного руководителя)
 windowed as (
     select
         src.*,
-        sum(outflow_risk_fot)  over(partition by gosb_id, org_fixed_role) as outflow_risk_fot_sum,
-        sum(outflow_risk_fl)   over(partition by gosb_id, org_fixed_role) as outflow_risk_fl_sum,
-        sum(extension_fot)     over(partition by gosb_id, org_fixed_role) as extension_fot_sum,
-        sum(extension_fl)      over(partition by gosb_id, org_fixed_role) as extension_fl_sum,
-        sum(outflow_fot)       over(partition by gosb_id, org_fixed_role) as outflow_fot_sum,
-        sum(outflow_fl)        over(partition by gosb_id, org_fixed_role) as outflow_fl_sum,
-        sum(current_fot_amt)   over(partition by gosb_id, org_fixed_role) as current_fot_amt_sum,
-        sum(current_fl_qty)    over(partition by gosb_id, org_fixed_role) as current_fl_qty_sum,
-        sum(fot_potential_qty) over(partition by gosb_id, org_fixed_role) as fot_potential_qty_sum,
-        sum(fl_potential_qty)  over(partition by gosb_id, org_fixed_role) as fl_potential_qty_sum
+        sum(outflow_risk_fot)  over(partition by gosb_id, eff_role) as outflow_risk_fot_sum,
+        sum(outflow_risk_fl)   over(partition by gosb_id, eff_role) as outflow_risk_fl_sum,
+        sum(extension_fot)     over(partition by gosb_id, eff_role) as extension_fot_sum,
+        sum(extension_fl)      over(partition by gosb_id, eff_role) as extension_fl_sum,
+        sum(outflow_fot)       over(partition by gosb_id, eff_role) as outflow_fot_sum,
+        sum(outflow_fl)        over(partition by gosb_id, eff_role) as outflow_fl_sum,
+        sum(current_fot_amt)   over(partition by gosb_id, eff_role) as current_fot_amt_sum,
+        sum(current_fl_qty)    over(partition by gosb_id, eff_role) as current_fl_qty_sum,
+        sum(fot_potential_qty) over(partition by gosb_id, eff_role) as fot_potential_qty_sum,
+        sum(fl_potential_qty)  over(partition by gosb_id, eff_role) as fl_potential_qty_sum
     from src
 ),
 coefs as (
@@ -285,10 +330,9 @@ scored as (
 )
 select
     scored.*,
-    --- Модель H19: RANK.EQ по итогу внутри группы «ГОСБ + закреплённая роль».
-    --- Ранг считается ДО отсева по контактной политике, чтобы приоритет
-    --- сравнивался по всей закреплённой базе роли.
-    rank() over(partition by gosb_id, org_fixed_role
+    --- Модель H19: RANK.EQ по итогу внутри группы «ГОСБ + эффективная роль» —
+    --- приоритет выстраивается внутри списка того, кому уйдут задачи.
+    rank() over(partition by gosb_id, eff_role
                 order by final_coef desc nulls last) as rn_final_coef,
     fio                                              as mkk_ca_fio
 from
@@ -300,17 +344,10 @@ distributed by (inn);
 
 
 /* ============================================================================
-   Блок 6. Маршрутизация задач — БТ п.4 и п.5
+   Блок 7. Раскрытие в задачи — БТ п.4 и п.6
 
-   БТ п.5 — условия формирования задач на закреплённую роль:
-     а) привлечение
-        КМ+МЗП : Доля ЗП < 90% И Потенциал >= 30 ФЛ -> КМ+МЗП, иначе ТОЛЬКО МЗП
-        Упр / ЗУпр РБ : Потенциал >= 30 ФЛ -> сама роль,
-                        иначе НУ ГОСБ вместо Упр, НО ЗП вместо ЗУпр РБ
-     b) удержание, c) отток
-        КМ+МЗП : Портфель >= 30 ФЛ -> КМ+МЗП, иначе ТОЛЬКО МЗП
-        Упр / ЗУпр РБ : Потенциал >= 30 ФЛ ИЛИ Портфель >= 30 ФЛ -> сама роль,
-                        иначе НУ ГОСБ / НО ЗП
+   Подмена роли уже сделана в блоке 4; здесь эффективная роль разворачивается
+   в набор задач.
 
    БТ п.4 — инфо-задачи выставляются одновременно с основной, если та осталась
    на Упр / ЗУпр РБ. При подмене роли инфо-задачи не формируются: задача на
@@ -318,53 +355,26 @@ distributed by (inn);
 
    БТ п.6 — тексты для роли КМ МТ собираем, но задачи не выставляем
    (на стороне КИБ идут доработки). Признак is_task_set.
+
+   Коды task_role взяты из столбца «сборка для» файла текстов: у основной
+   задачи и инфо-задачи они различаются («НУ ГОСБ» против «НУ»).
    ============================================================================ */
 drop table if exists tmp_kk_task cascade;
 create temp table tmp_kk_task as
-with routed as (
-    select
-        tmp_kk_scoring.*,
-        --- эффективная роль после подмены/сужения по БТ п.5
-        case
-            when org_fixed_role = 'УПР' and inn_in_gosb_strategy = 'привлечение'
-                then case when fl_potential_qty >= 30 then 'УПР' else 'НУ ГОСБ' end
-            when org_fixed_role = 'УПР'
-                then case when fl_potential_qty >= 30 or current_fl_qty >= 30
-                          then 'УПР' else 'НУ ГОСБ' end
-            when org_fixed_role = 'ЗУПР РБ' and inn_in_gosb_strategy = 'привлечение'
-                then case when fl_potential_qty >= 30 then 'ЗУПР РБ' else 'НО ЗП' end
-            when org_fixed_role = 'ЗУПР РБ'
-                then case when fl_potential_qty >= 30 or current_fl_qty >= 30
-                          then 'ЗУПР РБ' else 'НО ЗП' end
-            --- zp_fl_perc — доля 0..1, порог «менее 90%» = < 0.90
-            when org_fixed_role = 'КМ+МЗП' and inn_in_gosb_strategy = 'привлечение'
-                then case when zp_fl_perc < 0.90 and fl_potential_qty >= 30
-                          then 'КМ+МЗП' else 'МЗП' end
-            when org_fixed_role = 'КМ+МЗП'
-                then case when current_fl_qty >= 30 then 'КМ+МЗП' else 'МЗП' end
-            else org_fixed_role
-        end as eff_role
-    from
-        tmp_kk_scoring
-    where
-        --- БТ п.3: задачу формируем только если контакт по роли просрочен.
-        --- Единственный отсев — отсечки по рангу заказчик не применяет.
-        contact_flag = 1
-),
 --- матрица «эффективная роль -> выставляемые задачи»
 --- (соответствует набору шаблонов в Excel, Лист2)
-slots (eff_role, task_role, task_type) as (
+with slots (eff_role, task_role, task_type) as (
     values
         ('УПР',     'УПР',     'основная'),   -- Excel, строка 2
         ('УПР',     'НУ',      'инфо'),       -- Excel, строка 3   (БТ п.4)
         ('УПР',     'КМ ВКО',  'инфо'),       -- Excel, строка 4   (БТ п.4)
         ('УПР',     'КМ МТ',   'инфо'),       -- Excel, строка 5   (БТ п.4)
         ('ЗУПР РБ', 'ЗУПР РБ', 'основная'),   -- Excel, строка 10
-        ('ЗУПР РБ', 'НО',      'инфо'),       -- Excel, строка 11  (БТ п.4)
+        ('ЗУПР РБ', 'НО ЗП',   'инфо'),       -- Excel, строка 11  (БТ п.4)
         ('ЗУПР РБ', 'КМ ВКО',  'инфо'),       -- Excel, строка 12  (БТ п.4)
         ('ЗУПР РБ', 'КМ МТ',   'инфо'),       -- Excel, строка 13  (БТ п.4)
-        ('НУ ГОСБ', 'НУ',      'основная'),   -- Excel, строка 14
-        ('НО ЗП',   'НО',      'основная'),   -- Excel, строка 15
+        ('НУ ГОСБ', 'НУ ГОСБ', 'основная'),   -- Excel, строка 14
+        ('НО ЗП',   'НО ЗП',   'основная'),   -- Excel, строка 15
         ('МКК ТБ',  'МКК ТБ',  'основная'),   -- Excel, строка 16
         ('МЗП',     'МЗП',     'основная'),   -- Excel, строка 18
         ('КМ+МЗП',  'МЗП',     'основная'),   -- Excel, строка 18 (задача МЗП)
@@ -372,21 +382,21 @@ slots (eff_role, task_role, task_type) as (
         ('КМ+МЗП',  'КМ МТ',   'основная')    -- Excel, строка 17 (задача КМ)
 )
 select
-    routed.*,
+    scoring.*,
     slots.task_role,
     slots.task_type,
     --- БТ п.6: тексты для КМ МТ собираем без выставления задачи
     case when slots.task_role = 'КМ МТ' then false else true end as is_task_set
 from
-    routed
+    tmp_kk_scoring scoring
 inner join
     slots
-        on slots.eff_role = routed.eff_role
+        on slots.eff_role = scoring.eff_role
 distributed by (inn);
 
 
 /* ============================================================================
-   Блок 7. Триггер «Новый продукт» — БТ п.7
+   Блок 8. Триггер «Новый продукт» — БТ п.7
 
    «все клиенты, где есть ФЛ, не получающие зарплату больше 90 дней. При оценке
    потенциала надо вычесть из него отток, произошедший меньше 90 дней назад.»
@@ -430,13 +440,13 @@ distributed by (inn);
    текстовому наименованию и захардкоженный период «c 01.07.2026 по 20.07.2026».
    Нормальный расчёт заказчик добавит позже.
 
-   Точка врезки — блок 9, выражение triggers_text: туда достаточно дописать
+   Точка врезки — блок 10, выражение triggers_text: туда достаточно дописать
    ещё одну ветку конкатенации по образцу «Нового продукта».
    ============================================================================ */
 
 
 /* ============================================================================
-   Блок 8. Шаблоны текстов задач
+   Блок 9. Шаблоны текстов задач
    Источник: «Тексты для основных задач 07.08.26 (1).xlsx», Лист2.
    Тексты перенесены дословно; заменены только плейсхолдеры на токены:
 
@@ -635,20 +645,20 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
 Вы можете эскалировать вопрос, если руководитель компании отказался от встречи или Вы узнали о предстоящем оттоке. Подробно опишите ситуацию: ожидаемая потеря Портфеля ФЛ, должность представителя клиента, дата коммуникации. Проблема будет направлена на уровень ТБ.
 
 {MKK_CA2}{TRIGGERS}'),
-    -- ЗУПР РБ -> НО / инфо / привлечение   (Excel Лист2, D11)
-    ('ЗУПР РБ', 'НО', 'инфо', 'привлечение',
+    -- ЗУПР РБ -> НО ЗП / инфо / привлечение   (Excel Лист2, D11)
+    ('ЗУПР РБ', 'НО ЗП', 'инфо', 'привлечение',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
 Уважаемый руководитель!
 Информируем Вас, что на ЗУпр РБ ГОСБ выставлена задача "Стратегия по ключевым клиентам" со сроком отработки до {DUE}.
 Необходимо обеспечить подготовку ЗУпр РБ ГОСБ и закреплённого МЗП ко встрече с клиентом, предоставить уточненные данные по доступному лимиту преференций.{TRIGGERS}'),
-    -- ЗУПР РБ -> НО / инфо / удержание   (Excel Лист2, E11)
-    ('ЗУПР РБ', 'НО', 'инфо', 'удержание',
+    -- ЗУПР РБ -> НО ЗП / инфо / удержание   (Excel Лист2, E11)
+    ('ЗУПР РБ', 'НО ЗП', 'инфо', 'удержание',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
 Уважаемый руководитель!
 Информируем Вас, что на ЗУпр РБ ГОСБ выставлена задача "Стратегия по ключевым клиентам" со сроком отработки до {DUE}.
 Необходимо обеспечить подготовку ЗУпр РБ ГОСБ и закреплённого МЗП ко встрече с клиентом, предоставить уточненные данные по доступному лимиту преференций.{TRIGGERS}'),
-    -- ЗУПР РБ -> НО / инфо / отток   (Excel Лист2, F11)
-    ('ЗУПР РБ', 'НО', 'инфо', 'отток',
+    -- ЗУПР РБ -> НО ЗП / инфо / отток   (Excel Лист2, F11)
+    ('ЗУПР РБ', 'НО ЗП', 'инфо', 'отток',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
 Уважаемый руководитель!
 Информируем Вас, что на ЗУпр РБ ГОСБ выставлена задача "Стратегия по ключевым клиентам" со сроком отработки до {DUE}.
@@ -689,8 +699,8 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
 По клиенту в головном отделении установлена стратегия «отток». {FACTS_B} 
 Необходимо связаться с клиентом, выяснить причины, согласовать действия по восстановлению зачислений и предложить преференции при наличии свободного лимита. 
 Достигнутые договоренности отразите в комментариях к рекомендации.{TRIGGERS}'),
-    -- НУ ГОСБ -> НУ / основная / привлечение   (Excel Лист2, D14)
-    ('НУ ГОСБ', 'НУ', 'основная', 'привлечение',
+    -- НУ ГОСБ -> НУ ГОСБ / основная / привлечение   (Excel Лист2, D14)
+    ('НУ ГОСБ', 'НУ ГОСБ', 'основная', 'привлечение',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
 
 По клиенту в головном отделении установлена стратегия: привлечение. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK}.
@@ -702,8 +712,8 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
 При закрытии задачи необходимо указать достигнутые договоренности.
 
 Вы можете эскалировать вопрос, если руководитель компании отказался от встречи или Вы узнали о предстоящем оттоке. Подробно опишите ситуацию: ожидаемая потеря Портфеля ФЛ, должность представителя клиента, дата коммуникации. Проблема будет направлена на уровень ВКО клиента.{TRIGGERS}'),
-    -- НУ ГОСБ -> НУ / основная / удержание   (Excel Лист2, E14)
-    ('НУ ГОСБ', 'НУ', 'основная', 'удержание',
+    -- НУ ГОСБ -> НУ ГОСБ / основная / удержание   (Excel Лист2, E14)
+    ('НУ ГОСБ', 'НУ ГОСБ', 'основная', 'удержание',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
 
 По клиенту в головном отделении установлена стратегия: удержание. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK}.
@@ -715,8 +725,8 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
 При закрытии задачи необходимо указать достигнутые договоренности.
 
 Вы можете эскалировать вопрос, если руководитель компании отказался от встречи или Вы узнали о предстоящем оттоке. Подробно опишите ситуацию: ожидаемая потеря Портфеля ФЛ, должность представителя клиента, дата коммуникации. Проблема будет направлена на уровень ВКО клиента.{TRIGGERS}'),
-    -- НУ ГОСБ -> НУ / основная / отток   (Excel Лист2, F14)
-    ('НУ ГОСБ', 'НУ', 'основная', 'отток',
+    -- НУ ГОСБ -> НУ ГОСБ / основная / отток   (Excel Лист2, F14)
+    ('НУ ГОСБ', 'НУ ГОСБ', 'основная', 'отток',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
 
 По клиенту в головном отделении зафиксированы риски, установлена стратегия: отток. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK}.
@@ -728,8 +738,8 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
 При закрытии задачи необходимо указать достигнутые договоренности.
 
 Вы можете эскалировать вопрос, если руководитель компании отказался от встречи или Вы узнали о предстоящем оттоке. Подробно опишите ситуацию: ожидаемая потеря Портфеля ФЛ, должность представителя клиента, дата коммуникации. Проблема будет направлена на уровень ВКО клиента.{TRIGGERS}'),
-    -- НО ЗП -> НО / основная / привлечение   (Excel Лист2, D15)
-    ('НО ЗП', 'НО', 'основная', 'привлечение',
+    -- НО ЗП -> НО ЗП / основная / привлечение   (Excel Лист2, D15)
+    ('НО ЗП', 'НО ЗП', 'основная', 'привлечение',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
 
 По клиенту в головном отделении установлена стратегия: привлечение. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK}.
@@ -741,8 +751,8 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
 При закрытии задачи необходимо указать достигнутые договоренности.
 
 Вы можете эскалировать вопрос, если руководитель компании отказался от встречи или Вы узнали о предстоящем оттоке. Подробно опишите ситуацию: ожидаемая потеря Портфеля ФЛ, должность представителя клиента, дата коммуникации. Проблема будет направлена на уровень ВКО клиента.{TRIGGERS}'),
-    -- НО ЗП -> НО / основная / удержание   (Excel Лист2, E15)
-    ('НО ЗП', 'НО', 'основная', 'удержание',
+    -- НО ЗП -> НО ЗП / основная / удержание   (Excel Лист2, E15)
+    ('НО ЗП', 'НО ЗП', 'основная', 'удержание',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
 
 По клиенту в головном отделении установлена стратегия: удержание. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK}.
@@ -754,8 +764,8 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
 При закрытии задачи необходимо указать достигнутые договоренности.
 
 Вы можете эскалировать вопрос, если руководитель компании отказался от встречи или Вы узнали о предстоящем оттоке. Подробно опишите ситуацию: ожидаемая потеря Портфеля ФЛ, должность представителя клиента, дата коммуникации. Проблема будет направлена на уровень ВКО клиента.{TRIGGERS}'),
-    -- НО ЗП -> НО / основная / отток   (Excel Лист2, F15)
-    ('НО ЗП', 'НО', 'основная', 'отток',
+    -- НО ЗП -> НО ЗП / основная / отток   (Excel Лист2, F15)
+    ('НО ЗП', 'НО ЗП', 'основная', 'отток',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
 
 По клиенту в головном отделении зафиксированы риски, установлена стратегия: отток. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK}.
@@ -914,7 +924,7 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
 
 
 /* ============================================================================
-   Блок 9. Итоговая выгрузка — подстановка значений в шаблоны
+   Блок 10. Итоговая выгрузка — подстановка значений в шаблоны
 
    БТ п.6 и п.7 — правила вырезания фраз про Потенциал и Портфель.
    Порог зависит от ЗАКРЕПЛЁННОЙ роли (org_fixed_role), а не от роли-получателя:
@@ -987,7 +997,7 @@ filled as (
         --- {FACTS_A}: «Текущий потенциал …» (привлечение) /
         ---            «Справочно: … , Портфель … » (удержание, отток).
         --- Значения собираются БЕЗ хвостового пробела: разделитель остался
-        --- в шаблоне (см. блок 8), лишний пробел схлопывается ниже.
+        --- в шаблоне (см. блок 9), лишний пробел схлопывается ниже.
         case
             when parts.inn_in_gosb_strategy = 'привлечение' then
                 case when parts.show_potential
