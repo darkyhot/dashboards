@@ -50,19 +50,25 @@ class RowLimitError(RuntimeError):
     """Выборка больше лимита. Обрезать нельзя — только сузить запрос."""
 
 
-def guard_rows(df: pd.DataFrame, name: str, limit: int | None = None) -> pd.DataFrame:
+DEFAULT_HINT = "Сузьте чанк (уменьшите CHUNK_TARGET) или окно месяцев."
+
+
+def guard_rows(df: pd.DataFrame, name: str, limit: int | None = None,
+               hint: str = DEFAULT_HINT) -> pd.DataFrame:
     """Не дать выборке съесть память ядра.
 
     Лимит разрешается ВНУТРИ функции, а не в значении по умолчанию: иначе он
     зафиксируется в момент импорта, и правка MAX_ROWS перед прогоном молча ни на
     что не повлияет — то есть защита окажется выключенной ровно тогда, когда её
     решили ужесточить.
+
+    `hint` — что делать именно с ЭТОЙ выборкой. Совет «уменьшите CHUNK_TARGET»
+    верен для панели и бесполезен для справочника организаций.
     """
     limit = MAX_ROWS if limit is None else limit
     if len(df) > limit:
-        raise RowLimitError(
-            f"{name}: {len(df):,} строк — больше лимита {limit:,}. "
-            f"Сузьте чанк (уменьшите CHUNK_TARGET) или окно месяцев.")
+        raise RowLimitError(f"{name}: {len(df):,} строк — больше лимита "
+                            f"{limit:,}. {hint}")
     return df
 
 
@@ -144,21 +150,47 @@ def plan_chunks(engine, d_from, d_to) -> list[dict]:
     return chunks
 
 
-def org_segments(engine, n_parts: int = 8) -> dict:
-    """ИНН -> код сегмента (extended_dim_1). Справочник крупный, читаем частями."""
+def org_segments(engine, n_parts: int | None = None) -> dict:
+    """ИНН -> код сегмента (extended_dim_1). Справочник крупный, читаем частями.
+
+    Число частей НЕ фиксировано: сначала считаем организации и делим так, чтобы
+    часть заведомо влезала в лимит строк. Захардкоженное число однажды
+    оказывается мало — на проме справочник больше, чем на отладке, и прогон
+    падает уже после того, как тяжёлый запрос отработал.
+
+    Если часть всё равно вышла за лимит (справочник подрос между счётом и
+    выгрузкой), число частей удваивается и чтение начинается заново.
+    """
     progress.step("Сегменты организаций из справочника")
-    out: dict[int, int] = {}
-    unknown_names: set = set()
-    for part in range(n_parts):
-        df = db.read_sql(engine, LQ.ORG_SEG, {"n_parts": n_parts, "part": part})
-        guard_rows(df, f"ORG_SEG part {part}")
-        for inn, big in zip(df["inn"], df["segment_big"]):
-            code = segments.code_of_big(big)
-            if code is None:
-                if big:
-                    unknown_names.add(str(big))
-                continue
-            out[int(inn)] = int(code)
+    if n_parts is None:
+        n_orgs = int(db.read_sql(engine, LQ.ORG_SEG_COUNT)["n"].iloc[0] or 0)
+        n_parts = max(1, int(np.ceil(n_orgs / CHUNK_TARGET)))
+        progress.done(f"Организаций в справочнике {n_orgs:,} — читаем "
+                      f"{n_parts} частями по ~{n_orgs // n_parts:,} строк")
+
+    while True:
+        out: dict[int, int] = {}
+        unknown_names: set = set()
+        try:
+            for part in range(n_parts):
+                df = db.read_sql(engine, LQ.ORG_SEG,
+                                 {"n_parts": n_parts, "part": part})
+                guard_rows(df, f"ORG_SEG часть {part + 1}/{n_parts}",
+                           hint="Справочник читается частями — число частей "
+                                "увеличивается автоматически.")
+                for inn, big in zip(df["inn"], df["segment_big"]):
+                    code = segments.code_of_big(big)
+                    if code is None:
+                        if big:
+                            unknown_names.add(str(big))
+                        continue
+                    out[int(inn)] = int(code)
+        except RowLimitError as ex:
+            n_parts *= 2
+            progress.warn(f"{ex} Читаем заново {n_parts} частями.")
+            continue
+        break
+
     progress.done(f"Сегмент известен у {len(out):,} организаций"
                   + (f"; не разобраны названия: {sorted(unknown_names)[:5]}"
                      if unknown_names else ""))
@@ -188,10 +220,18 @@ def pipeline_plan(engine, months: list) -> pd.DataFrame:
     progress.step("Пайплайн: план привлечения по месяцам")
     try:
         df = db.read_sql(engine, LQ.PIPELINE_PLAN, {"d_from": d_from, "d_to": d_to})
-    except Exception as ex:
-        progress.warn(f"пайплайн недоступен: {type(ex).__name__}: {str(ex)[:200]}")
+        # Чанковать этот запрос по ИНН нельзя: CTE codes группируется по КОДУ
+        # сделки и берёт min(inn), а один код встречается с несколькими ИНН.
+        # Разрезав выборку по ИНН, мы получили бы один код в двух частях с
+        # разными ИНН — и план вошёл бы в расчёт дважды.
+        guard_rows(df, "PIPELINE_PLAN",
+                   hint="Сузьте окно месяцев или отключите семейство пайплайна "
+                        "(use_pipeline=False).")
+    except (Exception, RowLimitError) as ex:
+        progress.warn(f"пайплайн не читается ({type(ex).__name__}: "
+                      f"{str(ex)[:200]}) — семейство кандидатов по нему "
+                      f"пропускается, остальной перебор идёт как обычно")
         return pd.DataFrame()
-    guard_rows(df, "PIPELINE_PLAN")
     if df.empty:
         progress.warn("пайплайн пуст — семейство кандидатов по нему пропускается")
         return df
@@ -407,7 +447,7 @@ def fetch_units(engine, cache_dir: Path, months: list, force: bool = False
     df = db.read_sql(engine, LQ.UNITS, {"m_fot": LQ.METRIC_FOT,
                                         "m_rcp": LQ.METRIC_RECIPIENTS,
                                         "d_from": d_from, "d_to": d_to})
-    guard_rows(df, "UNITS")
+    guard_rows(df, "UNITS", hint="Сузьте окно месяцев (параметр months).")
     # уровень gosb лежит на СТАРОМ id — сворачиваем в новый, как весь отчёт
     gmap = db.read_sql(engine, LQ.GOSB_MAP)
     new_of = {int(r.old_gosb_id): int(r.new_gosb_id) for r in gmap.itertuples()}
