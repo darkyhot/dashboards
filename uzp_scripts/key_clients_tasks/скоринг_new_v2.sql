@@ -957,18 +957,19 @@ with parts as (
         --- потенциал в витрине numeric; в тексте печатаем целым, как и раньше
         task.fl_potential_qty::bigint as potential_txt,
         task.current_fl_qty::bigint   as portfel_txt,
-        --- ссылки на карточку клиента в АС Навигатор (перенесено без изменений)
-        concat('<a href="https://navigator.ca.sbrf.ru/gdash/1000004325?vName_Visible=0&pLevelName=gosb_',
-            task.gosb_id,
-            '&vLevel_test=%D0%98%D1%80%D0%BA%D1%83%D1%82%D1%81%D0%BA%D0%BE%D0%B5%20%D0%BE%D1%82%D0%B4%D0%B5%D0%BB%D0%B5%D0%BD%D0%B8%D0%B5%20%E2%84%96',
-            task.gosb_id,
-            '&vLevel_Visible=1&vINN_Visible=1&vName_test=%D0%9E%D0%91%D0%A9%D0%95%D0%A1%D0%A2%D0%92%D0%9E%20%D0%A1%20%D0%9E%D0%93%D0%A0%D0%90%D0%9D%D0%98%D0%A7%D0%95%D0%9D%D0%9D%D0%9E%D0%99%20%D0%9E%D0%A2%D0%92%D0%95%D0%A2%D0%A1%D0%A2%D0%92%D0%95%D0%9D%D0%9D%D0%9E%D0%A1%D0%A2%D0%AC%D0%AE%20%D0%93%D0%90%D0%97%D0%9F%D0%A0%D0%9E%D0%9C%20%D0%94%D0%9E%D0%91%D0%AB%D0%A7%D0%90%20%D0%98%D0%A0%D0%9A%D0%A3%D0%A2%D0%A1%D0%9A&vWidget=1&vINN_test=',
-            task.inn, '">ссылка omega</a><br><a href="https://navigator.sigma.sbrf.ru/gdash/1000004325?vName_Visible=0&pLevelName=gosb_',
-            task.gosb_id,
-            '&vLevel_test=%D0%98%D1%80%D0%BA%D1%83%D1%82%D1%81%D0%BA%D0%BE%D0%B5%20%D0%BE%D1%82%D0%B4%D0%B5%D0%BB%D0%B5%D0%BD%D0%B8%D0%B5%20%E2%84%96',
-            task.gosb_id,
-            '&vLevel_Visible=1&vINN_Visible=1&vName_test=%D0%9E%D0%91%D0%A9%D0%95%D0%A1%D0%A2%D0%92%D0%9E%20%D0%A1%20%D0%9E%D0%93%D0%A0%D0%90%D0%9D%D0%98%D0%A7%D0%95%D0%9D%D0%9D%D0%9E%D0%99%20%D0%9E%D0%A2%D0%92%D0%95%D0%A2%D0%A1%D0%A2%D0%92%D0%95%D0%9D%D0%9D%D0%9E%D0%A1%D0%A2%D0%AC%D0%AE%20%D0%93%D0%90%D0%97%D0%9F%D0%A0%D0%9E%D0%9C%20%D0%94%D0%9E%D0%91%D0%AB%D0%A7%D0%90%20%D0%98%D0%A0%D0%9A%D0%A3%D0%A2%D0%A1%D0%9A&vWidget=1&vINN_test=',
-            task.inn, '">ссылка sigma</a>') as navigator_link,
+        --- Ссылки на карточку клиента в АС Навигатор, актуальный формат.
+        --- Прежний вариант тащил в URL захардкоженные vLevel_test и vName_test
+        --- (наименования ГОСБ и организации в percent-encoding) — они не нужны,
+        --- карточка открывается по паре pLevelName=gosb_<ГОСБ> + vINN_test=<ИНН>.
+        concat('<a href="https://navigator.ca.sbrf.ru/gdash/1000004325',
+            '?vName_Visible=1&vINN_Visible=1&pLevelName=gosb_', task.gosb_id,
+            '&vWidget=1&vINN_test=', task.inn,
+            '&vLevel_Visible=1">ссылка omega</a>',
+            ' || ',
+            '<a href="https://navigator.sigma.sbrf.ru/gdash/1000004325',
+            '?vName_Visible=1&vINN_Visible=1&pLevelName=gosb_', task.gosb_id,
+            '&vWidget=1&vINN_test=', task.inn,
+            '&vLevel_Visible=1">ссылка sigma</a>') as navigator_link,
         --- срок отработки в тексте задачи: единый для всех ролей (решение заказчика)
         (current_date + interval '32 days')::date as task_due_dt,
         --- БТ п.7: триггеры добавляются только к задачам на роль МЗП.
