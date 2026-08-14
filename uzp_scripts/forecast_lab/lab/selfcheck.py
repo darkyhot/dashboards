@@ -1,4 +1,14 @@
-"""Самопроверки forecast_lab. Запускаются из тетрадки ПЕРЕД прогоном.
+"""Самопроверки forecast_lab. Запускаются из тетрадки ПЕРЕД прогоном:
+
+    from lab import selfcheck
+    selfcheck.run_all()
+
+или из командной строки: `python -m lab.selfcheck` из каталога forecast_lab.
+
+Лежат внутри пакета намеренно. Раньше это был отдельный каталог `tests/`, и на
+проме тетрадка падала на `from tests.check_lab import ...`: имя `tests` слишком
+общее, его перехватывает первый попавшийся одноимённый пакет из окружения.
+
 
 Проверяется не «работает ли код», а то, из-за чего результату нельзя было бы
 верить:
@@ -18,18 +28,15 @@
 from __future__ import annotations
 
 import re
-import sys
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from uzp_dash.dashboards.tb_health import forecast as F
 
-from lab import backtest as B          # noqa: E402
-from lab import fetch, models          # noqa: E402
-from lab import queries as LQ          # noqa: E402
-from uzp_dash.dashboards.tb_health import forecast as F   # noqa: E402
+from . import backtest as B
+from . import fetch, models
+from . import queries as LQ
 
 
 class CheckFailed(AssertionError):

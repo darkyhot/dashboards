@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import lab                                  # находит и подключает uzp_dash
 from uzp_dash import config, db, progress
 
 from . import backtest as B
@@ -47,7 +48,7 @@ def run(conn: str | None = None, cache_dir: str | Path | None = None,
         progress.enable(verbose=verbose, show_sql=show_sql, llm_log_dir=None)
     t_start = time.time()
 
-    root = Path(__file__).resolve().parents[3]
+    root = lab.ROOT
     cache_dir = Path(cache_dir) if cache_dir else root / "output" / "forecast_lab_cache"
     out_dir = Path(out_dir) if out_dir else root / "output" / "forecast_lab"
     engine = db.get_engine(config.db_url(conn))
