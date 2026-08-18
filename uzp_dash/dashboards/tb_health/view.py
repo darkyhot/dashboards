@@ -106,7 +106,7 @@ def _level_body(a: analyze.Analysis, story: dict, idx: int) -> str:
         back
         + _hero(a)
         + _kpis(a)
-        + _waterfall(a, story.get("forecast"))
+        + _portfolio_block(a, story.get("forecast"))
         + _matrix(a, story.get("matrix"))
         + _problem_gosb(a, story.get("gosb"), idx)
     )
@@ -187,9 +187,9 @@ def _kpis(a: analyze.Analysis) -> str:
     return f'<div class="grid cols-2">{cards}</div>'
 
 
-def _wf_lines(wf: dict, d: dict, conv: float, conv_diag: dict | None = None,
+def _wf_lines(pf: dict, d: dict, conv: float, conv_diag: dict | None = None,
               conv_is_tb: bool = False) -> str:
-    """Строки водопада. Общие для блока по ТБ и для оверлея по ГОСБ — слагаемые
+    """Строки блока портфеля. Общие для уровня и для оверлея по единице — числа
     и порядок одни и те же, меняется только срез данных.
 
     `conv` — коэффициент ИМЕННО ЭТОГО уровня (у ГОСБ свой), `conv_is_tb` — что он
@@ -208,19 +208,21 @@ def _wf_lines(wf: dict, d: dict, conv: float, conv_diag: dict | None = None,
     # именно дни, а не проценты: «осталось 1 из 31 дн.» читается однозначно, а «3%»
     # можно спутать с долей отыгранных выплат в строке оттока выше.
     dl, dm = int(d.get("days_left", 0)), int(d.get("days_in_month", 0) or 1)
-    pipe_hint = (f'заявлено {C.fmt_num(wf.get("pipe_raw", 0))} · '
-                 f'пришло {C.fmt_num(wf.get("pipe_fact", 0))} · '
-                 f'остаток {C.fmt_num(wf.get("pipe_rest", 0))} × {conv_txt} × '
-                 f'осталось {dl} из {dm} дн. → +{C.fmt_num(wf.get("pipe_expect", 0))}')
+    pipe_hint = (f'заявлено {C.fmt_num(pf.get("pipe_raw", 0))} · '
+                 f'пришло {C.fmt_num(pf.get("pipe_fact", 0))} · '
+                 f'остаток {C.fmt_num(pf.get("pipe_rest", 0))} × {conv_txt} × '
+                 f'осталось {dl} из {dm} дн. → +{C.fmt_num(pf.get("pipe_expect", 0))}')
+    out_lbl = C.esc(d.get("out_label", ""))
     rows = [
-        (f'Портфель — {C.esc(d.get("closed_label", ""))} закрыт', wf["base"], 0, ""),
-        (f'Ежедневный отток на {C.esc(str(d.get("act_dt", "")))}', wf["observed"], -1, ""),
-        ("Риск оттока до конца месяца", wf["risk"], -1, "прогноз по истории"),
-        ("Сезонный приход", wf["in_exp"], 1, "клиенты, которые обычно возвращаются"),
-        ("Пайплайн на месяц", wf["pipe"], 1, pipe_hint),
+        (f'Портфель — {C.esc(d.get("closed_label", ""))} закрыт', pf["base"], 0, ""),
+        (f'Фактический отток за 3 месяца, который не вернулся',
+         pf.get("out_kept", 0), -1,
+         f'{out_lbl} · uzp_dwh_fact_outflow от {bank.OUT_MIN_QTY} чел '
+         f'за вычетом вернувшихся' if out_lbl else ""),
+        ("Пайплайн на месяц", pf["pipe"], 1, pipe_hint),
     ]
     # подсказка идёт классом g-hint, а НЕ .sub: .sub — это стиль подзаголовка
-    # страницы (19px), внутри строки водопада он выглядит крупнее самой строки
+    # страницы (19px), внутри строки блока он выглядит крупнее самой строки
     return "".join(
         f'<div class="g-seg"><b>{lbl}</b> '
         f'<span style="color:{"var(--bad)" if sign < 0 else "var(--good)"}">'
@@ -229,38 +231,43 @@ def _wf_lines(wf: dict, d: dict, conv: float, conv_diag: dict | None = None,
         for lbl, val, sign, hint in rows)
 
 
-def _waterfall(a: analyze.Analysis, ai: str | None = None) -> str:
-    """Из чего складывается прогноз: база закрытого месяца → отток → пайплайн.
+def _portfolio_block(a: analyze.Analysis, ai: str | None = None) -> str:
+    """Управление портфелем: что есть, что потеряли, что ждём.
 
-    Отток намеренно разбит на «уже не зачислились» и «риск»: первое уже случилось,
-    второе — то, на что ещё можно повлиять до конца месяца.
+    Это НЕ разложение прогноза на слагаемые. Прогноз берётся готовым из витрины
+    метрик и с этими тремя числами арифметически не связан — складывать их и
+    сверять с прогнозом бессмысленно. Здесь три независимых факта, каждый со своим
+    действием: портфель — что защищаем, невозвращённый отток — что уже потеряли,
+    пайплайн — что придёт само.
     """
-    wf = a.wf or {}
-    if not wf:
+    pf = a.pf or {}
+    if not pf:
         return ""
     d = a.dates or {}
     fc = a.fc_stats or {}
-    body = _wf_lines(wf, d, fc.get("conv_tb", 1.0), fc.get("conv"), conv_is_tb=False)
-    ex = wf.get("exec") or 0
-    st = C.status_of(wf.get("exec"))
+    body = _wf_lines(pf, d, fc.get("conv_tb", 1.0), fc.get("conv"), conv_is_tb=False)
+    ex = pf.get("exec") or 0
+    st = C.status_of(pf.get("exec"))
     total = (
-        f'<div class="g-do">Прогноз на {C.esc(d.get("label", ""))}: '
-        f'<b>{C.fmt_num(wf["forecast"])}</b> при плане {C.fmt_num(wf["plan"])} → '
+        f'<div class="g-do">Прогноз витрины на {C.esc(d.get("label", ""))}: '
+        f'<b>{C.fmt_num(pf["forecast"])}</b> при плане {C.fmt_num(pf["plan"])} → '
         + C.badge(f"{ex * 100:.0f}% плана", st) + '</div>'
     )
     upside = ""
-    if wf.get("pipe_upside", 0) >= 1:
-        upside = (f'<div class="g-act">Если пайплайн отработают на 100%, прогноз '
-                  f'вырастет до <b>{C.fmt_num(wf["ceiling"])}</b> '
-                  f'(+{C.fmt_num(wf["pipe_upside"])} чел) — это потолок месяца.</div>')
+    if pf.get("pipe_upside", 0) >= 1:
+        upside = (f'<div class="g-act">Если пайплайн отработают на 100%, придёт на '
+                  f'<b>+{C.fmt_num(pf["pipe_upside"])} фл</b> больше, чем заложено '
+                  f'с поправкой на реализуемость.</div>')
     note = ('<p class="sub" style="font-size:14px;margin:-4px 0 12px">'
-            'прогноз — пассивный сценарий «если ничего не делать»: приход из пайплайна '
-            'в нём уже учтён, а потенциал привлечения и удержание — нет. '
-            'Список организаций ниже показывает, чем прогноз можно улучшить.</p>')
-    return C.section("Из чего складывается прогноз",
-                     C.card('<h3>Расчёт по получателям</h3>' + note + body + total + upside)
+            'прогноз получателей считает витрина — отчёт его не пересчитывает. '
+            'Три строки ниже не складываются в него: это независимые факты '
+            'управления портфелем — что защищаем, что уже потеряли и что придёт '
+            'из сделок.</p>')
+    return C.section("Управление портфелем",
+                     C.card('<h3>Портфель, потери и приход</h3>' + note + body
+                            + total + upside)
                      + _ai(ai),
-                     eyebrow="Метод")
+                     eyebrow="Факт")
 
 
 def _matrix(a: analyze.Analysis, ai: str | None = None) -> str:
@@ -315,13 +322,13 @@ def _gosb_table(c: dict, wide: bool = False) -> str:
     вытягивает план, но взгляд по-прежнему цепляется за проблемные.
     У строки «Всего» бейджа нет — процент уже стоит крупно в шапке карточки.
 
-    wide=True (в оверлее) добавляет колонки оттока и пайплайна — это детализация
-    прогноза на грейне (ГОСБ, сегмент).
+    wide=True (в оверлее) добавляет колонку пайплайна. Оттока по сегментам здесь
+    нет: фактический отток лежит на грейне (ГОСБ, ИНН) и в разрез витрины по
+    сегментам не раскладывается — разносить его пропорционально было бы выдумкой.
     """
     def row(label, d, cls=""):
         pipe = d.get("pipe_np", 0)
-        extra = (f'<span>{_gap_cell(d.get("out_exp", 0))}</span>'
-                 f'<span>{"+" + C.fmt_num(pipe) if pipe >= 1 else "—"}</span>'
+        extra = (f'<span>{"+" + C.fmt_num(pipe) if pipe >= 1 else "—"}</span>'
                  if wide else "")
         return (f'<div class="g-row {cls}"><span>{label}</span>'
                 f'<span>{C.fmt_num(d["forecast"])}</span>'
@@ -329,12 +336,11 @@ def _gosb_table(c: dict, wide: bool = False) -> str:
                 f'<span>{_gap_cell(d["nedobor"])}</span>'
                 f'{extra}<span>{d.get("n_need") or "—"}</span></div>')
 
-    cols = ('<span>отток</span><span>пайплайн</span>' if wide else "")
+    cols = ('<span>пайплайн</span>' if wide else "")
     head = (f'<div class="g-row head"><span>сегмент</span><span>прогноз</span>'
             f'<span>план</span><span>недобор</span>{cols}<span>орг</span></div>')
     tot = {"forecast": c["forecast"], "plan": c["plan"], "nedobor": c["gap"],
            "n_need": c["n_need"],
-           "out_exp": sum(s.get("out_exp", 0) for s in c["segs"]),
            "pipe_np": sum(s.get("pipe_np", 0) for s in c["segs"])}
     rows = [row(_seg_badge(s), s, "" if s["failing"] else "ok") for s in c["segs"]]
     if not rows:
@@ -379,21 +385,26 @@ def _org_rows(rows: list, key: str, tail_n: int, tail_fl: float,
 
 
 def _why_out(r: dict) -> str:
-    """Пояснение к строке оттока: причина, что делать, и — отдельно — можно ли вообще.
+    """Пояснение к строке оттока: сколько вернулось, вывод по отработке, что делать.
 
     Пометка о зоне нужна именно здесь: в списке крупнейших неизбежно окажутся
-    организации, с которыми работать нельзя (нет в эталонной базе) или нечем (объективный
-    отток). Без пометки читатель начнёт распределять то, что не его.
+    организации, с которыми работать нельзя (нет в эталонной базе) или нечем — отток
+    уже отработан, а люди не вернулись. Без пометки читатель начнёт распределять то,
+    что не его.
 
-    У группы «только факт этого месяца» причины из модели нет вовсе (`note` пуст —
-    истории оттока не было), и строка осталась бы без единого пояснения. Для неё
-    подставляем `why` из стыковки: там сказано, что отток взят по факту дня.
+    `reason` — вывод аудита, если он был, иначе причина классификации: для возвратных
+    организаций она названа по МЕСЯЦАМ УХОДА («задач не заводили», «ни одной по
+    оттоку», «отработан»), и именно она объясняет, почему строка здесь.
     """
-    parts = [x for x in (r.get("note") or r.get("why"), r.get("action")) if x]
+    back = float(r.get("ret", 0) or 0)
+    parts = []
+    if back:
+        parts.append(f'вернулись {C.fmt_num(back)} из {C.fmt_num(r.get("gone", 0))}')
+    parts += [x for x in (r.get("reason"), r.get("action")) if x]
     zone = r.get("zone")
     if zone and zone != "можно работать":
         parts.insert(0, zone)
-    return " · ".join(parts)
+    return " · ".join(parts) if parts else "причина не зафиксирована"
 
 
 def _why_pipe(r: dict) -> str:
@@ -422,10 +433,8 @@ def _why_size(r: dict) -> str:
             parts.append(f'задач в те месяцы и следующие за ними: {r["yoy_tasks"]}')
         else:
             parts.append("задач ни в те месяцы, ни в следующие не заводили")
-    elif r.get("has_hist"):
-        parts.append("разовых оттоков в витрине нет")
     else:
-        parts.append("истории по паре в витрине нет")
+        parts.append("заметных оттоков за окно не было")
     parts.append(f'причина: {r["reason"]}' if r.get("reason") else "причина не зафиксирована")
     return " · ".join(parts)
 
@@ -481,17 +490,17 @@ def _group_html(g: dict, open_: bool, work: str, key: str, why) -> str:
 def _gosb_dialog(c: dict, det: dict, d: dict, uid: str, unit_label: str = "ГОСБ") -> str:
     """Оверлей «почему прогноз такой» по одному ГОСБ.
 
-    Порядок блоков: водопад → отток по причинам → пайплайн → тренд портфеля →
+    Порядок блоков: портфель → отток по группам → пайплайн → тренд портфеля →
     разбор по сегментам. Отток разложен на группы (см. `_out_group`) и покрыт целиком;
     в остальных блоках имена показываются только материальные, поэтому у них стоит
     подпись о покрытии.
     """
     if not det:
         return ""
-    wf = det["wf"]
-    ex = wf.get("exec") or 0
+    pf = det["pf"]
+    ex = pf.get("exec") or 0
     # у единицы свой коэффициент реализуемости и своя доля пройденного месяца
-    wf_html = _wf_lines(wf, d, det["conv"], det.get("conv_diag"),
+    wf_html = _wf_lines(pf, d, det["conv"], det.get("conv_diag"),
                         det.get("conv_is_tb", False))
     yoy = det["yoy_total"]
     # отток разложен по причине: первая (крупнейшая) группа раскрыта, иначе оверлей
@@ -514,12 +523,12 @@ def _gosb_dialog(c: dict, det: dict, d: dict, uid: str, unit_label: str = "ГО�
     return (
         f'<dialog class="gd" id="gd-{uid}"><div class="gd-sheet">'
         f'<div class="gd-head"><div><h3 style="margin:0">{C.esc(c["gosb_name"])}</h3>'
-        f'<div class="gd-note">прогноз {C.fmt_num(wf["forecast"])} из плана '
-        f'{C.fmt_num(wf["plan"])} · {ex*100:.0f}%</div></div>'
+        f'<div class="gd-note">прогноз {C.fmt_num(pf["forecast"])} из плана '
+        f'{C.fmt_num(pf["plan"])} · {ex*100:.0f}%</div></div>'
         f'<button class="gd-close" onclick="gdClose(\'{uid}\')" '
         f'aria-label="Закрыть">×</button></div>'
 
-        f'<div class="gd-block"><h4>Из чего сложился прогноз</h4>{wf_html}</div>'
+        f'<div class="gd-block"><h4>Портфель, потери и приход</h4>{wf_html}</div>'
 
         f'<div class="gd-block"><h4>Отток по причинам — всего '
         f'{C.fmt_num(det["out_tot"])} чел, {C.fmt_num(n_out)} орг</h4>'
@@ -527,7 +536,7 @@ def _gosb_dialog(c: dict, det: dict, d: dict, uid: str, unit_label: str = "ГО�
         + '</div>'
 
         f'<div class="gd-block"><h4>Пайплайн на месяц: заявлено '
-        f'{C.fmt_num(wf["pipe_raw"])}, в прогнозе {C.fmt_num(wf["pipe"])}</h4>'
+        f'{C.fmt_num(pf["pipe_raw"])}, в прогнозе {C.fmt_num(pf["pipe"])}</h4>'
         + _org_rows(det["top_pipe"], "pipe", det["pipe_tail_n"], det["pipe_tail_fl"],
                     "— хвост", 1, _why_pipe, cover=det.get("pipe_cov", 0.0),
                     n_all=det.get("pipe_n_all", 0))
@@ -695,6 +704,12 @@ def _orgs(a: analyze.Analysis, ai: str | None = None, idx: int = 0) -> str:
             "inn": int(r.inn), "company": (getattr(r, "company_name", "") or "")[:48],
             "lever": r.lever,
             "gosb": (r.gosb_name or "")[:28], "seg": r.seg_name or "—",
+            # закреплённый за парой (ГОСБ, организация) сотрудник; прочерк означает,
+            # что действующего закрепления в витрине нет — см. bank._merge_manager.
+            # isinstance, а не `or ""`: у пары без закрепления в колонке может
+            # оказаться NaN, а он проходит проверку на истинность и роняет strip()
+            "emp": (r.emp_fio.strip() if isinstance(getattr(r, "emp_fio", None), str)
+                    else "") or "—",
             "fl": round(float(r.impact_fl)), "fot": round(float(r.impact_fot_mln), 1),
             "reason": reason, "action": ins.get("action", ""),
             "needk": float(getattr(r, "need_k", 0.0)),
@@ -717,9 +732,9 @@ def _orgs(a: analyze.Analysis, ai: str | None = None, idx: int = 0) -> str:
     # именно segs_bad: в segs теперь лежат ВСЕ сегменты ГОСБ, включая выполняющие
     bad_segs = sorted({s["seg"] for c in a.gosb_cards for s in c["segs_bad"]},
                       key=lambda x: SEG_ORDER.index(x) if x in SEG_ORDER else 99)
-    n_hold = sum(1 for r in rows if r["lever"] == "Удержать")
-    hold = (f' · из них «Удержать» — <b>{n_hold}</b>: оттекают прямо сейчас'
-            if n_hold else "")
+    n_ret = sum(1 for r in rows if r["lever"] == "Вернуть")
+    hold = (f' · из них «Вернуть» — <b>{n_ret}</b>: люди ушли и не вернулись, а отток '
+            f'в месяц ухода не отработан' if n_ret else "")
     # хвост не прячем молча: сказано, сколько кандидатов есть всего, по какому правилу
     # часть из них в файл не попала и сколько среди скрытых нужных под план — иначе
     # заголовок «N закрывают план» выглядел бы расходящимся с таблицей без объяснения

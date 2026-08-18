@@ -1,11 +1,12 @@
 """SQL для дэша tb_health. {schema} / {schema_t} подставляются в db.read_sql,
 значения — :params.
 
-Дэш строится на ТЕКУЩИЙ (незакрытый) месяц :ref_cur — по прогнозу, потому что
-окончательная ЗП-ведомость есть только за закрытый месяц. Опорные даты:
-  :ref_cur    — прогнозный месяц (конец месяца), из uzp_dwh_day_outflow;
-  :act_dt     — по какую дату в нём есть факт зачислений;
-  :ref_closed — предыдущий, ЗАКРЫТЫЙ месяц: база прогноза (факт метрик оттуда);
+Дэш строится на ТЕКУЩИЙ (незакрытый) месяц :ref_cur — по ПРОГНОЗУ ВИТРИНЫ
+(uzp_dwh_metrics.prediction_amt), потому что окончательная ЗП-ведомость есть только
+за закрытый месяц. Свой прогноз дэш не считает. Опорные даты:
+  :ref_cur    — прогнозный месяц (конец месяца): самый свежий с prediction_amt;
+  :ref_closed — предыдущий, ЗАКРЫТЫЙ месяц: портфель-база (факт метрик оттуда);
+  :m_out1..3  — три закрытых месяца (T-1, T-2, T-3) под фактический отток;
   :ref_funnel — конец окна воронки, совпадает с :ref_cur.
 Метрики фильтруются по end_dt = <нужный месяц> (а не по max(end_dt) — там бывают
 будущие плановые месяцы). Активности — окно 3 мес до :ref_funnel.
@@ -35,7 +36,7 @@ MOTIV_COUNTED = "учтено"
 # ЕДИНОЖДЫ здесь, во всех запросах, которые перечисляют ТБ и подразделения, — тогда
 # про него не знают ни список вкладок, ни ранг ТБ, ни свод уровня СБ, ни карточки.
 # Вердикт банка при этом по-прежнему берётся строкой level_name='sb', где ЦА внутри:
-# уровни витрины считаются независимо, и сумма единиц ей и так не равна (раздел 12).
+# уровни витрины считаются независимо, и сумма единиц ей и так не равна (раздел 11).
 EXCLUDE_TB = ("ЦА",)
 _NO_CA = "tb_short_name NOT IN (" + ", ".join(f"'{t}'" for t in EXCLUDE_TB) + ")"
 
@@ -45,25 +46,15 @@ REF_DATE = """
 SELECT max(report_dt) AS ref FROM {schema}.uzp_dwh_company_holding_metric
 """
 
-# Опорные даты дэша по умолчанию: САМЫЙ СВЕЖИЙ месяц ежедневной витрины и дата, по
-# которую в нём есть факт зачислений. Витрина хранит ВСЕ месяцы, поэтому max() здесь
-# означает «последний доступный», а не «единственный»; чтобы построить отчёт за более
-# ранний месяц, он задаётся параметром, и тогда act_dt берётся запросом ACT_DT_FOR.
+# Опорный месяц отчёта по умолчанию — САМЫЙ СВЕЖИЙ месяц, на который витрина уже
+# посчитала ПРОГНОЗ. Отчёт теперь целиком про витринный прогноз, и привязываться
+# логично к его наличию: месяц без prediction_amt показывать нечем.
+# Раньше якорем была ежедневная витрина оттока — она из дэша убрана.
 REF_CUR = """
-SELECT r.ref_cur,
-       (SELECT max(d.act_dt) FROM {schema}.uzp_dwh_day_outflow d
-        WHERE d.report_dt = r.ref_cur) AS act_dt
-FROM (SELECT max(report_dt) AS ref_cur FROM {schema}.uzp_dwh_day_outflow) r
-WHERE r.ref_cur IS NOT NULL
-"""
-
-# Дата актуальности ИМЕННО ЗАДАННОГО месяца. Нужна, когда месяц отчёта задан
-# параметром и не совпадает с последним: брать act_dt последнего месяца нельзя —
-# он из другого периода, и весь расчёт «сколько выплат уже увидели» поедет.
-ACT_DT_FOR = """
-SELECT max(act_dt) AS act_dt, count(*) AS n_rows
-FROM {schema}.uzp_dwh_day_outflow
-WHERE report_dt = :ref_cur
+SELECT max(end_dt) AS ref_cur
+FROM {schema}.uzp_dwh_metrics
+WHERE period_type='m' AND prediction_amt IS NOT NULL
+  AND metric_id = :m_rcp AND level_name = 'sb'
 """
 
 # Все ТБ — по вкладке на каждый плюс сводный уровень СБ
@@ -79,7 +70,7 @@ ORDER BY tb_short_name
 # год назад × уровень) — при 12 ТБ порядка сорока запросов на одну и ту же таблицу.
 #
 # Уровень банка живёт ТОЛЬКО здесь, как level_name='sb': план и факт СБ читаются
-# отсюда, а НЕ складываются из ТБ (сумма ТБ витрине не равна — см. раздел 12
+# отсюда, а НЕ складываются из ТБ (сумма ТБ витрине не равна — см. раздел 11
 # методологии). Ранга у банка нет: сравнивать его не с кем, поэтому окно ранга
 # разбито и по level_name — у 'sb' в нём одна строка.
 #
@@ -91,6 +82,8 @@ WITH tb AS (SELECT DISTINCT tb_id, tb_short_name FROM {schema}.uzp_dim_gosb
             WHERE tb_short_name IS NOT NULL AND """ + _NO_CA + """)
 SELECT m.level_name, m.metric_id, m.level_id, tb.tb_short_name, m.end_dt,
        m.plan_amt, m.fact_amt, m.execution_percent,
+       -- ПРОГНОЗ витрины: дэш его больше не считает, а берёт готовым
+       m.prediction_amt AS pred_amt, m.prediction_percent AS pred_pct,
        rank() OVER (PARTITION BY m.metric_id, m.end_dt, m.level_name
                     ORDER BY m.execution_percent DESC)               AS rnk,
        count(*) OVER (PARTITION BY m.metric_id, m.end_dt, m.level_name) AS n_tb
@@ -155,6 +148,7 @@ tb AS (SELECT DISTINCT tb_id, tb_short_name FROM {schema}.uzp_dim_gosb
 SELECT 'gosb' AS level_name, g.new_gosb_id AS unit_id, g.gosb_name AS unit_name,
        g.tb_id, m.end_dt, {seg_col}
        sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
+       sum(m.prediction_amt) AS pred_amt,
        sum(m.plan_amt - m.fact_amt) AS nedobor
 FROM {schema}.uzp_dwh_metrics m
 JOIN gmap g ON g.old_gosb_id=m.level_id
@@ -165,6 +159,7 @@ UNION ALL
 SELECT 'tb' AS level_name, m.level_id AS unit_id, tb.tb_short_name AS unit_name,
        m.level_id AS tb_id, m.end_dt, {seg_col}
        sum(m.plan_amt) AS plan_amt, sum(m.fact_amt) AS fact_amt,
+       sum(m.prediction_amt) AS pred_amt,
        sum(m.plan_amt - m.fact_amt) AS nedobor
 FROM {schema}.uzp_dwh_metrics m
 JOIN tb ON tb.tb_id = m.level_id
@@ -188,7 +183,7 @@ UNIT_TOTALS = _UNITS.replace("{seg_col}", "") \
 # причём второй выполнялся дважды на каждый ТБ. Фильтр эталонной базы перенесён в
 # pandas: выборка одна и та же, а нужны оба среза — работать можно только с
 # закреплёнными парами, но в ожидаемый отток входят и организации вне базы
-# (на тестовом ТБ это ~12% оттока), и без них детализация не сойдётся с водопадом.
+# (на тестовом ТБ это ~12% оттока), и без них детализация не сойдётся с итогом.
 #
 # EXISTS, а не JOIN: в эталонной базе несколько срезов actual_dt на одну пару.
 #
@@ -248,6 +243,67 @@ FROM {schema}.uzp_dwh_company_holding_metric c
 WHERE c.level_name = 'tb'
   AND c.report_dt = :ref_closed
   AND c.org_type = 'inn'
+"""
+
+# Закреплённый за организацией сотрудник — на грейне (ГОСБ, ИНН), по всему банку.
+#
+# Цепочка: закрепление (uzp_data_emp_epk_assignment) → ЕПК (uzp_data_epk_consolidation,
+# оттуда ИНН) → штатка (uzp_dwh_sap_staff_emp, оттуда ФИО по табельному).
+#
+# Берутся ДЕЙСТВУЮЩИЕ закрепления: end_dttm IS NULL. Заполненный end_dttm означает,
+# что закрепление уже закрыто, — по такому в отчёт приехало бы ФИО бывшего менеджера.
+#
+# Дедуп ИМЕННО на паре (new_gosb_id, ИНН), а не на epk_id: несколько ЕПК могут
+# указывать на один ИНН, и организация приехала бы в список двумя строками с разными
+# ФИО. Из нескольких закреплений пары берём ПОСЛЕДНЕЕ по start_dttm; второй ключ
+# сортировки (saphr_id) нужен только ради детерминированности при равных датах.
+#
+# ЕПК группируется по epk_id со взятием min(inn) — страховка от размножения строк,
+# если витрина придёт с историей на один ЕПК. Ключ в профиле уникален, но джойн,
+# способный задвоить список к работе, лучше обезвредить в самом запросе.
+#
+# row_number() вместо DISTINCT ON и коррелированных max(): Greenplum стоит на ядре
+# PostgreSQL 9.4 — оконные функции там есть, а диалектными конструкциями рисковать
+# незачем.
+#
+# ФИО берётся за МАКСИМАЛЬНУЮ дату штатки, где оно заполнено: в свежем срезе ФИО
+# бывает пустым, и сортировка без фильтра вернула бы пустую строку вместо имени.
+ROLE_ATTACHED = 14            # role_id закрепления «за сотрудником ведётся клиент»
+
+ORG_MANAGER = """
+WITH gmap AS (""" + _GMAP + """),
+asg AS (
+  SELECT g.new_gosb_id, a.epk_id, a.saphr_id, a.start_dttm
+  FROM {schema}.uzp_data_emp_epk_assignment a
+  JOIN gmap g ON g.old_gosb_id = a.gosb_id
+  WHERE a.role_id = :role AND a.end_dttm IS NULL
+),
+epk AS (
+  SELECT epk_id, min(inn) AS inn
+  FROM {schema}.uzp_data_epk_consolidation
+  WHERE inn IS NOT NULL
+  GROUP BY epk_id
+),
+fio AS (
+  SELECT saphr_id, fio FROM (
+    SELECT s.saphr_id, s.fio,
+           row_number() OVER (PARTITION BY s.saphr_id
+                              ORDER BY s.report_dt DESC) AS rn
+    FROM {schema}.uzp_dwh_sap_staff_emp s
+    WHERE s.fio IS NOT NULL
+  ) t WHERE t.rn = 1
+),
+pair AS (
+  SELECT a.new_gosb_id, e.inn, a.saphr_id,
+         row_number() OVER (PARTITION BY a.new_gosb_id, e.inn
+                            ORDER BY a.start_dttm DESC, a.saphr_id DESC) AS rn
+  FROM asg a
+  JOIN epk e ON e.epk_id = a.epk_id
+)
+SELECT p.new_gosb_id, p.inn, p.saphr_id, f.fio
+FROM pair p
+LEFT JOIN fio f ON f.saphr_id = p.saphr_id
+WHERE p.rn = 1
 """
 
 # Окно активностей: три КАЛЕНДАРНЫХ месяца — от первого дня месяца T-2 до конца
@@ -321,6 +377,11 @@ SELECT g.new_gosb_id, f.tb_id, f.inn,
        count(*)                                                     AS n_tasks,
        sum(CASE WHEN f.is_task_closed_success THEN 1 ELSE 0 END)    AS n_success,
        sum(CASE WHEN f.task_type='Отток' THEN 1 ELSE 0 END)         AS n_outflow,
+       -- УСПЕШНО закрытая задача ИМЕННО ПО ОТТОКУ. Отдельная колонка, а не пересечение
+       -- двух предыдущих: успешная задача о привлечении и проваленная об оттоке дали бы
+       -- «отработано», хотя отток как раз не отработан. По ней решается рычаг «Вернуть».
+       sum(CASE WHEN f.task_type='Отток' AND f.is_task_closed_success
+                THEN 1 ELSE 0 END)                                  AS n_out_success,
        bool_or(COALESCE(btrim(f.task_comment), '') <> ''
                OR COALESCE(btrim(f.task_questionnaire), '') <> '')  AS has_text
 FROM {schema}.uzp_dwh_sale_funnel_task f
@@ -424,132 +485,53 @@ WHERE f.inn = ANY(:inns)
 ORDER BY f.inn, g.new_gosb_id, f.last_active_dttm DESC NULLS LAST
 """
 
-# ==================== Прогноз на текущий месяц ============================== #
+# ==================== Отток и пайплайн ===================================== #
 
-# Ежедневный отток: сколько получателей прошлого месяца ещё НЕ зачислились, хотя
-# их выплатная дата уже прошла. Грейн (ГОСБ, ИНН).
+# ФАКТИЧЕСКИЙ отток, который НЕ ВЕРНУЛСЯ, за три ЗАКРЫТЫХ месяца (T-1, T-2, T-3).
 #
-# ТРИ правила, и все три существенны.
+# Заменяет собой и ежедневную витрину, и модель истории: отчёт больше ничего не
+# предсказывает — он показывает, сколько людей уже ушло и не вернулось.
 #
-# 1. ПОСЛЕДНЯЯ ПРОШЕДШАЯ ВЫПЛАТА, а не свёртка по обеим. У организации в месяце
-#    обычно две выплаты (аванс + основная), но outflow_unpaid_m_qty — величина
-#    НАКОПИТЕЛЬНАЯ, «с начала месяца по отчётную дату»: строка последней прошедшей
-#    выплаты уже содержит итог обеих. Поэтому берём её (rn = 1 при сортировке по
-#    payment_order_num DESC), а не min() по всем строкам, как было раньше.
-# 2. ГРАНИЦА ПО ВЫПЛАТНОЙ ДАТЕ: salary_payment_dt <= :act_dt. Выплата, дата которой
-#    ещё не наступила, оттоком быть не может — по ней просто ещё не платили.
-#    Граница — дата актуальности витрины, а НЕ current_date: отчёт умеет собираться
-#    за прошлый месяц, и тогда сегодняшняя дата дала бы картину не того периода.
-# 3. ФИЛЬТР is_d_outflow_task: в отток идут только строки, по которым витрина
-#    выставляет задачу. Пара, у которой последняя прошедшая выплата без признака,
-#    из выборки уходит ЦЕЛИКОМ — так решено сознательно. Следствие: у неё нет и
-#    paid_mtd, значит has_day=False и settled=0 (см. forecast.reconcile), и её
-#    модельный риск войдёт в прогноз целиком. Сколько таких пар — в прогрессе.
+# Порог `outflow_qty >= :out_min` — требование бизнеса: уход одного-двух человек это
+# текучка, а не потеря клиента, и разбирать её поимённо смысла нет.
 #
-# Разбиение окна — по СТАРОМУ gosb_id (грейн витрины), свёртка old -> new остаётся
-# внешнему GROUP BY. Количества людей при этом СУММИРУЮТСЯ: несколько старых ГОСБ
-# сворачиваются в один новый, и это разные бывшие отделения с разными людьми — та же
-# свёртка, что в ORGS_ALL и OUTFLOW_HIST_AGG. Средняя ЗП не количество, а ставка,
-# поэтому у неё max.
+# Возвраты приклеиваются LEFT JOIN-ом по (report_dt, gosb_id, inn) — тому же грейну,
+# на котором лежит сам отток. LEFT, а не INNER: строка без возврата означает «никто
+# не вернулся», и терять её нельзя — это как раз худший случай.
 #
-# paid_mtd / fl_prev_m нужны для стыковки с прогнозным оттоком: доля уже
-# зачислившихся показывает, сколько риска месяца уже отыграно (см. forecast.reconcile).
-# segment_name здесь КОРОТКИЙ (ММБ/КСБ/…) — это основной источник сегмента
-# организации, справочник uzp_dim_company идёт фолбэком.
-DAY_OUTFLOW = """
-WITH gmap AS (""" + _GMAP + """),
-d AS (
-  -- JOIN, а не LEFT JOIN: подразделение вне справочника (в т.ч. ЦА) отсекается прямо
-  -- здесь. При LEFT JOIN оно давало группу с new_gosb_id = NULL, которую всё равно
-  -- молча выбрасывал reconcile, — лучше отсечь в SQL, как в ORGS_ALL.
-  SELECT g.new_gosb_id, o.org_inn AS inn, o.segment_name, o.outflow_unpaid_m_qty,
-         o.fact_fl_qty, o.fl_prev_m_qty, o.m_avg_salary_amt, o.is_d_outflow_task,
-         row_number() OVER (PARTITION BY o.gosb_id, o.org_inn
-                            ORDER BY o.payment_order_num DESC) AS rn
-  FROM {schema}.uzp_dwh_day_outflow o
-  JOIN gmap g ON g.old_gosb_id = o.gosb_id
-  WHERE o.report_dt = :ref_cur AND o.act_dt = :act_dt
-    AND o.salary_payment_dt <= CAST(:act_dt AS date)
-)
-SELECT new_gosb_id, inn,
-       max(segment_name)         AS seg_day,
-       sum(outflow_unpaid_m_qty) AS out_observed,
-       sum(fact_fl_qty)          AS paid_mtd,
-       sum(fl_prev_m_qty)        AS fl_prev_m,
-       max(m_avg_salary_amt)     AS avg_salary_m
-FROM d
-WHERE rn = 1 AND is_d_outflow_task IS TRUE
-GROUP BY new_gosb_id, inn
+# GREATEST(..., 0): в витрине возврат может превысить отток (вернулись ушедшие ранее
+# окна). Отрицательный «невозврат» смысла не имеет и всё равно обнулялся бы в pandas —
+# лучше сделать это явно и в одном месте.
+#
+# Грейн результата — (ГОСБ, ИНН, месяц): помесячная разбивка нужна блоку «крупнейшие
+# оттоки», который группирует организации по месяцу ухода.
+FACT_OUTFLOW = """
+WITH gmap AS (""" + _GMAP + """)
+SELECT g.new_gosb_id, f.inn, f.report_dt,
+       max(f.segment_name)                                         AS seg_fact,
+       sum(f.outflow_qty)                                          AS out_qty,
+       sum(COALESCE(r.return_qty, 0))                              AS ret_qty,
+       sum(GREATEST(f.outflow_qty - COALESCE(r.return_qty, 0), 0)) AS out_kept,
+       max(f.m_avg_salary_amt)                                     AS avg_salary_m,
+       max(f.prev_m_fl_val)                                        AS fl_prev_m
+FROM {schema}.uzp_dwh_fact_outflow f
+JOIN gmap g ON g.old_gosb_id = f.gosb_id
+LEFT JOIN {schema}.uzp_data_outflow_return_detail r
+       ON r.report_dt = f.report_dt AND r.gosb_id = f.gosb_id AND r.inn = f.inn
+WHERE f.outflow_qty >= :out_min
+  AND f.report_dt IN (:m_out1, :m_out2, :m_out3)
+GROUP BY g.new_gosb_id, f.inn, f.report_dt
 """
 
-# Сколько пар (ГОСБ, ИНН) вообще есть в ведомости на эту дату — знаменатель к
-# DAY_OUTFLOW. Без него нельзя отличить «задач на отток нет» от «ведомости нет
-# вовсе»: обе ситуации дают ноль строк, но означают разное.
-DAY_OUTFLOW_STATS = """
-WITH gmap AS (""" + _GMAP + """),
-d AS (
-  SELECT o.gosb_id, o.org_inn, o.is_d_outflow_task,
-         row_number() OVER (PARTITION BY o.gosb_id, o.org_inn
-                            ORDER BY o.payment_order_num DESC) AS rn
-  FROM {schema}.uzp_dwh_day_outflow o
-  JOIN gmap g ON g.old_gosb_id = o.gosb_id
-  WHERE o.report_dt = :ref_cur AND o.act_dt = :act_dt
-    AND o.salary_payment_dt <= CAST(:act_dt AS date)
-)
-SELECT count(*) AS n_pairs,
-       count(*) FILTER (WHERE is_d_outflow_task) AS n_task
-FROM d WHERE rn = 1
-"""
-
-# История витрины под модель оттока: устойчивый отток два закрытых месяца подряд,
-# сезонность и переход «год назад». Свёрнута ДО ПРИЗНАКОВ МОДЕЛИ прямо в БД —
-# одна строка на пару (ГОСБ, ИНН) вместо 24 месячных строк на пару. По всему банку
-# это порядка 700 тыс. строк вместо 17 млн: сырую историю в память тянуть незачем,
-# модели нужны только агрегаты, а считаются они одинаково что здесь, что в pandas.
-#
-# sum() внутри CTE: у пары бывает несколько old_gosb_id, сворачивающихся в один
-# new_gosb_id, и это разные бывшие отделения с разными людьми — ровно та же свёртка,
-# что в ORGS_ALL и в матрице метрик.
-#
-# Порядок месяцев внутри string_agg НЕ задаём: упорядоченные агрегаты в Greenplum
-# ненадёжны, а отсортировать 13 меток в pandas стоит ничего.
-OUTFLOW_HIST_AGG = """
-WITH gmap AS (""" + _GMAP + """),
-h AS (
-  SELECT g.new_gosb_id, c.org_id AS inn,
-         CAST(date_trunc('month', c.report_dt) AS date) AS ym,
-         sum(COALESCE(c.current_fl_qty, 0)) AS fl,
-         sum(COALESCE(c.fl_outflow_qty, 0)) AS out_q
-  FROM {schema}.uzp_dwh_company_holding_metric c
-  JOIN gmap g ON g.old_gosb_id = c.level_id
-  WHERE c.level_name = 'gosb'
-    AND c.org_type   = 'inn'
-    AND c.report_dt >  CAST(:hist_from  AS date)
-    AND c.report_dt <= CAST(:ref_closed AS date)
-  GROUP BY 1, 2, 3
-)
-SELECT new_gosb_id, inn,
-       count(*) AS n_months, min(ym) AS ym_min, max(ym) AS ym_max,
-       -- база прогноза и отток двух последних закрытых месяцев
-       max(fl)    FILTER (WHERE ym = :m_closed)                  AS base_fl,
-       max(out_q) FILTER (WHERE ym = :m_closed)                  AS out_1,
-       max(out_q) FILTER (WHERE ym = :m_prev)                    AS out_2,
-       -- сезонность: средняя численность по календарным месяцам. Индекс к годовому
-       -- среднему не нужен — в отношении «прогнозный месяц / базовый» оно сокращается
-       avg(fl)                                                   AS fl_avg_all,
-       avg(fl)  FILTER (WHERE EXTRACT(MONTH FROM ym) = :mon_cur) AS fl_avg_mcur,
-       count(*) FILTER (WHERE EXTRACT(MONTH FROM ym) = :mon_cur) AS n_mcur,
-       avg(fl)  FILTER (WHERE EXTRACT(MONTH FROM ym) = :mon_cls) AS fl_avg_mcls,
-       count(*) FILTER (WHERE EXTRACT(MONTH FROM ym) = :mon_cls) AS n_mcls,
-       -- год назад: был ли отток в прогнозном месяце и вернулся ли клиент за 3 мес
-       max(out_q) FILTER (WHERE ym = :m_yoy)                     AS yoy_out,
-       max(fl)    FILTER (WHERE ym = :m_yoy)                     AS fl_yoy,
-       max(fl)    FILTER (WHERE ym = :m_yoy_prev)                AS fl_before,
-       max(fl)    FILTER (WHERE ym IN (:m_y1, :m_y2, :m_y3))     AS fl_after,
-       -- месяцы с оттоком за окно годового тренда — под блок «Портфель год к году»
-       string_agg(to_char(ym, 'YYYY-MM'), ',')
-              FILTER (WHERE out_q > 0 AND ym >= :m_out_from)     AS out_months
-FROM h GROUP BY new_gosb_id, inn
+# Знаменатель к FACT_OUTFLOW: сколько строк оттока есть всего и сколько отсекает
+# порог. Без этого «оттока мало» не отличить от «порог съел почти всё».
+FACT_OUTFLOW_STATS = """
+SELECT count(*)                                                AS n_all,
+       count(*) FILTER (WHERE outflow_qty >= :out_min)         AS n_kept,
+       sum(outflow_qty)                                        AS qty_all,
+       sum(outflow_qty) FILTER (WHERE outflow_qty >= :out_min) AS qty_kept
+FROM {schema}.uzp_dwh_fact_outflow
+WHERE report_dt IN (:m_out1, :m_out2, :m_out3)
 """
 
 # Пайплайн: сколько НП сотрудник запланировал ИМЕННО на текущий месяц.

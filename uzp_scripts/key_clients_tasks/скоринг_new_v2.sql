@@ -476,8 +476,7 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
     -- УПР -> УПР / основная / привлечение   (Excel Лист2, D2)
     ('УПР', 'УПР', 'основная', 'привлечение',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
-По клиенту в головном отделении установлена стратегия: привлечение. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK} или запросить у AI-помощника ЛИСА.
-Задача: Провести встречу с руководителем компании (срок — до {DUE}).
+По клиенту в головном отделении установлена стратегия: привлечение. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK} или запросить у AI-помощника ЛИСА.{SPLIT}Задача: Провести встречу с руководителем компании (срок — до {DUE}).
 Цель встречи:
 1. договориться о расширении сотрудничества по зарплатному проекту;
 2. выявить текущий уровень лояльности и возможные риски (неудовлетворённость сервисом, активность конкурентов);
@@ -497,8 +496,7 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
     -- УПР -> УПР / основная / удержание   (Excel Лист2, E2)
     ('УПР', 'УПР', 'основная', 'удержание',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
-По клиенту в головном отделении установлена стратегия: удержание. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK} или запросить у AI-помощника ЛИСА.
-Задача: Провести встречу с руководителем компании (срок — до {DUE}).
+По клиенту в головном отделении установлена стратегия: удержание. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK} или запросить у AI-помощника ЛИСА.{SPLIT}Задача: Провести встречу с руководителем компании (срок — до {DUE}).
 Цель встречи:
 1. выявить текущий уровень лояльности и возможные риски (неудовлетворённость сервисом, активность конкурентов);
 2. подтвердить намерения клиента по сохранению объёмов зачислений заработной платы и кол-ва получателей на действующем уровне;
@@ -518,8 +516,7 @@ insert into tmp_task_tmpl (eff_role, task_role, task_type, strategy, tmpl_text) 
     -- УПР -> УПР / основная / отток   (Excel Лист2, F2)
     ('УПР', 'УПР', 'основная', 'отток',
      'Компания {COMPANY} ({INN}). ГОСБ №{GOSB}
-По клиенту в головном отделении зафиксированы риски, установлена стратегия: отток. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK} или запросить у AI-помощника ЛИСА.
-Задача: Провести встречу с руководителем компании (срок — до {DUE}).
+По клиенту в головном отделении зафиксированы риски, установлена стратегия: отток. {FACTS_A} Более подробную информацию можно изучить в Карточке клиента в АС Навигатор {LINK} или запросить у AI-помощника ЛИСА.{SPLIT}Задача: Провести встречу с руководителем компании (срок — до {DUE}).
 Цель встречи:
 1. поддержать конструктивные отношения для сохранения оставшихся объёмов сотрудничества;
 2. выявить наличие новых рисков дальнейшего сокращения;
@@ -1031,69 +1028,84 @@ filled as (
              else 'При возникновении вопросов по задаче просьба обращаться к '
                   || parts.mkk_ca_fio || ', Управление зарплатных проектов (ЦА)' end as mkk_ca_text2
     from parts
+),
+--- Готовый текст задачи. Вынесен в отдельный CTE, потому что ниже он режется
+--- на две части: считать цепочку replace дважды не нужно.
+rendered as (
+    select
+        filled.*,
+        replace(
+        replace(
+        replace(
+        replace(
+        replace(
+        replace(
+        replace(
+        replace(
+        replace(
+        replace(
+        replace(tmpl.tmpl_text,
+            '{FACTS_A}',  filled.facts_a),
+            '{FACTS_B}',  filled.facts_b),
+            --- если фразу про Потенциал/Портфель вырезали, на её месте остаётся
+            --- пробел-разделитель из шаблона — схлопываем. В исходных текстах Excel
+            --- двойных пробелов нет, а company_name и ссылки подставляются ниже,
+            --- поэтому схлопывание задевает только этот артефакт.
+            '  ', ' '),
+            '{COMPANY}',  filled.company_name),
+            '{INN}',      filled.inn::text),
+            '{GOSB}',     filled.gosb_id::text),
+            '{LINK}',     filled.navigator_link),
+            '{DUE}',      to_char(filled.task_due_dt, 'DD.MM.YYYY')),
+            '{MKK_CA2}',  filled.mkk_ca_text2),
+            '{MKK_CA}',   filled.mkk_ca_text),
+            '{TRIGGERS}', filled.triggers_text) as full_text
+    from
+        filled
+    inner join
+        tmp_task_tmpl tmpl
+            on tmpl.eff_role = filled.eff_role
+            and tmpl.task_role = filled.task_role
+            and tmpl.task_type = filled.task_type
+            and tmpl.strategy = filled.inn_in_gosb_strategy
 )
 select
-    filled.report_dt,
-    filled.tb_id,
-    filled.gosb_id,
-    filled.inn,
-    filled.company_name,
-    filled.desk_nm,
-    filled.inn_status_name,
-    filled.inn_in_gosb_strategy,
-    filled.org_fixed_role,
-    filled.eff_role,
-    filled.task_role,
-    filled.task_type,
-    filled.is_task_set,
-    filled.task_due_dt,
-    filled.current_fl_qty,
-    filled.fl_potential_qty,
-    filled.current_fot_amt,
-    filled.outflow_fl,
-    filled.contact_flag,
-    filled.last_contact_dttm,
-    filled.outflow_risk_coef,
-    filled.extension_coef,
-    filled.outflow_coef,
-    filled.portfel_coef,
-    filled.potential_coef,
-    filled.strategy_coef,
-    filled.final_coef,
-    filled.rn_final_coef,
-    filled.mkk_ca_saphr_id,
-    replace(
-    replace(
-    replace(
-    replace(
-    replace(
-    replace(
-    replace(
-    replace(
-    replace(
-    replace(
-    replace(tmpl.tmpl_text,
-        '{FACTS_A}',  filled.facts_a),
-        '{FACTS_B}',  filled.facts_b),
-        --- если фразу про Потенциал/Портфель вырезали, на её месте остаётся
-        --- пробел-разделитель из шаблона — схлопываем. В исходных текстах Excel
-        --- двойных пробелов нет, а company_name и ссылки подставляются ниже,
-        --- поэтому схлопывание задевает только этот артефакт.
-        '  ', ' '),
-        '{COMPANY}',  filled.company_name),
-        '{INN}',      filled.inn::text),
-        '{GOSB}',     filled.gosb_id::text),
-        '{LINK}',     filled.navigator_link),
-        '{DUE}',      to_char(filled.task_due_dt, 'DD.MM.YYYY')),
-        '{MKK_CA2}',  filled.mkk_ca_text2),
-        '{MKK_CA}',   filled.mkk_ca_text),
-        '{TRIGGERS}', filled.triggers_text) as task_text
+    rendered.report_dt,
+    rendered.tb_id,
+    rendered.gosb_id,
+    rendered.inn,
+    rendered.company_name,
+    rendered.desk_nm,
+    rendered.inn_status_name,
+    rendered.inn_in_gosb_strategy,
+    rendered.org_fixed_role,
+    rendered.eff_role,
+    rendered.task_role,
+    rendered.task_type,
+    rendered.is_task_set,
+    rendered.task_due_dt,
+    rendered.current_fl_qty,
+    rendered.fl_potential_qty,
+    rendered.current_fot_amt,
+    rendered.outflow_fl,
+    rendered.contact_flag,
+    rendered.last_contact_dttm,
+    rendered.outflow_risk_coef,
+    rendered.extension_coef,
+    rendered.outflow_coef,
+    rendered.portfel_coef,
+    rendered.potential_coef,
+    rendered.strategy_coef,
+    rendered.final_coef,
+    rendered.rn_final_coef,
+    rendered.mkk_ca_saphr_id,
+    --- У основной задачи Упр шаблон разрезан маркером {SPLIT}: карточка клиента
+    --- (до ссылки на АС Навигатор включительно) уходит в task_text, блок
+    --- «Задача: …» — в task_reason. У остальных ролей маркера в шаблоне нет:
+    --- split_part вернёт текст целиком, а вторая часть будет пустой строкой,
+    --- которую nullif превращает в NULL.
+    split_part(rendered.full_text, '{SPLIT}', 1)             as task_text,
+    nullif(split_part(rendered.full_text, '{SPLIT}', 2), '') as task_reason
 from
-    filled
-inner join
-    tmp_task_tmpl tmpl
-        on tmpl.eff_role = filled.eff_role
-        and tmpl.task_role = filled.task_role
-        and tmpl.task_type = filled.task_type
-        and tmpl.strategy = filled.inn_in_gosb_strategy
+    rendered
 distributed by (inn);

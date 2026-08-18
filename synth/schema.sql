@@ -16,6 +16,11 @@ DROP TABLE IF EXISTS uzp_dwh_sale_funnel_task CASCADE;
 DROP TABLE IF EXISTS uzp_dim_company CASCADE;
 DROP TABLE IF EXISTS uzp_dim_mzp_reference_base CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_day_outflow CASCADE;
+DROP TABLE IF EXISTS uzp_dwh_fact_outflow CASCADE;
+DROP TABLE IF EXISTS uzp_data_outflow_return_detail CASCADE;
+DROP TABLE IF EXISTS uzp_data_emp_epk_assignment CASCADE;
+DROP TABLE IF EXISTS uzp_data_epk_consolidation CASCADE;
+DROP TABLE IF EXISTS uzp_dwh_sap_staff_emp CASCADE;
 DROP TABLE IF EXISTS uzp_data_mzp_motivation_detail_corr CASCADE;
 DROP TABLE IF EXISTS __SCHEMA_T__.yva_pl_task_deal_code CASCADE;
 
@@ -193,60 +198,6 @@ CREATE TABLE uzp_dim_mzp_reference_base (
   author_login   text
 );
 
--- ============ Ежедневный отток ============
--- Витрина хранит ВСЕ месяцы: у каждого свой report_dt (конец месяца) и свой act_dt
--- (максимальная дата ЗП-зачислений в дневной ведомости). По умолчанию дэш берёт
--- САМЫЙ СВЕЖИЙ месяц (ref_cur = max(report_dt), ref_closed = ref_cur - 1 мес), но
--- отчёт можно пересобрать и за прошлый период — тогда месяц задаётся параметром
--- report_month, а act_dt берётся именно за него (запрос ACT_DT_FOR).
--- Грейн: (report_dt, act_dt, gosb_id, org_inn, payment_order_num) — по строке на
--- каждую выплатную дату месяца (обычно аванс + основная).
--- outflow_unpaid_m_qty — ФЛ, не получившие выплату с начала месяца по act_dt,
--- т.е. те, кто на эту дату уже должен был зачислиться, но не зачислился.
-
-CREATE TABLE uzp_dwh_day_outflow (
-  row_code                         varchar,     -- report_dt_act_dt_gosb_inn_order
-  report_dt                        date,        -- отчётный месяц (конец месяца)
-  act_dt                           date,        -- по какую дату есть факт зачислений
-  tb_id                            integer,
-  gosb_id                          integer,
-  org_inn                          bigint,
-  segment_name                     varchar,     -- КОРОТКОЕ имя сегмента (ММБ/КСБ/…)
-  company_name                     varchar,
-  holding_name                     varchar,
-  is_security_force                boolean,
-  saphr_id                         bigint,
-  salary_payment_dt                date,        -- дата ЗП-выплаты этой строки
-  payment_order_num                smallint,    -- порядковый номер выплаты в месяце
-  expect_fl_qty                    integer,
-  overflow_qty                     integer,
-  plan_fl_qty                      integer,
-  fl_day_qty                       integer,
-  fl_2_d_qty                       integer,
-  fact_fl_qty                      integer,     -- получили выплату с начала месяца по act_dt
-  outflow_unpaid_report_qty        integer,
-  outflow_unpaid_2_d_qty           integer,
-  outflow_unpaid_m_qty             integer,     -- ключевая метрика оттока месяца
-  outflow_day_perc                 numeric,
-  outflow_2_d_perc                 numeric,
-  outflow_unpaid_m_perc            numeric,
-  overflow_other_inn_perc          numeric,
-  m_avg_salary_amt                 numeric,     -- средняя ЗП в текущем месяце
-  prev_m_avg_salary_amt            numeric,
-  next_m_avg_salary_amt            numeric,
-  fl_crnt_m_qty                    integer,
-  fl_prev_m_qty                    integer,     -- ФЛ в предыдущем (закрытом) месяце
-  fl_next_m_qty                    integer,
-  is_d_outflow_task                boolean,
-  client_communication_infopovod   varchar,
-  is_oktmo                         boolean,
-  oktmo_subject_code               varchar,
-  oktmo_subject_district_code      varchar,
-  oktmo_subject_district_city_code varchar,
-  oktmo_code                       varchar,
-  inserted_dttm                    timestamp,
-  author_login                     text
-);
 
 -- ============ Месячный факт оттока (отдельная витрина) ============
 -- Дэш tb_health её не использует: модель оттока он строит по
@@ -279,6 +230,91 @@ CREATE TABLE uzp_dwh_fact_outflow (
   next_m_fl_val        integer,    -- смотрит ВПЕРЁД: forecast_lab её не читает
   is_task              boolean,
   inserted_dttm        timestamp
+);
+
+-- ============ Возвраты оттока ============
+-- Кто из ушедших вернулся. Грейн тот же, что у uzp_dwh_fact_outflow, связь —
+-- (report_dt, gosb_id, inn). Дэш считает «отток, который НЕ вернулся»:
+--     outflow_qty − COALESCE(return_qty, 0)
+-- Поэтому строки здесь обязаны ссылаться на реально существующие строки оттока;
+-- сгенерированные независимо, они дали бы пустой join и молча нулевой блок.
+
+CREATE TABLE uzp_data_outflow_return_detail (
+  report_dt                 date,
+  tb_id                     integer,
+  gosb_id                   integer,
+  inn                       bigint,
+  segment_name              varchar,
+  is_outflow_task           boolean,
+  outflow_qty               integer,   -- сколько ушло (копия строки оттока)
+  is_outflow_return_success boolean,
+  return_qty                integer,   -- сколько из них вернулось, <= outflow_qty
+  inserted_dttm             timestamp
+);
+
+-- ============ Справочники сотрудников и ЕПК ============
+-- Дэшем пока НЕ используются: заведены под будущие разрезы (закрепление
+-- сотрудника за клиентом, консолидированная карточка ЕПК, штатное расписание).
+-- Наполняются минимально-правдоподобно, чтобы схема открытого контура совпадала
+-- с промом и запросы к ним не падали на «нет такой таблицы».
+
+CREATE TABLE uzp_data_emp_epk_assignment (
+  epk_id            bigint,
+  saphr_id          bigint,
+  post_id           bigint,
+  pos_id            bigint,
+  role_id           integer,
+  start_dttm        timestamp,
+  end_dttm          timestamp,
+  balance_unit_code varchar,
+  tb_id             integer,
+  gosb_id           integer,
+  gosb_code         varchar,
+  sap_gosb_code     varchar,
+  vsp_code          varchar,
+  modified_dttm     timestamp
+);
+
+CREATE TABLE uzp_data_epk_consolidation (
+  epk_id           bigint,
+  epk_create_dttm  timestamp,
+  client_type_id   integer,
+  client_type_name varchar,
+  industry_id      integer,
+  industry_name    varchar,
+  inn              bigint,
+  kpp              varchar,
+  ogrn             varchar,
+  okato            varchar,
+  oktmo            varchar,
+  old_epk_id       bigint,
+  segment_id       integer,
+  segment_name     varchar,
+  tb_id            integer,
+  gosb_id          integer,
+  full_name        varchar,
+  short_name       varchar,
+  is_active        boolean,
+  inserted_dttm    timestamp
+);
+
+CREATE TABLE uzp_dwh_sap_staff_emp (
+  report_dt               date,
+  saphr_id                bigint,
+  fio                     varchar,
+  post_id                 bigint,
+  post_name               varchar,
+  pos_id                  bigint,
+  pos_name                varchar,
+  tb_code                 varchar,
+  tb_id                   integer,
+  gosb_code               varchar,
+  sap_gosb_code           varchar,
+  gosb_id                 integer,
+  city                    varchar,
+  post_total_experience_ym numeric,
+  is_actual               boolean,
+  inserted_dttm           timestamp
 );
 
 -- ============ Пайплайн: помесячная раскладка плана привлечения ============
@@ -350,5 +386,6 @@ CREATE INDEX ix_funnel_inn ON uzp_dwh_sale_funnel_task (inn);
 CREATE INDEX ix_gosb_tb ON uzp_dim_gosb (tb_id);
 CREATE INDEX ix_ref_base ON uzp_dim_mzp_reference_base (gosb_id, inn);
 CREATE INDEX ix_chm_hist ON uzp_dwh_company_holding_metric (org_id, level_id, report_dt);
-CREATE INDEX ix_day_outflow ON uzp_dwh_day_outflow (report_dt, act_dt, gosb_id);
 CREATE INDEX ix_motiv ON uzp_data_mzp_motivation_detail_corr (tb_id, metric_id, report_dt);
+CREATE INDEX ix_fact_outflow ON uzp_dwh_fact_outflow (report_dt, gosb_id, inn);
+CREATE INDEX ix_outflow_return ON uzp_data_outflow_return_detail (report_dt, gosb_id, inn);

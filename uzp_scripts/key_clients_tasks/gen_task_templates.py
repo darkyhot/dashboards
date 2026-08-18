@@ -75,11 +75,22 @@ def main() -> None:
     ws = openpyxl.load_workbook(SRC, data_only=True)["Лист2"]
     out = []
     left = set()
+    split_rows = 0
     for row, eff_role, task_role, task_type in ROWS:
         for strategy, col in STRAT_COL.items():
             raw = ws[f"{col}{row}"].value
             assert raw, f"пустая ячейка {col}{row}"
             tokenized = tokenize(str(raw))
+            # Основная задача Упр отдаётся потребителю двумя полями: карточка
+            # клиента в task_text, блок «Задача: …» в task_reason. Маркер ставим
+            # вместо переноса строки — он и будет разделителем для split_part().
+            if (eff_role, task_role) == ("УПР", "УПР"):
+                tokenized, n = re.subn(r"\nЗадача:", "{SPLIT}Задача:", tokenized, count=1)
+                assert n == 1, f"не найдено начало блока «Задача:» в {col}{row}"
+                split_rows += 1
+            assert tokenized.count("{SPLIT}") == (
+                1 if (eff_role, task_role) == ("УПР", "УПР") else 0
+            ), f"неверное число маркеров {{SPLIT}} в {col}{row}"
             left.update(re.findall(r"\[[^\]]*\]", tokenized))
             out.append(
                 f"    -- {eff_role} -> {task_role} / {task_type} / {strategy}"
@@ -88,6 +99,7 @@ def main() -> None:
                 f"     '{tokenized.replace(chr(39), chr(39) * 2)}')"
             )
     assert not left, f"необработанные плейсхолдеры: {left}"
+    assert split_rows == len(STRAT_COL), f"маркер проставлен в {split_rows} шаблонах вместо 3"
     print(",\n".join(out))
 
 

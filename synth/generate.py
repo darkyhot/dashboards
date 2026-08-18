@@ -48,17 +48,13 @@ FUNNEL_END = MAX_MONTH_END + pd.offsets.MonthEnd(1)   # 2026-07-31
 
 # --- Текущий (незакрытый) месяц: на него дэш строит ПРОГНОЗ ---
 CUR_MONTH_END = FUNNEL_END                            # 2026-07-31
-# Дата актуальности ежедневной витрины: по какое число есть факт зачислений
-ACT_DT = CUR_MONTH_END - pd.Timedelta(days=5)         # 2026-07-26
-# Доля месяца, которая уже прошла — столько же риска оттока уже отыграно
-MONTH_ELAPSED = ACT_DT.day / CUR_MONTH_END.day
+# Какая доля текущего месяца уже прошла: столько же факта привлечения успело прийти.
+# Нужна ТОЛЬКО генератору мотивации — дэш долями месяца больше не оперирует.
+MONTH_ELAPSED = (CUR_MONTH_END.day - 5) / CUR_MONTH_END.day
 # Сезонное окно организаций-«сезонников» начинается С ПРОГНОЗНОГО месяца: иначе
 # база (июнь) и прогноз (июль) лежат в одной фазе сезона и сезонной дельты нет.
 SEASON_MONTHS = (7, 8, 9)
 SEASON_UP, SEASON_DOWN = 1.40, 0.60
-# Ежедневная витрина оттока хранит ВСЕ месяцы, а не только текущий: без этого не
-# проверить пересборку отчёта за прошлый месяц. Закрытые месяцы отдаются целиком.
-DAY_OUTFLOW_MONTHS = 4
 # Частичная ЗП-ведомость текущего месяца: этот факт в дэше НЕ используется
 # (в этом и смысл прогноза), но в витрине он есть — как на проме.
 PARTIAL_FACT_SHARE = 0.62
@@ -77,6 +73,17 @@ FUTURE_MONTH_NAME = ("январе феврале марте апреле мае
                      "октябре ноябре декабре").split()[_NEXT_MONTH.month - 1]
 ORGS_TOTAL = 4000
 
+# --- Закрепление сотрудников за организациями (uzp_data_emp_epk_assignment) ---
+# Дэш читает ДЕЙСТВУЮЩИЕ закрепления роли 14 и берёт последнее по start_dttm.
+# Доли ниже нужны, чтобы синтетика содержала все случаи этого отбора.
+ASSIGN_ROLE = 14              # роль «клиент закреплён за сотрудником» — её читает дэш
+ASSIGN_OTHER_ROLE = 6         # любая другая роль: должна отсекаться фильтром
+ASSIGN_NONE_SHARE = 0.12      # доля пар (ГОСБ, орг) вовсе без закрепления → прочерк
+ASSIGN_MULTI_SHARE = 0.25     # доля пар с ДВУМЯ действующими закреплениями подряд
+ASSIGN_OTHER_ROLE_SHARE = 0.15  # доля пар, где есть свежее закрепление чужой роли
+STAFF_SLICES = 3              # срезов штатки (месяцев) на сотрудника
+STAFF_NO_FIO_SHARE = 0.10     # доля сотрудников без ФИО в САМОМ СВЕЖЕМ срезе
+
 
 # --------------------------------------------------------------------------- #
 def generate_all(engine: Engine) -> dict[str, int]:
@@ -88,10 +95,12 @@ def generate_all(engine: Engine) -> dict[str, int]:
     funnel = _funnel(orgs, gosb)
     pipeline = _pipeline(funnel, orgs)
     motivation = _motivation(funnel, pipeline, orgs)
-    day_outflow = _day_outflow(orgs, profiles)
-    # План текущего месяца выводится ИЗ прогноза, поэтому считается последним
-    metrics_cur = _metrics_current(orgs, latest, company, funnel, pipeline,
-                                   day_outflow, motivation)
+    fact_out = _fact_outflow(company, orgs)
+    returns = _outflow_return(fact_out)
+    # Прогноз и план текущего месяца выводятся из фактического оттока и пайплайна,
+    # поэтому считаются последними — после того, как эти таблицы построены
+    metrics_cur = _metrics_current(orgs, latest, fact_out, returns, funnel, pipeline,
+                                   motivation)
     metrics = pd.concat([metrics, metrics_cur], ignore_index=True)
     ref_base = _reference_base(orgs, gosb)
 
@@ -100,10 +109,12 @@ def generate_all(engine: Engine) -> dict[str, int]:
     counts["uzp_dim_mzp_reference_base"] = _bulk(engine, ref_base, "uzp_dim_mzp_reference_base")
     counts["uzp_dwh_metrics"] = _bulk(engine, metrics, "uzp_dwh_metrics")
     counts["uzp_dwh_company_holding_metric"] = _bulk(engine, company, "uzp_dwh_company_holding_metric")
-    counts["uzp_dwh_fact_outflow"] = _bulk(engine, _fact_outflow(company, orgs),
-                                           "uzp_dwh_fact_outflow")
+    counts["uzp_dwh_fact_outflow"] = _bulk(engine, fact_out, "uzp_dwh_fact_outflow")
+    counts["uzp_data_outflow_return_detail"] = _bulk(
+        engine, returns, "uzp_data_outflow_return_detail")
+    for table, frame in _epk_staff(orgs, funnel).items():
+        counts[table] = _bulk(engine, frame, table)
     counts["uzp_dwh_sale_funnel_task"] = _bulk(engine, funnel, "uzp_dwh_sale_funnel_task")
-    counts["uzp_dwh_day_outflow"] = _bulk(engine, day_outflow, "uzp_dwh_day_outflow")
     counts["yva_pl_task_deal_code"] = _bulk(engine, pipeline, "yva_pl_task_deal_code",
                                             schema=config.SCHEMA_T)
     counts["uzp_data_mzp_motivation_detail_corr"] = _bulk(
@@ -243,18 +254,32 @@ def _level_frames(tidy: pd.DataFrame) -> list:
 def _agg(tidy: pd.DataFrame, level_field: str, level_name: str, by_segment: bool) -> pd.DataFrame:
     """Свернуть tidy до уровня (gosb|tb) × (сегмент|all) и развернуть в 2 метрики."""
     keys = [level_field, "start_dt", "end_dt"] + (["seg_id"] if by_segment else [])
-    a = tidy.groupby(keys, as_index=False).agg(
-        plan_r=("plan_r", "sum"), fact_r=("fact_r", "sum"),
-        fot_plan=("fot_plan", "sum"), fot_fact=("fot_fact", "sum"))
+    spec = dict(plan_r=("plan_r", "sum"), fact_r=("fact_r", "sum"),
+                fot_plan=("fot_plan", "sum"), fot_fact=("fot_fact", "sum"))
+    # прогноз есть только у незакрытого месяца — на закрытых его в витрине нет
+    if "pred_r" in tidy:
+        spec["pred_r"] = ("pred_r", "sum")
+        spec["pred_fot"] = ("pred_fot", "sum")
+    a = tidy.groupby(keys, as_index=False).agg(**spec)
     a["extended_dim_1"] = a["seg_id"] if by_segment else 1
 
-    rec = _rows(a, METRIC_RECIPIENTS, level_name, level_field, "plan_r", "fact_r")
-    fot = _rows(a, METRIC_FOT, level_name, level_field, "fot_plan", "fot_fact")
+    rec = _rows(a, METRIC_RECIPIENTS, level_name, level_field, "plan_r", "fact_r",
+                "pred_r")
+    fot = _rows(a, METRIC_FOT, level_name, level_field, "fot_plan", "fot_fact",
+                "pred_fot")
     return pd.concat([rec, fot], ignore_index=True)
 
 
 def _rows(a: pd.DataFrame, metric_id: int, level_name: str,
-          level_field: str, plan_col: str, fact_col: str) -> pd.DataFrame:
+          level_field: str, plan_col: str, fact_col: str,
+          pred_col: str | None = None) -> pd.DataFrame:
+    """Строки витрины метрик. `pred_col` — прогноз, если он для месяца известен.
+
+    Прогноз проставляется ТОЛЬКО у незакрытого месяца, как на проме (там
+    prediction_amt заполнен менее чем у трети строк). Дэш берёт прогноз именно
+    отсюда — считать его самостоятельно он больше не умеет.
+    """
+    pred = a[pred_col] if pred_col and pred_col in a else None
     df = pd.DataFrame({
         "metric_id": metric_id,
         "start_dt": a["start_dt"], "end_dt": a["end_dt"],
@@ -264,7 +289,9 @@ def _rows(a: pd.DataFrame, metric_id: int, level_name: str,
         "period_type": "m",
         "plan_amt": a[plan_col].round(3), "fact_amt": a[fact_col].round(3),
         "execution_percent": (a[fact_col] / a[plan_col]).round(6),
-        "prediction_amt": None, "prediction_percent": None,
+        "prediction_amt": pred.round(3) if pred is not None else None,
+        "prediction_percent": ((pred / a[plan_col]).round(6)
+                               if pred is not None else None),
         "modified_dttm": pd.Timestamp.now(),
         "extended_dim_1": a["extended_dim_1"].astype(int),
     })
@@ -452,6 +479,152 @@ def _fact_outflow(company: pd.DataFrame, orgs: pd.DataFrame) -> pd.DataFrame:
     })
 
 
+def _outflow_return(fact_out: pd.DataFrame) -> pd.DataFrame:
+    """Возвраты оттока — СТРОГО из строк уже сгенерированного оттока.
+
+    Дэш считает «отток, который не вернулся»: outflow_qty − COALESCE(return_qty, 0)
+    с join по (report_dt, gosb_id, inn). Если бы возвраты рисовались независимо,
+    join не сошёлся бы ни на одной строке, блок молча показывал бы весь отток
+    невозвращённым, и на синтетике это выглядело бы правдоподобно — а на проме нет.
+
+    Возврат ставим примерно трети строк с заметным оттоком и всегда неполный:
+    полный возврат означал бы, что работать не с кем, и список организаций опустел.
+    """
+    src = fact_out[fact_out["outflow_qty"] >= 1].copy()
+    if src.empty:
+        return src.iloc[:0]
+    take = RNG.random(len(src)) < 0.35
+    r = src[take].copy()
+    out = r["outflow_qty"].to_numpy(dtype=float)
+    # возвращается от 20% до 90% ушедших, но не меньше одного и не весь отток
+    back = np.rint(out * RNG.uniform(0.2, 0.9, len(r)))
+    back = np.clip(back, 1, np.maximum(out - 1, 1))
+    return pd.DataFrame({
+        "report_dt": r["report_dt"].to_numpy(),
+        "tb_id": r["tb_id"].to_numpy(),
+        "gosb_id": r["gosb_id"].to_numpy(),
+        "inn": r["inn"].to_numpy(),
+        "segment_name": r["segment_name"].to_numpy(),
+        "is_outflow_task": True,
+        "outflow_qty": out.astype(int),
+        "is_outflow_return_success": True,
+        "return_qty": back.astype(int),
+        "inserted_dttm": pd.Timestamp.now(),
+    })
+
+
+def _epk_staff(orgs: pd.DataFrame, funnel: pd.DataFrame) -> dict:
+    """Справочники ЕПК, штатки и закрепления сотрудников за организациями.
+
+    Наполняются от уже существующих сущностей — организаций и авторов задач
+    воронки, — иначе это были бы три таблицы случайных чисел, ни с чем в синтетике
+    не связанные.
+
+    Из этих трёх таблиц дэш собирает ФИО закреплённого сотрудника для списка к
+    работе (`queries.ORG_MANAGER`), поэтому синтетика обязана содержать ровно те
+    случаи, которые запрос разбирает: закрытые закрепления, чужие роли, несколько
+    закреплений на одну пару и сотрудников с пустым ФИО в самом свежем срезе
+    штатки. Без них запрос отработал бы, не проверив ни одного своего правила.
+    """
+    o = orgs.drop_duplicates("inn")
+    epk_of = {int(i): 900_000_000 + n for n, i in enumerate(o["inn"].astype("int64"))}
+    epk = pd.DataFrame({
+        "epk_id": [epk_of[int(i)] for i in o["inn"]],
+        "epk_create_dttm": pd.Timestamp("2020-01-01"),
+        "client_type_id": 1, "client_type_name": "ЮЛ",
+        "industry_id": RNG.integers(1, 40, len(o)),
+        "industry_name": "Отрасль",
+        "inn": o["inn"].astype("int64").to_numpy(),
+        "kpp": None, "ogrn": None, "okato": None, "oktmo": None, "old_epk_id": None,
+        "segment_id": 0, "segment_name": o["segment_name"].to_numpy(),
+        "tb_id": o["tb_id"].astype(int).to_numpy(),
+        "gosb_id": o["gosb_id"].astype(int).to_numpy(),
+        "full_name": [f"Организация {int(i)}" for i in o["inn"]],
+        "short_name": [f"Орг. {int(i)}" for i in o["inn"]],
+        "is_active": True, "inserted_dttm": pd.Timestamp.now(),
+    })
+
+    # сотрудники — авторы задач воронки: другого источника табельных в синтетике нет
+    au = (funnel[["isu_struct_saphr_id", "tb_id", "gosb_id"]]
+          .dropna(subset=["isu_struct_saphr_id"])
+          .drop_duplicates("isu_struct_saphr_id")
+          .reset_index(drop=True))
+    fio_of = {int(s): FAKE.name()
+              for s in au["isu_struct_saphr_id"].astype("int64")}
+    # Штатка приходит СРЕЗАМИ: у сотрудника несколько строк на разные даты. Часть
+    # сотрудников в самом свежем срезе без ФИО — дэш обязан взять имя с предыдущей
+    # даты, а не пустую строку из максимальной.
+    no_fio = {int(s) for s in au["isu_struct_saphr_id"].astype("int64")
+              if RNG.random() < STAFF_NO_FIO_SHARE}
+    staff_rows = []
+    for k in range(STAFF_SLICES):
+        dt = (MAX_MONTH_END - pd.offsets.MonthEnd(k)).date()
+        for r in au.itertuples():
+            sid = int(r.isu_struct_saphr_id)
+            staff_rows.append({
+                "report_dt": dt,
+                "saphr_id": sid,
+                "fio": None if (k == 0 and sid in no_fio) else fio_of[sid],
+                "post_id": None, "post_name": "Клиентский менеджер",
+                "pos_id": None, "pos_name": "Менеджер",
+                "tb_code": None, "tb_id": int(r.tb_id),
+                "gosb_code": None, "sap_gosb_code": None,
+                "gosb_id": int(r.gosb_id),
+                "city": None,
+                "post_total_experience_ym": None,
+                "is_actual": k == 0, "inserted_dttm": pd.Timestamp.now(),
+            })
+    staff = pd.DataFrame(staff_rows)
+
+    # Закрепление — на грейне (ГОСБ, организация), а не на организации: та же
+    # компания в соседнем ГОСБ ведётся другим сотрудником, и дэш ищет закрепление
+    # именно по паре.
+    by_gosb: dict = {}
+    for sid, gid in zip(staff["saphr_id"], staff["gosb_id"]):
+        pool = by_gosb.setdefault(int(gid), [])
+        if int(sid) not in pool:
+            pool.append(int(sid))
+    base = pd.Timestamp("2024-01-01")
+    rows = []
+
+    def _asg(inn, tb, gid, sid, start, end, role):
+        rows.append({
+            "epk_id": epk_of[int(inn)], "saphr_id": int(sid),
+            "post_id": None, "pos_id": None, "role_id": int(role),
+            "start_dttm": start, "end_dttm": end,
+            "balance_unit_code": None,
+            "tb_id": int(tb), "gosb_id": int(gid),
+            "gosb_code": None, "sap_gosb_code": None, "vsp_code": None,
+            "modified_dttm": pd.Timestamp.now(),
+        })
+
+    for r in orgs.drop_duplicates(["gosb_id", "inn"]).itertuples():
+        pool = by_gosb.get(int(r.gosb_id))
+        if not pool:
+            continue
+        # часть пар вовсе без закрепления — в отчёте у них должен стоять прочерк
+        if RNG.random() < ASSIGN_NONE_SHARE:
+            continue
+        pick = lambda: int(RNG.choice(pool))            # noqa: E731
+        # закрытое закрепление: у него заполнен end_dttm, и в отчёт оно идти не должно
+        _asg(r.inn, r.tb_id, r.gosb_id, pick(),
+             base, base + pd.Timedelta(days=200), ASSIGN_ROLE)
+        # действующее закрепление нужной роли
+        n_act = 2 if RNG.random() < ASSIGN_MULTI_SHARE else 1
+        for k in range(n_act):
+            _asg(r.inn, r.tb_id, r.gosb_id, pick(),
+                 base + pd.Timedelta(days=300 + 90 * k), None, ASSIGN_ROLE)
+        # чужая роль, причём СВЕЖЕЕ всех остальных: если фильтр роли забыть, в отчёт
+        # приедет именно этот сотрудник — ошибка станет заметной сразу
+        if RNG.random() < ASSIGN_OTHER_ROLE_SHARE:
+            _asg(r.inn, r.tb_id, r.gosb_id, pick(),
+                 base + pd.Timedelta(days=900), None, ASSIGN_OTHER_ROLE)
+
+    return {"uzp_data_epk_consolidation": epk,
+            "uzp_dwh_sap_staff_emp": staff,
+            "uzp_data_emp_epk_assignment": pd.DataFrame(rows)}
+
+
 def _company_holding(orgs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Витрина по организациям за MONTHS месяцев (нужна модели прогноза оттока).
 
@@ -581,101 +754,6 @@ def _company_holding(orgs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     })
     return pd.concat([df, samp] + upper, ignore_index=True), profiles
 
-
-def _day_outflow(orgs: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
-    """Ежедневная витрина оттока за DAY_OUTFLOW_MONTHS месяцев.
-
-    Витрина хранит ВСЕ месяцы, а не только текущий, — иначе не проверить сценарий
-    «пересобрать отчёт за прошлый месяц». Закрытые месяцы отдаются целиком
-    (act_dt = конец месяца), текущий — частично (act_dt = ACT_DT).
-
-    Строка на каждую ПРОШЕДШУЮ выплатную дату месяца (аванс + основная). У аванса
-    неоплаченных больше, поэтому min(outflow_unpaid_m_qty) по двум датам — это и
-    есть «отток по итогу обеих дат зачисления», как считает бизнес.
-
-    Намеренно воспроизводим оба кейса стыковки прогноза и факта:
-      * у части организаций с сильным прогнозным оттоком факт ≈ 0 — прогноз не
-        оправдался, почти все уже зачислились;
-      * у части ровных, наоборот, крупный наблюдаемый отток, которого модель не ждала.
-    У ~30% организаций прошёл только аванс — на них проверяется остаточный риск.
-    """
-    o = orgs.merge(profiles, on=["inn", "gosb_id"], how="left")
-    rows = []
-    months = [(CUR_MONTH_END.to_period("M") - k).to_timestamp("M")
-              for k in range(DAY_OUTFLOW_MONTHS - 1, -1, -1)]
-    for month_end in months:
-        is_cur = month_end.to_period("M") == CUR_MONTH_END.to_period("M")
-        act = ACT_DT if is_cur else month_end
-        for r in o.itertuples():
-            fl_prev = int(r.current_fl_qty)
-            kind = r.kind if isinstance(r.kind, str) else "flat"
-            u = float(RNG.random())
-            if kind in ("persistent", "season_out"):
-                observed = (int(RNG.integers(0, 4)) if u < 0.45
-                            else int(round(fl_prev * RNG.uniform(0.05, 0.20))))
-            elif kind == "flat" and u > 0.85:
-                observed = int(round(fl_prev * RNG.uniform(0.15, 0.30)))
-            else:
-                observed = int(RNG.integers(0, 3))
-            observed = min(observed, fl_prev)
-            two_pay = bool(RNG.random() < 0.70)
-            paid = fl_prev - observed
-            if not two_pay:                      # прошёл только аванс — часть ещё в пути
-                paid = int(round(paid * RNG.uniform(0.80, 0.92)))
-            sal = float(r.avg_salary)
-            expect = max(1, fl_prev)
-            for order in ((1, 2) if two_pay else (1,)):
-                # у аванса «неоплаченных» больше: часть получит только основную выплату
-                extra = int(RNG.integers(0, 6)) if (two_pay and order == 1) else 0
-                unpaid_m = min(expect, observed + extra)
-                day_out = min(expect, unpaid_m + int(RNG.integers(0, 3)))
-                pay_dt = month_end.replace(day=10 if order == 1 else 25)
-                rows.append({
-                    "row_code": (f"{month_end:%Y%m%d}_{act:%Y%m%d}_"
-                                 f"{int(r.gosb_id)}_{int(r.inn)}_{order}"),
-                    "report_dt": month_end.date(),
-                    "act_dt": act.date(),
-                    "tb_id": int(r.tb_id),
-                    "gosb_id": int(r.gosb_id),
-                    "org_inn": int(r.inn),
-                    "segment_name": SEG_SHORT[int(r.seg_code)],
-                    "company_name": None,
-                    "holding_name": None,
-                    "is_security_force": False,
-                    "saphr_id": (None if RNG.random() < 0.15
-                                 else int(1_000_000 + int(r.inn) % 900_000)),
-                    "salary_payment_dt": pay_dt.date(),
-                    "payment_order_num": order,
-                    "expect_fl_qty": expect,
-                    "overflow_qty": 0,
-                    "plan_fl_qty": expect,
-                    "fl_day_qty": max(0, expect - day_out),
-                    "fl_2_d_qty": max(0, expect - unpaid_m),
-                    "fact_fl_qty": paid,
-                    "outflow_unpaid_report_qty": day_out,
-                    "outflow_unpaid_2_d_qty": unpaid_m,
-                    "outflow_unpaid_m_qty": unpaid_m,
-                    "outflow_day_perc": round(day_out / expect, 4),
-                    "outflow_2_d_perc": round(unpaid_m / expect, 4),
-                    "outflow_unpaid_m_perc": round(unpaid_m / expect, 4),
-                    "overflow_other_inn_perc": 0.0,
-                    "m_avg_salary_amt": round(sal, 2),
-                    "prev_m_avg_salary_amt": round(sal * float(RNG.uniform(0.95, 1.05)), 2),
-                    "next_m_avg_salary_amt": None,
-                    "fl_crnt_m_qty": paid,
-                    "fl_prev_m_qty": fl_prev,
-                    "fl_next_m_qty": 0,
-                    "is_d_outflow_task": bool(unpaid_m > 0 and RNG.random() < 0.3),
-                    "client_communication_infopovod": None,
-                    "is_oktmo": None,
-                    "oktmo_subject_code": None,
-                    "oktmo_subject_district_code": None,
-                    "oktmo_subject_district_city_code": None,
-                    "oktmo_code": None,
-                    "inserted_dttm": pd.Timestamp.now(),
-                    "author_login": "synth",
-                })
-    return pd.DataFrame(rows)
 
 
 def _pipeline(funnel: pd.DataFrame, orgs: pd.DataFrame) -> pd.DataFrame:
@@ -835,30 +913,36 @@ def _motivation(funnel: pd.DataFrame, pipeline: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
-def _forecast_delta(orgs: pd.DataFrame, company: pd.DataFrame, funnel: pd.DataFrame,
-                    pipeline: pd.DataFrame, day_outflow: pd.DataFrame,
+def _forecast_delta(orgs: pd.DataFrame, fact_out: pd.DataFrame, returns: pd.DataFrame,
+                    funnel: pd.DataFrame, pipeline: pd.DataFrame,
                     motivation: pd.DataFrame) -> dict:
-    """Дельта прогноза по (ГОСБ, сегмент): −отток +приток +пайплайн.
+    """Дельта прогноза по (ГОСБ, сегмент): −невозвращённый отток +пайплайн.
 
-    Считается ТЕМИ ЖЕ функциями forecast.py, что и в дэше, и из тех же таблиц,
-    поэтому план текущего месяца не разъезжается с прогнозом, который дэш покажет.
+    Из этой дельты выводится и prediction_amt, и план текущего месяца, поэтому она
+    считается ТЕМИ ЖЕ функциями forecast.py и ИЗ ТЕХ ЖЕ таблиц, что читает дэш.
+    Модели оттока больше нет — вместо ожидаемого оттока берётся фактический за три
+    закрытых месяца за вычетом вернувшихся, ровно как в отчёте.
+
+    Отток трёх месяцев делится на три: prediction_amt — прогноз на ОДИН месяц, и
+    вычитать из портфеля потерю за квартал целиком означало бы занизить его втрое.
     """
     from uzp_dash.dashboards.tb_health import forecast
 
-    # level_name='gosb' обязателен: в витрине лежат ещё строки уровней ТБ и СБ, и без
-    # фильтра агрегаты уровня ТБ вошли бы в историю как обычный ГОСБ (номера ТБ
-    # встречаются среди old_gosb_id) — ровно та ошибка, от которой защищается дэш
-    hist = (company[(company["org_type"] == "inn") & (company["level_name"] == "gosb")]
-            .rename(columns={"level_id": "new_gosb_id", "org_id": "inn"})
-            [["new_gosb_id", "inn", "report_dt", "fl_outflow_qty", "current_fl_qty"]])
-
-    day = (day_outflow.groupby(["gosb_id", "org_inn"], as_index=False)
-           .agg(seg_day=("segment_name", "max"),
-                out_observed=("outflow_unpaid_m_qty", "min"),
-                paid_mtd=("fact_fl_qty", "max"),
-                fl_prev_m=("fl_prev_m_qty", "max"),
-                avg_salary_m=("m_avg_salary_amt", "max"))
-           .rename(columns={"gosb_id": "new_gosb_id", "org_inn": "inn"}))
+    # три закрытых месяца, как в bank.dates: T-1, T-2, T-3
+    p_closed = pd.Period(MAX_MONTH_END, freq="M")
+    months = {(p_closed - k).to_timestamp("M").date() for k in range(3)}
+    fo = fact_out[[pd.Timestamp(d).date() in months for d in fact_out["report_dt"]]]
+    fo = fo[fo["outflow_qty"] >= 3]
+    ret = returns[[pd.Timestamp(d).date() in months for d in returns["report_dt"]]] \
+        if returns is not None and not returns.empty else returns
+    keys = ["report_dt", "gosb_id", "inn"]
+    if ret is not None and not ret.empty:
+        fo = fo.merge(ret[keys + ["return_qty"]], on=keys, how="left")
+    else:
+        fo = fo.copy(); fo["return_qty"] = 0.0
+    fo["kept"] = (fo["outflow_qty"] - fo["return_qty"].fillna(0)).clip(lower=0)
+    out = (fo.groupby(["gosb_id", "inn"], as_index=False)
+             .agg(kept=("kept", "sum"), sal=("m_avg_salary_amt", "max")))
 
     # план и факт пайплайна помесячно — ровно те же функции, что и в дэше
     plan_m = (_plan_months(funnel, pipeline)
@@ -876,31 +960,33 @@ def _forecast_delta(orgs: pd.DataFrame, company: pd.DataFrame, funnel: pd.DataFr
 
     tb_of = {int(r.gosb_id): int(r.tb_id) for r in orgs.itertuples()}
     conv = forecast.conversion_by_month(plan_m, fact_m, CUR_MONTH_END, tb_of)
-    # дэшу историю сворачивает БД; здесь она уже в памяти — сворачиваем той же
-    # функцией, которая описывает, что именно должен посчитать SQL
-    pred = forecast.outflow_model(
-        forecast.aggregate_history(hist, CUR_MONTH_END), CUR_MONTH_END)
-    rec = forecast.reconcile(day, pred, MONTH_ELAPSED)
     pipe_fc = forecast.pipeline_current(plan_m, fact_m, CUR_MONTH_END,
                                         conv["of_gosb"], conv["sb"])
-    ofc = forecast.org_forecast(rec, pipe_fc, seg_of={})
 
-    code_of = {v: k for k, v in SEG_SHORT.items()}
+    seg_of = {int(r.inn): int(r.seg_code) for r in orgs.itertuples()}
+    sal_of = {int(r.inn): float(r.avg_salary or 0) for r in orgs.itertuples()}
     delta: dict = {}
-    for r in ofc.itertuples():
-        seg = code_of.get(r.seg_name)
-        if seg is None or pd.isna(r.new_gosb_id):
-            continue
-        d_fl = float(r.delta_fl)
-        cur = delta.setdefault((int(r.new_gosb_id), int(seg)), [0.0, 0.0])
+
+    def add(gosb, inn, d_fl, sal):
+        seg = seg_of.get(int(inn))
+        if seg is None or pd.isna(gosb):
+            return
+        cur = delta.setdefault((int(gosb), int(seg)), [0.0, 0.0])
         cur[0] += d_fl
-        cur[1] += d_fl * float(r.avg_salary_m or 0.0)
+        cur[1] += d_fl * sal
+
+    for r in out.itertuples():
+        # месячная доля квартальной потери
+        add(r.gosb_id, r.inn, -float(r.kept) / 3.0,
+            float(r.sal or 0) or sal_of.get(int(r.inn), 0.0))
+    for r in pipe_fc.itertuples():
+        add(r.new_gosb_id, r.inn, float(r.pipe_np), sal_of.get(int(r.inn), 0.0))
     return {k: (v[0], v[1]) for k, v in delta.items()}
 
 
-def _metrics_current(orgs: pd.DataFrame, latest: pd.DataFrame, company: pd.DataFrame,
-                     funnel: pd.DataFrame, pipeline: pd.DataFrame,
-                     day_outflow: pd.DataFrame, motivation: pd.DataFrame) -> pd.DataFrame:
+def _metrics_current(orgs: pd.DataFrame, latest: pd.DataFrame, fact_out: pd.DataFrame,
+                     returns: pd.DataFrame, funnel: pd.DataFrame,
+                     pipeline: pd.DataFrame, motivation: pd.DataFrame) -> pd.DataFrame:
     """Строки uzp_dwh_metrics за ТЕКУЩИЙ (незакрытый) месяц.
 
     План выводится ИЗ прогноза: plan = прогноз / целевое выполнение. Так сценарий
@@ -911,7 +997,7 @@ def _metrics_current(orgs: pd.DataFrame, latest: pd.DataFrame, company: pd.DataF
     но она должна быть, как на проме: если кто-то возьмёт её по ошибке, это сразу
     видно по заниженным цифрам.
     """
-    delta = _forecast_delta(orgs, company, funnel, pipeline, day_outflow, motivation)
+    delta = _forecast_delta(orgs, fact_out, returns, funnel, pipeline, motivation)
     start = CUR_MONTH_END.replace(day=1)
     tidy = []
     for r in latest.itertuples():
@@ -925,6 +1011,8 @@ def _metrics_current(orgs: pd.DataFrame, latest: pd.DataFrame, company: pd.DataF
             "start_dt": start.date(), "end_dt": CUR_MONTH_END.date(),
             "plan_r": plan_r, "fact_r": fc_r * PARTIAL_FACT_SHARE,
             "fot_plan": plan_r * sal, "fot_fact": fc_fot * PARTIAL_FACT_SHARE,
+            # ПРОГНОЗ витрины — то, что дэш теперь читает вместо своего расчёта
+            "pred_r": fc_r, "pred_fot": fc_fot,
         })
     tidy = pd.DataFrame(tidy)
     return pd.concat(_level_frames(tidy), ignore_index=True)[OUT_COLS]

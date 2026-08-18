@@ -6,9 +6,11 @@
 организаций и помесячных активностей на уровне СБ — около 290 запросов и ~45 минут
 на проме, притом что данные там были одни и те же.
 
-Здесь же считается и прогноз: его грейн — (ГОСБ, ИНН), от ТБ он не зависит, и
-разбивать его по ТБ незачем. Коэффициент реализуемости пайплайна возвращается сразу
-для трёх уровней (ГОСБ / ТБ / банк) — у каждого уровня отчёта он свой.
+Сам ПРОГНОЗ дэш не считает — он берёт готовый prediction_amt из витрины метрик.
+Здесь считается то, чего в витрине нет на грейне организации: фактический отток за
+три закрытых месяца (за вычетом вернувшихся) и ожидаемый приход из пайплайна.
+Коэффициент реализуемости пайплайна возвращается сразу для трёх уровней
+(ГОСБ / ТБ / банк) — у каждого уровня отчёта он свой.
 """
 from __future__ import annotations
 
@@ -21,8 +23,16 @@ from ...db import read_sql
 from . import forecast, queries as Q, segments
 
 RUB_TO_MLN = 1e6
-HIST_MONTHS = 24                 # глубина истории витрины под модель сезонности
 PIPE_MONTHS = 12                 # закрытых месяцев сделок для коэффициента реализуемости
+# Окно фактического оттока: три ЗАКРЫТЫХ месяца (T-1, T-2, T-3). Текущий не берём —
+# он не закрыт, и отток по нему был бы неполным.
+OUT_MONTHS = 3
+# Порог оттока: уход одного-двух человек — текучка, а не потеря клиента. Требование
+# бизнеса; ниже порога организация в разбор не попадает.
+OUT_MIN_QTY = 3
+# Глубина окна помесячных активностей под блок «Портфель год к году»: год плюс месяц,
+# потому что задачу на отток заводят и в следующем отчётном месяце.
+YOY_DEPTH = 13
 # Аппарат ТБ — не продающее подразделение, в разборе ему делать нечего. Опознаётся
 # по имени, но с обязательной оговоркой: если аппарат — ЕДИНСТВЕННОЕ подразделение
 # своего ТБ (Московский банк), исключать его нельзя, иначе ТБ обнулится.
@@ -40,21 +50,21 @@ class Bank:
     verdict: pd.DataFrame             # план/факт уровней tb и sb за три месяца
     unit_seg: pd.DataFrame            # ГОСБ × сегмент, обе опорные даты
     unit_tot: pd.DataFrame            # итоги ГОСБ, обе опорные даты
-    orgs: pd.DataFrame                # (ГОСБ, ИНН) — витрина + воронка + прогноз
+    orgs: pd.DataFrame                # (ГОСБ, ИНН) — витрина + воронка + отток
     orgs_tb: pd.DataFrame             # (ТБ, ИНН) — строки витрины уровнем выше
     fagg: pd.DataFrame                # агрегат воронки по (ГОСБ, ИНН)
     act_tot: pd.DataFrame             # итоги активностей по ТБ
     act_brk: pd.DataFrame             # разрезы активностей по ТБ
     fmonths: pd.DataFrame             # активности по месяцам (ГОСБ, ИНН, месяц)
-    orgs_fc: pd.DataFrame             # прогноз на грейне (ГОСБ, ИНН)
+    orgs_fc: pd.DataFrame             # отток и пайплайн на грейне (ГОСБ, ИНН)
     conv: dict                        # коэффициенты реализуемости трёх уровней
     params: dict = field(default_factory=dict)     # параметры запуска (ctx.params)
-    fc_stats: dict = field(default_factory=dict)   # диагностика прогноза
+    fc_stats: dict = field(default_factory=dict)   # диагностика оттока и пайплайна
 
 
 # --------------------------------------------------------------------------- #
 def load(ctx) -> Bank:
-    """Прочитать всё, что нужно отчёту, и посчитать прогноз по банку."""
+    """Прочитать всё, что нужно отчёту, и посчитать отток с пайплайном."""
     e = ctx.engine
     d = dates(e, ctx.params)
     p_dates = {"ref_cur": d["ref_cur"], "ref_closed": d["ref_closed"],
@@ -104,6 +114,9 @@ def load(ctx) -> Bank:
     orgs_tb = _prepare_orgs_tb(orgs_tb, orgs)
     _log_orgs(orgs, orgs_tb)
 
+    mgr = read_sql(e, Q.ORG_MANAGER, {"role": Q.ROLE_ATTACHED})
+    orgs = _merge_manager(orgs, mgr)
+
     progress.step("Активности воронки за 3 мес: агрегат по (ГОСБ, ИНН)")
     pf = {"ref_funnel": d["ref_funnel"], "funnel_from": d["funnel_from"],
           "fresh_from": d["fresh_from"]}
@@ -127,6 +140,11 @@ def load(ctx) -> Bank:
 
     orgs = _merge_funnel(orgs, fagg)
     orgs, orgs_fc, conv, stats = forecast_bank(e, orgs, d, tb_of)
+    # отрабатывали ли отток в месяц ухода — считается ПОСЛЕ прогноза: раньше
+    # `out_months` ещё не приклеен к строкам организаций
+    orgs = _outflow_worked(orgs, fmonths)
+    orgs_fc = _outflow_worked(orgs_fc, fmonths)
+    _log_outflow_worked(orgs)
 
     return Bank(dates=d, tbs=tbs, apparat=apparat, tb_of=tb_of, gosb_name=gosb_name,
                 verdict=verdict, unit_seg=unit_seg, unit_tot=unit_tot,
@@ -158,46 +176,29 @@ def dates(engine, params: dict) -> dict:
     """Опорные даты дэша. Считаются ОДИН раз на отчёт.
 
     ПРОГНОЗНЫЙ месяц задаётся параметром `report_month` (синоним — устаревший `date`).
-    Если он не задан, берётся самый свежий месяц ежедневной витрины оттока. Витрина
-    хранит ВСЕ месяцы, поэтому отчёт можно пересобрать и за прошлый период — но тогда
-    дату актуальности надо брать ИМЕННО ЗА ЭТОТ месяц (`ACT_DT_FOR`), а не за
-    последний: иначе весь расчёт «сколько выплат уже увидели» считается по чужому
-    периоду. Если витрины нет вовсе — откат на закрытый месяц company_holding + 1.
+    Если он не задан, берётся самый свежий месяц, на который витрина уже посчитала
+    прогноз (`REF_CUR`): дэш прогноз не считает, а показывает витринный, и месяц без
+    `prediction_amt` показывать нечем. Если прогноза нет вовсе — откат на закрытый
+    месяц company_holding + 1, и об этом говорится вслух.
     """
-    ref_cur = act_dt = None
+    ref_cur = None
     src = ""
     asked = params.get("report_month") or params.get("date")
     if asked:
         ref_cur = (pd.to_datetime(asked) + pd.offsets.MonthEnd(0)).date()
         src = "задан параметром report_month"
-    row = read_sql(engine, Q.REF_CUR)
-    if not row.empty and pd.notna(row.ref_cur.iloc[0]):
-        d_cur = pd.to_datetime(row.ref_cur.iloc[0]).date()
-        d_act = (pd.to_datetime(row.act_dt.iloc[0]).date()
-                 if pd.notna(row.act_dt.iloc[0]) else d_cur)
-        if ref_cur is None:
-            ref_cur, act_dt, src = d_cur, d_act, "последний месяц ежедневной витрины"
-        elif d_cur == ref_cur:
-            act_dt = d_act
-        else:
-            # заданный месяц не последний — берём дату актуальности ЭТОГО месяца
-            a = read_sql(engine, Q.ACT_DT_FOR, {"ref_cur": ref_cur})
-            n_rows = int(a.n_rows.iloc[0] or 0) if not a.empty else 0
-            if n_rows and pd.notna(a.act_dt.iloc[0]):
-                act_dt = pd.to_datetime(a.act_dt.iloc[0]).date()
-                progress.done(f"Месяц отчёта {ref_cur} — не последний в витрине "
-                              f"(там {d_cur}); дата актуальности взята за этот месяц: "
-                              f"{act_dt}, строк {n_rows}")
-            else:
-                progress.done(f"ВНИМАНИЕ: за {ref_cur} в ежедневной витрине нет строк "
-                              f"(последний месяц там {d_cur}) — наблюдаемого оттока не "
-                              f"будет, отток посчитается только по модели истории")
+    row = read_sql(engine, Q.REF_CUR, {"m_rcp": Q.METRIC_RECIPIENTS})
+    d_cur = (pd.to_datetime(row.ref_cur.iloc[0]).date()
+             if not row.empty and pd.notna(row.ref_cur.iloc[0]) else None)
+    if ref_cur is None and d_cur is not None:
+        ref_cur, src = d_cur, "последний месяц с прогнозом в витрине"
+    elif ref_cur is not None and d_cur is not None and ref_cur > d_cur:
+        progress.warn(f"На {ref_cur} прогноза в витрине нет (последний с прогнозом — "
+                      f"{d_cur}). Отчёт соберётся, но прогноз будет пустым")
     if ref_cur is None:
         closed = pd.to_datetime(read_sql(engine, Q.REF_DATE).iloc[0, 0]).date()
         ref_cur = (pd.Timestamp(closed) + pd.offsets.MonthEnd(1)).date()
-        src = "ФОЛБЭК: ежедневной витрины нет — закрытый месяц витрины + 1"
-    if act_dt is None:
-        act_dt = ref_cur
+        src = "ФОЛБЭК: прогноза в витрине нет — закрытый месяц витрины + 1"
     cur = pd.Timestamp(ref_cur)
     p_cur = cur.to_period("M")
     p_closed = p_cur - 1
@@ -209,24 +210,20 @@ def dates(engine, params: dict) -> dict:
     # Сделки судим по дате СОЗДАНИЯ СДЕЛКИ: заведённые в двух последних месяцах окна
     # ещё не могли дать зачисления, по ним недоработку не считаем.
     fresh_from = (p_cur - 1).to_timestamp().date()
-    hist_from = (p_cur - (HIST_MONTHS + 1)).to_timestamp("M").date()
+    # ТРИ ЗАКРЫТЫХ МЕСЯЦА под фактический отток: T-1, T-2, T-3. Текущий сюда не
+    # входит намеренно — он не закрыт, и отток по нему был бы неполным.
+    out_months = [(p_closed - k).to_timestamp("M").date() for k in range(OUT_MONTHS)]
     # окно помесячных активностей под вопрос «отрабатывали ли отток тогда»: та же
-    # глубина, что у месяцев оттока в годовом тренде (forecast.YOY_DEPTH), плюс ещё
-    # один месяц вперёд — задачу на отток заводят и в СЛЕДУЮЩЕМ отчётном месяце
-    months_from = (p_cur - forecast.YOY_DEPTH).to_timestamp().date()
+    # глубина, что у годового тренда портфеля, плюс ещё один месяц вперёд — задачу
+    # на отток заводят и в СЛЕДУЮЩЕМ отчётном месяце
+    months_from = (p_cur - YOY_DEPTH).to_timestamp().date()
     # тот же месяц год назад — для прироста «год к году» по закрытому месяцу
     ref_yoy = (p_cur - 13).to_timestamp("M").date()
     # окно сделок для помесячного план/факт: PIPE_MONTHS закрытых месяцев + текущий.
     # Шире окна активностей: коэффициент реализуемости считается по закрытым месяцам.
     plan_from = (p_cur - PIPE_MONTHS).to_timestamp().date()
-    # ДВЕ РАЗНЫЕ величины, их нельзя путать:
-    #  * observed — какую долю выплатных событий месяца мы уже УВИДЕЛИ. Меряется по
-    #    act_dt (дата актуальности витрины оттока) и отвечает за то, сколько риска
-    #    оттока уже отыграно;
-    #  * days_left — сколько КАЛЕНДАРНОГО времени осталось, чтобы привлечения по
-    #    сделкам успели дойти. Меряется по РЕАЛЬНОЙ текущей дате: витрина оттока про
-    #    будущие дни ничего не знает, и её act_dt тут ни при чём.
-    observed = min(1.0, pd.Timestamp(act_dt).day / cur.day)
+    # days_left — сколько КАЛЕНДАРНОГО времени осталось, чтобы привлечения по сделкам
+    # успели дойти. Меряется по РЕАЛЬНОЙ текущей дате.
     today = params.get("today")
     today = (pd.Timestamp(today).date() if today
              else pd.Timestamp.now().date())
@@ -239,39 +236,30 @@ def dates(engine, params: dict) -> dict:
         days_left = int(cur.day) - today.day + 1
     pipe_left = days_left / float(cur.day)
 
-    progress.done(f"Прогнозный месяц: {ref_cur} ({src}) · факт зачислений по {act_dt} "
-                  f"(выплат месяца отыграно {observed * 100:.0f}%)")
+    out_lbl = ", ".join(f"{pd.Timestamp(m).month:02d}.{pd.Timestamp(m).year}"
+                        for m in out_months)
+    progress.done(f"Прогнозный месяц: {ref_cur} ({src}) — прогноз берётся из витрины")
     progress.done(f"Сегодня {today}: до конца месяца {days_left} из {cur.day} дн. "
                   f"({pipe_left * 100:.0f}%) — столько времени осталось у пайплайна")
-    progress.done(f"Портфель-база прогноза — закрытый месяц {ref_closed}; "
-                  f"история витрины с {hist_from} ({HIST_MONTHS} мес)")
+    progress.done(f"Портфель — закрытый месяц {ref_closed}; фактический отток за "
+                  f"{OUT_MONTHS} закрытых месяца: {out_lbl}")
     months = ", ".join((p_cur - k).strftime("%m.%Y") for k in (2, 1, 0))
     progress.done(f"Окно задач воронки: {funnel_from} … {ref_funnel} ({months}) · "
                   f"сделки с {fresh_from} — свежие")
 
-    # Опорные месяцы для свёрнутой истории (queries.OUTFLOW_HIST_AGG). Все — НАЧАЛА
-    # месяцев: в запросе ym = date_trunc('month', report_dt).
-    p_yoy = p_cur - 12
-    first = lambda p: p.to_timestamp().date()          # noqa: E731 — узкий хелпер
-    hist_params = {
-        "m_closed": first(p_closed), "m_prev": first(p_closed - 1),
-        "mon_cur": int(p_cur.month), "mon_cls": int(p_closed.month),
-        "m_yoy": first(p_yoy), "m_yoy_prev": first(p_yoy - 1),
-        "m_y1": first(p_yoy + 1), "m_y2": first(p_yoy + 2), "m_y3": first(p_yoy + 3),
-        "m_out_from": first(p_closed - (forecast.YOY_DEPTH - 1)),
-    }
-    return {"ref_cur": ref_cur, "ref_closed": ref_closed, "act_dt": act_dt,
+    return {"ref_cur": ref_cur, "ref_closed": ref_closed,
             "ref_yoy": ref_yoy,
             "ref_funnel": ref_funnel, "funnel_from": funnel_from,
-            "fresh_from": fresh_from, "hist_from": hist_from, "plan_from": plan_from,
+            "fresh_from": fresh_from, "plan_from": plan_from,
             "months_from": months_from,
-            "cur_month": int(cur.month), "month_elapsed": float(observed),
+            "out_months": out_months, "out_label": out_lbl,
+            "m_out1": out_months[0], "m_out2": out_months[1], "m_out3": out_months[2],
+            "cur_month": int(cur.month),
             "today": today, "days_left": int(days_left),
             "days_in_month": int(cur.day), "pipe_left": float(pipe_left), "src": src,
             "label": f"{cur.month:02d}.{cur.year}",
             "closed_label": f"{pd.Timestamp(ref_closed).month:02d}."
-                            f"{pd.Timestamp(ref_closed).year}",
-            **hist_params}
+                            f"{pd.Timestamp(ref_closed).year}"}
 
 
 # --------------------------------------------------------------------------- #
@@ -422,6 +410,81 @@ def _log_funnel(fagg: pd.DataFrame, act_tot: pd.DataFrame,
                           f"не к чему отнести")
 
 
+def _merge_manager(orgs: pd.DataFrame, mgr: pd.DataFrame) -> pd.DataFrame:
+    """Приклеить ФИО закреплённого сотрудника на грейне (ГОСБ, ИНН).
+
+    Строка списка к работе говорит, ЧТО сделать; закрепление отвечает, КОМУ это
+    поручить, — без него задачу приходится раздавать вручную.
+
+    Соответствие строго по паре (ГОСБ, организация): та же организация в соседнем
+    ГОСБ ведётся другим сотрудником, и подставлять его сюда нельзя. Где закрепления
+    нет — пусто, и в отчёте будет прочерк.
+
+    Покрытие печатается в прогресс: столбец, пустой у половины строк, без этого
+    выглядит сломанным, а не «так в данных».
+    """
+    out = orgs.copy()
+    if orgs.empty:
+        out["emp_fio"] = pd.Series(dtype=object)
+        out["emp_saphr_id"] = pd.Series(dtype="Int64")
+        return out
+    if mgr is None or mgr.empty:
+        progress.warn("Закреплений сотрудников за организациями не нашлось — столбец "
+                      "«Сотрудник» в списке к работе будет пустым")
+        out["emp_fio"] = ""
+        out["emp_saphr_id"] = pd.NA
+        return out
+    m = mgr.dropna(subset=["new_gosb_id", "inn"]).copy()
+    m["new_gosb_id"] = m["new_gosb_id"].astype("int64")
+    m["inn"] = m["inn"].astype("int64")
+    m["emp_saphr_id"] = pd.to_numeric(m["saphr_id"], errors="coerce").astype("Int64")
+    m["emp_fio"] = m["fio"].fillna("").astype(str).str.strip()
+    n_rows = len(m)
+    # дедуп уже сделан в SQL; проверяем это здесь, потому что дубль пары размножил бы
+    # строки списка к работе — молчаливой такая ошибка быть не должна
+    n_pairs = int(m.drop_duplicates(["new_gosb_id", "inn"]).shape[0])
+    if n_pairs != n_rows:
+        progress.warn(f"Закрепления: {n_rows - n_pairs} пар (ГОСБ, организация) пришли "
+                      f"больше одного раза — берётся первая, список не задваивается")
+        m = m.drop_duplicates(["new_gosb_id", "inn"])
+    n0 = len(out)
+    out = out.merge(m[["new_gosb_id", "inn", "emp_saphr_id", "emp_fio"]],
+                    on=["new_gosb_id", "inn"], how="left")
+    if len(out) != n0:
+        progress.warn(f"Склейка закреплений изменила число организаций: {n0} → "
+                      f"{len(out)} — в отчёт попали дубли строк")
+    out["emp_fio"] = out["emp_fio"].fillna("")
+    _log_manager(out, m)
+    return out
+
+
+def _log_manager(orgs: pd.DataFrame, mgr: pd.DataFrame) -> None:
+    """Покрытие закреплениями: сколько пар с сотрудником, без ФИО и мимо отчёта."""
+    n_all = len(orgs)
+    if not n_all:
+        return
+    has_emp = orgs["emp_saphr_id"].notna()
+    n_emp = int(has_emp.sum())
+    # закреплённые, но без имени: табельного нет в штатке или ФИО там пустое
+    n_no_fio = int((has_emp & (orgs["emp_fio"].astype(str) == "")).sum())
+    # закрепления, для которых пары (ГОСБ, организация) в отчёте не нашлось
+    keys = set(zip(orgs["new_gosb_id"], orgs["inn"]))
+    n_orphan = sum(1 for g, i in zip(mgr["new_gosb_id"], mgr["inn"])
+                   if (g, i) not in keys)
+    share = n_emp / n_all * 100
+    msg = (f"Закреплённые сотрудники: ФИО нашлось у {n_emp - n_no_fio} из {n_all} пар "
+           f"(ГОСБ, организация), {share:.0f}% закреплено")
+    tail = []
+    if n_no_fio:
+        tail.append(f"у {n_no_fio} закреплённых нет ФИО в штатке")
+    if n_orphan:
+        tail.append(f"{n_orphan} закреплений не нашли свою пару в отчёте")
+    if tail:
+        msg += " · " + "; ".join(tail)
+    (progress.warn if share < 50 else progress.done)(
+        msg + ("" if share >= 50 else " — у большинства строк списка будет прочерк"))
+
+
 def _merge_funnel(orgs: pd.DataFrame, fagg: pd.DataFrame) -> pd.DataFrame:
     """Приклеить агрегат воронки на грейне (ГОСБ, ИНН)."""
     num_cols = ["n_tasks", "n_calls", "n_meetings", "n_success", "n_overdue", "n_outflow",
@@ -450,21 +513,21 @@ def _merge_funnel(orgs: pd.DataFrame, fagg: pd.DataFrame) -> pd.DataFrame:
 
 # --------------------------------------------------------------------------- #
 def forecast_bank(engine, orgs: pd.DataFrame, d: dict, tb_of: dict):
-    """Прогноз по (ГОСБ, ИНН) на весь банк: ожидаемый отток + приход из пайплайна.
+    """Фактический отток и приход из пайплайна по (ГОСБ, ИНН) на весь банк.
 
-    Возвращает (orgs с приклеенным прогнозом, кадр прогноза, коэффициенты, диагностика).
-    Отдельно считается ФОТ-эффект: отток пересчитывается по средней ЗП организации,
-    а по пайплайну план ФОТа есть свой.
+    Прогноз здесь БОЛЬШЕ НЕ СЧИТАЕТСЯ: он приходит готовым из витрины метрик
+    (prediction_amt). Эта функция отвечает за две вещи, которых в витрине нет на
+    грейне организации:
+      * сколько людей УЖЕ ушло за три закрытых месяца и не вернулось — по нему
+        строится список к работе и блок «крупнейшие оттоки»;
+      * сколько людей ждём из пайплайна — с поправкой на реализуемость.
     """
-    progress.step(f"Прогноз на {d['ref_cur']}: отток по истории + ежедневный + пайплайн")
-    dp = {"ref_cur": d["ref_cur"], "act_dt": d["act_dt"]}
-    day = read_sql(engine, Q.DAY_OUTFLOW, dp)
-    _log_day_outflow(read_sql(engine, Q.DAY_OUTFLOW_STATS, dp), day, d)
-    hist = read_sql(engine, Q.OUTFLOW_HIST_AGG,
-                    {"hist_from": d["hist_from"], "ref_closed": d["ref_closed"],
-                     **{k: d[k] for k in ("m_closed", "m_prev", "mon_cur", "mon_cls",
-                                          "m_yoy", "m_yoy_prev", "m_y1", "m_y2", "m_y3",
-                                          "m_out_from")}})
+    progress.step(f"Отток за {d['out_label']} и пайплайн на {d['label']}")
+    op = {"out_min": OUT_MIN_QTY, "m_out1": d["m_out1"], "m_out2": d["m_out2"],
+          "m_out3": d["m_out3"]}
+    out = read_sql(engine, Q.FACT_OUTFLOW, op)
+    _log_outflow(read_sql(engine, Q.FACT_OUTFLOW_STATS, op), out, d)
+
     # План и ФАКТ пайплайна помесячно на грейне (ГОСБ, ИНН, сотрудник): именно на нём
     # план двух сделок одного месяца складывается в одно число, с которым и сравнивается
     # пришедший факт.
@@ -478,11 +541,7 @@ def forecast_bank(engine, orgs: pd.DataFrame, d: dict, tb_of: dict):
                       "m_np": Q.METRIC_NEW_RECIPIENTS_B2B, "counted": Q.MOTIV_COUNTED})
     pstat = read_sql(engine, Q.PIPELINE_PLAN_STATS, pp)
 
-    pred = forecast.outflow_model(hist, d["ref_cur"])
-    rec = forecast.reconcile(day, pred, d["month_elapsed"])
     conv = forecast.conversion_by_month(plan_m, fact_m, d["ref_cur"], tb_of)
-    # у пайплайна своя мера времени — сколько КАЛЕНДАРНЫХ дней осталось до конца
-    # месяца (от реальной даты), а не сколько выплат мы увидели в витрине оттока
     pipe_fc = forecast.pipeline_current(plan_m, fact_m, d["ref_cur"], conv["of_gosb"],
                                         conv["sb"], d["pipe_left"])
     due = forecast.deal_due(plan_m, fact_m, d["ref_cur"])
@@ -494,52 +553,39 @@ def forecast_bank(engine, orgs: pd.DataFrame, d: dict, tb_of: dict):
         pipe_fc["seg_funnel"] = short.fillna(pipe_fc["seg_funnel"])
     seg_of = {int(r.inn): r.seg_name for r in orgs.itertuples()
               if r.seg_name and r.seg_name != "—"}
-    fc = forecast.org_forecast(rec, pipe_fc, seg_of)
+    fc = forecast.org_outflow(out, pipe_fc, seg_of)
 
-    # ФОТ-эффект: средняя ЗП из ежедневной витрины, фолбэк — из витрины организаций
+    # ФОТ-эффект: средняя ЗП из витрины оттока, фолбэк — из витрины организаций
     sal_of = {(int(r.new_gosb_id), int(r.inn)): float(r.avg_salary or 0)
               for r in orgs.itertuples() if pd.notna(r.new_gosb_id)}
     sal = [float(s) if float(s or 0) > 0 else sal_of.get((int(g), int(i)), 0.0)
            for s, g, i in zip(fc["avg_salary_m"], fc["new_gosb_id"], fc["inn"])]
     fc["salary"] = sal
-    fc["out_fot"] = fc["out_exp"] * fc["salary"]
-    fc["in_fot"] = fc["in_exp"] * fc["salary"]
+    fc["out_fot"] = fc["out_kept"] * fc["salary"]
     # ТБ пишем прямо в строку организации: уровню отчёта тогда не нужен обратный
     # маппинг ГОСБ → ТБ, единица разбора задаётся просто именем колонки
     fc["tb_id"] = [tb_of.get(int(g)) if pd.notna(g) else None for g in fc["new_gosb_id"]]
 
-    hd = pred.attrs.get("diag", {}) if not pred.empty else {}
-    n_hist = int(hd.get("hist_months", 0))
-    classes = fc["out_class"].value_counts().to_dict() if not fc.empty else {}
-    stats = {"n_day": len(day), "n_hist_orgs": len(pred), "hist_months": n_hist,
-             "n_pipe": len(pipe_fc),
-             "classes": classes, "hist": hd,
+    stats = {"n_out": len(out), "n_pipe": len(pipe_fc),
+             "out_kept": float(fc["out_kept"].sum()) if not fc.empty else 0.0,
+             "out_ret": float(fc["ret_qty"].sum()) if not fc.empty else 0.0,
              "pipe_np": float(fc["pipe_np"].sum()) if not fc.empty else 0.0,
              "pipe_np_raw": float(fc["pipe_np_raw"].sum()) if not fc.empty else 0.0}
     raw = conv["diag_sb"].get("tb_raw")
     conv_txt = (f"коэф. банка {raw:.2f} → поднят до пола {conv['sb']:.2f}"
                 if conv["diag_sb"].get("tb_clipped") else f"коэф. банка {conv['sb']:.2f}")
-    progress.done(f"История: {n_hist} мес ({hd.get('hist_from','—')}…"
-                  f"{hd.get('hist_to','—')}) по {len(pred)} парам · ежедневная витрина: "
-                  f"{len(day)} пар · пайплайн на {d['label']}: {len(pipe_fc)} орг, "
-                  f"{stats['pipe_np_raw']:.0f} чел заявлено → {stats['pipe_np']:.0f} "
+    progress.done(f"Пайплайн на {d['label']}: {len(pipe_fc)} орг, "
+                  f"{stats['pipe_np_raw']:.0f} чел заявлено → {stats['pipe_np']:.0f} фл "
                   f"с поправкой на реализуемость ({conv_txt})")
     n_clip = conv["diag_sb"].get("n_gosb_clipped", 0)
     if n_clip:
         progress.done(f"Коэффициент реализуемости упёрся в границы "
                       f"[{forecast.CONV_MIN}, {forecast.CONV_MAX}] у {n_clip} из "
                       f"{conv['diag_sb'].get('n_gosb', 0)} ТБ — по ним вклад пайплайна "
-                      f"в прогноз завышен")
-    _log_history(hd, d)
-    if classes:
-        n_all = sum(classes.values()) or 1
-        progress.done("Классы оттока: " + " · ".join(
-            f"{k} {v} ({v / n_all * 100:.1f}%)"
-            for k, v in sorted(classes.items(), key=lambda x: -x[1])))
+                      f"завышен")
 
-    keep = ["new_gosb_id", "inn", "out_exp", "in_exp", "pipe_np", "pipe_np_raw",
-            "pipe_fact_mtd", "pipe_fot", "out_observed", "pred", "out_class", "note",
-            "why", "settled", "n_deals", "out_months", "has_hist", "recovered"]
+    keep = ["new_gosb_id", "inn", "out_qty", "ret_qty", "out_kept", "out_months",
+            "pipe_np", "pipe_np_raw", "pipe_fact_mtd", "pipe_fot", "n_deals"]
     merged = orgs.copy()
     merged["new_gosb_id"] = merged["new_gosb_id"].astype("Int64")
     if not fc.empty:
@@ -553,48 +599,159 @@ def forecast_bank(engine, orgs: pd.DataFrame, d: dict, tb_of: dict):
         dd["new_gosb_id"] = dd["new_gosb_id"].astype("Int64")
         dd["inn"] = dd["inn"].astype("int64")
         merged = merged.merge(dd, on=["new_gosb_id", "inn"], how="left")
-    for c in ("out_exp", "in_exp", "pipe_np", "pipe_np_raw", "pipe_fact_mtd", "pipe_fot",
-              "out_observed", "pred", "settled", "n_deals",
+    for c in ("out_qty", "ret_qty", "out_kept", "pipe_np", "pipe_np_raw",
+              "pipe_fact_mtd", "pipe_fot", "n_deals",
               "plan_np_due", "fact_np_due", "due_months"):
         merged[c] = forecast.num(merged, c)
-    for c in ("out_class", "note", "why"):
-        merged[c] = merged.get(c).fillna("") if c in merged else ""
-    merged["out_class"] = merged["out_class"].replace("", forecast.CLS_STABLE)
-    # колонка-список: у организаций без истории после left join приезжает NaN, а он
+    # колонка-список: у организаций без оттока после left join приезжает NaN, а он
     # ПРОХОДИТ проверку `or []` (nan истинно) и роняет list() уже в детализации
     merged["out_months"] = [v if isinstance(v, list) else []
                             for v in merged.get("out_months", pd.Series(dtype=object))] \
         if "out_months" in merged else [[] for _ in range(len(merged))]
-    # «истории по паре нет вовсе» — это не то же самое, что «оттока не было»
-    merged["has_hist"] = (merged["has_hist"].fillna(False).astype(bool)
-                          if "has_hist" in merged else False)
     return merged, fc, conv, stats
 
 
-def _log_day_outflow(stats: pd.DataFrame, day: pd.DataFrame, d: dict) -> None:
-    """Что дала ежедневная ведомость: сколько пар в ней есть и у скольких задача.
+def next_month(label: str) -> str:
+    """«MM.YYYY» → следующий месяц. Метки месяцев в блоках — строки, а не даты."""
+    try:
+        mm, yy = label.split(".")
+        m, y = int(mm), int(yy)
+    except (ValueError, AttributeError):
+        return label
+    return f"01.{y + 1}" if m == 12 else f"{m + 1:02d}.{y}"
 
-    Ноль строк — ШТАТНАЯ ситуация начала месяца: выплатные даты ещё не наступили либо
-    задачи на отток пока не завели. Говорим об этом спокойно и отдельной строкой,
-    иначе «0 пар» читается как сбой. От «ведомости за месяц нет вовсе» это отличается
-    знаменателем: там нет и самих пар, и про это предупреждает `dates()`.
+
+def month_index(fm: pd.DataFrame | None, unit_src: str) -> tuple[dict, set]:
+    """Активности по месяцам → индекс {(единица, ИНН, «MM.YYYY»): агрегат} + окно месяцев.
+
+    Окно возвращается отдельно и намеренно: по нему отличается «задач не было» от
+    «месяц вне выборки, данных нет». Без него обе ситуации выглядели бы одинаково.
+
+    Единица разбора — ГОСБ или ТБ, поэтому ключ собирается по `unit_src`: у ТБ строки
+    воронки нескольких ГОСБ схлопываются в одну пару (ТБ, ИНН).
+
+    Строки без единицы или без организации выбрасываются: ключ по ним не собрать. На
+    проме такие есть — у задачи может не оказаться ИНН, а `gosb_id` задачи может не
+    найтись в справочнике (join витрины с ним внешний). Раньше это роняло разбор на
+    `int(NaN)`. Сколько строк потеряно — печатается: по этому индексу отвечают на
+    вопрос «отрабатывали ли отток тогда», и молча недосчитаться активностей значит
+    записать организацию в неотработанные без оснований.
     """
-    n_pairs = int(stats.n_pairs.iloc[0] or 0) if stats is not None and not stats.empty else 0
-    n_task = len(day)
-    if not n_pairs:
-        progress.done(f"Ежедневная ведомость на {d['act_dt']}: выплатных дат ещё не "
-                      f"наступило — наблюдаемого оттока нет, отток пойдёт только по "
-                      f"модели истории. Для начала месяца это нормально")
+    idx: dict = {}
+    window: set = set()
+    if fm is None or fm.empty:
+        return idx, window
+    src = unit_src if unit_src in fm else "new_gosb_id"
+    keys = [c for c in (src, "inn", "ym") if c in fm]
+    n_all = len(fm)
+    # пустоты считаем ДО отбрасывания — после него считать уже нечего
+    lost = {c: int(fm[c].isna().sum()) for c in keys}
+    fm = fm.dropna(subset=keys)
+    if len(fm) < n_all:
+        progress.warn(
+            f"Помесячные активности: отброшено {n_all - len(fm)} строк из {n_all} — "
+            f"нечем собрать ключ (пусто: "
+            + ", ".join(f"{c} {n}" for c, n in lost.items() if n) + "). "
+            f"По этим задачам отработка не учитывается")
+    for r in fm.itertuples():
+        ym = pd.Timestamp(getattr(r, "ym"))
+        label = f"{ym.month:02d}.{ym.year}"
+        window.add(label)
+        key = (int(getattr(r, src)), int(r.inn), label)
+        cur = idx.setdefault(key, {"n_tasks": 0, "n_success": 0, "n_outflow": 0,
+                                   "n_out_success": 0})
+        cur["n_tasks"] += int(r.n_tasks or 0)
+        cur["n_success"] += int(r.n_success or 0)
+        cur["n_outflow"] += int(getattr(r, "n_outflow", 0) or 0)
+        cur["n_out_success"] += int(getattr(r, "n_out_success", 0) or 0)
+    return idx, window
+
+
+def _outflow_worked(orgs: pd.DataFrame, fmonths: pd.DataFrame) -> pd.DataFrame:
+    """Отрабатывали ли отток в месяц ухода — признак для рычага «Вернуть».
+
+    Невозвращённый отток сам по себе не означает, что банк недоработал: по части
+    организаций отток отработали, задачу закрыли успешно, а люди всё равно не
+    вернулись. Требовать по ним «вернуть» второй раз бессмысленно.
+
+    Смотрим ДВА месяца на каждый месяц ухода M — сам M и M+1: витрина оттока
+    закрывается позже, чем он случился, и задачу на отток заводят следующим отчётным
+    месяцем. Без M+1 нормально отработанный отток выглядел бы пропущенным.
+
+    Отработанным считается только тот отток, по которому есть УСПЕШНО ЗАКРЫТАЯ задача
+    ИМЕННО ТИПА «Отток» (`n_out_success`). Успешная задача о привлечении рядом с
+    проваленной задачей об оттоке отработкой оттока не является.
+
+    Считается один раз на банк: признак принадлежит паре (ГОСБ, ИНН), а не уровню
+    отчёта, поэтому уровень СБ берёт тот же флаг без пересчёта.
+    """
+    idx, window = month_index(fmonths, "new_gosb_id")
+    tasks, outflow, done, known = [], [], [], []
+    for r in orgs.itertuples():
+        months = list(getattr(r, "out_months", None) or [])
+        g = getattr(r, "new_gosb_id", None)
+        t = o = s = 0
+        cov = True
+        if months and pd.notna(g):
+            for m in months:
+                look = (m, next_month(m))
+                if not any(x in window for x in look):
+                    cov = False          # месяц вне окна воронки — судить не о чем
+                for x in look:
+                    c = idx.get((int(g), int(r.inn), x))
+                    if c:
+                        t += c["n_tasks"]; o += c["n_outflow"]; s += c["n_out_success"]
+        tasks.append(t); outflow.append(o); done.append(s); known.append(cov)
+    out = orgs.copy()
+    out["out_tasks"] = tasks
+    out["out_tasks_outflow"] = outflow
+    out["out_done"] = done
+    out["out_known"] = known
+    # отработан = есть успешно закрытая задача по оттоку; при неизвестном окне
+    # (месяц ухода вне выборки воронки) утверждать «не отрабатывали» нельзя
+    out["out_worked"] = [bool(s > 0) for s in done]
+    return out
+
+
+def _log_outflow_worked(orgs: pd.DataFrame) -> None:
+    """Сколько пар с оттоком отработали, а сколько нет. Молча отсеивать нельзя."""
+    with_out = orgs[forecast.num(orgs, "out_kept") > 0]
+    n = len(with_out)
+    if not n:
         return
-    if not n_task:
-        progress.done(f"Ежедневная ведомость на {d['act_dt']}: {n_pairs} пар "
-                      f"(ГОСБ, ИНН), задач на отток НИ ОДНОЙ — наблюдаемого оттока нет, "
-                      f"отток пойдёт только по модели истории")
+    ok = int(with_out["out_worked"].sum())
+    fl_ok = float(forecast.num(with_out[with_out["out_worked"]], "out_kept").sum())
+    fl_all = float(forecast.num(with_out, "out_kept").sum())
+    unknown = int((~with_out["out_known"]).sum())
+    progress.done(
+        f"Отработка оттока в месяц ухода и следующий: из {n} пар с невозвращённым "
+        f"оттоком отработали {ok} ({ok / n * 100:.0f}%, {fl_ok:.0f} из {fl_all:.0f} чел) "
+        f"— у них закрыта успешная задача по оттоку, в рычаг «Вернуть» они не идут")
+    if unknown:
+        progress.warn(f"У {unknown} пар месяц ухода вне окна воронки — про отработку "
+                      f"данных нет, они остаются кандидатами на возврат")
+
+
+def _log_outflow(stats: pd.DataFrame, out: pd.DataFrame, d: dict) -> None:
+    """Что дал фактический отток и сколько срезал порог.
+
+    Порог печатается всегда: «оттока мало» и «порог съел почти всё» — разные
+    ситуации, а по одному числу строк их не различить.
+    """
+    if stats is None or stats.empty:
+        progress.warn(f"Витрина фактического оттока за {d['out_label']} пуста — "
+                      f"список организаций к работе будет только по привлечению")
         return
-    progress.done(f"Ежедневный отток на {d['act_dt']}: задача выставлена у {n_task} пар "
-                  f"из {n_pairs} в ведомости (по последней прошедшей выплате). "
-                  f"У остальных {n_pairs - n_task} наблюдения нет — их риск месяца "
-                  f"не гасится и войдёт в прогноз по модели целиком")
+    s = stats.iloc[0]
+    n_all = int(s.n_all or 0)
+    n_kept = int(s.n_kept or 0)
+    q_all = float(s.qty_all or 0)
+    q_kept = float(s.qty_kept or 0)
+    share = (q_kept / q_all * 100) if q_all else 0.0
+    progress.done(f"Фактический отток за {d['out_label']}: {n_kept} строк из {n_all} "
+                  f"прошли порог ≥{OUT_MIN_QTY} чел — это {q_kept:.0f} из {q_all:.0f} "
+                  f"человек ({share:.0f}%); свёрнуто в {len(out)} пар (ГОСБ, ИНН, месяц)")
+
 
 
 def _log_pipeline(fstat: pd.DataFrame, pstat: pd.DataFrame, conv: dict, d: dict) -> None:
@@ -640,39 +797,3 @@ def _log_pipeline(fstat: pd.DataFrame, pstat: pd.DataFrame, conv: dict, d: dict)
                       "пайплайн войдёт в прогноз без поправки (коэф. 1.0)")
 
 
-def _log_history(hd: dict, d: dict) -> None:
-    """Диагностика истории витрины: хватает ли её модели и что вообще посчиталось.
-
-    Раньше здесь стоял чек `n_hist < 13`, и он был неверен дважды: при ровно 13
-    месяцах не срабатывал, а 13 месяцев и не хватает — у ПРОГНОЗНОГО месяца второе
-    наблюдение появляется только на 24-м месяце (`forecast.seasonal_depth_needed`).
-    Поэтому вместо порога печатаем факт: чем посчитана сезонность и у скольких пар.
-    """
-    if not hd:
-        return
-    # молчаливый сбой: если базового месяца нет в истории, отток закрытого месяца
-    # везде окажется нулём, и ВСЁ уедет в класс «стабильно» без единой жалобы
-    if not hd.get("base_present"):
-        progress.done(f"ВНИМАНИЕ: базового месяца {hd.get('base_month')} НЕТ в истории "
-                      f"витрины — отток закрытого месяца везде будет нулевым, "
-                      f"модель оттока фактически отключена")
-    n_pairs = max(int(hd.get("n_pairs", 0)), 1)
-    n_out = int(hd.get("n_with_outflow", 0))
-    progress.done(f"Отток в закрытом месяце есть у {n_out} из {n_pairs} пар "
-                  f"({n_out / n_pairs * 100:.1f}%) — остальные попадут в «стабильно»")
-    src = hd.get("seas_src", {})
-    need, have = int(hd.get("need_months", 0)), int(hd.get("hist_months", 0))
-    n_idx = int(src.get(forecast.SRC_INDEX, 0))
-    n_yoy = int(src.get(forecast.SRC_YOY, 0))
-    if n_idx:
-        progress.done(f"Сезонность: индекс по ≥{forecast.MIN_SEASON_OBS} наблюдениям "
-                      f"у {n_idx} пар, переход год назад у {n_yoy}, без сигнала "
-                      f"{int(src.get(forecast.SRC_NONE, 0))}")
-    elif n_yoy:
-        progress.done(f"Сезонность: индекса нет (для месяца {d.get('label','')} нужно "
-                      f"{need} мес истории, есть {have}) → считаем по переходу год "
-                      f"назад, сигнал у {n_yoy} пар из {n_pairs}")
-    else:
-        progress.done(f"Сезонность НЕ рассчитана: для месяца {d.get('label','')} нужно "
-                      f"{need} мес истории (есть {have}), а перехода год назад нет — "
-                      f"работает только модель двух закрытых месяцев")

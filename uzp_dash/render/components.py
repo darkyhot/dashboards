@@ -187,7 +187,7 @@ def _bold(t: str) -> str:
 
 # поля, которые повторяются из строки в строку: их выносим в словари
 # (первые буквы имён различны — они же ключи словаря в payload)
-_PACK_DICT = ("lever", "gosb", "seg", "reason", "action")
+_PACK_DICT = ("lever", "gosb", "seg", "reason", "action", "emp")
 
 
 def _pack(rows: list[dict]) -> str:
@@ -200,6 +200,9 @@ def _pack(rows: list[dict]) -> str:
 
     `needk` кодируется индексом в списке значений: их всего три-четыре, зато
     исчезает риск, что 1.2 приедет в браузер с другим хвостом float.
+
+    ФИО закреплённого сотрудника (`emp`) идёт именно СЛОВАРЁМ: сотрудников тысячи,
+    а строк на проме десятки тысяч — повтор имени в каждой строке раздул бы файл.
     """
     import json
 
@@ -222,12 +225,14 @@ def _pack(rows: list[dict]) -> str:
                idx["gosb"][r.get("gosb") or ""], idx["seg"][r.get("seg") or ""],
                r["fl"], r["fot"], idx["reason"][r.get("reason") or ""],
                idx["action"][r.get("action") or ""],
-               kidx[float(r.get("needk") or 0.0)]] for r in rows]
+               kidx[float(r.get("needk") or 0.0)],
+               idx["emp"][r.get("emp") or ""]] for r in rows]
     d = ",".join(f'{c[0]}:{js(dicts[c])}' for c in _PACK_DICT)
     return (f'(function(){{var D={{{d}}},K={js(ks)},R={js(packed)};'
             f'return R.map(function(x){{return {{inn:x[0],company:x[1],'
             f'lever:D.l[x[2]],gosb:D.g[x[3]],seg:D.s[x[4]],fl:x[5],fot:x[6],'
-            f'reason:D.r[x[7]],action:D.a[x[8]],needk:K[x[9]]}};}});}})()')
+            f'reason:D.r[x[7]],action:D.a[x[8]],needk:K[x[9]],'
+            f'emp:D.e[x[10]]}};}});}})()')
 
 
 def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
@@ -236,7 +241,8 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     """Интерактивная таблица организаций: цель по плану + поиск + фильтры (ГОСБ,
     сегмент, рычаг) + пагинация. Самодостаточный инлайн-JS (работает офлайн).
 
-    rows: [{inn, lever, gosb, seg, fl, fot, reason, action, needk}, ...]
+    rows: [{inn, lever, gosb, seg, emp, fl, fot, reason, action, needk}, ...]
+    emp — ФИО закреплённого за организацией сотрудника (пусто → прочерк).
     Фильтр «Цель»: needk — минимальная цель (1.0/1.2/1.5), при которой организация
     нужна для закрытия разрыва её сегмента; 0 — не нужна ни при какой (видна только
     при выборе «все с эффектом от порога»).
@@ -260,7 +266,7 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
     <option value="1.5">Перевыполнить на 50%</option>
     <option value="0">{esc(all_label)}</option>
   </select>
-  <input id="{tid}-q" placeholder="Поиск: номер, название, ГОСБ, сегмент, причина…">
+  <input id="{tid}-q" placeholder="Поиск: номер, название, ГОСБ, сотрудник, сегмент, причина…">
   <select id="{tid}-g"><option value="">Все ГОСБ</option>{gopts}</select>
   <select id="{tid}-s"><option value="">Все сегменты</option>{sopts}</select>
   <select id="{tid}-l"><option value="">Все рычаги</option>
@@ -268,7 +274,7 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
 </div>
 <div class="tbl-scroll"><table id="{tid}-t">
   <thead><tr>
-    <th>Организация</th><th>Рычаг</th><th>ГОСБ</th><th>Сегмент</th>
+    <th>Организация</th><th>Рычаг</th><th>ГОСБ</th><th>Сотрудник</th><th>Сегмент</th>
     <th class="num">Эффект, чел</th><th class="num">ФОТ, млн</th><th>Причина / действие</th>
   </tr></thead><tbody></tbody>
 </table></div>
@@ -292,7 +298,7 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
       if(g&&r.gosb!==g)return false;
       if(s&&r.seg!==s)return false;
       if(l&&r.lever!==l)return false;
-      if(q){{const hay=(r.inn+' '+(r.company||'')+' '+r.gosb+' '+r.seg+' '+r.reason).toLowerCase();
+      if(q){{const hay=(r.inn+' '+(r.company||'')+' '+r.gosb+' '+(r.emp||'')+' '+r.seg+' '+r.reason).toLowerCase();
         if(!hay.includes(q))return false;}}
       return true;
     }});
@@ -309,10 +315,10 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
       return '<tr><td><div>'+esc(r.company||('Орг. '+r.inn))+'</div>'
         +'<div style="font-size:12px;color:var(--text-2)">Орг. '+r.inn+'</div></td>'
         +'<td><span class="badge '+cls+'">'+r.lever+'</span></td>'
-        +'<td>'+esc(r.gosb)+'</td><td>'+esc(r.seg)+'</td>'
+        +'<td>'+esc(r.gosb)+'</td><td>'+esc(r.emp||'—')+'</td><td>'+esc(r.seg)+'</td>'
         +'<td class="num">'+fmt(r.fl)+'</td><td class="num">'+fmt(r.fot)+'</td>'
         +'<td>'+esc(r.reason)+act+'</td></tr>';
-    }}).join('')||'<tr><td colspan="7" style="color:var(--text-2)">Ничего не найдено</td></tr>';
+    }}).join('')||'<tr><td colspan="8" style="color:var(--text-2)">Ничего не найдено</td></tr>';
     const sumFl=rows.reduce((a,r)=>a+Number(r.fl||0),0);
     $('i').textContent='Показано '+slice.length+' из '+rows.length+' орг · суммарный эффект +'
       +fmt(sumFl)+' чел · стр. '+(page+1)+'/'+pages;

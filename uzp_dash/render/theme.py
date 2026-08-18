@@ -192,8 +192,8 @@ td.heat { font-weight: 600; font-variant-numeric: tabular-nums; border-radius: 6
 .gcard .g-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .gcard .g-head h3 { font-size: 17px; }
 .gcard .g-ex { font-variant-numeric: tabular-nums; font-weight: 680; font-size: 20px; letter-spacing: -0.02em; }
-/* Строки водопада и таблицы НЕ привязаны к .gcard: те же блоки рендерятся
-   в разделе «Из чего складывается прогноз» по ТБ и в оверлее по ГОСБ. */
+/* Строки блоков и таблицы НЕ привязаны к .gcard: те же блоки рендерятся
+   в разделе «Управление портфелем» по ТБ и в оверлее по ГОСБ. */
 .g-seg { font-size: 13.5px; line-height: 1.5; letter-spacing: -0.004em; margin: 5px 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
 .g-seg b { font-variant-numeric: tabular-nums; }
 .g-hint { color: var(--text-2); font-size: 12.5px; letter-spacing: -0.003em; }
