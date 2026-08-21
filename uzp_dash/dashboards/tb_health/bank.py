@@ -95,6 +95,7 @@ def load(ctx) -> Bank:
     if len(sb_ids) > 1:
         progress.done(f"ВНИМАНИЕ: под level_name='sb' несколько level_id {sb_ids} — "
                       f"вердикт банка неоднозначен, берётся строка с наибольшим фактом")
+    _log_metrics(verdict, d)
 
     progress.step("Матрица ГОСБ × сегмент и итоги ГОСБ по всему банку")
     unit_seg = read_sql(e, Q.UNIT_SEG, {"m_rcp": Q.METRIC_RECIPIENTS,
@@ -105,6 +106,7 @@ def load(ctx) -> Bank:
                                            "ref_closed": d["ref_closed"]})
     for f in (unit_seg, unit_tot):
         f["end_dt"] = pd.to_datetime(f["end_dt"]).dt.date
+    _log_units(unit_seg, unit_tot, d)
 
     progress.step("Витрина организаций по всему банку (потенциал/отток/год к году)")
     orgs = read_sql(e, Q.ORGS_ALL, {"ref_closed": d["ref_closed"]})
@@ -193,12 +195,16 @@ def dates(engine, params: dict) -> dict:
     if ref_cur is None and d_cur is not None:
         ref_cur, src = d_cur, "последний месяц с прогнозом в витрине"
     elif ref_cur is not None and d_cur is not None and ref_cur > d_cur:
-        progress.warn(f"На {ref_cur} прогноза в витрине нет (последний с прогнозом — "
-                      f"{d_cur}). Отчёт соберётся, но прогноз будет пустым")
+        progress.warn(f"На {ref_cur} прогноза по метрике {Q.METRIC_RECIPIENTS} в "
+                      f"витрине нет (последний с прогнозом — {d_cur}). Отчёт "
+                      f"соберётся, но прогноз будет пустым")
     if ref_cur is None:
         closed = pd.to_datetime(read_sql(engine, Q.REF_DATE).iloc[0, 0]).date()
         ref_cur = (pd.Timestamp(closed) + pd.offsets.MonthEnd(1)).date()
-        src = "ФОЛБЭК: прогноза в витрине нет — закрытый месяц витрины + 1"
+        # якорь отчёта стоит на prediction_amt ИМЕННО метрики портфеля: если у неё
+        # прогноза нет вовсе, виновника надо назвать, иначе фолбэк выглядит загадкой
+        src = (f"ФОЛБЭК: прогноза по метрике {Q.METRIC_RECIPIENTS} в витрине нет — "
+               f"закрытый месяц витрины + 1")
     cur = pd.Timestamp(ref_cur)
     p_cur = cur.to_period("M")
     p_closed = p_cur - 1
@@ -279,6 +285,68 @@ def _only_known_tb(df: pd.DataFrame, tb_ids: set, what: str) -> pd.DataFrame:
         dropped = sorted({int(x) for x in df.loc[~keep, "tb_id"].dropna()})
         progress.done(f"Отброшено {n_drop} {what}: ТБ {dropped} не входят в отчёт")
     return df[keep].reset_index(drop=True)
+
+
+def _log_metrics(verdict: pd.DataFrame, d: dict) -> None:
+    """Сколько строк витрина дала по каждой метрике — и порядок величины ФОТ.
+
+    Если метрики за опорный месяц в витрине нет, `analyze._verdict` отдаёт нули, и
+    отчёт рисует их как настоящий результат: план 0, факт 0, выполнение «—». Отличить
+    это от честного нуля по самому отчёту нельзя, поэтому пустота называется вслух.
+    Особенно важно при СМЕНЕ id метрики: новая метрика может быть посчитана не на всех
+    уровнях и не за все месяцы.
+
+    Сырой ФОТ печатается до деления на 1e6: если метрика придёт не в рублях, ошибка в
+    миллион раз видна сразу, а не после сверки отчёта с чужой выгрузкой.
+    """
+    what = {Q.METRIC_RECIPIENTS: "портфель", Q.METRIC_FOT: "ФОТ"}
+    months = [("прогнозный", d["ref_cur"]), ("закрытый", d["ref_closed"]),
+              ("год назад", d["ref_yoy"])]
+    for mid, label in what.items():
+        sub = verdict[verdict["metric_id"] == mid] if not verdict.empty else verdict
+        by_month = [f"{name} {dt}: {int((sub['end_dt'] == dt).sum()) if len(sub) else 0}"
+                    for name, dt in months]
+        progress.done(f"Метрика {label} ({mid}): строк уровней sb/tb — "
+                      + " · ".join(by_month))
+        missing = [f"{name} {dt}" for name, dt in months[:2]
+                   if not len(sub) or not int((sub["end_dt"] == dt).sum())]
+        if missing:
+            progress.warn(f"Метрики {mid} ({label}) в витрине нет за: "
+                          f"{', '.join(missing)} — план и факт этих месяцев будут "
+                          f"нулями, а выполнение пустым. Проверьте id метрики")
+    fot = verdict[(verdict["metric_id"] == Q.METRIC_FOT)
+                  & (verdict["level_name"] == "sb")
+                  & (verdict["end_dt"] == d["ref_closed"])] if not verdict.empty else None
+    if fot is not None and not fot.empty:
+        raw = float(pd.to_numeric(fot["fact_amt"], errors="coerce").max() or 0)
+        # пробел как разделитель разрядов — только В ЧИСЛАХ: replace по всей строке
+        # съедал бы и запятые самого текста
+        num = f"{raw:,.0f}".replace(",", " ")
+        mln = f"{raw / RUB_TO_MLN:,.0f}".replace(",", " ")
+        progress.done(f"ФОТ банка за {d['ref_closed']} из витрины: {num} — в отчёте "
+                      f"это {mln} млн ₽. Если метрика придёт не в рублях, расхождение "
+                      f"будет ровно в 1e6")
+
+
+def _log_units(unit_seg: pd.DataFrame, unit_tot: pd.DataFrame, d: dict) -> None:
+    """Матрица «единица × сегмент» и итоги единиц: сколько строк и по каким уровням.
+
+    Разрез по сегментам (`extended_dim_1`) есть не у каждой метрики витрины. Если его
+    нет, матрица приезжает пустой, западающих сегментов не находится, и отчёт молча
+    теряет и таблицу сегментов, и весь отбор организаций под план.
+    """
+    for df, name in ((unit_seg, "матрица единица × сегмент"),
+                     (unit_tot, "итоги единиц")):
+        if df is None or df.empty:
+            progress.warn(f"{name.capitalize()}: строк нет вовсе — метрика портфеля "
+                          f"({Q.METRIC_RECIPIENTS}) за {d['ref_cur']}/{d['ref_closed']} "
+                          f"в этом разрезе не посчитана")
+            continue
+        lvl = ", ".join(f"{k}: {v}" for k, v in
+                        df["level_name"].value_counts().to_dict().items())
+        segs = (df["seg_id"].nunique() if "seg_id" in df else 0)
+        tail = f" · сегментов {segs}" if "seg_id" in df else ""
+        progress.done(f"{name.capitalize()}: {len(df)} строк ({lvl}){tail}")
 
 
 def _apparat(flags: pd.DataFrame) -> tuple[set, dict, dict]:

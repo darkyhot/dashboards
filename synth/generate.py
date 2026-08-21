@@ -15,14 +15,15 @@ from faker import Faker
 from sqlalchemy.engine import Engine
 
 from uzp_dash import config
+# Метрики берутся ИЗ ДЭША, а не дублируются числами: если id разъедутся, синтетика
+# молча наполнит витрину не теми метриками, отчёт покажет пустоту, и выглядеть это
+# будет как поломка кода, а не как рассинхрон двух констант.
+from uzp_dash.dashboards.tb_health.queries import METRIC_FOT, METRIC_RECIPIENTS
 from uzp_dash.db import read_sql
 
 RNG = np.random.default_rng(42)
 FAKE = Faker("ru_RU")
 Faker.seed(42)
-
-METRIC_FOT = 1000164          # Общий ФОТ, млн руб
-METRIC_RECIPIENTS = 12400196  # Количество уникальных получателей до ИНН
 
 # Сегменты УЗП: extended_dim_1 (короткие коды). 1 = Все. Некоторые коды
 # объединяют несколько «больших» сегментов (см. BIG_BY_CODE).
