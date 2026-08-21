@@ -243,6 +243,8 @@ dialog.gd[open] { animation: gd-in 0.22s cubic-bezier(0.22, 1, 0.36, 1); }
 .gd-row > span:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums;
                               font-weight: 620; }
 .gd-row .gd-why { color: var(--text-2); font-size: 12.5px; }
+/* Закреплённый сотрудник — подпись под названием организации */
+.gd-row .gd-emp { display: block; color: var(--text-2); font-size: 12px; margin-top: 1px; }
 
 /* Группы оттока по причине: нативный <details>, шапка в колонках строки организации */
 .gd-grp { border-top: 1px solid var(--separator); }

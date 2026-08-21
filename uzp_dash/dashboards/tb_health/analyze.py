@@ -1335,7 +1335,7 @@ def _out_groups(rows: list, closed_label: str, out_label: str = "") -> list:
 
 
 def _yoy_rows(nid: int, inns, rows: list, names: dict, yoy: dict, cur: dict, ref: dict,
-              insights: dict, work: set, nopt: set) -> list:
+              insights: dict, work: set, nopt: set, emp_of: dict | None = None) -> list:
     """Просевшие за год организации единицы — ПО СТРОКАМ ВИТРИНЫ, а не по прогнозу.
 
     Источник принципиален. Блок отвечает на вопрос «на сколько просел портфель за год»,
@@ -1347,6 +1347,10 @@ def _yoy_rows(nid: int, inns, rows: list, names: dict, yoy: dict, cur: dict, ref
     Всё, что известно про отток и отработку, подмешивается из прогноза, если строка
     там есть; если нет — месяцев оттока мы не знаем, и организация уходит в группу
     «отработка неизвестна», а не в «таяли постепенно».
+
+    `emp_of` — ФИО закреплённого сотрудника по паре; заполнен только на уровне, где
+    единица разбора это ГОСБ (см. `_unit_detail`). Пустая строка означает «показывать
+    нечего», и подпись под названием организации просто не рисуется.
     """
     known = {r["inn"]: r for r in rows}
     out = []
@@ -1359,6 +1363,7 @@ def _yoy_rows(nid: int, inns, rows: list, names: dict, yoy: dict, cur: dict, ref
         ins = insights.get(k, {})
         out.append({
             "inn": int(inn), "name": names.get(k, f"Орг. {int(inn)}"),
+            "emp": (emp_of or {}).get(k, ""),
             "yoy": delta, "cur": cur.get(k, 0.0),
             "out": base.get("out", 0.0), "pipe": base.get("pipe", 0.0),
             "out_months": list(base.get("out_months") or []),
@@ -1513,6 +1518,13 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
     names, yoy, ref, cur = {}, {}, {}, {}
     yoy_tot: dict = {}
     det_by_unit: dict = {}
+    emp_of: dict = {}
+    # ФИО закреплённого сотрудника показываем ТОЛЬКО там, где единица разбора — ГОСБ.
+    # Закрепление живёт на грейне (ГОСБ, организация): на уровне ТБ у организации
+    # закреплённых может быть несколько, и выбрать «того самого» нечем. Условие
+    # явное, а не «в кадре нет колонки»: кадр уровня СБ приходит другой (строки
+    # витрины уровня tb), и молчаливое совпадение легко потерять при правке.
+    with_emp = unit_src == "new_gosb_id" and detail is not None and "emp_fio" in detail
     # Справочник приходит на грейне ЕДИНИЦЫ УРОВНЯ: у ТБ это строки витрины уровня
     # gosb, у банка — строки уровня tb. Ключ по ГОСБ на уровне СБ не нашёлся бы
     # никогда, и блок годового тренда молча оставался бы пустым.
@@ -1528,6 +1540,8 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
             # dict как упорядоченное множество: если справочник вдруг придёт с
             # повторами пары, организация не должна попасть в блок дважды
             det_by_unit.setdefault(k[0], {})[k[1]] = None
+            if with_emp:
+                emp_of[k] = str(getattr(r, "emp_fio", "") or "").strip()
 
     def _keys(df):
         src = unit_src if (df is not None and unit_src in df) else "new_gosb_id"
@@ -1571,6 +1585,10 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
             ins = insights.get(k, {})
             rows.append({
                 "inn": int(r.inn), "name": names.get(k, f"Орг. {int(r.inn)}"),
+                # ФИО закреплённого сотрудника: тем же ключом, что и у годового
+                # тренда. Показывать его или нет, решает уже view — этими строками
+                # живут ДВА блока (отток и пайплайн), а подпись нужна одному
+                "emp": emp_of.get(k, ""),
                 "out": float(r.out_kept), "ret": float(r.ret_qty),
                 "gone": float(r.out_qty),
                 "pipe": float(r.pipe_np_raw), "pipe_adj": float(r.pipe_np),
@@ -1603,7 +1621,7 @@ def _unit_detail(orgs_fc: pd.DataFrame, detail: pd.DataFrame, insights: dict,
         top_pipe, pipe_n, pipe_fl, pipe_cov = _material(pipe_rows, "pipe")
         # выросшие за год не показываем: блок отвечает на «почему просели»
         yoy_rows = _yoy_rows(nid, det_by_unit.get(nid, ()), rows, names, yoy, cur, ref,
-                             insights, work, nopt)
+                             insights, work, nopt, emp_of)
         yoy_groups = _yoy_groups(yoy_rows, nid, fmonths, fwindow)
         out[nid] = {
             # коэффициент ИМЕННО ЭТОГО ГОСБ; если своей истории мало, он ушёл на

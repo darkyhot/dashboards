@@ -353,10 +353,15 @@ def _gosb_table(c: dict, wide: bool = False) -> str:
 
 def _org_rows(rows: list, key: str, tail_n: int, tail_fl: float,
               tail_txt: str, sign: int = -1, why=None,
-              cover: float = 0.0, n_all: int = 0) -> str:
+              cover: float = 0.0, n_all: int = 0, with_emp: bool = False) -> str:
     """Строки именной детализации: организация · вклад · причина и что сделать.
 
-    Названия компаний приходят из БД — обязательно через C.esc.
+    Названия компаний приходят из БД — обязательно через C.esc. Оттуда же ФИО
+    закреплённого сотрудника (`emp`).
+
+    `with_emp` — показывать ли ФИО. Флагом, а не «есть ли поле в строке»: строками
+    одного и того же кадра живут два блока (отток и пайплайн), поле несут оба, а
+    подпись нужна только оттоку. Кто её показывает, видно по вызовам.
 
     Хвост не прячем, и покрытие тоже: подпись всегда говорит, сколько организаций из
     общего числа показано и какую долю блока они объясняют. На проме в блоке бывает
@@ -374,8 +379,17 @@ def _org_rows(rows: list, key: str, tail_n: int, tail_fl: float,
                    f'это {cover * 100:.0f}% блока</div>')
     for r in rows:
         mark = "−" if sign < 0 else "+"
+        # ФИО закреплённого сотрудника — второй строкой под названием, как «Орг. N»
+        # в списке к работе. Отдельной колонкой его не сделать: строка организации и
+        # шапка группы размечены ОДНОЙ сеткой в три колонки, четвёртая разъехалась бы
+        # в обеих. Пусто на уровне СБ: там единица разбора ТБ, а закрепление живёт
+        # на грейне (ГОСБ, организация) — см. analyze._unit_detail.
+        emp = str(r.get("emp") or "").strip() if with_emp else ""
+        # span, а не div: ячейка сетки — сам <span>, а блочный элемент внутри
+        # фразового делает разметку невалидной. Перевод строки даёт CSS
+        sub = f'<span class="gd-emp">{C.esc(emp)}</span>' if emp else ""
         out.append(
-            f'<div class="gd-row"><span>{C.esc(r["name"])}</span>'
+            f'<div class="gd-row"><span>{C.esc(r["name"])}{sub}</span>'
             f'<span>{mark}{C.fmt_num(abs(r[key]))}</span>'
             f'<span class="gd-why">{C.esc(why_fn(r)) or "—"}</span></div>')
     if tail_n:
@@ -451,7 +465,7 @@ def _out_group(g: dict, open_: bool = False) -> str:
     """
     work = (f'можно работать: {g["work_n"]} орг (−{C.fmt_num(g["work_fl"])})'
             if g["work_n"] else "работать не с кем — вне зоны влияния")
-    return _group_html(g, open_, work, "out", _why_out)
+    return _group_html(g, open_, work, "out", _why_out, with_emp=True)
 
 
 def _yoy_group(g: dict, open_: bool = False) -> str:
@@ -460,10 +474,11 @@ def _yoy_group(g: dict, open_: bool = False) -> str:
     организаций группы имеют зафиксированную причину."""
     work = (f'причина зафиксирована у {g["work_n"]} орг (−{C.fmt_num(g["work_fl"])})'
             if g["work_n"] else "причина не зафиксирована ни у одной")
-    return _group_html(g, open_, work, "yoy", _why_size)
+    return _group_html(g, open_, work, "yoy", _why_size, with_emp=True)
 
 
-def _group_html(g: dict, open_: bool, work: str, key: str, why) -> str:
+def _group_html(g: dict, open_: bool, work: str, key: str, why,
+                with_emp: bool = False) -> str:
     """Группа: шапка с причиной и итогом, внутри — список организаций.
 
     Нативный `<details>`: клик и клавиатура работают без JS, а печать раскрывает
@@ -482,7 +497,8 @@ def _group_html(g: dict, open_: bool, work: str, key: str, why) -> str:
         f'<span>−{C.fmt_num(g["fl"])}</span>'
         f'<span class="gd-sub">{C.esc(sub)}</span></summary>'
         f'<div class="gd-rows">'
-        + _org_rows(g["rows"], key, g["tail_n"], g["tail_fl"], "— хвост", why=why)
+        + _org_rows(g["rows"], key, g["tail_n"], g["tail_fl"], "— хвост", why=why,
+                    with_emp=with_emp)
         + '</div></details>'
     )
 
