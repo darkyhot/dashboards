@@ -1136,3 +1136,106 @@ select
 from
     rendered
 distributed by (inn);
+
+
+/* ============================================================================
+   Проверка сколько задач встанет на сотрудника
+
+   Контрольный запрос: ничего не создаёт и не пишет, нужен чтобы оценить нагрузку
+   перед выкаткой. Считается только по eff_role = 'МЗП' — это роль, которая
+   исполняет задачу лично.
+
+   Цепочка витрин та же, что в дэше tb_health (uzp_dash/dashboards/tb_health/
+   queries.py, ORG_MANAGER; описание в methodology.md §8.2), только без ФИО:
+
+     uzp_data_emp_epk_assignment   role_id = 14, end_dttm is null
+             | epk_id                 -> gosb_id (СТАРЫЙ код), saphr_id, start_dttm
+             v
+     uzp_data_epk_consolidation    epk_id -> ИНН
+             v
+             пара (ГОСБ, ИНН) -> saphr_id
+
+   Заполненный end_dttm означает, что закрепление уже закрыто — по такому приехал
+   бы бывший менеджер.
+   ============================================================================ */
+with gmap as (
+    --- В assignment лежит СТАРЫЙ код ГОСБ (1023, 130000, 400000 ...), а задачи
+    --- ключуются новым (8586). Без перекладки join почти ничего не найдёт.
+    select
+        old_gosb_id,
+        min(new_gosb_id) as new_gosb_id
+    from
+        s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dim_gosb
+    group by 1
+),
+asg as (
+    --- действующие закрепления роли 14 «за сотрудником ведётся клиент»
+    select
+        gmap.new_gosb_id as gosb_id,
+        assignment.epk_id,
+        assignment.saphr_id,
+        assignment.start_dttm
+    from
+        s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_emp_epk_assignment assignment
+    inner join
+        gmap
+            on gmap.old_gosb_id = assignment.gosb_id
+    where
+        assignment.role_id = 14
+        and assignment.end_dttm is null
+),
+epk as (
+    --- min(inn) на epk_id — страховка от размножения строк, если витрина придёт
+    --- с историей на один ЕПК
+    select
+        epk_id,
+        min(inn) as inn
+    from
+        s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation
+    where
+        inn is not null
+    group by 1
+),
+emp as (
+    --- Дедуп на паре (ГОСБ, ИНН), а не на epk_id: несколько ЕПК могут указывать
+    --- на один ИНН, и организация задвоилась бы с разными табельными. Из
+    --- нескольких действующих закреплений берём последнее по start_dttm;
+    --- saphr_id во втором ключе — только ради детерминированности.
+    --- row_number(), а не distinct on — ядро 9.4.
+    select
+        gosb_id,
+        inn,
+        saphr_id
+    from (
+        select
+            asg.gosb_id,
+            epk.inn,
+            asg.saphr_id,
+            row_number() over(partition by asg.gosb_id, epk.inn
+                              order by asg.start_dttm desc, asg.saphr_id desc) as rn
+        from
+            asg
+        inner join
+            epk
+                on epk.epk_id = asg.epk_id) t
+    where
+        rn = 1
+)
+select
+    emp.saphr_id,
+    count(*)                  as task_qty,
+    count(distinct task.inn)  as inn_qty
+from
+    s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.yva_kk_new_scoring_v3 task
+--- left join намеренно: строка с saphr_id is null покажет, по скольким задачам
+--- МЗП закреплённого сотрудника не нашлось
+left join
+    emp
+        on emp.gosb_id = task.gosb_id
+        and emp.inn = task.inn
+where
+    task.eff_role = 'МЗП'
+group by 1
+--- при eff_role = 'МЗП' слот ровно один, поэтому task_qty и inn_qty обязаны
+--- совпасть; расхождение означает размножение строк на джойне
+order by task_qty desc;
