@@ -229,7 +229,19 @@ CREATE TABLE uzp_dwh_fact_outflow (
   prev_m_fl_val        integer,
   next_m_fl_val        integer,    -- смотрит ВПЕРЁД: forecast_lab её не читает
   is_task              boolean,
-  inserted_dttm        timestamp
+  -- Территориальная привязка по ОКТМО. Разрезы «по территориям» строятся отсюда.
+  -- На проме oktmo_subject_code НЕГОДЕН: длина 0-2, среди значений «"0», «М»,
+  -- «П», «tr» — это мусор загрузки, а не код субъекта. Синтетика воспроизводит
+  -- его таким же намеренно: ветка «код субъекта негоден, берём substr(oktmo,1,2)»
+  -- обязана проверяться снаружи, а не открыться на проме.
+  is_oktmo             boolean,
+  oktmo_subject_code   varchar,
+  oktmo_subject_district_code      varchar,
+  oktmo_subject_district_city_code varchar,
+  oktmo                varchar,
+  client_communication_infopovod   varchar,
+  inserted_dttm        timestamp,
+  author_login         text
 );
 
 -- ============ Возвраты оттока ============
@@ -250,6 +262,32 @@ CREATE TABLE uzp_data_outflow_return_detail (
   is_outflow_return_success boolean,
   return_qty                integer,   -- сколько из них вернулось, <= outflow_qty
   inserted_dttm             timestamp
+);
+
+-- ============ Доп. атрибуты по ключевым клиентам ============
+-- Единственный источник в витринах, где названы БАНКИ-КОНКУРЕНТЫ и кэптивный банк.
+-- Ключевая особенность прома, которую воспроизводим: витрина покрывает ТОЛЬКО
+-- ключевых клиентов (на проме ~16.7 тыс. ИНН против ~88 тыс. в витрине оттока).
+-- Код обязан считать и показывать это покрытие: без него блок конкурентов
+-- выглядит как «конкурентов почти нет», хотя на самом деле их просто не спросили.
+-- Колонок на проме под сотню; здесь заведены те, которые реально читаются.
+
+CREATE TABLE uzp_data_key_client_info_add_attr (
+  report_dt              date,
+  inn                    bigint,
+  tb_id                  integer,
+  gosb_id                integer,
+  segment_name           varchar,   -- БОЛЬШОЕ имя сегмента («Рег. госсектор»)
+  industry_name          varchar,
+  company_name           varchar,
+  holding_name           varchar,
+  holding_strategy_name  varchar,   -- отток | привлечение | удержание
+  bank_competitor        varchar,   -- основные банки-конкуренты
+  captive_bank_name      varchar,
+  is_key_client          boolean,
+  inn_current_fl_qty     bigint,
+  inn_emp_potential_qty  numeric,
+  modified_dttm          timestamp
 );
 
 -- ============ Справочники сотрудников и ЕПК ============

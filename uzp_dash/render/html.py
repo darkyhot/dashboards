@@ -16,8 +16,18 @@ def sanitize(text: str) -> str:
     return _INN_WORD.sub("Орг.", text or "")
 
 
-def page(title: str, subtitle: str, body: str, footer: str = "") -> str:
+def page(title: str, subtitle: str, body: str, footer: str = "",
+         chrome: bool = True) -> str:
+    """Каркас страницы.
+
+    `chrome=False` убирает шапку с заголовком: у отчёта-презентации первый экран
+    должен начинаться прямо с первого слайда, а не съезжать вниз на высоту шапки.
+    Заголовок такой отчёт показывает сам — в закреплённой полосе сверху.
+    """
     footer_html = f'<div class="footer">{footer}</div>' if footer else ""
+    head_html = ("" if not chrome else
+                 f'<header><div class="eyebrow">УЗП · Дэшборд</div>'
+                 f'<h1>{title}</h1><p class="sub">{subtitle}</p></header>')
     html = f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -28,11 +38,7 @@ def page(title: str, subtitle: str, body: str, footer: str = "") -> str:
 </head>
 <body>
 <div class="wrap">
-<header>
-<div class="eyebrow">УЗП · Дэшборд</div>
-<h1>{title}</h1>
-<p class="sub">{subtitle}</p>
-</header>
+{head_html}
 {body}
 {footer_html}
 </div>

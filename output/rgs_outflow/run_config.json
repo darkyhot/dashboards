@@ -1,0 +1,15 @@
+{
+  "report_month": "2026-06",
+  "horizon_to": "2026-01",
+  "history_months": 12,
+  "panel_months": 24,
+  "cause_window": 6,
+  "forecast_window": 6,
+  "llm_max_calls": 0,
+  "top_n": 12,
+  "contour": "open",
+  "model": "deepseek-v4-flash",
+  "d_from": "2025-07-31",
+  "d_to": "2026-06-30",
+  "p_from": "2024-07-31"
+}

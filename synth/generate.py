@@ -74,6 +74,67 @@ FUTURE_MONTH_NAME = ("январе феврале марте апреле мае
                      "октябре ноябре декабре").split()[_NEXT_MONTH.month - 1]
 ORGS_TOTAL = 4000
 
+# --------------------------------------------------------------------------- #
+# Бюджетная сфера (РГС): ведомства, причины оттока, ОКТМО, конкуренты.
+#
+# Всё это нужно скрипту uzp_scripts/rgs_outflow. Отдельного поля «ведомство» нет
+# ни в одной витрине — оно выводится из НАИМЕНОВАНИЯ организации, поэтому имена
+# РГС-организаций обязаны быть бюджетного вида. С faker-названиями («ООО Иванов
+# и партнёры») классификатор ведомств снаружи не проверялся бы вовсе.
+#
+# Ключи совпадают с rgs.agency.AGENCIES — там же лежат правила разбора. Синтетика
+# и классификатор специально смотрят на одни и те же префиксы: если правило
+# сломается, это увидит selfcheck, а не пром.
+# --------------------------------------------------------------------------- #
+AGENCY_NAMES = {
+    "education":  ["МБОУ СОШ № {n}", "МАОУ ГИМНАЗИЯ № {n}", "МБДОУ ДЕТСКИЙ САД № {n}",
+                   "ГБОУ ЛИЦЕЙ № {n}", "ФГБОУ ВО УНИВЕРСИТЕТ № {n}"],
+    "health":     ["ГБУЗ ГОРОДСКАЯ БОЛЬНИЦА № {n}", "ГБУЗ ЦРБ № {n}",
+                   "ГАУЗ ПОЛИКЛИНИКА № {n}", "ГБУЗ ДИСПАНСЕР № {n}"],
+    "social":     ["ГБУ КЦСОН № {n}", "ГБУ СО ИНТЕРНАТ № {n}", "ГКУ ЦСО № {n}"],
+    "culture":    ["МБУК ДОМ КУЛЬТУРЫ № {n}", "МБУК ЦЕНТРАЛЬНАЯ БИБЛИОТЕКА № {n}",
+                   "МБУК МУЗЕЙ № {n}", "МБУДО ШКОЛА ИСКУССТВ № {n}"],
+    "sport":      ["МБУ ДЮСШ № {n}", "МАУ СПОРТИВНАЯ ШКОЛА № {n}"],
+    "security":   ["УМВД № {n}", "ФКУ ИК-{n} УФСИН", "УПРАВЛЕНИЕ РОСГВАРДИИ № {n}"],
+    "justice":    ["РАЙОННЫЙ СУД № {n}", "ПРОКУРАТУРА № {n}", "УФССП № {n}"],
+    "fiscal":     ["УФНС № {n}", "УФК № {n}"],
+    "government": ["АДМИНИСТРАЦИЯ ГОРОДСКОГО ОКРУГА № {n}", "МИНИСТЕРСТВО № {n}",
+                   "КОМИТЕТ № {n}", "ДЕПАРТАМЕНТ № {n}", "СОВЕТ ДЕПУТАТОВ № {n}"],
+    "utilities":  ["МУП ВОДОКАНАЛ № {n}", "МУП БЛАГОУСТРОЙСТВО № {n}",
+                   "ГУП ТЕПЛОСЕТИ № {n}"],
+}
+AGENCY_KINDS = list(AGENCY_NAMES)
+# Веса ведомств: образование и здравоохранение — самые массовые в бюджетной сфере
+AGENCY_WEIGHTS = np.array([0.30, 0.20, 0.07, 0.08, 0.05, 0.06, 0.05, 0.03, 0.11, 0.05])
+# Доля РГС-организаций с НЕразбираемым именем: ветка «не классифицировано» обязана
+# встречаться, иначе её обработка (отдельная строка в отчёте) поедет непроверенной.
+AGENCY_UNKNOWN_SHARE = 0.07
+# Ведомство, у которого отток растёт три закрытых месяца подряд — ветка «тенденция»
+AGENCY_PERSISTENT = "education"
+
+# Причина оттока. Различаются ИМЕННО поведением штата (total_emp_qty):
+#   staff_cut  — штат падает вместе с получателями -> zp_fl_perc держится;
+#   competitor — штат стоит, получатели падают     -> zp_fl_perc падает.
+# До этой правки emp_k был постоянным множителем к численности получателей, из-за
+# чего zp_fl_perc не менялся НИ У КОГО и ветка «уход к конкуренту» не встречалась.
+CAUSE_KINDS = ("staff_cut", "competitor", "mixed")
+CAUSE_GOSB_SHARE = 0.25      # доля ГОСБ, целиком окрашенных одной причиной
+
+# Банки-конкуренты и кэптивы (нейтральные вымышленные названия: настоящие имена
+# банков в открытый контур не переносим).
+COMPETITOR_BANKS = ["Банк А", "Банк Б", "Банк В", "Банк Г", "Банк Д"]
+CAPTIVE_BANKS = ["Кэптив-1", "Кэптив-2", "Кэптив-3"]
+KEY_CLIENT_SHARE = 0.19      # покрытие витрины ключевых клиентов, как на проме
+# Отрасли РГС из справочника ЕПК (промовские формулировки)
+RGS_INDUSTRIES = ["Органы гос. и мун. управления", "Здравоохранение, образование",
+                  "Услуги", "Прочее"]
+
+# Мусор в oktmo_subject_code — воспроизводится намеренно (см. комментарий в
+# schema.sql): на проме там встречаются «"0», «М», «П», «tr» и пустая строка.
+OKTMO_JUNK = ['"0', '"1', "М", "П", "tr", ""]
+OKTMO_JUNK_SHARE = 0.08
+OKTMO_EMPTY_SHARE = 0.12     # доля строк вообще без ОКТМО
+
 # --- Закрепление сотрудников за организациями (uzp_data_emp_epk_assignment) ---
 # Дэш читает ДЕЙСТВУЮЩИЕ закрепления роли 14 и берёт последнее по start_dttm.
 # Доли ниже нужны, чтобы синтетика содержала все случаи этого отбора.
@@ -96,7 +157,7 @@ def generate_all(engine: Engine) -> dict[str, int]:
     funnel = _funnel(orgs, gosb)
     pipeline = _pipeline(funnel, orgs)
     motivation = _motivation(funnel, pipeline, orgs)
-    fact_out = _fact_outflow(company, orgs)
+    fact_out = _add_oktmo(_fact_outflow(company, orgs))
     returns = _outflow_return(fact_out)
     # Прогноз и план текущего месяца выводятся из фактического оттока и пайплайна,
     # поэтому считаются последними — после того, как эти таблицы построены
@@ -113,6 +174,9 @@ def generate_all(engine: Engine) -> dict[str, int]:
     counts["uzp_dwh_fact_outflow"] = _bulk(engine, fact_out, "uzp_dwh_fact_outflow")
     counts["uzp_data_outflow_return_detail"] = _bulk(
         engine, returns, "uzp_data_outflow_return_detail")
+    counts["uzp_data_key_client_info_add_attr"] = _bulk(
+        engine, _key_client_attrs(orgs, dim_company),
+        "uzp_data_key_client_info_add_attr")
     for table, frame in _epk_staff(orgs, funnel).items():
         counts[table] = _bulk(engine, frame, table)
     counts["uzp_dwh_sale_funnel_task"] = _bulk(engine, funnel, "uzp_dwh_sale_funnel_task")
@@ -365,7 +429,52 @@ def _orgs(gosb: pd.DataFrame, latest: pd.DataFrame) -> pd.DataFrame:
     df["fot_potential_amt"] = (df["_pull"] * df["avg_salary"]).round(2)
     df["fl_outflow_qty"] = df["_back"].round().astype(int)
     df["fot_outflow_amt"] = (df["_back"] * df["avg_salary"]).round(2)
-    return df.drop(columns=["_pull", "_back"])
+    return _mark_rgs(df.drop(columns=["_pull", "_back"]))
+
+
+def _mark_rgs(df: pd.DataFrame) -> pd.DataFrame:
+    """Разметить бюджетную сферу: ведомство и причина оттока.
+
+    Разметка идёт ПО ИНН, а не по строке: одна организация может работать
+    в нескольких ГОСБ (_spread_multi_gosb), и построчный жребий дал бы ей два
+    разных ведомства. В справочнике компаний выжила бы одна строка, в витрине
+    оттока — обе, и суммы по ведомствам перестали бы сходиться с итогом. Ошибка
+    молчаливая: отчёт выглядел бы правдоподобно.
+
+    Причина оттока красится ПО ГОСБ: разрез «территории и регионы» должен
+    показывать регионы с разным характером оттока, а не равномерный шум.
+    """
+    is_rgs = df["seg_code"] == 22
+    inns = df.loc[is_rgs, "inn"].drop_duplicates().sort_values().to_numpy()
+
+    r = RNG.random(len(inns))
+    p_ag = AGENCY_WEIGHTS / AGENCY_WEIGHTS.sum()
+    picked = RNG.choice(AGENCY_KINDS, size=len(inns), p=p_ag)
+    # часть организаций остаётся без разбираемого имени
+    picked = np.where(r < AGENCY_UNKNOWN_SHARE, "unknown", picked)
+    agency = dict(zip(inns.tolist(), picked.tolist()))
+
+    # ГОСБ, целиком окрашенные одной причиной: сокращение штата / уход к конкуренту
+    gosb_ids = np.sort(df["gosb_id"].unique())
+    k = max(1, int(len(gosb_ids) * CAUSE_GOSB_SHARE))
+    cut_gosb = set(gosb_ids[:k].tolist())
+    comp_gosb = set(gosb_ids[k:2 * k].tolist())
+    # ГОСБ организации — минимальный: у распространённой на несколько ГОСБ
+    # организации причина должна быть одна, иначе она попадёт в оба разреза
+    first_gosb = df.groupby("inn")["gosb_id"].min()
+
+    def _cause(inn: int) -> str:
+        g = int(first_gosb.loc[inn])
+        if g in cut_gosb:
+            return "staff_cut"
+        if g in comp_gosb:
+            return "competitor"
+        return "mixed"
+
+    df["agency_kind"] = [agency.get(int(i), "") for i in df["inn"]]
+    df["cause_kind"] = [_cause(int(i)) if a else "" for i, a in
+                        zip(df["inn"], df["agency_kind"])]
+    return df
 
 
 def _scarce_segments(seg_gap: dict, every: int = 5) -> set:
@@ -428,6 +537,12 @@ def _archetypes(orgs: pd.DataFrame) -> np.ndarray:
         np.where(r < 0.35, "persistent", np.where(r < 0.70, "one_off", "season_out")),
         np.where(r < 0.75, "flat", "season_in"),
     )
+    # Одно ведомство бюджетной сферы обязано показывать РАСТУЩИЙ отток три
+    # закрытых месяца подряд: без такой ветки блок тенденций проверяется только
+    # на шуме, и «тренд есть / тренда нет» снаружи не различить.
+    if "agency_kind" in orgs:
+        forced = has_out & (orgs["agency_kind"].to_numpy() == AGENCY_PERSISTENT)
+        kind = np.where(forced, "persistent", kind)
     return kind.astype(object)
 
 
@@ -444,8 +559,19 @@ def _fact_outflow(company: pd.DataFrame, orgs: pd.DataFrame) -> pd.DataFrame:
     """
     c = company[(company["level_name"] == "gosb")
                 & (company["org_type"] == "inn")].copy()
-    seg_of = dict(zip(orgs["inn"].astype("int64"), orgs["segment_name"]))
+    # Сегмент здесь — КОРОТКИЙ код (РГС, ММБ, КСБ, КФИ, СКМ), как на проме, а не
+    # большое имя из справочника компаний. Витрины говорят на разных словарях,
+    # и это ловушка: фильтр `segment_name = 'РГС'` по большому имени вернул бы
+    # ноль строк, а выглядело бы это как «в бюджетной сфере оттока нет».
+    # Отличие от прома, оставленное сознательно: там в этой витрине пяти
+    # сегментов, БМО (SBI) в неё не попадает. Здесь БМО оставлен — выбрасывать
+    # его значило бы менять цифры уже работающего дэша ради разреза, который
+    # этот скрипт всё равно не читает.
+    seg_of = dict(zip(orgs["inn"].astype("int64"),
+                      orgs["seg_code"].astype(int).map(SEG_SHORT)))
     tb_of = dict(zip(orgs["gosb_id"].astype(int), orgs["tb_id"].astype(int)))
+    agency_of = dict(zip(orgs["inn"].astype("int64"), orgs.get(
+        "agency_kind", pd.Series("", index=orgs.index))))
     fl = c["current_fl_qty"].to_numpy(dtype=float)
     out = c["fl_outflow_qty"].to_numpy(dtype=float)
     # фоновая убыль там, где основная витрина показывает ноль
@@ -458,8 +584,11 @@ def _fact_outflow(company: pd.DataFrame, orgs: pd.DataFrame) -> pd.DataFrame:
         "tb_id": [tb_of.get(int(g), 0) for g in c["level_id"]],
         "gosb_id": c["level_id"].astype(int).to_numpy(),
         "inn": c["org_id"].astype("int64").to_numpy(),
-        "segment_name": [seg_of.get(int(i), "Микро") for i in c["org_id"]],
-        "is_force": False,
+        "segment_name": [seg_of.get(int(i), "ММБ") for i in c["org_id"]],
+        # Силовые организации — те самые, что классификатор ведомств узнаёт по
+        # имени. Флаг и имя обязаны совпадать: иначе не проверить, что правило
+        # «УМВД → силовые» и флаг витрины не спорят друг с другом.
+        "is_force": [agency_of.get(int(i), "") == "security" for i in c["org_id"]],
         "mzp_fio": None,
         "saphr_id": None,
         "calc_fl_qty": fl.astype(int),
@@ -476,8 +605,48 @@ def _fact_outflow(company: pd.DataFrame, orgs: pd.DataFrame) -> pd.DataFrame:
         "prev_m_fl_val": prev.astype(int),
         "next_m_fl_val": None,
         "is_task": out_full > 0,
+        "client_communication_infopovod": "",
         "inserted_dttm": pd.Timestamp.now(),
+        "author_login": "synth",
     })
+
+
+def _add_oktmo(df: pd.DataFrame) -> pd.DataFrame:
+    """Дописать колонки ОКТМО — территориальный разрез витрины оттока.
+
+    Субъект выводится ИЗ ГОСБ, а район и поселение — из ИНН: тогда территория
+    устойчива (одна организация всегда в одном месте) и при этом даёт разрез,
+    независимый от справочника ГОСБ.
+
+    Главное, что здесь воспроизводится, — ЛОВУШКА ПРОМА: `oktmo_subject_code`
+    там негоден (длина 0-2, среди значений «"0», «М», «П», «tr»). Код обязан
+    брать субъект из `substr(oktmo, 1, 2)`, и проверить это можно только если
+    мусор есть и снаружи. Чистая синтетика показала бы, что «всё работает», а
+    на проме разрез по субъектам молча рассыпался бы.
+    """
+    n = len(df)
+    gosb = df["gosb_id"].to_numpy(dtype="int64")
+    inn = df["inn"].to_numpy(dtype="int64")
+    subj = (gosb % 89 + 1) % 100                       # 2 знака: субъект
+    district = (inn // 7) % 1000                       # 3 знака: район
+    city = (inn // 13) % 1000                          # 3 знака: поселение
+    tail = (inn // 3) % 1000
+
+    oktmo = np.array([f"{s:02d}{d:03d}{c:03d}{t:03d}"[:11]
+                      for s, d, c, t in zip(subj, district, city, tail)])
+    empty = RNG.random(n) < OKTMO_EMPTY_SHARE
+    oktmo = np.where(empty, "", oktmo)
+
+    subject_code = np.array([o[:2] for o in oktmo], dtype=object)
+    junk = (RNG.random(n) < OKTMO_JUNK_SHARE) & ~empty
+    subject_code[junk] = RNG.choice(OKTMO_JUNK, size=int(junk.sum()))
+
+    df["is_oktmo"] = RNG.random(n) < 0.45      # признак ГОСБ эмиссии карт, ~как на проме
+    df["oktmo_subject_code"] = subject_code
+    df["oktmo_subject_district_code"] = [o[:5] for o in oktmo]
+    df["oktmo_subject_district_city_code"] = [o[:8] for o in oktmo]
+    df["oktmo"] = oktmo
+    return df
 
 
 def _outflow_return(fact_out: pd.DataFrame) -> pd.DataFrame:
@@ -702,9 +871,26 @@ def _company_holding(orgs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     df.loc[last, "fot_outflow_amt"] = o["fot_outflow_amt"].to_numpy()
     df.loc[last, "current_fot_amt"] = o["current_fot_amt"].to_numpy()
 
-    # штат ≥ получателей; проникновение = получатели/штат (низкое = резерв привлечения)
-    emp_k = RNG.uniform(1.05, 2.5, n)[idx]
-    total_emp = np.maximum(np.rint(fl_flat * emp_k), fl_flat)
+    # Штат ≥ получателей; проникновение = получатели/штат.
+    #
+    # Форма штата ВО ВРЕМЕНИ и есть признак причины оттока — на ней держится
+    # весь разбор «сокращение штата или уход к конкуренту»:
+    #   штат идёт за получателями -> zp_fl_perc держится -> СОКРАЩЕНИЕ ШТАТА;
+    #   штат стоит, получатели падают -> zp_fl_perc падает -> УХОД К КОНКУРЕНТУ.
+    # Раньше emp_k был одним множителем к численности получателей, то есть штат
+    # ВСЕГДА шёл за получателями и zp_fl_perc не менялся ни у кого: вторая ветка
+    # разбора не встречалась в синтетике вовсе и поехала бы на пром вслепую.
+    emp_k = RNG.uniform(1.05, 2.5, n)
+    cause = (o["cause_kind"].to_numpy() if "cause_kind" in o
+             else np.full(n, "", dtype=object))
+    flat_staff = fl.max(axis=1, keepdims=True)              # штат стоит
+    follow_staff = fl                                       # штат идёт за получателями
+    shape = np.where(
+        (cause == "competitor")[:, None], flat_staff,
+        np.where((cause == "mixed")[:, None],
+                 0.5 * follow_staff + 0.5 * flat_staff, follow_staff))
+    total_emp_m = np.maximum(np.rint(shape * emp_k[:, None]), fl)
+    total_emp = total_emp_m.reshape(-1)
     df["total_emp_qty"] = total_emp
     df["zp_fl_perc"] = (fl_flat / np.maximum(total_emp, 1)).round(4)
     df["new_fl_cnt"] = RNG.integers(0, 20, len(df))
@@ -1025,7 +1211,7 @@ def _dim_company(orgs: pd.DataFrame) -> pd.DataFrame:
     n = len(o)
     df = pd.DataFrame({
         "epk_id": o["inn"].astype("int64").to_numpy(),
-        "company_name": [FAKE.company() for _ in range(n)],
+        "company_name": _company_names(o),
         "inn": o["inn"].astype("int64").to_numpy(),
         "kpp": None,
         "segment_name": o["segment_name"].to_numpy(),   # большое имя сегмента
@@ -1039,6 +1225,27 @@ def _dim_company(orgs: pd.DataFrame) -> pd.DataFrame:
     df["info"] = None
     df["modified_dttm"] = pd.Timestamp.now()
     return df
+
+
+def _company_names(o: pd.DataFrame) -> list:
+    """Наименования организаций. У бюджетной сферы — бюджетного вида.
+
+    Ведомство нигде не хранится отдельным полем: и на проме, и здесь оно
+    выводится ИЗ ИМЕНИ. Поэтому имена РГС-организаций строятся по тем же
+    префиксам, которые разбирает rgs.agency, а часть намеренно оставлена
+    неразбираемой — ветку «не классифицировано» тоже надо проверить.
+    """
+    kinds = (o["agency_kind"].to_numpy() if "agency_kind" in o
+             else np.full(len(o), "", dtype=object))
+    inn = o["inn"].to_numpy(dtype="int64")
+    names = []
+    for kind, i in zip(kinds, inn):
+        tpl = AGENCY_NAMES.get(kind)
+        if not tpl:                       # не РГС либо намеренно неразбираемое имя
+            names.append(FAKE.company())
+            continue
+        names.append(tpl[int(i) % len(tpl)].format(n=int(i) % 90 + 1))
+    return names
 
 
 REF_COVERAGE = 0.85     # доля пар (ГОСБ, ИНН) витрины, закреплённых в эталонной базе
@@ -1271,6 +1478,57 @@ def _text_outflow(o, success: bool):
 
 
 # --------------------------------------------------------------------------- #
+def _key_client_attrs(orgs: pd.DataFrame, dim_company: pd.DataFrame) -> pd.DataFrame:
+    """Доп. атрибуты ключевых клиентов: банки-конкуренты, кэптив, стратегия.
+
+    Витрина покрывает ТОЛЬКО ключевых клиентов — на проме это ~19% организаций
+    витрины оттока. Покрытие воспроизводится специально: код обязан его считать
+    и подписывать, иначе блок конкурентов читается как «конкурентов нет», хотя
+    на самом деле про остальных просто не спрашивали.
+
+    Конкурент называется не у всех даже среди ключевых: на проме поле заполнено
+    не всегда, и ветка «ключевой клиент без конкурента» тоже должна встречаться.
+    """
+    o = orgs.drop_duplicates("inn").reset_index(drop=True)
+    take = RNG.random(len(o)) < KEY_CLIENT_SHARE
+    # у организаций с заметным оттоком шанс попасть в витрину выше — так на проме
+    take |= (o["fl_outflow_qty"].to_numpy() >= 3) & (RNG.random(len(o)) < 0.5)
+    k = o[take].copy()
+    if k.empty:
+        return k
+    n = len(k)
+    name_of = dict(zip(dim_company["inn"].astype("int64"), dim_company["company_name"]))
+
+    has_comp = RNG.random(n) < 0.65
+    comp = np.where(has_comp, RNG.choice(COMPETITOR_BANKS, size=n), None)
+    has_captive = RNG.random(n) < 0.12
+    captive = np.where(has_captive, RNG.choice(CAPTIVE_BANKS, size=n), None)
+    # Стратегия «отток» ставится там, где отток реально есть: иначе разрез
+    # «стратегия против факта» не проверяется — все клиенты выглядели бы ровно.
+    out = k["fl_outflow_qty"].to_numpy()
+    strategy = np.where(out >= 3, "отток",
+                        np.where(RNG.random(n) < 0.5, "удержание", "привлечение"))
+    return pd.DataFrame({
+        "report_dt": MAX_MONTH_END.date(),
+        "inn": k["inn"].astype("int64").to_numpy(),
+        "tb_id": k["tb_id"].astype(int).to_numpy(),
+        "gosb_id": k["gosb_id"].astype(int).to_numpy(),
+        "segment_name": k["segment_name"].to_numpy(),      # БОЛЬШОЕ имя, как на проме
+        "industry_name": np.where(
+            k["seg_code"].to_numpy() == 22,
+            RNG.choice(RGS_INDUSTRIES, size=n), "Прочее"),
+        "company_name": [name_of.get(int(i), "") for i in k["inn"]],
+        "holding_name": None,
+        "holding_strategy_name": strategy,
+        "bank_competitor": comp,
+        "captive_bank_name": captive,
+        "is_key_client": True,
+        "inn_current_fl_qty": k["current_fl_qty"].astype("int64").to_numpy(),
+        "inn_emp_potential_qty": k["emp_potential_qty"].to_numpy(),
+        "modified_dttm": pd.Timestamp.now(),
+    })
+
+
 def _bulk(engine: Engine, df: pd.DataFrame, table: str, schema: str | None = None) -> int:
     df = df.where(pd.notnull(df), None)
     df.to_sql(table, engine, schema=schema or config.SCHEMA, if_exists="append",
