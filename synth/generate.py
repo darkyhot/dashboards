@@ -9,6 +9,9 @@
 """
 from __future__ import annotations
 
+import io
+import json
+
 import numpy as np
 import pandas as pd
 from faker import Faker
@@ -82,7 +85,7 @@ ORGS_TOTAL = 4000
 # РГС-организаций обязаны быть бюджетного вида. С faker-названиями («ООО Иванов
 # и партнёры») классификатор ведомств снаружи не проверялся бы вовсе.
 #
-# Ключи совпадают с rgs.agency.AGENCIES — там же лежат правила разбора. Синтетика
+# Ключи совпадают с uzp_dash.agency.AGENCIES — там же лежат правила разбора. Синтетика
 # и классификатор специально смотрят на одни и те же префиксы: если правило
 # сломается, это увидит selfcheck, а не пром.
 # --------------------------------------------------------------------------- #
@@ -135,6 +138,78 @@ OKTMO_JUNK = ['"0', '"1', "М", "П", "tr", ""]
 OKTMO_JUNK_SHARE = 0.08
 OKTMO_EMPTY_SHARE = 0.12     # доля строк вообще без ОКТМО
 
+# --- Атрибуты ЕПК организаций (uzp_data_epk_consolidation) ---
+# Витрина — ТЕКУЩИЙ срез без отчётной даты, поэтому сегмент организации известен
+# только «на сегодня». Разбор численности РГС на это и опирается: один и тот же
+# список ИНН применяется к обоим сравниваемым годам.
+EPK_INDUSTRY_EMPTY_SHARE = 0.35   # доля организаций без отрасли (на проме её нет у 90%)
+EPK_LIQUIDATED_SHARE = 0.04       # доля ИНН без единой активной записи
+EPK_SECOND_EPK_SHARE = 0.05       # доля ИНН с ВТОРОЙ, ликвидированной записью при живой
+
+# Ведомственные холдинги. Нужны, чтобы разрез «где утекло» имел строки, а «уход
+# холдинга целиком» был отличим от равномерной текучести.
+HOLDINGS = {
+    "security":   "Холдинг силовых ведомств",
+    "education":  "Холдинг образования",
+    "health":     "Холдинг здравоохранения",
+    "government": "Холдинг органов власти",
+}
+HOLDING_KNOWN_SHARE = 0.55        # у остальных холдинг не заполнен, как на проме
+
+
+# --- ЗП-ведомости (uzp_data_payroll_m) ---
+# Разбор считает получателем ПАРУ (epk_id, ИНН) с суммой зачислений за месяц выше
+# порога. Синтетика обязана содержать каждый случай, который разбирает лестница
+# причин, — иначе прогон подтвердит работоспособность кода, не проверив ни одной
+# его ветки. Ожидаемые доли собираются в _payroll_expect и печатаются при сборке.
+PAYROLL_MONTHS = 25               # авг-24 … авг-26 на проме; здесь — 25 мес. до конца ряда
+PAYROLL_AMT_MIN = 2500            # порог получателя: строго БОЛЬШЕ этой суммы
+
+# Коды зачисления, которые считает разбор (список задан заказчиком).
+PAYROLL_CODES_IN = (1, 2, 16, 18, 19, 26, 28, 33, 38, 39, 40, 42, 49,
+                    82, 87, 88, 94, 95)
+# Коды ВНЕ списка: на них уезжают выплаты при смене кодировки — деньги те же,
+# а получатель из метрики пропадает.
+PAYROLL_CODES_OUT = (3, 5, 7, 21, 25, 29, 31, 47)
+PAYROLL_CODE_NAMES = {
+    1: "Заработная плата", 2: "Стипендия учащимся", 16: "Аванс по заработной плате",
+    18: "Премия, вознаграждение", 19: "Отпускные", 26: "Денежное довольствие",
+    28: "Расчет при увольнении", 33: "Иные выплаты от работодателя",
+    3: "Пенсия социальная", 5: "Пособия и другие выплаты", 7: "Прочие выплаты",
+    21: "Субсидии (все виды)", 25: "Компенсации (все виды)",
+    29: "ЕДВ социальные", 31: "Социальные выплаты", 47: "Прочее",
+}
+
+# Доля совместителей — людей, получающих в ДВУХ ИНН сразу. Падает по ряду с 7% до
+# 5%, ровно как на проме. Метрика считается ПАРАМИ, поэтому одно это падение даёт
+# часть годового минуса, не тронув ни одного человека.
+PAYROLL_MULTI_START = 0.07
+PAYROLL_MULTI_END = 0.05
+
+# Сценарии, зашитые в ряд. Каждый обязан быть найден разбором; месяцы заданы
+# смещением от последнего месяца ряда, чтобы ряд можно было двигать целиком.
+PAYROLL_CLIFF_BACK = 7            # мес. назад от конца: месяц-обрыв у группы ИНН
+PAYROLL_CLIFF_SHARE = 0.06        # доля РГС-ИНН, теряющих всех получателей разом
+PAYROLL_CODESWITCH_BACK = 9       # мес. назад: силовые уходят на код вне списка
+PAYROLL_REORG_BACK = 5            # мес. назад: люди переезжают в другой ИНН
+PAYROLL_REORG_ORGS = 6            # сколько ИНН реорганизуется
+PAYROLL_DRIFT_SHARE = 0.05        # доля пар, сползающих ниже порога 2500
+PAYROLL_LEAVE_RATE = 0.010        # ежемесячная доля людей, уходящих из банка совсем
+PAYROLL_JOIN_RATE = 0.008         # ежемесячная доля новых людей
+PAYROLL_TO_OTHER_SEG = 0.003      # ежемесячная доля перешедших в небюджетный ИНН
+
+# Грязь в ИНН: на проме колонка TEXT, и в ней встречается то, что в bigint не
+# приводится. Прямой CAST роняет запрос целиком — синтетика обязана это ловить.
+PAYROLL_INN_JUNK_SHARE = 0.010    # нечисловой ИНН
+PAYROLL_INN_ZERO_SHARE = 0.015    # ИНН с ведущим нулём: в bigint он не сойдётся
+PAYROLL_INN_ORPHAN_SHARE = 0.020  # ИНН, которого нет в uzp_data_epk_consolidation
+
+# Доля небюджетных организаций, попадающих в ведомости: нужна, чтобы ветка «ушёл
+# в другой сегмент» была отличима от «ушёл из банка».
+PAYROLL_RGS_SCALE = 0.50          # масштаб численности бюджетных организаций
+PAYROLL_OTHER_SEG_ORGS = 0.25     # доля небюджетных организаций в ведомостях
+PAYROLL_OTHER_SEG_SCALE = 0.15    # и они меньше по численности, чем бюджетные
+
 # --- Закрепление сотрудников за организациями (uzp_data_emp_epk_assignment) ---
 # Дэш читает ДЕЙСТВУЮЩИЕ закрепления роли 14 и берёт последнее по start_dttm.
 # Доли ниже нужны, чтобы синтетика содержала все случаи этого отбора.
@@ -179,6 +254,11 @@ def generate_all(engine: Engine) -> dict[str, int]:
         "uzp_data_key_client_info_add_attr")
     for table, frame in _epk_staff(orgs, funnel).items():
         counts[table] = _bulk(engine, frame, table)
+    # Ведомости строятся ПОСЛЕ справочника ЕПК: список ликвидированных организаций
+    # приходит оттуда, и получатели таких организаций обязаны пропадать из ряда.
+    payroll_frames, payroll_expect = _payroll(orgs, set(_epk_expect["liquidated_inn"]))
+    counts["uzp_data_payroll_m"] = _copy(engine, payroll_frames, "uzp_data_payroll_m")
+    _write_expectations(payroll_expect)
     counts["uzp_dwh_sale_funnel_task"] = _bulk(engine, funnel, "uzp_dwh_sale_funnel_task")
     counts["yva_pl_task_deal_code"] = _bulk(engine, pipeline, "yva_pl_task_deal_code",
                                             schema=config.SCHEMA_T)
@@ -683,6 +763,321 @@ def _outflow_return(fact_out: pd.DataFrame) -> pd.DataFrame:
     })
 
 
+# --------------------------------------------------------------------------- #
+# ЗП-ведомости: помесячный ряд пар (человек, ИНН)
+# --------------------------------------------------------------------------- #
+# Разбор численности РГС считает получателем ПАРУ (epk_id, ИНН) с суммой зачислений
+# за месяц выше порога. Поэтому генератор строит не строки, а ПАРЫ с расписанием
+# жизни, и уже из них разворачивает строки ведомостей.
+#
+# Каждый сценарий ниже — ветка лестницы причин из отчёта. Ветка, которой нет в
+# синтетике, уедет на пром непроверенной, и первым, кто её отладит, будет пром.
+_payroll_expect: dict = {}
+_epk_expect: dict = {}
+
+
+def _write_expectations(expect: dict) -> None:
+    """Ожидаемые ответы синтетики — на диск, рядом с отчётами.
+
+    Разбор ведомостей проверяется не «отработал без ошибок», а «нашёл то, что в
+    данные заложено»: месяц-обрыв, месяц смены кода, карту реорганизации ИНН.
+    Держать эти числа в голове нельзя, а сверять глазами — то же самое, что не
+    сверять. Файл читает `cohort.selfcheck.check_against_synth`.
+    """
+    path = config.OUTPUT_DIR / "synth_payroll_expect.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(expect, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8")
+    print(f"  ожидания синтетики -> {path}")
+
+
+def _holdings(o: pd.DataFrame, is_rgs: np.ndarray) -> list:
+    """Холдинг по организации. Заполнен не у всех — как на проме."""
+    out = []
+    for kind, rgs, r in zip(o["agency_kind"], is_rgs, RNG.random(len(o))):
+        name = HOLDINGS.get(str(kind)) if rgs else None
+        out.append(name if (name and r < HOLDING_KNOWN_SHARE) else None)
+    return out
+
+
+def _payroll_inn_text(inn: int, kind: str) -> str:
+    """ИНН строкой — так, как он лежит в payroll_m на проме.
+
+    Колонка TEXT, и в неё попадает то, что в bigint не приводится: нечисловые
+    значения и номера с ведущим нулём. Прямой CAST(inn AS bigint) на таком
+    значении роняет ВЕСЬ запрос, а не одну строку, поэтому джойн обязан идти
+    через маску. Проверить это можно только на данных, где такое есть.
+    """
+    if kind == "junk":
+        return f"ИНН{inn % 1000:03d}"
+    if kind == "zero":
+        return f"0{inn}"[:12]
+    return str(inn)
+
+
+def _payroll(orgs: pd.DataFrame, liquidated: set):
+    """Ведомости за PAYROLL_MONTHS месяцев. Возвращает (генератор кадров, ожидания).
+
+    Кадры отдаются ПОМЕСЯЧНО: весь ряд разом — это миллионы строк, и держать их
+    в памяти незачем, они всё равно уезжают в базу по одному месяцу.
+    """
+    months = [MAX_MONTH_END - pd.offsets.MonthEnd(k)
+              for k in range(PAYROLL_MONTHS - 1, -1, -1)]
+    last = PAYROLL_MONTHS - 1
+
+    o = orgs.drop_duplicates("inn").reset_index(drop=True)
+    rgs = o[o["seg_code"] == 22].reset_index(drop=True)
+    other = o[o["seg_code"] != 22].sample(frac=PAYROLL_OTHER_SEG_ORGS,
+                                          random_state=11).reset_index(drop=True)
+
+    # --- организации ведомостей: свои численности, свой вид записи ИНН ---
+    def _org_table(src: pd.DataFrame, scale: float, seg: str) -> pd.DataFrame:
+        t = src[["inn", "gosb_id", "tb_id", "agency_kind", "avg_salary"]].copy()
+        t["n_recv"] = np.maximum(2, (src["current_fl_qty"] * scale).round()).astype(int)
+        t["seg"] = seg
+        return t
+
+    tab = pd.concat([_org_table(rgs, PAYROLL_RGS_SCALE, "rgs"),
+                     _org_table(other, PAYROLL_OTHER_SEG_SCALE, "other")],
+                    ignore_index=True)
+
+    # Вид записи ИНН. «Сирота» — ИНН, которого нет в справочнике ЕПК: он не
+    # сойдётся по джойну, и отчёт обязан показать долю таких строк, а не потерять
+    # их молча.
+    r = RNG.random(len(tab))
+    kind = np.where(r < PAYROLL_INN_JUNK_SHARE, "junk",
+             np.where(r < PAYROLL_INN_JUNK_SHARE + PAYROLL_INN_ZERO_SHARE, "zero",
+               np.where(r < (PAYROLL_INN_JUNK_SHARE + PAYROLL_INN_ZERO_SHARE
+                             + PAYROLL_INN_ORPHAN_SHARE), "orphan", "ok")))
+    tab["inn_kind"] = kind
+    # у «сироты» ИНН просто другой — такого номера в справочнике нет
+    tab["inn_out"] = [i + 700_000_000 if k == "orphan" else i
+                      for i, k in zip(tab["inn"].astype("int64"), tab["inn_kind"])]
+    tab["inn_txt"] = [_payroll_inn_text(int(i), k)
+                      for i, k in zip(tab["inn_out"], tab["inn_kind"])]
+
+    # --- реорганизация: ИНН-приёмники, которых до события не существовало ---
+    rgs_ok = tab[(tab.seg == "rgs") & (tab.inn_kind == "ok")].index.to_numpy()
+    reorg_src = rgs_ok[:PAYROLL_REORG_ORGS]
+    reorg_dst_inn = {int(tab.at[i, "inn_out"]): int(tab.at[i, "inn_out"]) + 11_000_000
+                     for i in reorg_src}
+
+    # --- сценарии по организациям ---
+    cliff_m = last - PAYROLL_CLIFF_BACK
+    switch_m = last - PAYROLL_CODESWITCH_BACK
+    reorg_m = last - PAYROLL_REORG_BACK
+
+    pool = [i for i in rgs_ok if i not in set(reorg_src)]
+    n_cliff = max(1, int(len(pool) * PAYROLL_CLIFF_SHARE))
+    cliff_orgs = set(int(x) for x in RNG.choice(pool, size=n_cliff, replace=False))
+    # ликвидированные организации теряют получателей за месяц до конца ряда
+    liq_orgs = {i for i in tab.index
+                if int(tab.at[i, "inn"]) in liquidated and tab.at[i, "seg"] == "rgs"}
+    switch_orgs = {i for i in tab.index
+                   if tab.at[i, "agency_kind"] == "security" and tab.at[i, "seg"] == "rgs"}
+
+    # --- пары (человек, организация) ---
+    pairs_org, pairs_person = [], []
+    pid = 0
+    for idx, row in enumerate(tab.itertuples()):
+        k = int(row.n_recv)
+        pairs_org.extend([idx] * k)
+        pairs_person.extend(range(pid, pid + k))
+        pid += k
+    pairs_org = np.asarray(pairs_org, dtype=np.int64)
+    pairs_person = np.asarray(pairs_person, dtype=np.int64)
+    n_persons = pid
+
+    # Совместители: часть людей получает во ВТОРОЙ бюджетной организации. Метрика
+    # считается парами, поэтому такой человек весит два получателя, и схлопывание
+    # совместительства выглядит оттоком, не будучи им.
+    rgs_pair_idx = np.flatnonzero(np.isin(pairs_org, tab.index[tab.seg == "rgs"]))
+    n_multi = int(n_persons * PAYROLL_MULTI_START)
+    multi_persons = RNG.choice(pairs_person[rgs_pair_idx], size=n_multi, replace=False)
+    rgs_org_ids = tab.index[tab.seg == "rgs"].to_numpy()
+    second_org = RNG.choice(rgs_org_ids, size=n_multi)
+    pairs_org = np.concatenate([pairs_org, second_org])
+    pairs_person = np.concatenate([pairs_person, multi_persons])
+    is_second = np.concatenate([np.zeros(len(pairs_org) - n_multi, bool),
+                                np.ones(n_multi, bool)])
+
+    n_pairs = len(pairs_org)
+    org_seg = tab["seg"].to_numpy()
+    org_sal = tab["avg_salary"].to_numpy(dtype=float)
+
+    # --- расписание жизни пары ---
+    start = np.zeros(n_pairs, dtype=np.int16)
+    end = np.full(n_pairs, last + 1, dtype=np.int16)     # конец исключительно
+    drift = np.full(n_pairs, last + 1, dtype=np.int16)   # с какого месяца ниже порога
+    switch = np.full(n_pairs, last + 1, dtype=np.int16)  # с какого месяца код вне списка
+    moved_to = np.full(n_pairs, -1, dtype=np.int64)      # ИНН-приёмник реорганизации
+
+    org_of_pair = pairs_org
+    in_cliff = np.isin(org_of_pair, list(cliff_orgs))
+    end[in_cliff] = cliff_m
+    in_liq = np.isin(org_of_pair, list(liq_orgs))
+    end[in_liq] = np.minimum(end[in_liq], last - 1)
+    in_switch = np.isin(org_of_pair, list(switch_orgs))
+    switch[in_switch] = switch_m
+    in_reorg = np.isin(org_of_pair, list(reorg_src))
+    end[in_reorg] = np.minimum(end[in_reorg], reorg_m)
+    moved_to[in_reorg] = [reorg_dst_inn[int(tab.at[i, "inn_out"])]
+                          for i in org_of_pair[in_reorg]]
+
+    # Схлопывание совместительства: доля совместителей падает с 7% до 5%, значит
+    # примерно две седьмых вторых пар за ряд должны закончиться — вразнобой, а не
+    # одним месяцем, иначе это будет неотличимо от обрыва.
+    sec_idx = np.flatnonzero(is_second)
+    n_collapse = int(len(sec_idx) * (1 - PAYROLL_MULTI_END / PAYROLL_MULTI_START))
+    collapse = RNG.choice(sec_idx, size=n_collapse, replace=False)
+    end[collapse] = np.minimum(end[collapse],
+                               RNG.integers(1, last + 1, size=n_collapse).astype(np.int16))
+
+    # Сползание ниже порога: деньги приходят, получателя в метрике нет.
+    n_drift = int(n_pairs * PAYROLL_DRIFT_SHARE)
+    drift_idx = RNG.choice(n_pairs, size=n_drift, replace=False)
+    drift[drift_idx] = RNG.integers(max(0, last - 11), last + 1,
+                                    size=n_drift).astype(np.int16)
+
+    # Уход человека из банка совсем и приход новых. Это единственная ветка,
+    # которая является НАСТОЯЩИМ оттоком физлица.
+    person_left = np.full(n_persons, last + 1, dtype=np.int16)
+    n_leave = int(n_persons * PAYROLL_LEAVE_RATE * PAYROLL_MONTHS)
+    leavers = RNG.choice(n_persons, size=n_leave, replace=False)
+    person_left[leavers] = RNG.integers(1, last + 1, size=n_leave).astype(np.int16)
+
+    person_start = np.zeros(n_persons, dtype=np.int16)
+    n_join = int(n_persons * PAYROLL_JOIN_RATE * PAYROLL_MONTHS)
+    joiners = RNG.choice(np.setdiff1d(np.arange(n_persons), leavers),
+                         size=n_join, replace=False)
+    person_start[joiners] = RNG.integers(1, last + 1, size=n_join).astype(np.int16)
+
+    # Переход в небюджетную организацию: пара в РГС закрывается, открывается пара
+    # в другом сегменте. Человек из банка НЕ уходит — и отчёт обязан их различать.
+    other_orgs = tab.index[tab.seg == "other"].to_numpy()
+    rgs_first = np.flatnonzero((~is_second) & (org_seg[org_of_pair] == "rgs"))
+    n_move = int(len(rgs_first) * PAYROLL_TO_OTHER_SEG * PAYROLL_MONTHS)
+    movers = RNG.choice(rgs_first, size=min(n_move, len(rgs_first)), replace=False)
+    move_m = RNG.integers(1, last + 1, size=len(movers)).astype(np.int16)
+    end[movers] = np.minimum(end[movers], move_m)
+    extra_org = RNG.choice(other_orgs, size=len(movers))
+    pairs_org = np.concatenate([pairs_org, extra_org])
+    pairs_person = np.concatenate([pairs_person, pairs_person[movers]])
+    start = np.concatenate([start, move_m])
+    end = np.concatenate([end, np.full(len(movers), last + 1, dtype=np.int16)])
+    drift = np.concatenate([drift, np.full(len(movers), last + 1, dtype=np.int16)])
+    switch = np.concatenate([switch, np.full(len(movers), last + 1, dtype=np.int16)])
+    moved_to = np.concatenate([moved_to, np.full(len(movers), -1, dtype=np.int64)])
+    is_second = np.concatenate([is_second, np.zeros(len(movers), bool)])
+    org_of_pair = pairs_org
+    n_pairs = len(pairs_org)
+
+    # --- пары-приёмники реорганизации: те же люди, новый ИНН ---
+    src_idx = np.flatnonzero(in_reorg)
+    if len(src_idx):
+        pairs_org = np.concatenate([pairs_org, org_of_pair[src_idx]])
+        pairs_person = np.concatenate([pairs_person, pairs_person[src_idx]])
+        start = np.concatenate([start, np.full(len(src_idx), reorg_m, dtype=np.int16)])
+        end = np.concatenate([end, np.full(len(src_idx), last + 1, dtype=np.int16)])
+        drift = np.concatenate([drift, np.full(len(src_idx), last + 1, dtype=np.int16)])
+        switch = np.concatenate([switch, np.full(len(src_idx), last + 1, dtype=np.int16)])
+        moved_to = np.concatenate([moved_to, moved_to[src_idx]])
+        is_second = np.concatenate([is_second, np.zeros(len(src_idx), bool)])
+        org_of_pair = pairs_org
+        n_pairs = len(pairs_org)
+
+    # --- суммы и постоянные атрибуты ---
+    base_amt = (org_sal[org_of_pair] * RNG.uniform(0.35, 0.75, n_pairs)).round(0)
+    base_amt = np.maximum(base_amt, PAYROLL_AMT_MIN * 1.3)
+    # часть пар живёт ВПРИТЫК к порогу: без них проверка чувствительности к порогу
+    # ничего не покажет — она обязана видеть массу, которую порог реально режет
+    near = RNG.random(n_pairs) < 0.08
+    base_amt[near] = PAYROLL_AMT_MIN + RNG.integers(50, 900, int(near.sum()))
+
+    epk_person = 1_126_000_000_000_000_000 + pairs_person.astype(np.int64)
+    acc_num = np.array([f"40817810{int(g):04d}{i:08d}"
+                        for g, i in zip(tab["gosb_id"].to_numpy()[org_of_pair],
+                                        np.arange(n_pairs))])
+
+    inn_txt = tab["inn_txt"].to_numpy()[org_of_pair]
+    # у пар-приёмников реорганизации ИНН СВОЙ, отличный от исходного
+    if len(src_idx):
+        tail = np.arange(n_pairs - len(src_idx), n_pairs)
+        inn_txt = inn_txt.copy()
+        inn_txt[tail] = [str(int(v)) for v in moved_to[tail]]
+
+    gosb_arr = tab["gosb_id"].to_numpy()[org_of_pair]
+    tb_arr = tab["tb_id"].to_numpy()[org_of_pair]
+    name_arr = np.array([f"ОРГ {int(v)}" for v in tab["inn_out"].to_numpy()])[org_of_pair]
+
+    expect = {
+        "months": [str(m.date()) for m in months],
+        "report_month": str(months[-1].date()),
+        "base_month": str(months[-13].date()),
+        "cliff_month": str(months[cliff_m].date()),
+        "codeswitch_month": str(months[switch_m].date()),
+        "reorg_month": str(months[reorg_m].date()),
+        "cliff_inns": sorted(str(tab.at[i, "inn_txt"]) for i in cliff_orgs),
+        "reorg_map": {str(tab.at[i, "inn_txt"]): str(reorg_dst_inn[int(tab.at[i, "inn_out"])])
+                      for i in reorg_src},
+        "n_pairs_built": int(n_pairs),
+        "n_persons": int(n_persons),
+        "pairs_by_month": {},
+    }
+
+    def frames():
+        for m, dt in enumerate(months):
+            alive = ((start <= m) & (m < end)
+                     & (person_start[pairs_person] <= m)
+                     & (m < person_left[pairs_person]))
+            idx = np.flatnonzero(alive)
+            if not len(idx):
+                continue
+            k = len(idx)
+            amt = base_amt[idx].copy()
+            below = drift[idx] <= m
+            amt[below] = RNG.integers(400, PAYROLL_AMT_MIN - 200, int(below.sum()))
+            out_code = switch[idx] <= m
+
+            # Строк на пару — две (зарплата и аванс) либо одна: грейн витрины
+            # тоньше метрики, и разбор обязан суммировать, а не считать строки.
+            two = RNG.random(k) < 0.8
+            rows = []
+            for part, share in ((0, np.where(two, 0.6, 1.0)), (1, np.where(two, 0.4, 0.0))):
+                take = np.flatnonzero(share > 0)
+                if not len(take):
+                    continue
+                code = np.where(out_code[take],
+                                PAYROLL_CODES_OUT[-1],
+                                PAYROLL_CODES_IN[0] if part == 0 else PAYROLL_CODES_IN[2])
+                rows.append(pd.DataFrame({
+                    "acc_num": acc_num[idx][take],
+                    "amt": (amt[take] * share[take]).round(2),
+                    "company_name": name_arr[idx][take],
+                    "enrollment_type": code.astype("int16"),
+                    "enrollment_transcription": [PAYROLL_CODE_NAMES.get(int(c), "")
+                                                 for c in code],
+                    "epk_id": epk_person[idx][take],
+                    "document_info_sha1": epk_person[idx][take],
+                    "gosb_id": gosb_arr[idx][take],
+                    "sys_gosb_id": gosb_arr[idx][take],
+                    "inn": inn_txt[idx][take],
+                    "tb_id": tb_arr[idx][take],
+                    "sys_tb_id": tb_arr[idx][take],
+                    "report_dt": dt.date(),
+                    "transaction_qty": 1,
+                    "modified_dttm": dt,
+                }))
+            df = pd.concat(rows, ignore_index=True)
+            # получателей месяца считаем ровно так же, как отчёт: сумма по паре
+            g = df[df["enrollment_type"].isin(PAYROLL_CODES_IN)].groupby(
+                ["epk_id", "inn"])["amt"].sum()
+            expect["pairs_by_month"][str(dt.date())] = int((g > PAYROLL_AMT_MIN).sum())
+            yield df
+
+    return frames, expect
+
+
 def _epk_staff(orgs: pd.DataFrame, funnel: pd.DataFrame) -> dict:
     """Справочники ЕПК, штатки и закрепления сотрудников за организациями.
 
@@ -696,22 +1091,86 @@ def _epk_staff(orgs: pd.DataFrame, funnel: pd.DataFrame) -> dict:
     закреплений на одну пару и сотрудников с пустым ФИО в самом свежем срезе
     штатки. Без них запрос отработал бы, не проверив ни одного своего правила.
     """
-    o = orgs.drop_duplicates("inn")
+    o = orgs.drop_duplicates("inn").reset_index(drop=True)
     epk_of = {int(i): 900_000_000 + n for n, i in enumerate(o["inn"].astype("int64"))}
+    names = _company_names(o)
+    n = len(o)
+    is_rgs = (o["seg_code"] == 22).to_numpy()
+
+    # Отрасль: у бюджетной сферы — промовские формулировки, у остальных «Прочее».
+    # Заполнена НЕ У ВСЕХ: на проме industry_name известен лишь у ~10% организаций,
+    # и разрез по отрасли обязан честно показывать, какая доля осталась без неё.
+    ind = np.where(
+        is_rgs,
+        RNG.choice(RGS_INDUSTRIES, size=n, p=[0.34, 0.42, 0.14, 0.10]),
+        "Прочее")
+    ind = np.where(RNG.random(n) < EPK_INDUSTRY_EMPTY_SHARE, None, ind)
+
+    # Холдинг. На проме поле в этой витрине заполнено редко — воспроизводим:
+    # большинство организаций без холдинга, и отчёт обязан это показать, а не
+    # выдать «холдингов нет». Крупные ведомственные холдинги нужны, чтобы разрез
+    # «где утекло» вообще имел строки.
+    hold = _holdings(o, is_rgs)
+
+    # Ликвидация. Определяется отсутствием АКТИВНОЙ записи по ИНН, поэтому часть
+    # организаций получает ВТОРУЮ строку ЕПК со статусом «Ликвидирована» при живой
+    # первой: код, который смотрит на одну строку, ошибётся именно на них.
+    liquidated = set(o.loc[RNG.random(n) < EPK_LIQUIDATED_SHARE, "inn"]
+                     .astype("int64").tolist())
+
     epk = pd.DataFrame({
         "epk_id": [epk_of[int(i)] for i in o["inn"]],
         "epk_create_dttm": pd.Timestamp("2020-01-01"),
-        "client_type_id": 1, "client_type_name": "ЮЛ",
-        "industry_id": RNG.integers(1, 40, len(o)),
-        "industry_name": "Отрасль",
+        "client_type_id": 1, "client_type_name": "Юридическое лицо",
+        "industry_id": RNG.integers(1, 24, n),
+        "industry_name": ind,
         "inn": o["inn"].astype("int64").to_numpy(),
         "kpp": None, "ogrn": None, "okato": None, "oktmo": None, "old_epk_id": None,
-        "segment_id": 0, "segment_name": o["segment_name"].to_numpy(),
+        "segment_id": o["seg_code"].astype(int).to_numpy(),
+        "segment_name": o["segment_name"].to_numpy(),
+        "priority_id": None, "priority_name": None,
+        "company_name": names,
+        "holding_epk_id": None,
+        "holding_name": hold,
+        "reference_holding_name": hold,
+        "head_holding_epk_id": None,
+        "head_holding_name": hold,
+        "reference_head_holding_name": hold,
+        "is_parent": True, "is_key_client": False,
+        "importance_lvl_id": None,
         "tb_id": o["tb_id"].astype(int).to_numpy(),
         "gosb_id": o["gosb_id"].astype(int).to_numpy(),
-        "full_name": [f"Организация {int(i)}" for i in o["inn"]],
-        "short_name": [f"Орг. {int(i)}" for i in o["inn"]],
-        "is_active": True, "inserted_dttm": pd.Timestamp.now(),
+        "oktmo_gosb_id": None, "okato_gosb_id": None, "epk_gosb_id": None,
+        "payroll_gosb_id": None, "km_gosb_id": None,
+        "last_mzp_activity_gosb_id": None, "last_deal_gosb_id": None,
+        "kpp_gosb_id": None, "gosb_method_id": 1,
+        "status_id": 1, "status_name": "Активна",
+        "is_educational": [bool(k == "education") for k in o["agency_kind"]],
+        "is_military": [bool(k == "security") for k in o["agency_kind"]],
+        "report_id": None,
+        "modified_dttm": pd.Timestamp.now(),
+    })
+
+    # Ликвидированные: у них ЕДИНСТВЕННАЯ строка становится неактивной. Плюс
+    # отдельная горстка организаций получает ВТОРУЮ, ликвидированную строку при
+    # живой первой — ловушка для проверки «по ИНН нет ни одной активной».
+    liq_mask = epk["inn"].isin(liquidated).to_numpy()
+    epk.loc[liq_mask, ["status_id", "status_name"]] = [2, "Ликвидирована"]
+
+    alive = epk.loc[~liq_mask]
+    if len(alive):
+        extra = alive.sample(n=max(1, int(len(alive) * EPK_SECOND_EPK_SHARE)),
+                             random_state=7).copy()
+        extra["epk_id"] = extra["epk_id"] + 500_000_000
+        extra["status_id"], extra["status_name"] = 2, "Ликвидирована"
+        extra["is_parent"] = False
+        epk = pd.concat([epk, extra], ignore_index=True)
+
+    _epk_expect.update({
+        "liquidated_inn": sorted(int(i) for i in liquidated),
+        "epk_of": epk_of,
+        "holding_by_inn": dict(zip(o["inn"].astype("int64").tolist(),
+                                   list(hold))),
     })
 
     # сотрудники — авторы задач воронки: другого источника табельных в синтетике нет
@@ -1534,3 +1993,41 @@ def _bulk(engine: Engine, df: pd.DataFrame, table: str, schema: str | None = Non
     df.to_sql(table, engine, schema=schema or config.SCHEMA, if_exists="append",
               index=False, method="multi", chunksize=1000)
     return len(df)
+
+
+def _copy(engine: Engine, frames, table: str) -> int:
+    """Загрузка потоком через COPY. Для ведомостей `to_sql` неприменим.
+
+    В ведомостях миллионы строк, а `to_sql(method="multi")` собирает из них
+    гигантские INSERT-ы и грузит такой объём десятками минут. COPY делает то же
+    за секунды. Кадры приходят ГЕНЕРАТОРОМ, по месяцу за раз: ряд целиком в
+    память не помещается, да и незачем.
+
+    Фолбэк обязателен: если драйвер не даёт copy_expert (не psycopg2), загрузка
+    идёт прежним путём — медленно, но прогон не срывается.
+    """
+    total = 0
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        if not hasattr(cur, "copy_expert"):
+            raw.close()
+            for df in frames():
+                total += _bulk(engine, df, table)
+            return total
+        cols = None
+        for df in frames():
+            df = df.where(pd.notnull(df), None)
+            if cols is None:
+                cols = list(df.columns)
+            buf = io.StringIO()
+            df[cols].to_csv(buf, index=False, header=False, na_rep="\\N")
+            buf.seek(0)
+            cur.copy_expert(
+                f'COPY {config.SCHEMA}.{table} ({", ".join(cols)}) '
+                f"FROM STDIN WITH (FORMAT csv, NULL '\\N')", buf)
+            total += len(df)
+        raw.commit()
+    finally:
+        raw.close()
+    return total

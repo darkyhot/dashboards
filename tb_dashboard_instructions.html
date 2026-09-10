@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Как пользоваться дэшбордом · Прогноз портфеля, причины невыполнения</title>
+<style>
+:root {
+  --bg: #f5f5f7;
+  --surface: rgba(255,255,255,0.9);
+  --surface-solid: #ffffff;
+  --text: #1d1d1f;
+  --text-2: #6e6e73;
+  --separator: rgba(0,0,0,0.08);
+  --accent: #0071e3;
+  --good: #34c759;
+  --warn: #ff9f0a;
+  --bad: #ff3b30;
+  --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
+  --radius: 16px;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.page { max-width: 1180px; margin: 0 auto; padding: 26px 28px 34px; }
+
+header { margin-bottom: 16px; }
+.eyebrow {
+  color: var(--accent); font-weight: 700; font-size: 12px;
+  letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 4px;
+}
+h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.02em; }
+.sub { color: var(--text-2); font-size: 14px; margin: 0; }
+
+.grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px;
+  margin-top: 18px;
+}
+.card {
+  background: var(--surface); border: 1px solid var(--separator);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 16px 18px;
+}
+.card h2 {
+  font-size: 14.5px; margin: 0 0 6px; display: flex; align-items: center; gap: 8px;
+}
+.num {
+  flex: none; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--accent); color: #fff; font-size: 12px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.card p { font-size: 13px; line-height: 1.5; color: var(--text-2); margin: 0; }
+.card p + p { margin-top: 6px; }
+.card b { color: var(--text); font-weight: 650; }
+.card code {
+  background: var(--bg); border: 1px solid var(--separator);
+  border-radius: 6px; padding: 1px 6px; font-size: 12px; color: var(--text);
+}
+
+.wide { grid-column: span 3; }
+.half { grid-column: span 1; }
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+  .wide, .half { grid-column: span 1; }
+}
+
+.legend-row {
+  display: flex; flex-wrap: wrap; gap: 14px 22px; margin-top: 6px;
+}
+.legend-item { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-2); }
+.dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.dot.good { background: var(--good); }
+.dot.warn { background: var(--warn); }
+.dot.bad { background: var(--bad); }
+
+.pillbtn {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--accent); color: #fff; font-size: 12px; font-weight: 650;
+  padding: 4px 10px; border-radius: 980px;
+}
+
+.tip {
+  margin-top: 16px; padding: 12px 16px; border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface-solid));
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--separator));
+  font-size: 13px; color: var(--text);
+}
+.tip b { color: var(--accent); }
+
+.steps { margin: 0; padding-left: 18px; font-size: 13px; color: var(--text-2); line-height: 1.6; }
+.steps li b { color: var(--text); }
+
+footer { margin-top: 18px; font-size: 11.5px; color: var(--text-2); text-align: center; }
+
+@media print {
+  body { background: #fff; }
+  .card { box-shadow: none; }
+  .page { padding: 10px; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <div class="eyebrow">УЗП · Памятка</div>
+    <h1>Как пользоваться дэшбордом «Прогноз портфеля, причины невыполнения»</h1>
+    <p class="sub">Одна страница — весь путь от общей картины по сети до конкретного ГОСБ и организации.</p>
+  </header>
+
+  <div class="grid">
+
+    <div class="card half">
+      <h2><span class="num">1</span>Главный экран</h2>
+      <p>Дэшборд всегда открывается с уровня <b>«СБ»</b> — сводного прогноза по всей сети. Это точка отсчёта, сюда можно вернуться в любой момент.</p>
+    </div>
+
+    <div class="card half">
+      <h2><span class="num">2</span>Переключение ТБ и ГОСБ</h2>
+      <p>Справа вверху — два поля: <b>«Территориальный банк»</b> и <b>«ГОСБ»</b>. Можно выбрать из выпадающего списка или начать вводить название вручную — поле само подскажет совпадения.</p>
+      <p>Выбор ГОСБ сразу переключает на его банк и открывает подробный разбор именно по этому ГОСБ.</p>
+    </div>
+
+    <div class="card half">
+      <h2><span class="num">3</span>Плашка «Прогноз выполнения»</h2>
+      <p>Открыта по умолчанию — план, получатели и ФОТ видны сразу. Кнопка <b>«Свернуть показатели»</b> прячет KPI, но кнопка «Управление портфелем: потери и прирост» остаётся доступной всегда.</p>
+    </div>
+
+    <div class="card wide">
+      <h2><span class="num">4</span>Разделы страницы</h2>
+      <p>Ниже прогноза — три раздела, каждый свёрнут по умолчанию (нажмите на заголовок, чтобы развернуть):</p>
+      <p><b>Матрица выполнения ГОСБ/сегмент</b> — где именно проблема: конкретный ГОСБ, конкретный сегмент.</p>
+      <p><b>Детализация по ГОСБ</b> — карточка на каждый ГОСБ; клик по карточке открывает разбор вплоть до организаций.</p>
+      <p><b>Потенциал организаций</b> — конкретные организации, по которым нужно отработать отток или привлечение.</p>
+      <p style="margin-top:8px">Слева, в блоке <b>«Разделы страницы»</b>, те же три пункта плюс «Прогноз выполнения» — клик сразу разворачивает нужный раздел и прокручивает к нему. Белая точка на пункте и счётчик «Просмотрено разделов: X из Y» показывают, что вы уже открыли, а что ещё нет.</p>
+    </div>
+
+    <div class="card wide">
+      <h2><span class="num">5</span>Цвета и что кликабельно</h2>
+      <div class="legend-row">
+        <span class="legend-item"><span class="dot good"></span>план выполняется</span>
+        <span class="legend-item"><span class="dot warn"></span>план выполняется, но есть слабый сегмент</span>
+        <span class="legend-item"><span class="dot bad"></span>план не выполняется</span>
+      </div>
+      <p style="margin-top:10px">Все синие элементы — кликабельны: <span class="pillbtn">пример</span> кнопки, пункты меню разделов, стрелки в карточках. Карточки ГОСБ со стрелкой «→» открывают подробный разбор в отдельном окне.</p>
+    </div>
+
+    <div class="card wide">
+      <h2><span class="num">6</span>Карточка ГОСБ — что внутри и в каком порядке</h2>
+      <ol class="steps">
+        <li>Заголовок — название ГОСБ и итоговый прогноз (план/факт/%).</li>
+        <li>Кнопки возврата: <b>«← Главный экран»</b> (на СБ) и <b>«← [название ТБ]»</b> (к банку, которому принадлежит этот ГОСБ).</li>
+        <li>Кнопка <b>«Управление портфелем: потери и прирост»</b> — открывает отдельное окно с фактом по портфелю, оттоку и пайплайну.</li>
+        <li><b>«Разбор по сегментам»</b> — какие сегменты внутри ГОСБ просели.</li>
+        <li><b>«Отток по причинам»</b> — сгруппированный список: кто ушёл, почему, с кем работать в первую очередь.</li>
+        <li>Далее — пайплайн на месяц и портфель год к году, тоже по группам причин.</li>
+      </ol>
+    </div>
+
+    <div class="card half">
+      <h2><span class="num">7</span>Поиск внутри раздела</h2>
+      <p>Внутри «Детализации по ГОСБ» есть поле поиска по названию и список <b>«Перейти к разбору →»</b> — быстро найти нужную карточку, не листая все подряд.</p>
+    </div>
+
+    <div class="card half">
+      <h2><span class="num">8</span>«Потенциал организаций»</h2>
+      <p>Таблица с фильтрами по ГОСБ, сегменту, рычагу и цели — чтобы собрать точный список организаций под конкретную задачу отработки.</p>
+    </div>
+
+  </div>
+
+  <div class="tip">
+    <b>Совет:</b> если нужно быстро оценить состояние конкретного ГОСБ — используйте поле «ГОСБ» вверху страницы, а не листайте карточки вручную.
+  </div>
+
+  <footer>Прогноз портфеля, причины невыполнения · памятка на одну страницу</footer>
+
+</div>
+</body>
+</html>

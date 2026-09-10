@@ -18,8 +18,10 @@ DROP TABLE IF EXISTS uzp_dim_mzp_reference_base CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_day_outflow CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_fact_outflow CASCADE;
 DROP TABLE IF EXISTS uzp_data_outflow_return_detail CASCADE;
+DROP TABLE IF EXISTS uzp_data_key_client_info_add_attr CASCADE;
 DROP TABLE IF EXISTS uzp_data_emp_epk_assignment CASCADE;
 DROP TABLE IF EXISTS uzp_data_epk_consolidation CASCADE;
+DROP TABLE IF EXISTS uzp_data_payroll_m CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_sap_staff_emp CASCADE;
 DROP TABLE IF EXISTS uzp_data_mzp_motivation_detail_corr CASCADE;
 DROP TABLE IF EXISTS __SCHEMA_T__.yva_pl_task_deal_code CASCADE;
@@ -313,28 +315,124 @@ CREATE TABLE uzp_data_emp_epk_assignment (
   modified_dttm     timestamp
 );
 
+-- Атрибуты ЕПК организаций. ТЕКУЩИЙ срез, отчётной даты здесь нет вовсе —
+-- поэтому сегмент организации известен только «на сегодня», а не на дату.
+--
+-- Колонки приведены к пром-профилю (data/profiles/...uzp_data_epk_consolidation).
+-- Прежняя версия таблицы в синтетике была короче прома (не было company_name,
+-- holding_name, industry_name, status_name, is_educational, is_military), и
+-- разбор численности РГС отладить снаружи было нельзя вовсе.
+--
+-- ЛИКВИДАЦИЯ определяется по ОТСУТСТВИЮ активной записи у ИНН, а не по одной
+-- строке: у одного ИНН может быть несколько ЕПК, и «Ликвидирована» на одной из
+-- них ничего не значит, пока жива другая.
 CREATE TABLE uzp_data_epk_consolidation (
-  epk_id           bigint,
-  epk_create_dttm  timestamp,
-  client_type_id   integer,
-  client_type_name varchar,
-  industry_id      integer,
-  industry_name    varchar,
-  inn              bigint,
-  kpp              varchar,
-  ogrn             varchar,
-  okato            varchar,
-  oktmo            varchar,
-  old_epk_id       bigint,
-  segment_id       integer,
-  segment_name     varchar,
-  tb_id            integer,
-  gosb_id          integer,
-  full_name        varchar,
-  short_name       varchar,
-  is_active        boolean,
-  inserted_dttm    timestamp
+  epk_id                      bigint,
+  epk_create_dttm             timestamp,
+  client_type_id              smallint,
+  client_type_name            varchar,
+  industry_id                 smallint,
+  industry_name               varchar,
+  inn                         bigint,
+  kpp                         bigint,
+  ogrn                        bigint,
+  okato                       bigint,
+  oktmo                       bigint,
+  old_epk_id                  varchar,
+  segment_id                  smallint,
+  segment_name                varchar,
+  priority_id                 smallint,
+  priority_name               varchar,
+  company_name                varchar,
+  holding_epk_id              bigint,
+  holding_name                varchar,
+  reference_holding_name      varchar,
+  head_holding_epk_id         bigint,
+  head_holding_name           varchar,
+  reference_head_holding_name varchar,
+  is_parent                   boolean,
+  is_key_client               boolean,
+  importance_lvl_id           smallint,
+  tb_id                       smallint,
+  gosb_id                     integer,
+  oktmo_gosb_id               integer,
+  okato_gosb_id               integer,
+  epk_gosb_id                 integer,
+  payroll_gosb_id             integer,
+  km_gosb_id                  integer,
+  last_mzp_activity_gosb_id   integer,
+  last_deal_gosb_id           integer,
+  kpp_gosb_id                 integer,
+  gosb_method_id              smallint,
+  status_id                   smallint,
+  status_name                 varchar,
+  is_educational              boolean,
+  is_military                 boolean,
+  report_id                   bigint,
+  modified_dttm               timestamp
 );
+
+-- ============ ЗП-ведомости, помесячно ============
+-- Самая большая таблица прома. Партиционирована по report_dt — КАЖДЫЙ запрос к ней
+-- обязан иметь report_dt в WHERE, иначе читается вся история.
+--
+-- Три вещи, из-за которых разбор по этой таблице ломается молча:
+--
+-- 1. Колонка кода зачисления называется `enrollment_type`, а НЕ
+--    `enrollment_type_id`. Имя проверяется разведкой по information_schema.
+-- 2. `inn` здесь TEXT длиной 1-12, а в uzp_data_epk_consolidation — bigint.
+--    Прямой CAST(inn AS bigint) на нечисловом значении роняет запрос. Синтетика
+--    намеренно содержит нечисловые ИНН и ИНН с ведущим нулём.
+-- 3. `segment_name` на проме ПУСТА (заполненность 0%), поэтому сегмент берётся
+--    только из uzp_data_epk_consolidation по ИНН. Колонка оставлена пустой и
+--    здесь: код, который на неё обопрётся, обязан сломаться и снаружи тоже.
+--
+-- Грейн: (report_dt, acc_num, inn, enrollment_type). Один человек в одном ИНН за
+-- месяц даёт НЕСКОЛЬКО строк — по строке на вид зачисления; получатель считается
+-- по СУММЕ этих строк.
+CREATE TABLE uzp_data_payroll_m (
+  acc_num                 text,
+  acc_open_dt             date,
+  acc_subtype             smallint,
+  acc_type                smallint,
+  actual_client_tid       bigint,
+  amt                     numeric,
+  client_category         smallint,
+  company_name            text,
+  document_info_sha1      bigint,
+  agrmnt_dt               date,
+  agrmnt_num              text,
+  enrollment_transcription text,
+  enrollment_type         smallint,
+  epk_id                  bigint,
+  gosb_id                 integer,
+  sys_gosb_id             integer,
+  inn                     text,
+  inn_parsing             text,
+  ipt_name                text,
+  sys_osb_id              integer,
+  card_type               text,
+  modified_dttm           timestamp,
+  report_dt               date,
+  tb_id                   smallint,
+  sys_tb_id               smallint,
+  transaction_qty         smallint,
+  untb                    bigint,
+  vsp_id                  integer,
+  sys_vsp_id              integer,
+  report_id               bigint,
+  is_security_force       boolean,
+  segment_name            text,
+  enrollment_kind_descr   text,
+  market_share_flag_name  text,
+  src_system_name         text
+);
+
+-- Партиции на проме нет — здесь её заменяет индекс: без него разбор за 25 месяцев
+-- на локальной синтетике идёт минутами вместо секунд.
+CREATE INDEX ix_payroll_m_dt ON uzp_data_payroll_m (report_dt);
+CREATE INDEX ix_payroll_m_dt_inn ON uzp_data_payroll_m (report_dt, inn);
+CREATE INDEX ix_payroll_m_dt_epk ON uzp_data_payroll_m (report_dt, epk_id);
 
 CREATE TABLE uzp_dwh_sap_staff_emp (
   report_dt               date,

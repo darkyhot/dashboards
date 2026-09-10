@@ -5,11 +5,12 @@
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from functools import lru_cache
 
 import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from . import config, progress
 
@@ -66,18 +67,69 @@ def get_engine(url: str) -> Engine:
     )
 
 
-def read_sql(engine: Engine, sql: str, params: dict | None = None) -> pd.DataFrame:
+@contextmanager
+def session(engine: Engine):
+    """Одно соединение на серию запросов. Нужно там, где живёт временная таблица.
+
+    По умолчанию каждый `read_sql` берёт соединение из пула и возвращает его
+    обратно, поэтому `CREATE TEMP TABLE` из одного вызова в следующем уже не
+    виден: временная таблица живёт ровно столько, сколько её сессия. Разбор,
+    который считает десяток запросов по одной тяжёлой выборке, обязан держать
+    соединение сам — иначе он либо не найдёт свою таблицу, либо (что хуже)
+    найдёт чужую, оставшуюся в пуле от прошлого прогона.
+
+    Полученное соединение передаётся в `read_sql(..., conn=conn)` и `execute`.
+    """
+    conn = engine.connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def execute(engine: Engine, sql: str, params: dict | None = None,
+            conn: Connection | None = None) -> None:
+    """Выполнить оператор без результата (CREATE TEMP TABLE, ANALYZE, DROP).
+
+    Отдельная функция, а не `read_sql`: `pd.read_sql` на операторе без строк
+    падает на попытке прочитать курсор, и ошибка выглядит как проблема с данными,
+    а не с тем, что запрос вообще ничего не возвращает.
+    """
+    sql = sql.format(schema=config.SCHEMA, schema_t=config.SCHEMA_T)
+    progress.sql(sql, params)
+    try:
+        if conn is not None:
+            conn.execute(text(sql), params or {})
+            # Коммит обязателен: SQLAlchemy 2.x открывает транзакцию сам и без
+            # коммита откатит её при закрытии соединения. Для TEMP-таблицы это
+            # означало бы, что она исчезает ровно тогда, когда понадобилась.
+            conn.commit()
+            return
+        with engine.begin() as c:
+            c.execute(text(sql), params or {})
+    except Exception as ex:
+        raise_if_kerberos(ex)
+        raise
+
+
+def read_sql(engine: Engine, sql: str, params: dict | None = None,
+             conn: Connection | None = None) -> pd.DataFrame:
     """Выполнить SELECT и вернуть DataFrame.
 
     В SQL используйте плейсхолдеры {schema} (основная витринная схема) и
     {schema_t} (схема пайплайна) — они подставляются автоматически,
     и именованные параметры :name (безопасная подстановка значений).
+
+    `conn` — необязательное готовое соединение из `session()`. Без него
+    поведение прежнее: соединение берётся из пула на один запрос.
     """
     sql = sql.format(schema=config.SCHEMA, schema_t=config.SCHEMA_T)
     progress.sql(sql, params)
     try:
-        with engine.connect() as conn:
+        if conn is not None:
             return pd.read_sql(text(sql), conn, params=params or {})
+        with engine.connect() as c:
+            return pd.read_sql(text(sql), c, params=params or {})
     except Exception as ex:
         raise_if_kerberos(ex)
         raise

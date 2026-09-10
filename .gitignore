@@ -9,3 +9,10 @@ output/llm_logs/
 # результаты — производные от неё. В репозиторий не кладём ни то, ни другое.
 output/forecast_lab_cache/
 output/forecast_lab/
+
+# payroll_rgs_cohort: HTML содержит настоящие наименования организаций, probe.json —
+# счётчики прома. Наружу из этой папки едет только обезличенный .md, и отдаётся он
+# руками, а не через репозиторий.
+output/payroll_rgs_cohort/
+# Ожидания синтетики — генерируемый артефакт открытого контура (python3 -m synth)
+output/synth_payroll_expect.json
