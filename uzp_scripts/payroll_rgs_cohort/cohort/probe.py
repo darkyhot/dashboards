@@ -44,8 +44,19 @@ INN_OK_MIN = 0.95
 GOSB_MATCH_MIN = 0.60
 
 
-def _df(engine, sql: str, params: dict | None = None, conn=None) -> pd.DataFrame:
-    """Запрос разведки. Отсутствие таблицы — не повод падать: раздел отключится."""
+def _df(engine, sql: str, params: dict | None = None, conn=None,
+        code_col: str | None = None) -> pd.DataFrame:
+    """Запрос разведки. Отсутствие таблицы — не повод падать: раздел отключится.
+
+    `code_col` подставляется ЗДЕСЬ, а не у вызывающего. Разведка идёт мимо
+    рабочего набора, который делает эту подстановку для всех остальных запросов,
+    и забыть её у одного отдельно стоящего — вопрос времени. Стоило это ровно
+    одного пропущенного раздела: `KeyError: 'code_col'` ловится этим же except и
+    печатается как «запрос недоступен», то есть выглядит как отсутствие прав, а
+    не как опечатка в коде.
+    """
+    if code_col:
+        sql = sql.replace("{code_col}", code_col)
     try:
         return db.read_sql(engine, sql, params or {}, conn=conn)
     except Exception as ex:
@@ -232,7 +243,7 @@ def run(engine, conn, months: list[str], d_base: str, d_cur: str, d_from: str,
     # --- два варианта порога: сверить с отчётностью до, а не после разбора ---
     sc = _df(engine, LQ.PROBE_AMT_SCOPE,
              {"months": list(months), "seg": LQ.SEG_BIG, "codes": list(LQ.CODES),
-              "amt_min": LQ.AMT_MIN}, conn=conn)
+              "amt_min": LQ.AMT_MIN}, conn=conn, code_col=code_col)
     if not sc.empty:
         sc = sc.copy()
         sc["report_dt"] = pd.to_datetime(sc["report_dt"]).dt.date.astype(str)

@@ -158,6 +158,32 @@ def check_triple_grain() -> None:
         f"(вариантов порога {len(LQ.AMT_COND)})")
 
 
+def check_probe_placeholders() -> None:
+    """Запросы разведки не должны уносить с собой неподставленные скобки.
+
+    Разведка идёт МИМО рабочего набора: она работает до его сборки, и подстановку
+    имени колонки кода делает сама. Забытая скобка не роняет прогон — `KeyError`
+    ловится общим `except` разведки и печатается как «запрос разведки
+    недоступен», то есть выглядит как отсутствие прав на витрину. Раздел молча
+    пропадает, а причина ищется не там. Так и вышло с проверкой порога.
+
+    Проверяется то же, что делает разведка: подставить схему и имя колонки — и
+    убедиться, что скобок не осталось.
+    """
+    from uzp_dash import db
+
+    for name, sql in _all_sql():
+        if not name.startswith("PROBE_"):
+            continue
+        built = db.render(sql.replace("{code_col}", "enrollment_type"))
+        left = re.findall(r"(?<!\{)\{([a-z_]+)\}(?!\})", built)
+        if left:
+            raise CheckFailed(
+                f"{name}: после подстановки остались скобки {left} — разведка "
+                f"упадёт с KeyError, а напечатает «запрос недоступен»")
+    _ok("разведка: в запросах не осталось неподставленных скобок")
+
+
 def check_workset_order() -> None:
     """Порядок рабочего набора: выборка не может ссылаться на объявленную позже.
 
@@ -876,7 +902,7 @@ def check_against_synth(res: dict, expect_path: str | None = None) -> None:
 ALL = [
     check_sql_dialect, check_sql_braces, check_partition_filter,
     check_inn_cast_guarded, check_codes_binding, check_triple_grain,
-    check_workset_order, check_prelude_minimal,
+    check_probe_placeholders, check_workset_order, check_prelude_minimal,
     check_causes_exhaustive, check_ladder_priority, check_additive,
     check_epk_ladder_shorter, check_ladder_table,
     check_steps_seasonal, check_steps_short_series, check_month_compare,
