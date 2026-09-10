@@ -229,19 +229,33 @@ ORDER BY x.report_dt
 # Бюджетные ИНН по ТЕКУЩЕМУ срезу справочника ЕПК (см. комментарий к _SEG_INN).
 _T_SEG = _SEG_INN
 
+# Сегмент ЛЮБОЙ организации, не только бюджетной.
+#
+# Нужен ровно для одного вопроса — «а куда человек ушёл». Без него уход из
+# сегмента остаётся строкой «ушёл» без адреса: неизвестно, забрал его
+# коммерческий клиент, малый бизнес или он просто сменил бюджетную работу на
+# небюджетную. Справочник маленький, отдельная выборка ничего не стоит.
+_T_SEG_ALL = """
+  SELECT e.inn, min(e.segment_name) AS segment_name
+  FROM {schema}.uzp_data_epk_consolidation e
+  WHERE e.inn IS NOT NULL
+  GROUP BY e.inn
+"""
+
 # Получатели на грейне (человек, ИНН, ГОСБ) за все опорные месяцы сразу.
 #
 # ГРЕЙН — ТРОЙКА. Человек, получающий в одном ИНН через два подразделения, весит
 # двух получателей: так считает отчётность, с которой сверяется результат.
-# Схлопывание ГОСБ через min() занижало бы базу и прятало целый класс движения —
-# перевод человека между подразделениями одной организации.
 #
 # ПОРОГ применяется к сумме за месяц В ИНН, а не в тройке: так он задан
 # постановкой. Порог и ключ счёта живут на разных грейнах, поэтому сумма по ИНН
 # считается оконной функцией поверх группировки, а не в HAVING — HAVING умеет
-# фильтровать только по своей группе. Вариант «порог на тройку» подставляется
-# через {amt_cond}: разведка печатает счёт при обоих, чтобы можно было сверить
-# с отчётностью и не гадать.
+# фильтровать только свою группу.
+#
+# ЧЕТЫРЕ опорных месяца, а не два: отчётный, предыдущий, тот же месяц год назад и
+# предыдущий год назад. Последний нужен для проверки сезонности — она требует
+# СРАВНИТЬ поведение человека в двух парах месяцев, и по трём месяцам этого не
+# сделать.
 _T_PAIRS = """
   SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.tb_id, x.amt
   FROM (
@@ -267,15 +281,12 @@ _T_PAIRS = """
 # Присутствие в ведомостях БЕЗ фильтров по коду и порогу — по всему банку, но
 # ТОЛЬКО по людям, которые хоть в одном опорном месяце были в сегменте.
 #
-# Ограничение по людям — не экономия, а единственный способ уложиться: вся
-# витрина за месяц это клиенты всего банка, а разбору нужны только те, про кого
-# он спрашивает. Спрашивает он ровно про людей из `t_pairs`, поэтому остальные
-# строки не понадобятся ни одной ветке.
+# Ограничение по людям — не экономия, а единственный способ уложиться: витрина за
+# месяц это клиенты всего банка, а разбору нужны только те, про кого он
+# спрашивает. Спрашивает он ровно про людей из `t_pairs`.
 #
-# Без этой выборки «человек ушёл из банка» неотличимо от «человек на месте, а из
-# метрики выпал»: если epk_id вообще не встречается в ведомостях — он ушёл; если
-# встречается, но тройки нет — сработал порог, код, перевод или смена
-# работодателя. Все четыре случая слиплись бы в «отток».
+# Без этой выборки нельзя отличить «ушёл из банка совсем» от «получает, но не по
+# зарплатным кодам» — а это два разных диагноза с разными решениями.
 _T_SEEN = """
   SELECT p.report_dt,
          p.epk_id,
@@ -297,9 +308,12 @@ _T_SEEN_EPK = """
   FROM t_seen GROUP BY report_dt, epk_id
 """
 
-# Он же, но ТОЛЬКО по бюджетным организациям: по этим суммам лестница ПО ЛЮДЯМ
-# отличает «упал ниже порога» от «ушёл из сегмента». На грейне человека тройки
-# не важны — важно, идут ли ему бюджетные деньги вообще.
+# Он же, но ТОЛЬКО по бюджетным организациям.
+#
+# По этим двум суммам различаются три ситуации, которые интересуют зарплатное
+# подразделение: деньги от бюджетной организации идут по зарплатным кодам, но
+# мало (порог); идут, но не по зарплатным кодам; не идут вовсе (ушёл в другой
+# сегмент). Одной суммой их не разделить.
 _T_SEEN_SEG = """
   SELECT t.report_dt, t.epk_id,
          sum(t.amt_all)   AS amt_all,
@@ -308,33 +322,8 @@ _T_SEEN_SEG = """
   GROUP BY t.report_dt, t.epk_id
 """
 
-# Существует ли организация в ведомостях — по месяцам. По ВСЕМ её получателям, а
-# не только по сегментным: организация, чьи бюджетные сотрудники ушли все до
-# одного, но которая продолжает платить остальным, из ведомостей не исчезла.
-# Ограничение по списку ИНН оставлено — про чужие организации разбор не спрашивает.
-_T_INN_SEEN = """
-  SELECT p.report_dt, CAST(p.inn AS bigint) AS inn
-  FROM {schema}.uzp_data_payroll_m p
-  JOIN (SELECT DISTINCT inn FROM t_pairs) k ON k.inn = CAST(p.inn AS bigint)
-  WHERE p.report_dt = ANY(CAST(:seen_months AS date[]))
-    AND """ + INN_OK + """
-  GROUP BY p.report_dt, CAST(p.inn AS bigint)
-"""
-
-# Был ли человек в ведомостях в месяцы ПЕРЕД отчётным.
-#
-# Ради этой выборки и затевалось окно. Отчётный месяц может быть сезонной ямой, и
-# тогда «нет зачисления в августе» означает не уход, а перерыв: человек был в
-# июне и июле и почти наверняка вернётся в сентябре. Различить эти два случая по
-# одному месяцу нельзя никак, а разница между ними — миллионы человек.
-_T_RECENT = """
-  SELECT DISTINCT epk_id FROM t_seen
-  WHERE report_dt = ANY(CAST(:recent_months AS date[]))
-"""
-
-# Сколько бюджетных организаций и подразделений у человека в каждом месяце.
-# Разница между месяцами и есть совместительство: человек с двумя организациями
-# весит двух получателей, и потеря одной из них выглядит оттоком, не будучи им.
+# Сколько бюджетных организаций у человека в каждом месяце. Разница между
+# месяцами и есть совместительство.
 _T_EPK_MONTH = """
   SELECT report_dt, epk_id,
          count(DISTINCT inn) AS n_inn,
@@ -342,83 +331,67 @@ _T_EPK_MONTH = """
   FROM t_pairs GROUP BY report_dt, epk_id
 """
 
-# Организации сегмента по месяцам — по ним отличается «организация пришла в
-# сегмент» от «в старую организацию пришли люди».
-_T_INN_MONTH = """
-  SELECT report_dt, inn, count(*) AS n_triples
-  FROM t_pairs GROUP BY report_dt, inn
-"""
-
-# Имя -> (тело выборки, колонка распределения). Распределение выбрано по тому,
-# ЧЕМ выборка соединяется дальше: почти вся арифметика разбора идёт по человеку,
-# и распределение по ИНН заставило бы Greenplum перекидывать данные между
-# сегментами на каждом шаге.
 WORKSET: list[tuple[str, str, str]] = [
     ("t_seg",       _T_SEG,       "inn"),
+    ("t_seg_all",   _T_SEG_ALL,   "inn"),
     ("t_pairs",     _T_PAIRS,     "epk_id"),
     ("t_seen",      _T_SEEN,      "epk_id"),
     ("t_seen_epk",  _T_SEEN_EPK,  "epk_id"),
     ("t_seen_seg",  _T_SEEN_SEG,  "epk_id"),
-    ("t_inn_seen",  _T_INN_SEEN,  "inn"),
-    ("t_recent",    _T_RECENT,    "epk_id"),
     ("t_epk_month", _T_EPK_MONTH, "epk_id"),
-    ("t_inn_month", _T_INN_MONTH, "inn"),
 ]
 
 CREATE_TMP = "CREATE TEMP TABLE {name} AS\n{body}\nDISTRIBUTED BY ({dist})"
-# Запасной вариант DDL: DISTRIBUTED BY — расширение Greenplum, и на обычном
-# PostgreSQL (открытый контур) оператор с ним не разбирается вовсе.
+# DISTRIBUTED BY — расширение Greenplum; на обычном PostgreSQL (открытый контур)
+# оператор с ним не разбирается вовсе.
 CREATE_TMP_PLAIN = "CREATE TEMP TABLE {name} AS\n{body}"
 ANALYZE_TMP = "ANALYZE {name}"
 DROP_TMP = "DROP TABLE IF EXISTS {name}"
 
 
 # --------------------------------------------------------------------------- #
-# Лестница причин: получатели (тройки)
+# Лестница: получатели
 # --------------------------------------------------------------------------- #
 #
 # Каждый потерянный получатель получает РОВНО ОДНУ причину — первую сработавшую
-# сверху вниз. Аддитивность не пожелание, а условие осмысленности: если тройка
-# попадёт в две ветки, «из чего состоит падение» перестанет складываться в
-# падение, и читатель не сможет проверить ни одну цифру.
+# сверху вниз. Аддитивность не пожелание, а условие осмысленности: если получатель
+# попадёт в две ветки, части падения перестанут складываться в падение.
 #
-# Порядок ветвей значим и обоснован так:
-#   1. организация ликвидирована — она не «ушла в другой банк», её просто нет;
-#   2. ИНН исчез из ведомостей целиком — это про организацию, а не про человека;
-#   3. человека нет в ведомостях банка ВООБЩЕ и не было в предыдущие месяцы —
-#      единственный НАСТОЯЩИЙ уход физлица;
-#   4. его нет в отчётном месяце, но он был только что — перерыв, а не уход;
-#   5. зачисления в этой же тройке есть, коды нужные, сумма не дотянула — порог;
-#   6. зачисления есть, а коды не те — кодировка;
-#   7. тот же ИНН, другое подразделение — перевод внутри организации;
-#   8. человека в сегменте больше нет — сменил работодателя;
-#   9. в базе у него было несколько организаций, стало меньше — совместительство;
-#  10. остальное: перешёл в другую бюджетную организацию.
+# ГЛАВНЫЙ ВОПРОС К КАЖДОЙ ВЕТКЕ ОДИН: остался ли человек получателем зарплаты в
+# сегменте — по ВАШЕМУ определению, то есть по зарплатным кодам и выше порога?
 #
-# Ветви 4-7, 9 и 10 выглядят оттоком в любом агрегате, но оттоком не являются.
-# Ради них разбор и опускается до физического лица.
+#   Остался  -> потери нет. Он мог перейти в другую бюджетную организацию, в
+#               другое подразделение или сократить число мест работы: для
+#               сегмента это движение внутри, а не убыль.
+#   Не остался -> ПОТЕРЯ. Неважно, ушёл он из банка, ушёл в другой сегмент,
+#               перестал зачислять по зарплатным кодам или не дотянул до порога:
+#               получателя не стало, и ветка говорит лишь КУДА он делся.
+#
+# Раньше здесь была третья категория — «особенности счёта», куда попадали порог и
+# коды вне списка. Это было неверно: порог и список кодов — часть ОПРЕДЕЛЕНИЯ
+# получателя, а не погрешность измерения. Человек, переставший зачислять по
+# зарплатному коду, для зарплатного подразделения пропал, и прятать его в
+# «методологию» значит занижать потерю.
 _LOST_CASE = """
     CASE
-      WHEN s.is_liquidated                            THEN 'liquidated'
-      WHEN si.inn IS NULL                             THEN 'inn_gone'
-      WHEN se.epk_id IS NULL AND rc.epk_id IS NULL    THEN 'left_bank'
-      WHEN se.epk_id IS NULL                          THEN 'gap_only'
-      WHEN t.amt_codes > 0                            THEN 'below_threshold'
-      WHEN t.amt_all > 0                              THEN 'code_out_of_list'
-      WHEN cg.epk_id IS NOT NULL                      THEN 'gosb_moved'
-      WHEN ce.epk_id IS NULL                          THEN 'left_rgs'
-      WHEN be.n_inn > 1                               THEN 'multi_collapsed'
-      ELSE 'moved_within_rgs'
+      WHEN ce.epk_id IS NOT NULL THEN 'stayed_in_segment'
+      WHEN se.epk_id IS NULL     THEN 'left_bank'
+      WHEN sg.amt_codes > 0      THEN 'below_threshold'
+      WHEN sg.amt_all > 0        THEN 'other_codes'
+      ELSE 'left_segment'
     END
 """
 
 # Общая часть запросов по потерянным получателям. Вынесена в кусок, чтобы итог и
-# разрезы считались ПО ОДНОМУ И ТОМУ ЖЕ определению — разъехавшись, они дали бы
-# разные ответы на один вопрос.
+# разрезы считались ПО ОДНОМУ И ТОМУ ЖЕ определению.
 #
-# Ветки «сумма ниже порога» и «код вне списка» не требуют отдельной проверки
-# `t.epk_id IS NOT NULL`: если зачислений в этой тройке нет вовсе, обе суммы
-# приходят NULL, оба условия ложны, и разбор идёт дальше сам.
+# ПЕРВАЯ ветка проверяется первой не случайно. Если человек остался получателем
+# бюджетного сегмента — всё равно, что случилось с его прежней организацией: её
+# могли ликвидировать, она могла исчезнуть из ведомостей, его могли перевести в
+# другое подразделение или он сам сменил работодателя. Сегмент получателя не
+# потерял, а больше ничего и не спрашивается. Раньше здесь стояли отдельные
+# ветки про подразделение, организацию и ликвидацию — они отвечали на вопрос,
+# которого никто не задавал, и заслоняли тот, который задавали.
 _LOST_BASE = """
   SELECT b.epk_id, b.inn, b.gosb_id, b.tb_id, b.amt,
          """ + _LOST_CASE + """ AS cause
@@ -426,47 +399,27 @@ _LOST_BASE = """
   LEFT JOIN t_pairs c ON c.report_dt = CAST(:d_cur AS date)
                      AND c.epk_id = b.epk_id AND c.inn = b.inn
                      AND c.gosb_id = b.gosb_id
-  LEFT JOIN t_seg s      ON s.inn = b.inn
-  LEFT JOIN t_inn_seen si ON si.inn = b.inn
-                         AND si.report_dt = CAST(:d_cur AS date)
-  LEFT JOIN t_seen_epk se ON se.epk_id = b.epk_id
-                         AND se.report_dt = CAST(:d_cur AS date)
-  LEFT JOIN t_seen t     ON t.epk_id = b.epk_id AND t.inn = b.inn
-                        AND t.gosb_id = b.gosb_id
-                        AND t.report_dt = CAST(:d_cur AS date)
-  LEFT JOIN t_recent rc  ON rc.epk_id = b.epk_id
-  LEFT JOIN (SELECT DISTINCT epk_id, inn FROM t_pairs
-             WHERE report_dt = CAST(:d_cur AS date)) cg
-                         ON cg.epk_id = b.epk_id AND cg.inn = b.inn
   LEFT JOIN t_epk_month ce ON ce.epk_id = b.epk_id
                           AND ce.report_dt = CAST(:d_cur AS date)
-  LEFT JOIN t_epk_month be ON be.epk_id = b.epk_id
-                          AND be.report_dt = CAST(:d_base AS date)
+  LEFT JOIN t_seen_epk se ON se.epk_id = b.epk_id
+                         AND se.report_dt = CAST(:d_cur AS date)
+  LEFT JOIN t_seen_seg sg ON sg.epk_id = b.epk_id
+                         AND sg.report_dt = CAST(:d_cur AS date)
   WHERE b.report_dt = CAST(:d_base AS date) AND c.epk_id IS NULL
 """
 
 # Зеркальная лестница по ПРИШЕДШИМ получателям.
 #
-# Зеркальная не ради симметрии отчёта: без неё видно только половину движения, и
-# «пришло меньше, чем раньше» не отличить от «ушло больше». Главное же — без
-# раскладки прихода нельзя ответить на вопрос, ради которого всё считается:
-# ВЫРОСЛИ ЛИ МЫ, если не брать методологию счёта. Вычитать из полного прихода
-# только настоящие потери — арифметика, не значащая ничего.
-#
-# Методологические ветки проверяются РАНЬШЕ «новых»: человек, который в базовом
-# месяце получал здесь же, но ниже порога, — это порог, а не новый сотрудник, и
-# назвать его новым значило бы завысить рост ровно на ту величину, которую мы и
-# вычитаем со стороны потерь.
+# Зеркальная не ради симметрии: без неё нельзя ответить на главный вопрос —
+# ВЫРОСЛИ ЛИ МЫ. Вычитать из полного прихода только настоящие потери значит
+# завысить рост ровно на ту величину, которую мы вычитаем со стороны потерь.
 _GAINED_CASE = """
     CASE
-      WHEN bt.amt_codes > 0        THEN 'crossed_threshold'
-      WHEN bt.amt_all > 0          THEN 'code_came_into_list'
-      WHEN bg.epk_id IS NOT NULL   THEN 'gosb_moved_in'
-      WHEN bse.epk_id IS NULL      THEN 'person_new_to_bank'
-      WHEN bp.epk_id IS NULL       THEN 'returned_to_rgs'
-      WHEN bi.inn IS NULL          THEN 'inn_new'
-      WHEN ce.n_inn > bp.n_inn     THEN 'multi_new'
-      ELSE 'moved_in'
+      WHEN bp.epk_id IS NOT NULL THEN 'stayed_in_segment'
+      WHEN bse.epk_id IS NULL    THEN 'new_to_bank'
+      WHEN bsg.amt_codes > 0     THEN 'above_threshold'
+      WHEN bsg.amt_all > 0       THEN 'back_to_codes'
+      ELSE 'from_segment'
     END
 """
 
@@ -477,20 +430,12 @@ _GAINED_BASE = """
   LEFT JOIN t_pairs b ON b.report_dt = CAST(:d_base AS date)
                      AND b.epk_id = c.epk_id AND b.inn = c.inn
                      AND b.gosb_id = c.gosb_id
-  LEFT JOIN t_seen bt     ON bt.epk_id = c.epk_id AND bt.inn = c.inn
-                         AND bt.gosb_id = c.gosb_id
-                         AND bt.report_dt = CAST(:d_base AS date)
-  LEFT JOIN (SELECT DISTINCT epk_id, inn FROM t_pairs
-             WHERE report_dt = CAST(:d_base AS date)) bg
-                         ON bg.epk_id = c.epk_id AND bg.inn = c.inn
-  LEFT JOIN t_seen_epk bse ON bse.epk_id = c.epk_id
-                          AND bse.report_dt = CAST(:d_base AS date)
   LEFT JOIN t_epk_month bp ON bp.epk_id = c.epk_id
                           AND bp.report_dt = CAST(:d_base AS date)
-  LEFT JOIN t_epk_month ce ON ce.epk_id = c.epk_id
-                          AND ce.report_dt = CAST(:d_cur AS date)
-  LEFT JOIN t_inn_month bi ON bi.inn = c.inn
-                          AND bi.report_dt = CAST(:d_base AS date)
+  LEFT JOIN t_seen_epk bse ON bse.epk_id = c.epk_id
+                          AND bse.report_dt = CAST(:d_base AS date)
+  LEFT JOIN t_seen_seg bsg ON bsg.epk_id = c.epk_id
+                          AND bsg.report_dt = CAST(:d_base AS date)
   WHERE c.report_dt = CAST(:d_cur AS date) AND b.epk_id IS NULL
 """
 
@@ -508,10 +453,6 @@ SELECT cause, count(*) AS n_triples, count(DISTINCT epk_id) AS n_epk,
 FROM gained GROUP BY cause ORDER BY count(*) DESC
 """
 
-# Потери в разрезе организации — с составом причин. Именно это агрегаты показать
-# не могут: «утекло образование» без состава причин остаётся утверждением без
-# содержания. Возвращаются ВСЕ бюджетные ИНН с потерями; обрезать выборку в SQL
-# нельзя — итог по разрезам перестал бы сходиться с общим итогом.
 LOST_BY_INN = """
 WITH lost AS (""" + _LOST_BASE + """)
 SELECT l.inn, l.cause, min(l.gosb_id) AS gosb_id, min(l.tb_id) AS tb_id,
@@ -521,37 +462,31 @@ FROM lost l GROUP BY l.inn, l.cause
 
 # Приход в разрезе организации. Без него таблица крупнейших потерь врёт:
 # организация, потерявшая двести тысяч получателей и набравшая столько же, в ней
-# выглядит катастрофой, хотя не потеряла ничего.
+# выглядит катастрофой, не потеряв ничего.
 GAINED_BY_INN = """
 WITH gained AS (""" + _GAINED_BASE + """)
-SELECT g.inn, count(*) AS n_triples,
-       sum(CASE WHEN g.cause IN ('person_new_to_bank', 'returned_to_rgs',
-                                 'inn_new') THEN 1 ELSE 0 END) AS n_real
+SELECT g.inn, count(*) AS n_triples
 FROM gained g GROUP BY g.inn
 """
 
 
 # --------------------------------------------------------------------------- #
-# Лестница причин: ЛЮДИ
+# Лестница: ЛЮДИ
 # --------------------------------------------------------------------------- #
 #
 # Второй разбор, на грейне человека, со своим тождеством:
 #     людей_база − потеряно_людей + пришло_людей = людей_отчёт
 #
-# Веток здесь меньше, и это главное: «схлопнулось совместительство», «сменил
-# организацию» и «переведён в другое подразделение» на уровне человека НЕ
-# СУЩЕСТВУЮТ — там не потерян никто. Разница между двумя лестницами и есть цена
-# методологии счёта, выраженная в людях.
-#
-# Колонка `n_epk` в лестнице получателей на этот вопрос не отвечает и отвечать не
-# может: один человек попадает в несколько её веток, складывать её нельзя.
+# Веток здесь ровно четыре, и все четыре — потеря. Движения внутри сегмента на
+# уровне человека НЕ СУЩЕСТВУЕТ: перевод, смена организации и сокращение числа
+# мест работы получателя убавляют, а человека нет. Разница между двумя
+# лестницами и есть цена того, что метрика считает не людей.
 _LOST_EPK_CASE = """
     CASE
-      WHEN se.epk_id IS NULL AND rc.epk_id IS NULL THEN 'left_bank'
-      WHEN se.epk_id IS NULL                       THEN 'gap_only'
-      WHEN sg.amt_codes > 0                        THEN 'below_threshold'
-      WHEN sg.amt_all > 0                          THEN 'code_out_of_list'
-      ELSE 'left_rgs'
+      WHEN se.epk_id IS NULL   THEN 'left_bank'
+      WHEN sg.amt_codes > 0    THEN 'below_threshold'
+      WHEN sg.amt_all > 0      THEN 'other_codes'
+      ELSE 'left_segment'
     END
 """
 
@@ -564,16 +499,15 @@ _LOST_EPK_BASE = """
                          AND se.report_dt = CAST(:d_cur AS date)
   LEFT JOIN t_seen_seg sg ON sg.epk_id = b.epk_id
                          AND sg.report_dt = CAST(:d_cur AS date)
-  LEFT JOIN t_recent rc   ON rc.epk_id = b.epk_id
   WHERE b.report_dt = CAST(:d_base AS date) AND c.epk_id IS NULL
 """
 
 _GAINED_EPK_CASE = """
     CASE
-      WHEN bsg.amt_codes > 0   THEN 'crossed_threshold'
-      WHEN bsg.amt_all > 0     THEN 'code_came_into_list'
-      WHEN bse.epk_id IS NULL  THEN 'person_new_to_bank'
-      ELSE 'returned_to_rgs'
+      WHEN bse.epk_id IS NULL  THEN 'new_to_bank'
+      WHEN bsg.amt_codes > 0   THEN 'above_threshold'
+      WHEN bsg.amt_all > 0     THEN 'back_to_codes'
+      ELSE 'from_segment'
     END
 """
 
@@ -599,14 +533,243 @@ WITH gained AS (""" + _GAINED_EPK_BASE + """)
 SELECT cause, count(*) AS n_epk FROM gained GROUP BY cause ORDER BY count(*) DESC
 """
 
-# Стаж ушедших: сколько месяцев из всего ряда человек был в сегменте до ухода.
+
+# --------------------------------------------------------------------------- #
+# Куда именно делись люди
+# --------------------------------------------------------------------------- #
+
+# В КАКОЙ СЕГМЕНТ ушли те, кто ушёл из бюджетного.
 #
-# Ответ, который она даёт: уходят недавно пришедшие (ротация, сезонники) или
-# старожилы (потеря ядра). Это разные диагнозы с разными решениями, и по одному
-# числу «ушло N человек» они неразличимы.
+# Строка «ушёл из сегмента» без адреса — это половина ответа. Забрал ли человека
+# коммерческий клиент, малый бизнес или он просто сменил бюджетную работу на
+# небюджетную — разные истории с разными выводами для зарплатного подразделения.
+LEFT_SEGMENT = """
+WITH lost AS (""" + _LOST_EPK_BASE + """)
+SELECT COALESCE(sa.segment_name, 'Организация не в справочнике') AS segment_name,
+       count(DISTINCT l.epk_id) AS n_epk
+FROM lost l
+JOIN t_seen t ON t.epk_id = l.epk_id AND t.report_dt = CAST(:d_cur AS date)
+LEFT JOIN t_seg_all sa ON sa.inn = t.inn
+WHERE l.cause = 'left_segment'
+GROUP BY 1
+ORDER BY 2 DESC
+"""
+
+# ЧЕМ заменились зарплатные зачисления у тех, кто перестал их получать.
 #
-# Возвращаются КОРЗИНЫ, а не люди: список из полутора миллионов строк в тетрадку
-# не поедет, а корзины отвечают на вопрос целиком.
+# Это НЕ разбор кодов витрины — тот был выброшен как вредный. Это детализация
+# ОДНОЙ ситуации из трёх: «зачисления есть, но не по зарплатным кодам». Сама
+# ситуация — уже потеря, и таблица её не оправдывает, а объясняет: пенсия
+# означает выход на пенсию, пособие на детей — декрет, расчёт при увольнении —
+# увольнение. Из строки «получает по другим кодам» ни один из этих выводов не
+# сделать, а решения по ним разные вплоть до противоположных.
+LEFT_CODES = """
+WITH lost AS (""" + _LOST_EPK_BASE + """)
+SELECT p.{code_col}                        AS code,
+       min(p.enrollment_transcription)     AS code_name,
+       count(DISTINCT p.epk_id)            AS n_epk,
+       sum(p.amt)                          AS amt
+FROM {schema}.uzp_data_payroll_m p
+JOIN (SELECT epk_id FROM lost WHERE cause = 'other_codes') l ON l.epk_id = p.epk_id
+JOIN t_seg s ON s.inn = CAST(p.inn AS bigint)
+WHERE p.report_dt = CAST(:d_cur AS date)
+  AND NOT (p.{code_col} = ANY(:codes))
+  AND """ + INN_OK + """
+GROUP BY p.{code_col}
+ORDER BY count(DISTINCT p.epk_id) DESC
+"""
+
+# ЗАРПЛАТНЫЕ КОДЫ по месяцам — только те, что входят в метрику.
+#
+# Отвечает на вопрос, который не виден ни в одной другой таблице: КАКОЙ ИМЕННО ВИД
+# ВЫПЛАТЫ просел. Метрика складывается из восемнадцати кодов, и провал одного из
+# них — стипендии в каникулы, премии в конце квартала — выглядит в итоге как
+# падение численности, хотя ни один человек никуда не ушёл: у него просто в этом
+# месяце нет выплаты этого вида.
+#
+# Коды ВНЕ списка здесь не считаются вовсе. Они на метрику не влияют по
+# построению, а в таблице занимали бы весь верх массовыми социальными выплатами и
+# сбивали бы вывод — это уже случилось однажды.
+#
+# Группировка идёт по коду, но показывается НАЗВАНИЕ: код — внутренний
+# идентификатор, читателю он ничего не говорит.
+CODE_MONTHS = """
+SELECT p.report_dt,
+       p.{code_col}                      AS code,
+       min(p.enrollment_transcription)   AS code_name,
+       count(DISTINCT p.epk_id)          AS n_epk,
+       sum(p.amt)                        AS amt
+FROM {schema}.uzp_data_payroll_m p
+JOIN t_seg s ON s.inn = CAST(p.inn AS bigint)
+WHERE p.report_dt = ANY(CAST(:months AS date[]))
+  AND p.{code_col} = ANY(:codes)
+  AND """ + INN_OK + """
+GROUP BY p.report_dt, p.{code_col}
+ORDER BY p.report_dt, p.{code_col}
+"""
+
+# СЕЗОННОСТЬ, проверенная повтором год к году.
+#
+# Определение узкое нарочно. «Получал в июле, не получает в августе» — это ещё не
+# сезон, это просто пропажа: доказать, что человек вернётся, нечем, следующего
+# месяца в данных нет. Сезонным поведение становится тогда, когда оно ПОВТОРЯЕТСЯ:
+# человек получал в июле ОБОИХ лет и не получал в августе ОБОИХ лет.
+#
+# Такие люди в сравнении август-к-августу не участвуют вовсе — их нет ни в базовом
+# месяце, ни в отчётном, — но именно они объясняют, почему август ниже июля. Это
+# не ветка потерь, а отдельный ответ на отдельный вопрос, и смешивать их нельзя.
+SEASONAL = """
+WITH bp AS (SELECT DISTINCT epk_id FROM t_pairs
+            WHERE report_dt = CAST(:d_base_prev AS date)),
+     bm AS (SELECT DISTINCT epk_id FROM t_pairs
+            WHERE report_dt = CAST(:d_base AS date)),
+     cp AS (SELECT DISTINCT epk_id FROM t_pairs
+            WHERE report_dt = CAST(:d_prev AS date)),
+     cm AS (SELECT DISTINCT epk_id FROM t_pairs
+            WHERE report_dt = CAST(:d_cur AS date)),
+     both_prev AS (
+       SELECT bp.epk_id FROM bp JOIN cp ON cp.epk_id = bp.epk_id)
+SELECT count(*)                                              AS n_prev_both,
+       count(*) FILTER (WHERE cm.epk_id IS NULL)             AS n_gone_cur,
+       count(*) FILTER (WHERE bm.epk_id IS NULL)             AS n_gone_base,
+       count(*) FILTER (WHERE cm.epk_id IS NULL
+                          AND bm.epk_id IS NULL)             AS n_seasonal
+FROM both_prev x
+LEFT JOIN bm ON bm.epk_id = x.epk_id
+LEFT JOIN cm ON cm.epk_id = x.epk_id
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Итоги, разрезы, ряды
+# --------------------------------------------------------------------------- #
+
+MONTH_TOTALS = """
+SELECT report_dt,
+       count(*)                  AS n_triples,
+       count(DISTINCT epk_id)    AS n_epk,
+       count(DISTINCT inn)       AS n_inn,
+       sum(amt)                  AS amt
+FROM t_pairs GROUP BY report_dt ORDER BY report_dt
+"""
+
+SEG_ATTRS = """
+SELECT * FROM t_seg
+"""
+
+# Помесячный ряд бюджетной сферы. Отвечает на «КОГДА»: обрыв в одном месяце — это
+# событие, плавное снижение — текучесть. По двум точкам года они неразличимы.
+MONTHLY = """
+WITH pairs AS (
+  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
+         sum(p.amt) AS amt,
+         sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
+                                            CAST(p.inn AS bigint)) AS amt_inn
+  FROM {schema}.uzp_data_payroll_m p
+  WHERE p.report_dt >= CAST(:d_from AS date)
+    AND p.report_dt <= CAST(:d_to AS date)
+    AND p.{code_col} = ANY(:codes)
+    AND p.epk_id IS NOT NULL
+    AND """ + INN_OK + """
+  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
+)
+SELECT x.report_dt,
+       count(*)                  AS n_triples,
+       count(DISTINCT x.epk_id)  AS n_epk,
+       count(DISTINCT x.inn)     AS n_inn,
+       sum(x.amt)                AS amt
+FROM pairs x JOIN t_seg s ON s.inn = x.inn
+WHERE {amt_cond}
+GROUP BY x.report_dt
+ORDER BY x.report_dt
+"""
+
+# Полнота загрузки ПО ВСЕМУ БАНКУ. Месяц с аномально низким числом строк —
+# недогруженная партиция, и любой вывод по нему будет выводом про загрузку.
+MONTHLY_ALL = """
+SELECT p.report_dt,
+       count(*)   AS n_rows,
+       sum(p.amt) AS amt
+FROM {schema}.uzp_data_payroll_m p
+WHERE p.report_dt >= CAST(:d_from AS date)
+  AND p.report_dt <= CAST(:d_to AS date)
+GROUP BY p.report_dt
+ORDER BY p.report_dt
+"""
+
+SURVIVAL = """
+WITH cohort AS (
+  SELECT epk_id, inn, gosb_id FROM t_pairs
+  WHERE report_dt = CAST(:d_base AS date)
+),
+pairs AS (
+  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
+         sum(p.amt) AS amt,
+         sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
+                                            CAST(p.inn AS bigint)) AS amt_inn
+  FROM {schema}.uzp_data_payroll_m p
+  WHERE p.report_dt >= CAST(:d_base AS date)
+    AND p.report_dt <= CAST(:d_cur AS date)
+    AND p.{code_col} = ANY(:codes)
+    AND p.epk_id IS NOT NULL
+    AND """ + INN_OK + """
+  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
+)
+SELECT x.report_dt, count(*) AS n_alive, count(DISTINCT x.epk_id) AS n_epk_alive
+FROM pairs x JOIN cohort c ON c.epk_id = x.epk_id AND c.inn = x.inn
+                          AND c.gosb_id = x.gosb_id
+WHERE {amt_cond}
+GROUP BY x.report_dt
+ORDER BY x.report_dt
+"""
+
+# Чувствительность к порогу. Порог фиксирован, а зарплаты индексируются — сам по
+# себе он должен год к году ДОБАВЛЯТЬ получателей. Если падение сохраняется при
+# пороге 0, порог ни при чём.
+THRESHOLD_SENS = """
+WITH pairs AS (
+  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
+         sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
+                                            CAST(p.inn AS bigint)) AS amt_inn
+  FROM {schema}.uzp_data_payroll_m p
+  WHERE p.report_dt = ANY(CAST(:months AS date[]))
+    AND p.{code_col} = ANY(:codes)
+    AND p.epk_id IS NOT NULL
+    AND """ + INN_OK + """
+  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
+)
+SELECT x.report_dt,
+       count(*) FILTER (WHERE x.amt_inn > 0)     AS t0,
+       count(*) FILTER (WHERE x.amt_inn > 1000)  AS t1000,
+       count(*) FILTER (WHERE x.amt_inn > 2500)  AS t2500,
+       count(*) FILTER (WHERE x.amt_inn > 5000)  AS t5000,
+       count(*) FILTER (WHERE x.amt_inn > 10000) AS t10000
+FROM pairs x JOIN t_seg s ON s.inn = x.inn
+GROUP BY x.report_dt
+ORDER BY x.report_dt
+"""
+
+# Миграция организаций: куда переехали люди, потерявшие свою организацию.
+INN_MIGRATION = """
+WITH lost AS (
+  SELECT DISTINCT b.epk_id, b.inn AS inn_from
+  FROM t_pairs b
+  LEFT JOIN t_pairs c ON c.report_dt = CAST(:d_cur AS date)
+                     AND c.epk_id = b.epk_id AND c.inn = b.inn
+  WHERE b.report_dt = CAST(:d_base AS date) AND c.epk_id IS NULL
+)
+SELECT l.inn_from, t.inn AS inn_to, count(DISTINCT l.epk_id) AS n_epk
+FROM lost l
+JOIN t_seen t ON t.epk_id = l.epk_id AND t.report_dt = CAST(:d_cur AS date)
+LEFT JOIN t_pairs b2 ON b2.report_dt = CAST(:d_base AS date)
+                    AND b2.epk_id = l.epk_id AND b2.inn = t.inn
+WHERE b2.epk_id IS NULL
+GROUP BY l.inn_from, t.inn
+HAVING count(DISTINCT l.epk_id) >= :min_movers
+ORDER BY count(DISTINCT l.epk_id) DESC
+"""
+
+# Стаж ушедших: сколько месяцев человек был в сегменте до ухода.
 TENURE = """
 WITH lost AS (""" + _LOST_EPK_BASE + """),
 mon AS (
@@ -639,203 +802,9 @@ FROM lost l LEFT JOIN ten t ON t.epk_id = l.epk_id
 GROUP BY l.cause, 2
 """
 
-
-# --------------------------------------------------------------------------- #
-# Итоги, разрезы, ряды
-# --------------------------------------------------------------------------- #
-
-# Итоги опорных месяцев: те самые числа, которые сравнивают с отчётностью.
-# Получатели И люди сразу — разница между ними и есть вклад совместительства.
-MONTH_TOTALS = """
-SELECT report_dt,
-       count(*)                  AS n_triples,
-       count(DISTINCT epk_id)    AS n_epk,
-       count(DISTINCT inn)       AS n_inn,
-       sum(amt)                  AS amt
-FROM t_pairs GROUP BY report_dt ORDER BY report_dt
-"""
-
-# Атрибуты бюджетных организаций — для разрезов. Отдельным запросом, а не джойном
-# в каждый разрез: справочник маленький, а джойн в тяжёлый запрос стоит дорого и
-# рискует задвоить строки.
-SEG_ATTRS = """
-SELECT * FROM t_seg
-"""
-
-# Помесячный ряд бюджетной сферы. Отвечает на «КОГДА»: обрыв в одном месяце — это
-# событие, плавное снижение — текучесть. По двум точкам года они неразличимы.
-#
-# Отношение получателей к людям — коэффициент совместительства. Его падение и
-# есть та часть минуса, где не потерян ни один человек.
-MONTHLY = """
-WITH pairs AS (
-  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
-         sum(p.amt) AS amt,
-         sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
-                                            CAST(p.inn AS bigint)) AS amt_inn
-  FROM {schema}.uzp_data_payroll_m p
-  WHERE p.report_dt >= CAST(:d_from AS date)
-    AND p.report_dt <= CAST(:d_to AS date)
-    AND p.{code_col} = ANY(:codes)
-    AND p.epk_id IS NOT NULL
-    AND """ + INN_OK + """
-  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
-)
-SELECT x.report_dt,
-       count(*)                  AS n_triples,
-       count(DISTINCT x.epk_id)  AS n_epk,
-       count(DISTINCT x.inn)     AS n_inn,
-       sum(x.amt)                AS amt
-FROM pairs x JOIN t_seg s ON s.inn = x.inn
-WHERE {amt_cond}
-GROUP BY x.report_dt
-ORDER BY x.report_dt
-"""
-
-# Полнота загрузки ПО ВСЕМУ БАНКУ, без фильтра сегмента и порога. Месяц с
-# аномально низким числом строк — недогруженная партиция, и любой вывод по нему
-# будет выводом про загрузку, а не про людей. Проверяется ДО объяснений.
-#
-# Только счёт строк и сумма: `count(DISTINCT epk_id)` по всему банку за 25 месяцев
-# — сортировка миллиардов значений ради числа, которого нет ни в одном разделе.
-MONTHLY_ALL = """
-SELECT p.report_dt,
-       count(*)   AS n_rows,
-       sum(p.amt) AS amt
-FROM {schema}.uzp_data_payroll_m p
-WHERE p.report_dt >= CAST(:d_from AS date)
-  AND p.report_dt <= CAST(:d_to AS date)
-GROUP BY p.report_dt
-ORDER BY p.report_dt
-"""
-
-# Кривая дожития когорты базового месяца: сколько её получателей живо в каждом
-# следующем месяце. Когорта берётся из рабочего набора, ряд — из витрины.
-SURVIVAL = """
-WITH cohort AS (
-  SELECT epk_id, inn, gosb_id FROM t_pairs
-  WHERE report_dt = CAST(:d_base AS date)
-),
-pairs AS (
-  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
-         sum(p.amt) AS amt,
-         sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
-                                            CAST(p.inn AS bigint)) AS amt_inn
-  FROM {schema}.uzp_data_payroll_m p
-  WHERE p.report_dt >= CAST(:d_base AS date)
-    AND p.report_dt <= CAST(:d_cur AS date)
-    AND p.{code_col} = ANY(:codes)
-    AND p.epk_id IS NOT NULL
-    AND """ + INN_OK + """
-  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
-)
-SELECT x.report_dt, count(*) AS n_alive, count(DISTINCT x.epk_id) AS n_epk_alive
-FROM pairs x JOIN cohort c ON c.epk_id = x.epk_id AND c.inn = x.inn
-                          AND c.gosb_id = x.gosb_id
-WHERE {amt_cond}
-GROUP BY x.report_dt
-ORDER BY x.report_dt
-"""
-
-# Чувствительность к порогу получателя. Порог фиксирован, а зарплаты индексируются
-# — сам по себе он должен год к году ДОБАВЛЯТЬ получателей, а не убавлять. Если
-# падение сохраняется при пороге 0, порог ни при чём; если исчезает — объяснение
-# найдено. Проверяется в лоб, а не рассуждением.
-THRESHOLD_SENS = """
-WITH pairs AS (
-  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
-         sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
-                                            CAST(p.inn AS bigint)) AS amt_inn
-  FROM {schema}.uzp_data_payroll_m p
-  WHERE p.report_dt = ANY(CAST(:months AS date[]))
-    AND p.{code_col} = ANY(:codes)
-    AND p.epk_id IS NOT NULL
-    AND """ + INN_OK + """
-  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
-)
-SELECT x.report_dt,
-       count(*) FILTER (WHERE x.amt_inn > 0)     AS t0,
-       count(*) FILTER (WHERE x.amt_inn > 1000)  AS t1000,
-       count(*) FILTER (WHERE x.amt_inn > 2500)  AS t2500,
-       count(*) FILTER (WHERE x.amt_inn > 5000)  AS t5000,
-       count(*) FILTER (WHERE x.amt_inn > 10000) AS t10000
-FROM pairs x JOIN t_seg s ON s.inn = x.inn
-GROUP BY x.report_dt
-ORDER BY x.report_dt
-"""
-
-# Зарплатные коды против всех остальных.
-#
-# Перечень кодов по одному бесполезен: его верх занимают массовые социальные
-# коды, которых метрика и не считала, и читатель делает из них вывод про метрику
-# — ровно эта ошибка и случилась при первом прогоне. Значение имеет ОДНО
-# отношение: держится ли объём зарплатных кодов и какова его доля. Если она
-# стабильна, перемены среди прочих кодов метрику не задевают по построению.
-CODE_SPLIT = """
-SELECT p.report_dt,
-       CASE WHEN p.{code_col} = ANY(:codes) THEN 'in' ELSE 'out' END AS grp,
-       count(DISTINCT p.epk_id) AS n_epk,
-       count(*)                 AS n_rows,
-       sum(p.amt)               AS amt
-FROM {schema}.uzp_data_payroll_m p
-JOIN t_seg s ON s.inn = CAST(p.inn AS bigint)
-WHERE p.report_dt = ANY(CAST(:months AS date[]))
-  AND """ + INN_OK + """
-GROUP BY p.report_dt, 2
-ORDER BY p.report_dt, 2
-"""
-
-# Коды по отдельности — СПРАВКА, а не объяснение. Нужна затем, чтобы увидеть коды,
-# исчезнувшие целиком: это признак смены кодировки в витрине. На метрику коды вне
-# списка не влияют по построению, и отчёт обязан говорить это прямо.
-CODE_MIX = """
-SELECT p.report_dt,
-       p.{code_col}                          AS code,
-       min(p.enrollment_transcription)       AS code_name,
-       count(DISTINCT p.epk_id)              AS n_epk,
-       sum(p.amt)                            AS amt
-FROM {schema}.uzp_data_payroll_m p
-JOIN t_seg s ON s.inn = CAST(p.inn AS bigint)
-WHERE p.report_dt = ANY(CAST(:months AS date[]))
-  AND """ + INN_OK + """
-GROUP BY p.report_dt, p.{code_col}
-ORDER BY p.report_dt, p.{code_col}
-"""
-
-# Миграция ИНН: куда переехали люди, потерявшие свою организацию.
-#
-# Единственная проверка, отличающая переоформление от оттока: если заметная доля
-# людей одного ИНН оказалась в одном и том же новом ИНН — организацию
-# переоформили, люди никуда не уходили. Ни один агрегат по холдингам этого не
-# покажет, потому что новый ИНН к старому холдингу ещё не привязан.
-#
-# Приёмник ищется по ВСЕЙ витрине отчётного месяца, без фильтра сегмента: при
-# переоформлении новый ИНН часто ещё не размечен как бюджетный.
-INN_MIGRATION = """
-WITH lost AS (
-  SELECT DISTINCT b.epk_id, b.inn AS inn_from
-  FROM t_pairs b
-  LEFT JOIN t_pairs c ON c.report_dt = CAST(:d_cur AS date)
-                     AND c.epk_id = b.epk_id AND c.inn = b.inn
-  WHERE b.report_dt = CAST(:d_base AS date) AND c.epk_id IS NULL
-)
-SELECT l.inn_from, t.inn AS inn_to, count(DISTINCT l.epk_id) AS n_epk
-FROM lost l
-JOIN t_seen t ON t.epk_id = l.epk_id AND t.report_dt = CAST(:d_cur AS date)
-LEFT JOIN t_pairs b2 ON b2.report_dt = CAST(:d_base AS date)
-                    AND b2.epk_id = l.epk_id AND b2.inn = t.inn
-WHERE b2.epk_id IS NULL                      -- приёмник НОВЫЙ для этого человека
-GROUP BY l.inn_from, t.inn
-HAVING count(DISTINCT l.epk_id) >= :min_movers
-ORDER BY count(DISTINCT l.epk_id) DESC
-"""
-
-# Территория: ТБ берётся ПРЯМО ИЗ ВЕДОМОСТЕЙ (`tb_id`), а не выводится через
-# справочник ГОСБ. На проме первый прогон показал, что `gosb_id` ведомостей со
-# справочником не сошёлся вовсе, и весь территориальный разрез схлопнулся в одну
-# строку «ТБ неизвестен». В ведомостях `tb_id` заполнен на 100% и принимает
-# двенадцать значений — этого достаточно, чтобы разрез был, даже когда ГОСБ не
-# опознан.
+# Территория: ТБ берётся ПРЯМО ИЗ ВЕДОМОСТЕЙ, а не выводится через справочник
+# ГОСБ. На проме первый прогон показал, что gosb_id ведомостей со справочником не
+# сошёлся, и весь территориальный разрез схлопнулся в одну строку-заглушку.
 TB_DIM = """
 SELECT d.tb_id, min(d.tb_short_name) AS tb_short_name
 FROM {schema}.uzp_dim_gosb d
@@ -843,9 +812,6 @@ WHERE """ + Q._NO_CA + """
 GROUP BY d.tb_id
 """
 
-# Справочник ГОСБ. Каким ключом он джойнится с ведомостями, решает разведка:
-# `old_gosb_id` и `new_gosb_id` — разные колонки с разной мощностью, и угадывать
-# нельзя. Запрос отдаёт оба, выбор делается по покрытию.
 GOSB_DIM = """
 SELECT d.old_gosb_id, d.new_gosb_id,
        min(d.tb_id)          AS tb_id,
@@ -857,9 +823,8 @@ WHERE """ + Q._NO_CA + """
 GROUP BY d.old_gosb_id, d.new_gosb_id
 """
 
-# Сколько ГОСБ ведомостей опознаётся каждым ключом справочника. Разведка выбирает
-# тот, что покрывает больше; не покрыл ни один — территориальный разрез честно
-# отключается, а не показывает заглушку под видом подразделения.
+# Каким ключом справочника опознаётся ГОСБ ведомостей. Угадывать нельзя: ошибка
+# не видна по результату — разрез из одной строки легко принять за свойство данных.
 GOSB_MATCH = """
 WITH used AS (SELECT DISTINCT gosb_id FROM t_pairs),
 dim AS (

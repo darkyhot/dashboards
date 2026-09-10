@@ -193,7 +193,8 @@ def check_leak(text: str, names) -> list[str]:
 # Колонки, значения которых — ДОЛИ, а не количества. Без этого списка доля
 # печатается как «0.4040» и читается как число получателей: документ уезжает
 # наружу на разбор, и там переспросить будет не у кого.
-PCT_COLUMNS = frozenset({"share", "delta_pct", "d_pairs_pct"})
+PCT_COLUMNS = frozenset({"share", "delta_pct", "d_pairs_pct",
+                         "d_month_pct", "d_year_pct", "d_triples_pct"})
 # Колонки, где дробь — это коэффициент, а не доля: печатается как есть.
 RATIO_COLUMNS = frozenset({"multi", "score"})
 
@@ -240,11 +241,12 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
           gains: pd.DataFrame, causes_epk: pd.DataFrame,
           gains_epk: pd.DataFrame, both: pd.DataFrame, tr: pd.DataFrame,
           st: pd.DataFrame, measured: str, cmp_months: pd.DataFrame,
-          surv: pd.DataFrame, thr: pd.DataFrame, split: pd.DataFrame,
-          gone: pd.DataFrame, mig: pd.DataFrame, cuts: dict,
-          orgs: pd.DataFrame, tenure: pd.DataFrame, checks: list[dict],
-          warnings: list[str], probe: dict, meta: dict, shown: dict,
-          texts: dict) -> tuple[str, list[str]]:
+          surv: pd.DataFrame, thr: pd.DataFrame, seas: dict,
+          codes_m: pd.DataFrame,
+          to_seg: pd.DataFrame, to_codes: pd.DataFrame, mig: pd.DataFrame,
+          cuts: dict, orgs: pd.DataFrame, tenure: pd.DataFrame,
+          checks: list[dict], warnings: list[str], probe: dict, meta: dict,
+          shown: dict, texts: dict) -> tuple[str, list[str]]:
     """Собрать документ. Возвращает (текст, список утечек).
 
     Утечки возвращаются, а не бросаются исключением: решение, что делать с
@@ -259,8 +261,8 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
     # выводов, и по ним же потом идёт проверка утечки. Один и тот же словарь на
     # оба шага — иначе маскирование и проверка разъедутся, и документ, прошедший
     # проверку, окажется замаскирован не полностью.
-    names = collect_names([causes, gains, tr, thr, gone, mig, orgs,
-                           *cuts.values()])
+    names = collect_names([causes, gains, tr, thr, to_seg, to_codes, codes_m,
+                           mig, orgs, *cuts.values()])
     # Тексты выводов приходят с ВОССТАНОВЛЕННЫМИ названиями — они нужны такими в
     # HTML, но не здесь. Прогоняем их через те же токены, что и таблицы.
     texts = {k: mask_text(v, al, names) for k, v in (texts or {}).items()}
@@ -309,40 +311,36 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
 {texts.get('overview', '')}
 """)
 
-    parts.append(f"""## Выросли или нет
+    parts.append(f"""## Реальные потери и реальный приход
 
-Движение разложено на три вида, причём **и потери, и приход** — иначе «рост»
-завышается ровно на ту величину, которую мы вычитаем со стороны потерь.
+Получатель считается **потерянным**, если он больше не получает зарплату по
+заданным кодам выше порога — неважно, ушёл он из банка, ушёл в другой сегмент или
+перешёл на другие коды. Порог и список кодов это **определение получателя**, а не
+погрешность измерения.
 
-| Вид движения | Получателей | Людей |
+Если человек остался получателем бюджетного сегмента — потери нет, и как
+именно он внутри переместился (сменил организацию, подразделение или число мест
+работы), для сегмента неважно.
+
+| | Получателей | Людей |
 |---|---|---|
-| Реальное движение | {_n(t['net_real'])} | {_n(t['net_real_epk'])} |
-| Особенности счёта | {_n(t['net_method'])} | {_n(t['net_method_epk'])} |
-| Перерывы в выплатах | {_n(t['net_gap'])} | {_n(t['net_gap_epk'])} |
-| **Итого изменение** | **{_n(t['d_triples'])}** | **{_n(t['d_epk'])}** |
+| Реально потеряно | {_n(t['real_lost'])} | {_n(t['real_lost_epk'])} |
+| Реально пришло | {_n(t['real_gained'])} | {_n(t['real_gained_epk'])} |
+| **Чистое изменение** | **{_n(t['net_real'])}** | **{_n(t['net_real_epk'])}** |
+| Остались получателями сегмента | −{_n(t['inside_lost'])} / +{_n(t['inside_gained'])} | — |
+| **Итого изменение метрики** | **{_n(t['d_triples'])}** | **{_n(t['d_epk'])}** |
 
 {texts.get('net', '')}
-
-### Из чего состоит приход
-
-Всего пришло **{_n(t['gained'])}** получателей: реальных {_n(gk['real'])},
-по особенностям счёта {_n(gk['method'])}.
-
-{_table(gains, ['title', 'kind', 'n_triples', 'n_epk', 'share'],
-        ['Откуда', 'Вид', 'Получателей', 'Человек', 'Доля'])}
-Приход по ЛЮДЯМ — веток меньше, потому что совместительство и переводы человека
-не прибавляют:
-
-{_table(gains_epk, ['title', 'kind', 'n_epk', 'share'],
-        ['Откуда', 'Вид', 'Человек', 'Доля'])}""")
+""")
 
     parts.append(f"""## Из чего состоит потеря
 
 Каждый потерянный получатель получает **ровно одну** причину — первую
 сработавшую по лестнице приоритетов, поэтому части складываются в целое.
 
-Потеряно **{_n(t['lost'])}** получателей: настоящая потеря {_n(lk['real'])},
-особенности счёта {_n(lk['method'])}, перерывы {_n(lk['gap'])}.
+Потеряно **{_n(t['lost'])}** получателей: настоящая потеря
+**{_n(t['real_lost'])}**, ещё {_n(t['inside_lost'])} остались получателями
+бюджетного сегмента — их сегмент не потерял.
 
 {_table(causes, ['title', 'kind', 'n_triples', 'n_epk', 'share'],
         ['Причина', 'Вид', 'Получателей', 'Человек*', 'Доля потерь'])}
@@ -363,7 +361,7 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
         ['Причина', 'Вид', 'Получателей', 'Людей'], limit=15)}
 Расшифровка веток:
 
-{chr(10).join(f"- **{v[0]}** ({v[2]}) — {v[1]}" for k, v in A.CAUSES.items())}""")
+{chr(10).join(_cause_line(k, v) for k, v in A.CAUSES.items())}""")
 
     prev_txt = ""
     if t_prev is not None:
@@ -375,9 +373,9 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
 |---|---|---|---|
 | Получателей | {_n(t_prev['triples_base'])} | {_n(t_prev['triples_cur'])} | {_n(t_prev['d_triples'])} |
 | Людей | {_n(t_prev['epk_base'])} | {_n(t_prev['epk_cur'])} | {_n(t_prev['d_epk'])} |
-| Реальное движение | | | {_n(t_prev['net_real'])} |
-| Особенности счёта | | | {_n(t_prev['net_method'])} |
-| Перерывы | | | {_n(t_prev['net_gap'])} |
+| Реально потеряно | | | {_n(t_prev['real_lost'])} |
+| Реально пришло | | | {_n(t_prev['real_gained'])} |
+| Чистое изменение | | | {_n(t_prev['net_real'])} |
 
 Та же лестница, другая база: видно, какая часть годового изменения пришлась на
 последний месяц.
@@ -402,6 +400,22 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
 {_table(tr, ['report_dt', 'n_triples', 'n_epk', 'multi', 'yoy', 'yoy_epk'],
         ['Месяц', 'Получателей', 'Людей', 'Получ. на человека',
          'Год к году', 'Год к году, люди'], limit=40)}
+### Сезонность: повторяется ли провал год к году
+
+Сезонным считается только ПОВТОРЯЮЩЕЕСЯ поведение: человек получал в предыдущем
+месяце оба года и не получал в отчётном оба года. Просто «был в прошлом месяце,
+нет сейчас» сезонностью не является — доказать, что человек вернётся, нечем.
+
+{_seasonal_md(seas)}
+### Какой вид выплаты просел
+
+Только зарплатные коды — те, что входят в метрику. Провал одного вида выплаты
+(стипендия в каникулы, премия в конце квартала) выглядит падением численности,
+хотя человек никуда не ушёл: у него просто нет выплаты этого вида в этом месяце.
+
+{_table(codes_m, ['name', 'base', 'prev', 'cur', 'd_month', 'd_month_pct', 'd_year', 'd_year_pct'],
+        ['Вид зачисления', 'Год назад', 'Пред. месяц', 'Отчётный',
+         'К пред. месяцу', '%', 'Год к году', '%'], limit=20)}
 ### Месяцы-обрывы
 
 Мерилось: {measured}. Регулярный сезонный провал обрывом не считается.
@@ -413,33 +427,43 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
 {_table(surv, ['report_dt', 'n_alive', 'share'],
         ['Месяц', 'Получателей живо', 'Доля от базы'], limit=40)}{prev_txt}""")
 
-    parts.append(f"""## Почему
+    parts.append(f"""## Куда делись люди
 
-{texts.get('why', '')}
+{texts.get('gone', '')}
 
-### Чувствительность к порогу получателя
+Есть ровно три ситуации, и они различаются по данным: зарплатные зачисления есть,
+но ниже порога; зачисления есть, но не по зарплатным кодам; зачислений нет вовсе.
 
-{_table(thr, ['threshold', 'base', 'cur', 'delta', 'delta_pct'],
-        ['Порог, ₽', bm, cm, 'Изменение', '%'], limit=8)}
-### Зарплатные коды против всех остальных
+### В какой сегмент ушли
 
-Метрика считает **только** зарплатные коды. Что бы ни произошло с остальными, на
-неё это не влияет по построению — смотреть надо на первую строку.
+{_table(to_seg, ['segment_name', 'n_epk', 'share'],
+        ['Сегмент', 'Человек', 'Доля'], limit=12)}
+### Чем заменились зарплатные зачисления
 
-{_table(split, ['title', 'epk_base', 'epk_cur', 'd_epk', 'd_epk_pct', 'd_amt_pct'],
-        ['Группа кодов', 'Людей в базе', 'Людей в отчёте', 'Изменение',
-         '% по людям', '% по объёму'], limit=4)}
-### Коды, исчезнувшие из витрины целиком
+Это те, кто продолжает получать от бюджетной организации, но не по зарплатным
+кодам. Получателями они быть перестали — это уже посчитано потерей. Таблица
+говорит, что с ними случилось.
 
-Справка о переменах в данных, а не объяснение падения.
-
-{_table(gone, ['code', 'code_name', 'base', 'in_list'],
-        ['Код', 'Вид зачисления', 'Людей было', 'Входит в метрику'], limit=15)}
+{_table(to_codes, ['code', 'code_name', 'n_epk', 'share'],
+        ['Код', 'Вид зачисления', 'Человек', 'Доля'], limit=15)}
 ### Похоже на переоформление
 
 {_table(m_mig, ['name_from', 'name_to', 'n_epk', 'share', 'to_in_segment'],
         ['Откуда', 'Куда', 'Человек', 'Доля потерь организации',
-         'Приёмник в сегменте'], limit=12)}""")
+         'Приёмник в сегменте'], limit=12)}
+### Сколько месяцев ушедшие были в сегменте
+
+{_table(tenure, list(tenure.columns) if tenure is not None and not tenure.empty else [],
+        ['Месяцев в сегменте'] + [str(c) for c in (list(tenure.columns)[1:]
+                                                   if tenure is not None and not tenure.empty else [])],
+        limit=10)}
+### А не в пороге ли дело
+
+{_table(thr, ['threshold', 'base', 'cur', 'delta', 'delta_pct'],
+        ['Порог, ₽', bm, cm, 'Изменение', '%'], limit=8)}
+Порог фиксирован, а зарплаты индексируются — сам по себе он должен год к году
+добавлять получателей. Если падение сохраняется при пороге 0, порог ни при чём.
+""")
 
     where_parts = []
     titles = {"holding_name": "Холдинги", "agency": "Ведомства (по наименованию)",
@@ -450,23 +474,14 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
             continue
         where_parts.append(
             f"### {titles.get(dim, dim)}\n\n"
-            + _table(df, [dim, "n_triples", "share", "n_inn", "real", "method", "gap"],
+            + _table(df, [dim, "n_triples", "share", "n_inn", "loss", "inside"],
                      [titles.get(dim, dim), "Потеряно", "Доля", "Организаций",
-                      "Реальная потеря", "Счёт", "Перерыв"]))
+                      "Реальная потеря", "Остались в сегменте"]))
     parts.append(f"""## Где
 
 {texts.get('where', '')}
 
 {chr(10).join(where_parts)}
-### Стаж ушедших
-
-Сколько месяцев человек был в сегменте до ухода. Уходят недавно пришедшие — это
-ротация; уходят старожилы — это потеря ядра.
-
-{_table(tenure, list(tenure.columns) if tenure is not None and not tenure.empty else [],
-        ['Месяцев в сегменте'] + [str(c) for c in (list(tenure.columns)[1:]
-                                                   if tenure is not None and not tenure.empty else [])],
-        limit=10)}
 ### Организации с наибольшим ЧИСТЫМ изменением
 
 Сортировка по нетто: организация, потерявшая много и набравшая столько же, ничего
@@ -512,6 +527,27 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
     text = "\n\n".join(parts)
     leaks = check_leak(text, names)
     return text, leaks
+
+
+def _cause_line(key: str, v: tuple) -> str:
+    """Строка расшифровки ветки: название, вид словом, описание."""
+    kind = "потеря получателя" if v[2] == A.LOSS else "остался в сегменте"
+    return f"- **{v[0]}** ({kind}) — {v[1]}"
+
+
+def _seasonal_md(seas: dict) -> str:
+    """Проверка сезонности таблицей. Пусто — честная строка, а не пустая таблица."""
+    if not seas or not seas.get("n_prev_both"):
+        return "_проверка сезонности не считалась_\n"
+    pm, rm = seas["prev_month"], seas["report_month"]
+    py, ry = pm - pd.DateOffset(months=12), rm - pd.DateOffset(months=12)
+    return (
+        f"| Показатель | Человек |\n|---|---|\n"
+        f"| Получали зарплату в {pm:%m.%Y} и в {py:%m.%Y} | {_n(seas['n_prev_both'])} |\n"
+        f"| Из них пропали в {rm:%m.%Y} | {_n(seas['n_gone_cur'])} |\n"
+        f"| Из них пропадали и в {ry:%m.%Y} — это сезонность | "
+        f"{_n(seas['n_seasonal'])} |\n\n"
+        f"Сезонными оказались {_pct(seas['share_of_gone'], 0)} от всех пропавших.\n")
 
 
 def _sql_appendix(shown: dict) -> str:

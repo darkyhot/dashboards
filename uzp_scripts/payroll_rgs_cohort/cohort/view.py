@@ -29,12 +29,21 @@ from uzp_dash.render import html as H
 
 from . import analyze as A
 
-# Цвета видов движения. Настоящее — тёплые тона, счёт — серо-синие, перерыв —
-# отдельный: читатель обязан отличать «людей стало меньше» от «людей столько же,
-# считаем иначе» и от «месяц пропущен» до того, как начнёт читать числа.
-KIND_COLOR = {A.REAL: "#c2410c", A.METHOD: "#0369a1", A.GAP: "#a16207"}
-KIND_TAG = {A.REAL: "реальное движение", A.METHOD: "счёт, а не люди",
-            A.GAP: "перерыв"}
+# Цвета видов. Потеря и приход — тёплые тона, переход внутри сегмента — серый:
+# читатель обязан отличать «получателя не стало» от «получатель остался в сегменте» до того, как начнёт читать числа.
+KIND_COLOR = {A.LOSS: "#c2410c", A.INSIDE: "#94a3b8"}
+
+
+def _tag(side: str, kind: str) -> str:
+    """Подпись вида. Зависит от стороны: «остался в сегменте» на потерях и
+    «перешёл внутри сегмента» на приходе — про одно и то же, но читаются иначе."""
+    return A.KIND_TAG.get((side, kind), "")
+
+
+def _tag_html(side: str, kind: str) -> str:
+    cls = "tag real" if kind == A.LOSS else "tag"
+    return f'<span class="{cls}">{C.esc(_tag(side, kind))}</span>'
+
 
 EXTRA_CSS = """
 <style>
@@ -54,7 +63,6 @@ EXTRA_CSS = """
 .tag{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;
      background:color-mix(in srgb,var(--text-2) 14%,transparent);color:var(--text-2)}
 .tag.real{background:color-mix(in srgb,#c2410c 16%,transparent);color:#c2410c}
-.tag.gap{background:color-mix(in srgb,#a16207 18%,transparent);color:#a16207}
 .qbox{margin:12px 0 2px}
 .qbox > summary{cursor:pointer;list-style:none;display:inline-flex;align-items:center;
   gap:7px;font-size:12px;color:var(--text-2);padding:3px 9px;border-radius:12px;
@@ -194,7 +202,7 @@ def sparkline(points: list[tuple[str, float]], height: int = 130,
         f'<span>{C.esc(points[-1][0])}</span></div>{cap}')
 
 
-def waterfall(rows: list[dict], total: float) -> str:
+def waterfall(rows: list[dict], total: float, side: str = "lost") -> str:
     """Раскладка одного целого на части: название, полоса, число, доля.
 
     Полоса рисуется от МАКСИМАЛЬНОЙ части, а не от целого: иначе мелкие ветки
@@ -207,12 +215,10 @@ def waterfall(rows: list[dict], total: float) -> str:
     out = []
     for r in rows:
         v = float(r["value"])
-        kind = r.get("kind", A.REAL)
-        cls = {A.REAL: "tag real", A.GAP: "tag gap"}.get(kind, "tag")
+        kind = r.get("kind", A.LOSS)
         out.append(
             f'<div class="wf-row">'
-            f'<div>{C.esc(r["name"])} <span class="{cls}">'
-            f'{C.esc(KIND_TAG.get(kind, ""))}</span></div>'
+            f'<div>{C.esc(r["name"])} {_tag_html(side, kind)}</div>'
             f'<div><div class="wf-bar" style="width:{abs(v) / mx * 100:.1f}%;'
             f'background:{KIND_COLOR.get(kind, "var(--accent)")}"></div></div>'
             f'<div class="wf-val">{_n(v)}</div>'
@@ -231,41 +237,44 @@ def _ladder_rows(df: pd.DataFrame, value_col: str) -> list[dict]:
 # Разделы
 # --------------------------------------------------------------------------- #
 def head_kpi(t: dict) -> str:
-    """Первый экран: падение метрики, изменение по людям и чистое движение.
+    """Первый экран: реальные потери, реальный приход и что вышло в итоге.
 
-    Три разных числа рядом, потому что они отвечают на разные вопросы и
-    расходятся: метрика может падать, когда людей столько же, — ради этого разбор
-    и затеян.
+    Четыре числа рядом, потому что они отвечают на разные вопросы и расходятся:
+    метрика может падать, когда людей столько же, — ради этого разбор и затеян.
     """
-    d, de, nr = t["d_triples"], t["d_epk"], t["net_real"]
+    net, de = t["net_real"], t["d_epk"]
     return C.stat_row([
-        {"value": _n(t["triples_cur"]),
-         "caption": f"получателей в {t['report_month']:%m.%Y}",
-         "sub": f"было {_n(t['triples_base'])} в {t['base_month']:%m.%Y}"},
-        {"value": _signed(d), "caption": "изменение получателей год к году",
-         "kind": "bad" if d < 0 else "good",
-         "sub": _pct(d / (t["triples_base"] or 1))},
-        {"value": _signed(de), "caption": "изменение по ЛЮДЯМ",
+        {"value": _n(t["real_lost"]), "caption": "реально потеряно получателей",
+         "kind": "bad",
+         "sub": f"{_n(t['real_lost_epk'])} человек"},
+        {"value": _n(t["real_gained"]), "caption": "реально пришло получателей",
+         "kind": "good",
+         "sub": f"{_n(t['real_gained_epk'])} человек"},
+        {"value": _signed(net), "caption": "чистое изменение по получателям",
+         "kind": "bad" if net < 0 else "good",
+         "sub": f"из {_n(t['triples_base'])} в {t['base_month']:%m.%Y}"},
+        {"value": _signed(de), "caption": "чистое изменение по ЛЮДЯМ",
          "kind": "bad" if de < 0 else "good",
          "sub": f"{_n(t['epk_cur'])} человек, {_pct(de / (t['epk_base'] or 1))}"},
-        {"value": _signed(nr), "caption": "чистое движение без счёта и перерывов",
-         "kind": "bad" if nr < 0 else "good",
-         "sub": "приход минус уход по настоящим причинам"},
     ])
 
 
-def metric_block(t: dict, shown: dict) -> str:
-    """Из чего сложено падение: людей меньше или получателей на человека меньше.
+def metric_block(t: dict, thr: pd.DataFrame, shown: dict) -> str:
+    """Метрика падает из-за людей или из-за того, чем она их считает.
 
     Это первое, что надо развести. Метрика считает тройки (человек, организация,
     подразделение), поэтому падение доли совместителей уменьшает её, не тронув ни
     одного человека, — и без этой раскладки весь дальнейший разбор идёт не про то.
+
+    Рядом — проверка порога. Порог фиксирован, а зарплаты индексируются: сам по
+    себе он должен год к году ДОБАВЛЯТЬ получателей. Если падение сохраняется при
+    пороге 0, порог ни при чём, и обсуждать его больше не нужно.
     """
     parts = [
-        {"name": "Людей стало меньше", "value": t["d_by_people"], "kind": A.REAL,
+        {"name": "Людей стало меньше", "value": t["d_by_people"], "kind": A.LOSS,
          "descr": "вклад изменения числа людей при прежнем совместительстве"},
         {"name": "Совместительство схлопнулось", "value": t["d_by_multi"],
-         "kind": A.METHOD,
+         "kind": A.INSIDE,
          "descr": "вклад изменения среднего числа получателей на человека — "
                   "людей это не убавляет"},
     ]
@@ -284,105 +293,164 @@ def metric_block(t: dict, shown: dict) -> str:
           _pct(t["multi_share_cur"], 2),
           _pct(t["multi_share_cur"] - t["multi_share_base"], 2)]],
         num_cols=[1, 2, 3])
+    thr_html = ""
+    if not thr.empty:
+        rows = [[_n(r.threshold) + " ₽", _n(r.base), _n(r.cur), _signed(r.delta),
+                 _pct(r.delta_pct)] for r in thr.itertuples()]
+        thr_html = ("<h3>А не в пороге ли дело</h3>"
+                    + C.table(["Порог", f"{t['base_month']:%m.%Y}",
+                               f"{t['report_month']:%m.%Y}", "Изменение", "%"],
+                              rows, num_cols=[1, 2, 3, 4])
+                    + _src("Порог фиксирован, а зарплаты индексируются — сам по "
+                           "себе он должен год к году добавлять получателей. Если "
+                           "падение сохраняется при пороге 0, порог ни при чём."))
     return C.section(
-        "Падение метрики: люди или счёт",
-        C.card(waterfall(parts, t["d_triples"]) + tbl
+        "Метрика: люди или то, чем их считают",
+        C.card(waterfall(parts, t["d_triples"]) + tbl + thr_html
                + _src("Получатель — тройка (человек, организация, подразделение) "
                       "с суммой зачислений в организацию за месяц выше порога. "
                       "Совместитель весит нескольких получателей.")
-               + sql_info(shown, "month_totals")),
+               + sql_info(shown, "month_totals", "threshold_sens")),
         eyebrow="с этого начинается разбор")
 
 
-def net_block(t: dict, gains: pd.DataFrame, gains_epk: pd.DataFrame,
-              shown: dict, text: str = "", fb: bool = False) -> str:
-    """Выросли мы или нет, если не брать методологию счёта.
+def net_block(t: dict, causes: pd.DataFrame, gains: pd.DataFrame,
+              causes_epk: pd.DataFrame, gains_epk: pd.DataFrame, shown: dict,
+              text: str = "", fb: bool = False) -> str:
+    """Реальные потери и реальный приход — главный ответ отчёта.
 
-    Раздел существует потому, что без раскладки ПРИХОДА ответить на этот вопрос
+    Раздел существует потому, что без раскладки ПРИХОДА ответить «выросли или нет»
     нельзя. Вычитать из полного прихода только настоящие потери — арифметика, не
     значащая ничего: она завышает рост ровно на ту величину, которую мы вычитаем
     со стороны потерь.
     """
-    rows = [
-        {"name": "Реальное движение", "value": t["net_real"], "kind": A.REAL,
-         "descr": "пришли новые люди и организации минус ушедшие из банка и из "
-                  "сегмента"},
-        {"name": "Особенности счёта", "value": t["net_method"], "kind": A.METHOD,
-         "descr": "порог, коды, переводы между подразделениями, совместительство "
-                  "и переходы внутри сегмента — людей не прибавляют и не убавляют"},
-        {"name": "Перерывы в выплатах", "value": t["net_gap"], "kind": A.GAP,
-         "descr": "человека нет в отчётном месяце, но он был в предыдущие"},
-    ]
-    epk_rows = [
-        ["Реальное движение", _signed(t["net_real"]), _signed(t["net_real_epk"])],
-        ["Особенности счёта", _signed(t["net_method"]), _signed(t["net_method_epk"])],
-        ["Перерывы", _signed(t["net_gap"]), _signed(t["net_gap_epk"])],
-        ["Итого изменение", _signed(t["d_triples"]), _signed(t["d_epk"])],
-    ]
-    gain_tbl = ""
+    lk, gk = t["lost_kinds"], t["gained_kinds"]
+    summary = C.table(
+        ["", "Получателей", "Людей"],
+        [["Реально потеряно", _n(t["real_lost"]), _n(t["real_lost_epk"])],
+         ["Реально пришло", _n(t["real_gained"]), _n(t["real_gained_epk"])],
+         ["Чистое изменение", _signed(t["net_real"]), _signed(t["net_real_epk"])],
+         ["Остались получателями сегмента (потери нет)",
+          f'−{_n(lk[A.INSIDE])} / +{_n(gk[A.INSIDE])}', "—"],
+         ["Итого изменение метрики", _signed(t["d_triples"]), _signed(t["d_epk"])]],
+        num_cols=[1, 2])
+
+    lost_html = ""
+    if not causes.empty:
+        lost_html = ("<h3>Из чего состоит потеря</h3>"
+                     + waterfall(_ladder_rows(causes, "n_triples"), t["lost"],
+                                 side="lost"))
+    gain_html = ""
     if not gains.empty:
-        rows_g = [[C.esc(r.title), _n(r.n_triples), _pct(r.share, 0),
-                   C.esc(KIND_TAG.get(r.kind, ""))] for r in gains.itertuples()]
-        gain_tbl = ("<h3>Из чего состоит приход</h3>"
-                    + C.table(["Откуда", "Получателей", "Доля", "Вид"], rows_g,
-                              num_cols=[1, 2]))
+        gain_html = ("<h3>Из чего состоит приход</h3>"
+                     + waterfall(_ladder_rows(gains, "n_triples"), t["gained"],
+                                 side="gained"))
     return C.section(
-        "Выросли или нет",
+        "Реальные потери и реальный приход",
         C.card(_fallback_mark(fb) + (C.narrative_html(text) if text else "")
-               + waterfall(rows, t["d_triples"])
-               + "<h3>То же самое по получателям и по людям</h3>"
-               + C.table(["Вид движения", "Получателей", "Людей"], epk_rows,
-                         num_cols=[1, 2])
-               + gain_tbl
-               + _src("Приход разложен теми же видами, что и потери. Иначе «рост» "
-                      "завышается ровно на ту величину, которую мы вычитаем со "
-                      "стороны потерь.")
-               + sql_info(shown, "gained_totals", "gained_epk", "lost_totals",
-                          "lost_epk")),
+               + summary + lost_html + gain_html
+               + _src("Получатель потерян, если он больше не получает зарплату по "
+                      "заданным кодам выше порога — неважно, ушёл он из банка, в "
+                      "другой сегмент или перешёл на другие коды. Если он остался "
+                      "получателем бюджетного сегмента, потери нет: как именно он "
+                      "внутри переместился, для сегмента неважно.")
+               + sql_info(shown, "lost_totals", "gained_totals", "lost_epk",
+                          "gained_epk")),
         eyebrow="главный ответ")
 
 
-def causes_block(causes: pd.DataFrame, both: pd.DataFrame, t: dict,
-                 shown: dict, text: str = "", fb: bool = False) -> str:
-    """Лестница причин потерь и она же — по людям, рядом."""
-    if causes.empty:
-        return _empty("Из чего состоит потеря", "раскладка не посчиталась")
-    side = ""
-    if not both.empty:
-        rows = [[C.esc(r.title), C.esc(KIND_TAG.get(r.kind, "")), _n(r.n_triples),
-                 _n(r.n_epk) if r.epk_applies else "—"]
-                for r in both.itertuples()]
-        side = ("<h3>Получатели и люди рядом</h3>"
-                + C.table(["Причина", "Вид", "Получателей", "Людей"], rows,
-                          num_cols=[2, 3])
-                + _note("Прочерк значит, что на уровне человека такой ветки нет "
-                        "вовсе: перевод, совместительство и переход внутри "
-                        "сегмента получателя убавляют, а человека — нет. Разница "
-                        "между колонками и есть цена методологии счёта."))
-    lk = t["lost_kinds"]
-    summary = (
-        f'<p>Потеряно <b>{_n(t["lost"])}</b> получателей, пришло '
-        f'<b>{_n(t["gained"])}</b>. Из потерянных настоящей потерей является '
-        f'<b>{_n(lk[A.REAL])}</b> ({_pct(lk[A.REAL] / (t["lost"] or 1), 0)}); '
-        f'<b>{_n(lk[A.METHOD])}</b> — особенности счёта, '
-        f'<b>{_n(lk[A.GAP])}</b> — перерывы в выплатах.</p>')
+def both_block(both: pd.DataFrame, t: dict, shown: dict) -> str:
+    """Потери по получателям и по людям рядом — цена того, что считаем не людей."""
+    if both.empty:
+        return ""
+    rows = [[C.esc(r.title), C.esc(_tag("lost", r.kind)), _n(r.n_triples),
+             _n(r.n_epk) if r.epk_applies else "—"] for r in both.itertuples()]
     return C.section(
-        "Из чего состоит потеря",
-        C.card(_fallback_mark(fb) + (C.narrative_html(text) if text else "")
-               + summary
-               + waterfall(_ladder_rows(causes, "n_triples"), t["lost"])
-               + side
-               + _src("Каждый потерянный получатель получает ровно одну причину — "
-                      "первую сработавшую по лестнице приоритетов, поэтому части "
-                      "складываются в целое.")
+        "Получатели и люди рядом",
+        C.card(C.table(["Причина", "Вид", "Получателей", "Людей"], rows,
+                       num_cols=[2, 3])
+               + _note("Прочерк значит, что на уровне человека такой ветки нет "
+                       "вовсе: переход внутри сегмента получателя убавляет, а "
+                       "человека — нет. Разница "
+                       f"между колонками ({_n(t['lost'])} получателей против "
+                       f"{_n(t['lost_epk'])} людей) и есть цена того, что метрика "
+                       f"считает не людей.")
                + sql_info(shown, "lost_totals", "lost_epk")),
-        eyebrow="ответ на «сколько на самом деле»")
+        eyebrow="цена счёта")
+
+
+def where_gone_block(to_seg: pd.DataFrame, to_codes: pd.DataFrame,
+                     mig: pd.DataFrame, tenure: pd.DataFrame, shown: dict,
+                     text: str = "", fb: bool = False) -> str:
+    """Куда именно делись люди: сегмент, вид выплат, переоформление, стаж.
+
+    Строка «ушёл» без адреса — половина ответа. Забрал ли человека коммерческий
+    клиент, вышел ли он на пенсию, или организацию просто переоформили — разные
+    истории, и решения по ним разные вплоть до противоположных.
+    """
+    parts = []
+    if not to_seg.empty:
+        rows = [[C.esc(str(r.segment_name)), _n(r.n_epk), _pct(r.share, 0)]
+                for r in to_seg.itertuples()]
+        parts.append("<h3>В какой сегмент ушли</h3>"
+                     + C.table(["Сегмент", "Человек", "Доля"], rows,
+                               num_cols=[1, 2]))
+    if not to_codes.empty:
+        rows = [[_n(r.code), C.esc(str(r.code_name or "")), _n(r.n_epk),
+                 _pct(r.share, 0)] for r in to_codes.itertuples()]
+        parts.append(
+            "<h3>Чем заменились зарплатные зачисления</h3>"
+            + C.table(["Код", "Вид зачисления", "Человек", "Доля"], rows,
+                      num_cols=[0, 2, 3])
+            + _note("Это те, кто продолжает получать от бюджетной организации, но "
+                    "не по зарплатным кодам. Получателями они быть перестали — "
+                    "это уже посчитано потерей. Таблица говорит, что с ними "
+                    "случилось: пенсия означает выход на пенсию, пособие на "
+                    "детей — декрет, расчёт при увольнении — увольнение."))
+    if not mig.empty:
+        rows = []
+        for r in mig.head(12).itertuples():
+            rows.append([
+                C.esc(str(getattr(r, "name_from", None) or r.inn_from)),
+                C.esc(str(getattr(r, "name_to", None) or r.inn_to)),
+                _n(r.n_epk), _pct(r.share, 0),
+                "да" if getattr(r, "to_in_segment", False) else "нет"])
+        parts.append(
+            "<h3>Похоже на переоформление, а не на уход</h3>"
+            + C.table(["Откуда", "Куда", "Человек", "Доля потерь организации",
+                       "Приёмник в сегменте"], rows, num_cols=[2, 3])
+            + _note("Люди этих организаций дружно оказались в одном и том же "
+                    "новом номере. Для банка они никуда не уходили. Если приёмник "
+                    "ещё не размечен как бюджетный, метрика теряет их дважды."))
+    if not tenure.empty:
+        head = list(tenure.columns)
+        rows = [[C.esc(str(row[0]))]
+                + [_pct(v, 0) if head[i + 1] == "Доля" else _n(v)
+                   for i, v in enumerate(row[1:])]
+                for row in tenure.itertuples(index=False)]
+        parts.append(
+            "<h3>Сколько месяцев ушедшие были в сегменте</h3>"
+            + C.table(["Месяцев в сегменте"] + [str(c) for c in head[1:]], rows,
+                      num_cols=list(range(1, len(head))))
+            + _note("Уходят недавно пришедшие — это ротация. Уходят старожилы — "
+                    "это потеря ядра. По числу «ушло N человек» эти два случая "
+                    "одинаковы, а решения по ним разные."))
+    if not parts:
+        return _empty("Куда делись люди", "ни один разрез не дал результата")
+    return C.section(
+        "Куда делись люди",
+        C.card(_fallback_mark(fb) + (C.narrative_html(text) if text else "")
+               + "".join(parts)
+               + sql_info(shown, "left_segment", "left_codes", "inn_migration",
+                          "tenure")),
+        eyebrow="ответ на «куда»")
 
 
 def when_block(tr: pd.DataFrame, st: pd.DataFrame, measured: str,
                cmp_months: pd.DataFrame, surv: pd.DataFrame, load: pd.DataFrame,
-               t_prev: dict | None, causes_prev: pd.DataFrame, shown: dict,
-               text: str = "", fb: bool = False) -> str:
+               seas: dict, codes: pd.DataFrame, t_prev: dict | None,
+               causes_prev: pd.DataFrame, shown: dict, text: str = "",
+               fb: bool = False) -> str:
     """Когда именно произошло падение — и не сезон ли это."""
     if tr.empty:
         return _empty("Когда это произошло", "помесячный ряд не построился")
@@ -413,9 +481,56 @@ def when_block(tr: pd.DataFrame, st: pd.DataFrame, measured: str,
                     "годовое падение повторяет обычный сезонный провал, и "
                     "выводить из него тренд нельзя."))
 
+    # Сезонность — сразу после сравнения месяцев: она объясняет провал отчётного
+    # месяца, и без неё этот провал читается как потеря.
+    seas_html = ""
+    if seas and seas.get("n_prev_both"):
+        seas_html = (
+            "<h3>Сезонность: повторяется ли провал год к году</h3>"
+            + C.table(
+                ["Показатель", "Человек"],
+                [[f"Получали зарплату в {seas['prev_month']:%m.%Y} и в "
+                  f"{seas['prev_month'] - pd.DateOffset(months=12):%m.%Y}",
+                  _n(seas["n_prev_both"])],
+                 [f"Из них пропали в {seas['report_month']:%m.%Y}",
+                  _n(seas["n_gone_cur"])],
+                 [f"Из них пропадали и в "
+                  f"{seas['report_month'] - pd.DateOffset(months=12):%m.%Y} — "
+                  f"это сезонность", _n(seas["n_seasonal"])]],
+                num_cols=[1])
+            + _note(
+                f"Сезонными считаются только те, у кого провал ПОВТОРИЛСЯ: "
+                f"получал в предыдущем месяце оба года и не получал в отчётном оба "
+                f"года. Таких {_pct(seas['share_of_gone'], 0)} от всех пропавших. "
+                f"Просто «был в прошлом месяце, нет сейчас» сезонностью не "
+                f"является: доказать, что человек вернётся, нечем — следующего "
+                f"месяца в данных нет. Эти люди не участвуют в сравнении год к "
+                f"году вовсе, но именно они объясняют, почему отчётный месяц ниже "
+                f"предыдущего."))
+
+    # Какой ВИД ВЫПЛАТЫ просел — сразу после сезонности: чаще всего именно он и
+    # объясняет провал отчётного месяца к предыдущему.
+    codes_html = ""
+    if not codes.empty:
+        rows = [[C.esc(str(r.name)), _n(r.base), _n(r.prev), _n(r.cur),
+                 _signed(r.d_month), _pct(r.d_month_pct),
+                 _signed(r.d_year), _pct(r.d_year_pct)]
+                for r in codes.itertuples()]
+        codes_html = (
+            "<h3>Какой вид выплаты просел</h3>"
+            + C.table(["Вид зачисления", "Год назад", "Пред. месяц", "Отчётный",
+                       "К пред. месяцу", "%", "Год к году", "%"], rows,
+                      num_cols=[1, 2, 3, 4, 5, 6, 7])
+            + _note("Только зарплатные коды — те, что входят в метрику. Метрика "
+                    "складывается из них, и провал одного вида выплаты (стипендия "
+                    "в каникулы, премия в конце квартала) выглядит падением "
+                    "численности, хотя человек никуда не ушёл: у него просто нет "
+                    "выплаты этого вида в этом месяце. Сортировка по изменению к "
+                    "предыдущему месяцу."))
+
     prev_html = ""
     if t_prev is not None and not causes_prev.empty:
-        rows = [[C.esc(r.title), C.esc(KIND_TAG.get(r.kind, "")), _n(r.n_triples),
+        rows = [[C.esc(r.title), C.esc(_tag("lost", r.kind)), _n(r.n_triples),
                  _pct(r.share, 0)] for r in causes_prev.itertuples()]
         prev_html = (
             f"<h3>Что произошло за один месяц: "
@@ -469,84 +584,15 @@ def when_block(tr: pd.DataFrame, st: pd.DataFrame, measured: str,
         C.card(_fallback_mark(fb) + (C.narrative_html(text) if text else "")
                + cmp_html
                + sparkline(pts, caption="получателей по месяцам", marks=marks)
-               + step_html + prev_html + surv_html + load_html
-               + sql_info(shown, "monthly", "survival", "lost_totals_prev",
-                          "monthly_all")),
+               + seas_html + codes_html + step_html + prev_html
+               + surv_html + load_html
+               + sql_info(shown, "monthly", "seasonal", "code_months",
+                          "survival", "lost_totals_prev", "monthly_all")),
         eyebrow="ответ на «когда»")
 
 
-def why_block(thr: pd.DataFrame, split: pd.DataFrame, gone: pd.DataFrame,
-              mig: pd.DataFrame, shown: dict, text: str = "",
-              fb: bool = False) -> str:
-    """Три проверки, каждая из которых может объяснить падение целиком."""
-    parts = []
-
-    if not thr.empty:
-        rows = [[_n(r.threshold) + " ₽", _n(r.base), _n(r.cur), _signed(r.delta),
-                 _pct(r.delta_pct)] for r in thr.itertuples()]
-        parts.append(
-            "<h3>Чувствительность к порогу получателя</h3>"
-            + C.table(["Порог", "База", "Отчёт", "Изменение", "%"], rows,
-                      num_cols=[1, 2, 3, 4])
-            + _src("Порог фиксирован, а зарплаты индексируются — сам по себе он "
-                   "должен год к году добавлять получателей. Если падение "
-                   "сохраняется при пороге 0, порог ни при чём."))
-
-    if not split.empty:
-        rows = [[C.esc(r.title), _n(r.epk_base), _n(r.epk_cur), _signed(r.d_epk),
-                 _pct(r.d_epk_pct), _pct(r.d_amt_pct)] for r in split.itertuples()]
-        parts.append(
-            "<h3>Зарплатные коды против всех остальных</h3>"
-            + C.table(["Группа кодов", "Людей в базе", "Людей в отчёте",
-                       "Изменение", "% по людям", "% по объёму"], rows,
-                      num_cols=[1, 2, 3, 4, 5])
-            + _note("Метрика считает ТОЛЬКО зарплатные коды. Что бы ни произошло "
-                    "с остальными, на неё это не влияет по построению — смотреть "
-                    "надо на первую строку."))
-
-    if not gone.empty:
-        rows = [[_n(r.code), C.esc(str(r.code_name or "")), _n(r.base),
-                 "да" if r.in_list else "нет"] for r in gone.itertuples()]
-        parts.append(
-            "<h3>Коды, исчезнувшие из витрины целиком</h3>"
-            + C.table(["Код", "Вид зачисления", "Людей было",
-                       "Влияет на метрику?"], rows, num_cols=[0, 2])
-            + _note("Справка о переменах в данных, а не объяснение падения. Код, "
-                    "которого нет в списке зарплатных, метрику не задевает ни при "
-                    "каком своём поведении."))
-
-    if not mig.empty:
-        rows = []
-        for r in mig.head(12).itertuples():
-            rows.append([
-                C.esc(str(getattr(r, "name_from", None) or r.inn_from)),
-                C.esc(str(getattr(r, "name_to", None) or r.inn_to)),
-                _n(r.n_epk), _pct(r.share, 0),
-                "да" if getattr(r, "to_in_segment", False) else "нет"])
-        parts.append(
-            "<h3>Похоже на переоформление, а не на отток</h3>"
-            + C.table(["Откуда", "Куда", "Человек", "Доля потерь организации",
-                       "Приёмник в сегменте"], rows, num_cols=[2, 3])
-            + _note("Люди этих организаций дружно оказались в одном и том же "
-                    "новом номере. Для банка они никуда не уходили. Если приёмник "
-                    "ещё не размечен как бюджетный, метрика теряет их дважды — и "
-                    "как отток, и как непопадание в сегмент."))
-
-    if not parts:
-        return _empty("Почему это произошло",
-                      "ни одна из проверок причины не дала результата")
-    return C.section(
-        "Почему это произошло",
-        C.card(_fallback_mark(fb) + (C.narrative_html(text) if text else "")
-               + "".join(parts)
-               + sql_info(shown, "threshold_sens", "code_split", "code_mix",
-                          "inn_migration")),
-        eyebrow="ответ на «почему»")
-
-
-def where_block(cuts: dict, orgs: pd.DataFrame, tenure: pd.DataFrame,
-                meta: dict, shown: dict, text: str = "",
-                fb: bool = False) -> str:
+def where_block(cuts: dict, orgs: pd.DataFrame, meta: dict, shown: dict,
+                text: str = "", fb: bool = False) -> str:
     """Разрезы потерь. В каждом — не только объём, но и состав по видам."""
     parts = []
     titles = {
@@ -564,26 +610,12 @@ def where_block(cuts: dict, orgs: pd.DataFrame, tenure: pd.DataFrame,
         for r in df.itertuples():
             rows.append([
                 C.esc(str(getattr(r, dim))), _n(r.n_triples), _pct(r.share, 0),
-                _n(r.n_inn), _n(getattr(r, A.REAL)), _n(getattr(r, A.METHOD)),
-                _n(getattr(r, A.GAP))])
+                _n(r.n_inn), _n(getattr(r, A.LOSS)), _n(getattr(r, A.INSIDE))])
         parts.append(f"<h3>{C.esc(titles.get(dim, dim))}</h3>"
                      + C.table([titles.get(dim, dim), "Потеряно", "Доля потерь",
-                                "Организаций", "Реальная потеря", "Счёт",
-                                "Перерыв"], rows, num_cols=[1, 2, 3, 4, 5, 6]))
-
-    if not tenure.empty:
-        head = list(tenure.columns)
-        rows = [[C.esc(str(row[0]))]
-                + [_pct(v, 0) if head[i + 1] == "Доля" else _n(v)
-                   for i, v in enumerate(row[1:])]
-                for row in tenure.itertuples(index=False)]
-        parts.append(
-            "<h3>Стаж ушедших: сколько месяцев были в сегменте</h3>"
-            + C.table(["Месяцев в сегменте"] + [str(c) for c in head[1:]], rows,
-                      num_cols=list(range(1, len(head))))
-            + _note("Уходят недавно пришедшие — это ротация и сезонники. Уходят "
-                    "старожилы — это потеря ядра. По числу «ушло N человек» эти "
-                    "два случая одинаковы, а решения по ним разные."))
+                                "Организаций", "Реальная потеря",
+                                "Остались в сегменте"], rows,
+                               num_cols=[1, 2, 3, 4, 5]))
 
     if not orgs.empty:
         rows = [[C.esc(str(r.company_name or r.inn)), _signed(r.net), _n(r.lost),
@@ -615,7 +647,7 @@ def where_block(cuts: dict, orgs: pd.DataFrame, tenure: pd.DataFrame,
         "Где это произошло",
         C.card(_fallback_mark(fb) + (C.narrative_html(text) if text else "")
                + "".join(parts) + cov
-               + sql_info(shown, "lost_by_inn", "gained_by_inn", "tenure")),
+               + sql_info(shown, "lost_by_inn", "gained_by_inn")),
         eyebrow="ответ на «где»")
 
 

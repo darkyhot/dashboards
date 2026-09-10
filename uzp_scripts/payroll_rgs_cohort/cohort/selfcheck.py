@@ -215,8 +215,8 @@ def check_prelude_minimal() -> None:
         raise CheckFailed("запрос справочника ТБ тянет за собой рабочий набор")
 
     lost = ws._prelude(LQ.LOST_TOTALS)                          # noqa: SLF001
-    for need in ("t_seg", "t_pairs", "t_seen", "t_seen_epk", "t_inn_seen",
-                 "t_recent", "t_epk_month"):
+    for need in ("t_seg", "t_pairs", "t_seen", "t_seen_epk", "t_seen_seg",
+                 "t_epk_month"):
         if f"{need} AS (" not in lost:
             raise CheckFailed(f"лестница причин осталась без выборки {need}")
     if lost.count("WITH ") != 1:
@@ -228,7 +228,7 @@ def check_prelude_minimal() -> None:
     # есть только там, где её нельзя отладить.
     for name, sql in (("MONTHLY", LQ.MONTHLY), ("SURVIVAL", LQ.SURVIVAL),
                       ("THRESHOLD_SENS", LQ.THRESHOLD_SENS),
-                      ("CODE_SPLIT", LQ.CODE_SPLIT), ("TENURE", LQ.TENURE),
+                      ("CODE_MONTHS", LQ.CODE_MONTHS), ("TENURE", LQ.TENURE),
                       ("LOST_TOTALS", LQ.LOST_TOTALS)):
         built = ws._body(ws._prelude(sql))                      # noqa: SLF001
         for ph in ("{code_col}", "{amt_cond}"):
@@ -250,10 +250,10 @@ def check_causes_exhaustive() -> None:
     данных, а не как забытое описание.
     """
     pairs = [
-        ("потери получателей", LQ._LOST_CASE, A.CAUSES, "moved_within_rgs"),
-        ("приход получателей", LQ._GAINED_CASE, A.GAINS, "moved_in"),
-        ("потери людей", LQ._LOST_EPK_CASE, A.EPK_CAUSES, "left_rgs"),
-        ("приход людей", LQ._GAINED_EPK_CASE, A.EPK_GAINS, "returned_to_rgs"),
+        ("потери получателей", LQ._LOST_CASE, A.CAUSES, "left_segment"),
+        ("приход получателей", LQ._GAINED_CASE, A.GAINS, "from_segment"),
+        ("потери людей", LQ._LOST_EPK_CASE, A.EPK_CAUSES, "left_segment"),
+        ("приход людей", LQ._GAINED_EPK_CASE, A.EPK_GAINS, "from_segment"),
     ]
     for what, case, book, else_branch in pairs:      # noqa: SLF001
         branches = set(re.findall(r"THEN\s+'([a-z_]+)'", case))
@@ -263,15 +263,20 @@ def check_causes_exhaustive() -> None:
                 f"{what}: ветки SQL и описания разъехались — "
                 f"{sorted(branches ^ set(book))}")
         for cause, (title, descr, kind) in book.items():
-            if kind not in (A.REAL, A.METHOD, A.GAP):
+            if kind not in (A.LOSS, A.INSIDE):
                 raise CheckFailed(f"{what}: у ветки «{cause}» неизвестный вид {kind}")
             if not title or not descr:
                 raise CheckFailed(f"{what}: ветка «{cause}» без названия/описания")
 
-    # На уровне ЧЕЛОВЕКА веток про получателей быть не может: это и есть смысл
-    # второй лестницы. Если они туда просочатся, обе лестницы станут одинаковыми,
-    # и разница между ними — главный вывод отчёта — исчезнет.
-    for cause in ("multi_collapsed", "moved_within_rgs", "gosb_moved"):
+    # На уровне ЧЕЛОВЕКА движения внутри сегмента не существует: это и есть смысл
+    # второй лестницы. Если такая ветка туда просочится, обе лестницы станут
+    # одинаковыми, и разница между ними — главный вывод отчёта — исчезнет.
+    for cause, (_, _, kind) in A.EPK_CAUSES.items():
+        if kind != A.LOSS:
+            raise CheckFailed(
+                f"ветка «{cause}» по людям помечена не как потеря: на уровне "
+                f"человека переходов внутри сегмента не бывает")
+    for cause in ("fewer_orgs", "moved_org", "moved_gosb"):
         if cause in A.EPK_CAUSES:
             raise CheckFailed(
                 f"ветка «{cause}» попала в лестницу по ЛЮДЯМ, а там она "
@@ -296,31 +301,39 @@ def check_ladder_priority() -> None:
     """
     order = re.findall(r"THEN\s+'([a-z_]+)'", LQ._LOST_CASE)     # noqa: SLF001
     pos = {name: i for i, name in enumerate(order)}
-    pos.setdefault("moved_within_rgs", len(order))
-    for first, second in [("liquidated", "inn_gone"),
-                          ("left_bank", "gap_only"),
-                          ("gap_only", "below_threshold"),
-                          ("below_threshold", "gosb_moved"),
-                          ("code_out_of_list", "gosb_moved"),
-                          ("gosb_moved", "left_rgs"),
-                          ("left_rgs", "multi_collapsed"),
-                          ("multi_collapsed", "moved_within_rgs")]:
+    pos.setdefault("left_segment", len(order))
+
+    # «Остался в сегменте» проверяется ПЕРВОЙ. Если человек остался получателем
+    # бюджетного сегмента, потери нет — и неважно, что случилось с его прежней
+    # организацией. Проверь эту ветку позже, и переход внутри сегмента посчитается
+    # уходом из банка или уходом в другой сегмент.
+    if pos.get("stayed_in_segment", 99) != 0:
+        raise CheckFailed(
+            "«остался в сегменте» проверяется не первой — переход внутри "
+            "сегмента посчитается потерей")
+    for first, second in [("stayed_in_segment", "left_bank"),
+                          ("left_bank", "below_threshold"),
+                          ("below_threshold", "other_codes"),
+                          ("other_codes", "left_segment")]:
         if pos.get(first, 99) >= pos.get(second, -1):
             raise CheckFailed(
                 f"ветка «{first}» обязана проверяться РАНЬШЕ «{second}» — "
                 f"иначе она не сработает никогда")
 
-    # В приходе методологические ветки идут РАНЬШЕ «новых»: человек, который в
-    # базовом месяце получал здесь же, но ниже порога, — это порог, а не новый
-    # сотрудник. Назвать его новым значило бы завысить рост ровно на ту величину,
-    # которую мы вычитаем со стороны потерь.
-    g_pos = {n: i for i, n in
-             enumerate(re.findall(r"THEN\s+'([a-z_]+)'", LQ._GAINED_CASE))}
-    for meth in ("crossed_threshold", "code_came_into_list", "gosb_moved_in"):
-        if g_pos.get(meth, 99) >= g_pos.get("person_new_to_bank", -1):
+    g_order = re.findall(r"THEN\s+'([a-z_]+)'", LQ._GAINED_CASE)  # noqa: SLF001
+    if g_order and g_order[0] != "stayed_in_segment":
+        raise CheckFailed("в приходе «остался в сегменте» проверяется не первой — "
+                          "переход внутри сегмента посчитается новым приходом")
+
+    # Организационных веток в лестнице быть не должно: сегмент главное, а не
+    # территория и не организация. Если они вернутся, отчёт снова начнёт отвечать
+    # на вопрос, которого никто не задавал.
+    for gone in ("moved_gosb", "moved_org", "fewer_orgs", "liquidated",
+                 "inn_gone", "inn_new", "moved_gosb_in", "more_orgs"):
+        if gone in set(order) | set(g_order) | set(A.CAUSES) | set(A.GAINS):
             raise CheckFailed(
-                f"в приходе «{meth}» обязана проверяться РАНЬШЕ "
-                f"«person_new_to_bank» — иначе рост будет завышен")
+                f"ветка «{gone}» вернулась в лестницу: подразделение и "
+                f"организация для сегмента неважны, если получатель остался")
     _ok("лестницы: порядок веток соблюдён в потерях и в приходе")
 
 
@@ -332,17 +345,18 @@ def _fake_totals() -> tuple:
         "n_inn": [50.0, 44.0], "amt": [1e7, 7e6],
     })
     lost = pd.DataFrame({
-        "cause": ["left_bank", "below_threshold", "multi_collapsed", "gap_only"],
-        "n_triples": [200.0, 90.0, 60.0, 40.0],
-        "n_epk": [200.0, 90.0, 60.0, 40.0], "amt": [1e6, 2e5, 3e5, 1e5]})
+        "cause": ["left_bank", "below_threshold", "other_codes",
+                  "stayed_in_segment"],
+        "n_triples": [200.0, 90.0, 40.0, 60.0],
+        "n_epk": [200.0, 90.0, 40.0, 60.0], "amt": [1e6, 2e5, 1e5, 3e5]})
     gained = pd.DataFrame({
-        "cause": ["person_new_to_bank", "crossed_threshold"],
+        "cause": ["new_to_bank", "stayed_in_segment"],
         "n_triples": [50.0, 40.0], "n_epk": [50.0, 40.0], "amt": [5e5, 1e5]})
     lost_e = pd.DataFrame({
-        "cause": ["left_bank", "gap_only", "below_threshold"],
-        "n_epk": [200.0, 40.0, 50.0]})
+        "cause": ["left_bank", "below_threshold", "other_codes"],
+        "n_epk": [200.0, 50.0, 40.0]})
     gained_e = pd.DataFrame({
-        "cause": ["person_new_to_bank", "crossed_threshold"],
+        "cause": ["new_to_bank", "above_threshold"],
         "n_epk": [12.0, 10.0]})
     return mt, lost, gained, lost_e, gained_e
 
@@ -367,12 +381,18 @@ def check_additive() -> None:
     # Реальное движение обязано считаться ПО ОБЕИМ сторонам: приход по настоящим
     # причинам минус уход по настоящим. Если бы вычиталось из ПОЛНОГО прихода,
     # число было бы завышено ровно на методологию — ошибка первого этапа.
-    if abs(t["net_real"] - (50.0 - 200.0)) > 1e-6:
-        raise CheckFailed(f"чистое реальное движение посчитано как {t['net_real']}, "
-                          f"ждали -150 (пришло 50 настоящих, ушло 200)")
-    if abs(t["net_gap"] - (0.0 - 40.0)) > 1e-6:
-        raise CheckFailed(f"перерывы посчитаны как {t['net_gap']}, ждали -40")
-    _ok("раскладка: обе лестницы сходятся, реальное движение считается "
+    # Реальная потеря — всё, кроме переходов внутри сегмента: 200 + 90 + 40.
+    if abs(t["real_lost"] - 330.0) > 1e-6:
+        raise CheckFailed(f"реальная потеря посчитана как {t['real_lost']}, "
+                          f"ждали 330 (200 + 90 + 40; 60 — переход внутри)")
+    if abs(t["net_real"] - (50.0 - 330.0)) > 1e-6:
+        raise CheckFailed(f"чистое реальное изменение посчитано как "
+                          f"{t['net_real']}, ждали -280")
+    # Переходы внутри сегмента считаются отдельно и в потерю не входят.
+    if abs(t["inside_lost"] - 60.0) > 1e-6:
+        raise CheckFailed(f"переходы внутри сегмента посчитаны как "
+                          f"{t['inside_lost']}, ждали 60")
+    _ok("раскладка: обе лестницы сходятся, реальные потери и приход считаются "
         "по обеим сторонам")
 
 
@@ -393,17 +413,17 @@ def check_epk_ladder_shorter() -> None:
     both = A.side_by_side(A.ladder(lost, A.CAUSES, "n_triples"), lost_e)
     if both.empty:
         raise CheckFailed("таблица «получатели и люди рядом» пуста")
-    mc = both[both["cause"] == "multi_collapsed"]
+    mc = both[both["cause"] == "stayed_in_segment"]
     if mc.empty or bool(mc.iloc[0]["epk_applies"]):
-        raise CheckFailed("«схлопнулось совместительство» помечено как имеющее "
-                          "смысл на уровне человека — а там оно бессмысленно")
+        raise CheckFailed("«остался в сегменте» помечено как имеющее смысл на "
+                          "уровне человека — а там такой ветки нет по построению")
     _ok("лестница по людям короче и помечает ветки, которых у человека нет")
 
 
 def check_ladder_table() -> None:
     """Лестница: доли от целого, порядок и виды."""
     lost = pd.DataFrame({
-        "cause": ["multi_collapsed", "left_bank", "inn_gone"],
+        "cause": ["stayed_in_segment", "left_bank", "other_codes"],
         "n_triples": [100.0, 300.0, 100.0], "n_epk": [100.0, 300.0, 100.0],
         "amt": [1.0, 2.0, 3.0]})
     tbl = A.ladder(lost, A.CAUSES, "n_triples")
@@ -412,8 +432,8 @@ def check_ladder_table() -> None:
     if list(tbl["cause"])[0] != "left_bank":
         raise CheckFailed("порядок веток не по смыслу: настоящий уход обязан "
                           "идти первым")
-    if tbl[tbl["cause"] == "multi_collapsed"]["kind"].iloc[0] != A.METHOD:
-        raise CheckFailed("схлопнувшееся совместительство помечено не как счёт")
+    if tbl[tbl["cause"] == "stayed_in_segment"]["kind"].iloc[0] != A.INSIDE:
+        raise CheckFailed("«остался в сегменте» помечено как потеря")
     _ok("лестница: доли от целого, порядок и виды верны")
 
 
@@ -470,6 +490,37 @@ def check_steps_short_series() -> None:
     _ok("обрывы: на коротком ряду оговорка о сезонности есть")
 
 
+def check_seasonality_definition() -> None:
+    """Сезонность требует ПОВТОРА год к году — и в SQL, и в арифметике.
+
+    Определение узкое нарочно, и ослабить его легко: достаточно убрать одно из
+    четырёх условий, и «сезонностью» станет любая пропажа. А это подменяет вывод:
+    «был в июле, нет в августе» — это потеря, пока не доказано, что так же было и
+    год назад. Доказать иначе нечем — следующего месяца в данных нет.
+    """
+    sql = LQ.SEASONAL
+    for par in (":d_base_prev", ":d_base", ":d_prev", ":d_cur"):
+        if par not in sql:
+            raise CheckFailed(
+                f"проверка сезонности не использует {par} — без всех четырёх "
+                f"месяцев повтор год к году не установить")
+    # Присутствие в предыдущем месяце ОБОИХ лет — соединением, отсутствие в
+    # отчётном ОБОИХ лет — двумя IS NULL. Одного IS NULL мало.
+    if sql.count("IS NULL") < 2:
+        raise CheckFailed("в проверке сезонности меньше двух условий отсутствия — "
+                          "значит отсутствие требуется не в обоих годах")
+
+    # Арифметика: доля считается от ПРОПАВШИХ, а не от всех получавших. От всех
+    # она была бы всегда мала и ничего не говорила бы.
+    df = pd.DataFrame({"n_prev_both": [1000.0], "n_gone_cur": [200.0],
+                       "n_gone_base": [180.0], "n_seasonal": [150.0]})
+    out = A.seasonality(df, pd.Timestamp("2026-08-31"), pd.Timestamp("2026-07-31"))
+    if abs(out["share_of_gone"] - 0.75) > 1e-9:
+        raise CheckFailed(f"доля сезонных посчитана как {out['share_of_gone']}, "
+                          f"ждали 0,75 (150 из 200 пропавших, а не из 1000)")
+    _ok("сезонность: требует повтора год к году, доля считается от пропавших")
+
+
 def check_month_compare() -> None:
     """Сравнение отчётного месяца с соседями и с годом назад."""
     tr = A.trend(_seasonal())
@@ -494,8 +545,8 @@ def check_by_dim() -> None:
     """Разрез обязан считать долю от ЦЕЛОГО, а не от показанного куска."""
     df = pd.DataFrame({
         "inn": [1, 1, 2, 3, 4, 5],
-        "cause": ["left_bank", "multi_collapsed", "left_bank", "inn_gone",
-                  "below_threshold", "gap_only"],
+        "cause": ["left_bank", "stayed_in_segment", "left_bank",
+                  "other_codes", "below_threshold", "stayed_in_segment"],
         "n_triples": [100.0, 50.0, 80.0, 60.0, 40.0, 20.0],
         "agency": ["Образование", "Образование", "Культура", "Спорт", "Спорт",
                    "Прочее"],
@@ -507,7 +558,7 @@ def check_by_dim() -> None:
         raise CheckFailed("доли показанных строк дают единицу — значит целое "
                           "посчитано по обрезанному кадру")
     edu = out[out["agency"] == "Образование"].iloc[0]
-    if abs(edu[A.REAL] - 100.0) > 1e-9 or abs(edu[A.METHOD] - 50.0) > 1e-9:
+    if abs(edu[A.LOSS] - 100.0) > 1e-9 or abs(edu[A.INSIDE] - 50.0) > 1e-9:
         raise CheckFailed("состав по видам внутри разреза посчитан неверно")
     _ok("разрезы: доля от целого, состав по видам внутри строки верен")
 
@@ -596,37 +647,58 @@ def check_top_orgs_net() -> None:
     _ok("топ организаций: сортировка по нетто, приход учтён")
 
 
-def check_code_split() -> None:
-    """Коды делятся на зарплатные и все прочие, и вывод строится по первым."""
-    b, c = pd.Timestamp("2025-08-31"), pd.Timestamp("2026-08-31")
-    df = pd.DataFrame({
-        "report_dt": [b, b, c, c], "grp": ["in", "out", "in", "out"],
-        "n_epk": [1000.0, 5000.0, 990.0, 0.0],
-        "n_rows": [1.0] * 4, "amt": [1e6, 5e6, 0.99e6, 0.0]})
-    out = A.code_split(df, b, c)
-    if len(out) != 2:
-        raise CheckFailed("раскладка кодов вернула не две строки")
-    if abs(float(out[out["grp"] == "in"].iloc[0]["d_epk"]) + 10.0) > 1e-9:
-        raise CheckFailed("изменение по зарплатным кодам посчитано неверно")
+def check_code_months() -> None:
+    """Таблица зарплатных кодов: только они, по названию, с двумя изменениями.
 
-    # Обнулившийся код ВНЕ списка на метрику не влияет по построению — таблица
-    # исчезнувших кодов обязана говорить это колонкой, а не подразумевать.
-    mix = pd.DataFrame({
-        "report_dt": [b, c], "code": [3, 3],
-        "code_name": ["Пенсия", "Пенсия"], "n_epk": [50000.0, 0.0],
-        "amt": [1e6, 0.0]})
-    gone = A.vanished_codes(mix, b, c, LQ.CODES)
-    if gone.empty:
-        raise CheckFailed("исчезнувший код не найден")
-    if bool(gone.iloc[0]["in_list"]):
-        raise CheckFailed("код 3 помечен как входящий в метрику, а его там нет")
-    _ok("коды: зарплатные отделены от прочих, исчезнувшие помечены верно")
+    Отвечает на вопрос «какой вид выплаты просел». Три вещи, без которых она
+    вводит в заблуждение:
+
+    * коды ВНЕ списка не считаются вовсе — они на метрику не влияют по
+      построению, а в таблице заняли бы весь верх массовыми социальными
+      выплатами и сбили бы вывод. Это уже случалось;
+    * строка подписана НАЗВАНИЕМ, а не номером: номер читателю ничего не говорит;
+    * сортировка по изменению к ПРЕДЫДУЩЕМУ месяцу — вопрос, ради которого
+      таблица написана, именно про соседние месяцы.
+    """
+    b = pd.Timestamp("2025-08-31")
+    pm = pd.Timestamp("2026-07-31")
+    c = pd.Timestamp("2026-08-31")
+    df = pd.DataFrame({
+        "report_dt": [b, b, pm, pm, c, c],
+        "code": [1, 2, 1, 2, 1, 2],
+        "code_name": ["Заработная плата", "Стипендия учащимся"] * 3,
+        "n_epk": [1000.0, 500.0, 1010.0, 520.0, 1005.0, 30.0],
+        "amt": [1e6, 5e5, 1e6, 5e5, 1e6, 3e4]})
+    out = A.code_months(df, b, pm, c)
+    if out.empty:
+        raise CheckFailed("таблица зарплатных кодов не построилась")
+    if "code" in out.columns:
+        raise CheckFailed("в таблице остался номер кода — подписывать надо названием")
+    top = out.iloc[0]
+    if top["name"] != "Стипендия учащимся":
+        raise CheckFailed(f"первой стоит «{top['name']}», а сильнее всех просела "
+                          f"стипендия — сортировка не по месячному изменению")
+    if abs(float(top["d_month"]) + 490.0) > 1e-9:
+        raise CheckFailed("месячное изменение посчитано неверно")
+    if abs(float(top["d_year"]) + 470.0) > 1e-9:
+        raise CheckFailed("годовое изменение посчитано неверно")
+
+    # Код без внятной расшифровки не должен остаться безымянной строкой: в
+    # витрине в этой колонке встречается сам номер строкой.
+    junk = pd.DataFrame({
+        "report_dt": [b, pm, c], "code": [47, 47, 47],
+        "code_name": ["47", "47", "47"], "n_epk": [10.0, 10.0, 5.0],
+        "amt": [1.0, 1.0, 1.0]})
+    out2 = A.code_months(junk, b, pm, c)
+    if out2.empty or not str(out2.iloc[0]["name"]).startswith("Код "):
+        raise CheckFailed("код без расшифровки остался без названия")
+    _ok("зарплатные коды: только они, подписаны названием, оба изменения верны")
 
 
 def check_tenure() -> None:
     """Стаж ушедших раскладывается по корзинам в осмысленном порядке."""
     df = pd.DataFrame({
-        "cause": ["left_bank"] * 3 + ["gap_only"] * 2,
+        "cause": ["left_bank"] * 3 + ["other_codes"] * 2,
         "bucket": ["1", "13-24", "2-3", "1", "25+"],
         "n_epk": [100.0, 50.0, 30.0, 20.0, 10.0]})
     out = A.tenure_table(df)
@@ -752,9 +824,13 @@ def check_llm_fallback() -> None:
     mt, lost, gained, lost_e, gained_e = _fake_totals()
     t = A.totals(mt, lost, gained, lost_e, gained_e,
                  pd.Timestamp("2025-08-31"), pd.Timestamp("2026-08-31"))
-    txt = N.fb_net("08.2025", "08.2026", t)
+    txt = N.fb_net("08.2025", "08.2026", t, A.ladder(lost, A.CAUSES, "n_triples"))
     if not txt or "сократил" not in txt:
-        raise CheckFailed(f"фолбэк раздела «выросли или нет» не дал вывода: {txt}")
+        raise CheckFailed(f"фолбэк главного вывода не дал ответа: {txt}")
+    for word in ("реально потеряно", "реально пришло"):
+        if word not in txt:
+            raise CheckFailed(f"в главном выводе нет «{word}» — читатель не "
+                              f"поймёт, что за число перед ним")
     _ok("LLM: фолбэк на правила, защёлка шлюза, главный вывод без модели")
 
 
@@ -807,8 +883,9 @@ def check_empty_frames() -> None:
                      (A.top_orgs, (e, e)), (A.by_dim, (e, "agency")),
                      (A.ladder, (e, A.CAUSES, "n_triples")),
                      (A.side_by_side, (e, e)), (A.tenure_table, (e,)),
-                     (A.code_split, (e,) + ts),
-                     (A.vanished_codes, (e,) + ts + (LQ.CODES,)),
+                     (A.left_segment, (e, LQ.SEG_BIG)),
+                     (A.left_codes, (e,)),
+                     (A.code_months, (e, ts[0], ts[0], ts[1])),
                      (A.month_compare, (e, ts[1])),
                      (A.migration, (e, e, e))):
         out = fn(*args)
@@ -821,6 +898,8 @@ def check_empty_frames() -> None:
     marked, _ = A.enrich(e, e, e, e, None)
     if not marked.empty:
         raise CheckFailed("разметка пустых потерь вернула непустой кадр")
+    if A.seasonality(e, ts[1], ts[0]) != {}:
+        raise CheckFailed("проверка сезонности на пустом кадре что-то вернула")
     _ok("пустые кадры: расчёты не падают, недоступный источник не уносит прогон")
 
 
@@ -855,8 +934,8 @@ def check_against_synth(res: dict, expect_path: str | None = None) -> None:
     if causes is None or causes.empty:
         raise CheckFailed("лестница причин пуста")
     got = set(causes["cause"])
-    for cause in ("code_out_of_list", "below_threshold", "multi_collapsed",
-                  "liquidated", "inn_gone", "left_bank", "gosb_moved"):
+    for cause in ("other_codes", "below_threshold", "stayed_in_segment",
+                  "left_bank", "left_segment"):
         if cause not in got:
             raise CheckFailed(
                 f"ветка «{cause}» в синтетику заложена, но разбором не найдена — "
@@ -869,9 +948,9 @@ def check_against_synth(res: dict, expect_path: str | None = None) -> None:
         raise CheckFailed(
             f"весь приход попал в одну ветку ({set(gains['cause'])}) — раскладка "
             f"прихода не работает, и «выросли или нет» посчитано зря")
-    if "gosb_moved_in" not in set(gains["cause"]):
-        raise CheckFailed("перевод между подразделениями не найден в приходе, "
-                          "хотя в синтетику он заложен")
+    if "stayed_in_segment" not in set(gains["cause"]):
+        raise CheckFailed("переход внутри сегмента не найден в приходе, хотя в "
+                          "синтетику он заложен")
 
     bad = [c["name"] for c in res.get("checks", []) if not c["ok"]]
     if bad:
@@ -905,8 +984,10 @@ ALL = [
     check_probe_placeholders, check_workset_order, check_prelude_minimal,
     check_causes_exhaustive, check_ladder_priority, check_additive,
     check_epk_ladder_shorter, check_ladder_table,
-    check_steps_seasonal, check_steps_short_series, check_month_compare,
-    check_by_dim, check_join_key_dtypes, check_top_orgs_net, check_code_split, check_tenure,
+    check_steps_seasonal, check_steps_short_series,
+    check_seasonality_definition, check_month_compare,
+    check_by_dim, check_join_key_dtypes, check_top_orgs_net,
+    check_code_months, check_tenure,
     check_shown_self_contained, check_shown_recorded,
     check_anonymize_doc, check_llm_fallback, check_row_limit,
     check_level_rules, check_empty_frames,

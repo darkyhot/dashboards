@@ -33,61 +33,86 @@ def _pct(v, digits: int = 1) -> str:
 
 
 def fb_overview(base_m: str, cur_m: str, t: dict, causes, causes_epk) -> str:
-    lk = t["lost_kinds"]
     top = ""
     if causes is not None and not causes.empty:
         first = causes.sort_values("n_triples", ascending=False).iloc[0]
         top = (f" Самая крупная ветка — «{first['title']}»: "
                f"{_n(first['n_triples'])} получателей, "
                f"{_pct(first['share'], 0)} всех потерь.")
-    epk_note = ""
-    if causes_epk is not None and not causes_epk.empty:
-        epk_note = (f" По людям та же лестница короче и даёт "
-                    f"{_n(t['lost_epk'])} потерянных человек против "
-                    f"{_n(t['lost'])} получателей — разница и есть цена счёта.")
     return (
         f"С {base_m} по {cur_m} получателей стало меньше на "
         f"{_n(abs(t['d_triples']))}, а людей — на {_n(abs(t['d_epk']))}. "
         f"Доля совместителей изменилась с {_pct(t['multi_share_base'], 2)} до "
         f"{_pct(t['multi_share_cur'], 2)}, что дало {_n(t['d_by_multi'])} "
-        f"получателей без потери единого человека. Из {_n(t['lost'])} потерянных "
-        f"получателей настоящей потерей является {_n(lk['real'])}, "
-        f"{_n(lk['method'])} приходится на особенности счёта и {_n(lk['gap'])} "
-        f"на перерывы в выплатах.{top}{epk_note}")
+        f"получателей без потери единого человека. Всего потеряно "
+        f"{_n(t['lost'])} получателей, из них {_n(t['real_lost'])} — настоящая "
+        f"потеря, а {_n(t['inside_lost'])} остались получателями бюджетного "
+        f"сегмента. По людям потеряно "
+        f"{_n(t['lost_epk'])}.{top}")
 
 
-def fb_net(base_m: str, cur_m: str, t: dict) -> str:
-    """Выросли или нет. Главный вывод отчёта — он обязан быть и без модели."""
+def fb_net(base_m: str, cur_m: str, t: dict, causes) -> str:
+    """Реальные потери и приход. Главный вывод — он обязан быть и без модели."""
     verdict = ("вырос" if t["net_real"] > 0 else
                "сократился" if t["net_real"] < 0 else "не изменился")
-    verdict_epk = ("выросло" if t["net_real_epk"] > 0 else
-                   "сократилось" if t["net_real_epk"] < 0 else "не изменилось")
+    biggest = ""
+    if causes is not None and not causes.empty:
+        real = causes[causes["kind"] == "loss"]
+        if not real.empty:
+            r = real.sort_values("n_triples", ascending=False).iloc[0]
+            biggest = (f" Крупнейшая причина потери — «{r['title']}»: "
+                       f"{_n(r['n_triples'])} получателей.")
     return (
-        f"Если считать только реальное движение — приход новых людей и "
-        f"организаций минус уход из банка и из сегмента, — сегмент за год "
-        f"{verdict} на {_n(abs(t['net_real']))} получателей, а число людей "
-        f"{verdict_epk} на {_n(abs(t['net_real_epk']))}. Особенности счёта дали "
-        f"{_n(t['net_method'])} получателей, перерывы в выплатах — "
-        f"{_n(t['net_gap'])}; ни то, ни другое людей не прибавляет и не убавляет. "
-        f"В сумме три вида дают общее изменение метрики "
-        f"{_n(t['d_triples'])} получателей.")
+        f"С {base_m} по {cur_m} реально потеряно {_n(t['real_lost'])} получателей "
+        f"({_n(t['real_lost_epk'])} человек) и реально пришло "
+        f"{_n(t['real_gained'])} ({_n(t['real_gained_epk'])} человек): сегмент "
+        f"{verdict} на {_n(abs(t['net_real']))} получателей. Ещё "
+        f"{_n(t['inside_lost'])} получателей остались в сегменте, перейдя внутри "
+        f"него, и {_n(t['inside_gained'])} пришли таким же переходом — сегмент их "
+        f"не потерял и не привёл. В сумме "
+        f"метрика изменилась на {_n(t['d_triples'])} получателей.{biggest}")
 
 
-def fb_when(tr, st, measured: str, cmp_months, surv) -> str:
+def fb_gone(to_seg, to_codes, mig) -> str:
+    """Куда делись люди."""
+    parts = []
+    if to_seg is not None and not to_seg.empty:
+        top = to_seg.iloc[0]
+        parts.append(
+            f"Из ушедших в другие сегменты больше всего забрал «{top['segment_name']}» "
+            f"— {_n(top['n_epk'])} человек, {_pct(top['share'], 0)} всех ушедших "
+            f"из бюджетной сферы.")
+    if to_codes is not None and not to_codes.empty:
+        top = to_codes.iloc[0]
+        names = ", ".join(f"«{r.code_name or r.code}» ({_n(r.n_epk)})"
+                          for r in to_codes.head(3).itertuples())
+        parts.append(
+            f"Те, кто перестал получать по зарплатным кодам, теперь получают по "
+            f"другим: {names}. Чаще всего это «{top['code_name'] or top['code']}» "
+            f"— {_pct(top['share'], 0)} таких людей.")
+    if mig is not None and not mig.empty:
+        n = int(mig["n_epk"].sum())
+        parts.append(
+            f"Ещё {len(mig)} организаций переоформлены: их люди ({_n(n)} человек) "
+            f"дружно перешли в один и тот же новый номер, никуда фактически не "
+            f"уходя.")
+    return " ".join(parts) or "Куда делись люди, разрезы не показали."
+
+
+def fb_when(tr, st, measured: str, cmp_months, surv, seas, codes_m) -> str:
     if tr is None or tr.empty:
         return "Помесячный ряд не построился — сказать, когда произошло падение, нечем."
     parts = []
-    # Сезонность — первым делом: если отчётный месяц яма, всё остальное читается
-    # иначе, и сказать об этом надо до, а не после.
-    if cmp_months is not None and not cmp_months.empty and "is_report" in cmp_months:
-        rep = cmp_months[cmp_months["is_report"]]
-        others = cmp_months[~cmp_months["is_report"]]
-        if not rep.empty and not others.empty:
-            gap = float(others["n_triples"].max()) - float(rep.iloc[0]["n_triples"])
-            if gap > 0:
-                parts.append(
-                    f"Отчётный месяц ниже соседних на {_n(gap)} получателей — это "
-                    f"сезонная яма, и годовое падение надо читать с поправкой на неё.")
+    # Сезонность — первым делом: она объясняет провал отчётного месяца, и без неё
+    # этот провал читается как потеря.
+    if seas and seas.get("n_gone_cur"):
+        parts.append(
+            f"Из {_n(seas['n_prev_both'])} человек, получавших в "
+            f"{seas['prev_month']:%m.%Y} оба года, в {seas['report_month']:%m.%Y} "
+            f"пропали {_n(seas['n_gone_cur'])}, и {_n(seas['n_seasonal'])} из них "
+            f"({_pct(seas['share_of_gone'], 0)}) пропадали в этом месяце и год "
+            f"назад — это сезонность. Остальные пропали впервые, и сезонностью их "
+            f"объяснить нельзя.")
     if st is not None and not st.empty:
         months = ", ".join(f"{pd.Timestamp(r.report_dt):%m.%Y}"
                            for r in st.head(3).itertuples())
@@ -100,57 +125,21 @@ def fb_when(tr, st, measured: str, cmp_months, surv) -> str:
     else:
         parts.append(f"Ни одного месяца-обрыва не найдено ({measured}): изменение "
                      f"идёт плавно. Это текучесть, а не разовое событие.")
+    # Какой вид выплаты просел — часто это и есть весь ответ про провал месяца.
+    if codes_m is not None and not codes_m.empty:
+        worst = codes_m.iloc[0]
+        if float(worst["d_month"]) < 0:
+            parts.append(
+                f"Сильнее всех к предыдущему месяцу просела выплата "
+                f"«{worst['name']}»: {_n(worst['d_month'])} человек "
+                f"({_pct(worst['d_month_pct'])}), год к году "
+                f"{_n(worst['d_year'])}. Это вид выплаты, а не ушедшие люди: у "
+                f"человека может просто не быть выплаты этого вида в этом месяце.")
     if surv is not None and not surv.empty:
         last = surv.iloc[-1]
         parts.append(f"Из получателей базового месяца дожили до конца периода "
                      f"{_n(last['n_alive'])} — {_pct(last['share'])}.")
     return " ".join(parts)
-
-
-def fb_why(thr, split, gone, mig) -> str:
-    parts = []
-    if thr is not None and not thr.empty:
-        zero = thr[thr["threshold"] == 0]
-        base_row = thr[thr["threshold"] == 2500]
-        if not zero.empty and not base_row.empty:
-            d0 = float(zero.iloc[0]["delta"])
-            d1 = float(base_row.iloc[0]["delta"])
-            if d0 < 0 and abs(d0) > abs(d1) * 0.7:
-                parts.append(
-                    f"Порог получателя падение не объясняет: без порога вовсе "
-                    f"численность меняется на {_n(d0)} против {_n(d1)} при "
-                    f"пороге 2500 ₽.")
-            else:
-                parts.append(
-                    f"Порог получателя объясняет заметную часть падения: без "
-                    f"порога изменение составляет {_n(d0)} против {_n(d1)} при "
-                    f"пороге 2500 ₽.")
-    if split is not None and not split.empty:
-        row = split[split["grp"] == "in"]
-        if not row.empty:
-            r = row.iloc[0]
-            parts.append(
-                f"По зарплатным кодам — тем, которые метрика только и считает, — "
-                f"людей стало {_n(r['d_epk'])} ({_pct(r['d_epk_pct'])}), объём "
-                f"изменился на {_pct(r['d_amt_pct'])}.")
-    if gone is not None and not gone.empty:
-        n_out = int((~gone["in_list"]).sum())
-        n_in = int(gone["in_list"].sum())
-        if n_out:
-            parts.append(
-                f"Из витрины целиком исчезло {n_out} кодов вне списка — на метрику "
-                f"они не влияют по построению, это перемена в данных, а не причина "
-                f"падения.")
-        if n_in:
-            parts.append(f"ВНИМАНИЕ: исчезло {n_in} кодов ИЗ СПИСКА — вот они на "
-                         f"метрику влияют напрямую.")
-    if mig is not None and not mig.empty:
-        n = int(mig["n_epk"].sum())
-        parts.append(
-            f"Найдено {len(mig)} организаций, чьи люди ({_n(n)} человек) дружно "
-            f"перешли в один и тот же новый номер: это переоформление, а не отток.")
-    return " ".join(parts) or ("Ни порог, ни смена кодов, ни переоформление "
-                               "падения не объясняют.")
 
 
 def fb_where(cuts: dict) -> str:
@@ -163,11 +152,11 @@ def fb_where(cuts: dict) -> str:
             continue
         top = df.iloc[0]
         tot = float(top.get("n_triples", 0)) or 1.0
-        real = float(top.get("real", 0))
+        loss = float(top.get("loss", 0))
         parts.append(
             f"По {titles.get(dim, dim)} больше всего потеряла группа "
             f"«{top[dim]}» — {_n(tot)} получателей ({_pct(top.get('share', 0), 0)} "
-            f"всех потерь), из них настоящей потерей является {_pct(real / tot, 0)}.")
+            f"всех потерь), из них настоящей потерей является {_pct(loss / tot, 0)}.")
         if len(parts) >= 3:
             break
     return " ".join(parts) or "Разрезы не построились."

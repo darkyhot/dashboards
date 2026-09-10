@@ -221,6 +221,13 @@ PAYROLL_GOSB_MOVE_BACK = 4        # мес. назад от конца: когд
 # обязан отличать это от ухода. Без ямы в синтетике ветка не сработает ни разу.
 PAYROLL_DIP_MONTHS = (1, 8)       # номера месяцев-ям (январь и август)
 PAYROLL_DIP_SHARE = 0.12          # доля людей, выпадающих из ведомостей в яме
+
+# Стипендия — зарплатный код (2), который в яме НЕ приходит, хотя человек из
+# ведомостей не исчезает: он получает по другим кодам. Ради этого случая и
+# заведена таблица «какой вид выплаты просел»: без него провал месяца выглядит
+# уходом людей, хотя пропал один вид выплаты.
+PAYROLL_STIPEND_CODE = 2
+PAYROLL_STIPEND_SHARE = 0.10      # доля пар, получающих стипендию
 PAYROLL_OTHER_SEG_ORGS = 0.25     # доля небюджетных организаций в ведомостях
 PAYROLL_OTHER_SEG_SCALE = 0.15    # и они меньше по численности, чем бюджетные
 
@@ -1034,6 +1041,12 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
     pair_gosb_after = np.where(pair_gosb == alt, org_gosb[org_of_pair], alt)
     pair_gosb_after = np.where(has_alt, pair_gosb_after, pair_gosb)
 
+    # --- стипендия: зарплатный код, пропадающий в яме ---
+    # Человек при этом из ведомостей НЕ исчезает: он получает по другим кодам.
+    # Значит в лестнице он не потеряется, а в таблице видов выплат провал будет
+    # виден. Это ровно тот случай, из-за которого месяц падает «без причины».
+    pair_stipend = RNG.random(n_pairs) < PAYROLL_STIPEND_SHARE
+
     # --- сезонная яма: человек выпадает из ведомостей на месяц ---
     # Ради этого и заведена ветка «перерыв». В яме человек не уходит никуда — он
     # просто не получает зачислений в этом месяце, и отчёт обязан отличать это от
@@ -1074,6 +1087,8 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                       for i in reorg_src},
         "gosb_move_month": str(months[last - PAYROLL_GOSB_MOVE_BACK].date()),
         "dip_months": list(PAYROLL_DIP_MONTHS),
+        "stipend_code": PAYROLL_STIPEND_CODE,
+        "stipend_name": PAYROLL_CODE_NAMES.get(PAYROLL_STIPEND_CODE, ""),
         "n_pairs_built": int(n_pairs),
         "n_persons": int(n_persons),
         "n_multi_gosb_orgs": int(len(second_gosb)),
@@ -1106,6 +1121,8 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
             # Строк на пару — две (зарплата и аванс) либо одна: грейн витрины
             # тоньше метрики, и разбор обязан суммировать, а не считать строки.
             two = RNG.random(k) < 0.8
+            # Стипендия приходит во все месяцы, КРОМЕ ямы: в каникулы её нет.
+            stip = pair_stipend[idx] & ~in_dip
             rows = []
             for part, share in ((0, np.where(two, 0.6, 1.0)), (1, np.where(two, 0.4, 0.0))):
                 take = np.flatnonzero(share > 0)
@@ -1128,6 +1145,27 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                     "inn": inn_txt[idx][take],
                     "tb_id": tb_arr[idx][take],
                     "sys_tb_id": tb_arr[idx][take],
+                    "report_dt": dt.date(),
+                    "transaction_qty": 1,
+                    "modified_dttm": dt,
+                }))
+            # Третья строка — стипендия, отдельным зарплатным кодом.
+            take_s = np.flatnonzero(stip)
+            if len(take_s):
+                rows.append(pd.DataFrame({
+                    "acc_num": acc_num[idx][take_s],
+                    "amt": (amt[take_s] * 0.25).round(2),
+                    "company_name": name_arr[idx][take_s],
+                    "enrollment_type": np.int16(PAYROLL_STIPEND_CODE),
+                    "enrollment_transcription": PAYROLL_CODE_NAMES.get(
+                        PAYROLL_STIPEND_CODE, ""),
+                    "epk_id": epk_person[idx][take_s],
+                    "document_info_sha1": epk_person[idx][take_s],
+                    "gosb_id": gosb_m[take_s],
+                    "sys_gosb_id": gosb_m[take_s],
+                    "inn": inn_txt[idx][take_s],
+                    "tb_id": tb_arr[idx][take_s],
+                    "sys_tb_id": tb_arr[idx][take_s],
                     "report_dt": dt.date(),
                     "transaction_qty": 1,
                     "modified_dttm": dt,

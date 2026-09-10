@@ -320,14 +320,35 @@ def threshold_sens(ws: Workspace) -> pd.DataFrame:
     return _opt(ws, "threshold_sens", LQ.THRESHOLD_SENS)
 
 
-def code_split(ws: Workspace) -> pd.DataFrame:
-    """Зарплатные коды против всех остальных — по людям и по объёму."""
-    return _opt(ws, "code_split", LQ.CODE_SPLIT)
+def seasonal(ws: Workspace) -> pd.DataFrame:
+    """Сезонность, подтверждённая повтором год к году."""
+    return _opt(ws, "seasonal", LQ.SEASONAL)
 
 
-def code_mix(ws: Workspace) -> pd.DataFrame:
-    """Коды по отдельности — справка, из которой видны исчезнувшие целиком."""
-    return _opt(ws, "code_mix", LQ.CODE_MIX)
+def code_months(ws: Workspace) -> pd.DataFrame:
+    """Зарплатные коды по опорным месяцам — какой вид выплаты просел."""
+    df = _opt(ws, "code_months", LQ.CODE_MONTHS)
+    if not df.empty:
+        progress.done(f"зарплатные коды: {df['code'].nunique()} видов выплат "
+                      f"по {df['report_dt'].nunique()} месяцам")
+    return df
+
+
+def left_segment(ws: Workspace, base: str) -> pd.DataFrame:
+    """В какой сегмент ушли те, кто ушёл из бюджетного."""
+    df = _opt(ws, "left_segment", LQ.LEFT_SEGMENT, {"d_base": base})
+    if not df.empty:
+        progress.done(f"ушли в другие сегменты: {int(df['n_epk'].sum()):,} человек "
+                      f"по {len(df)} сегментам")
+    return df
+
+
+def left_codes(ws: Workspace, base: str) -> pd.DataFrame:
+    """Чем заменились зарплатные зачисления у тех, кто их лишился."""
+    df = _opt(ws, "left_codes", LQ.LEFT_CODES, {"d_base": base})
+    if not df.empty:
+        progress.done(f"перешли на другие коды: {len(df)} видов зачисления")
+    return df
 
 
 def inn_migration(ws: Workspace, base: str, min_movers: int) -> pd.DataFrame:

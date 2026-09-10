@@ -26,16 +26,31 @@ from uzp_dash.agency import classify_frame as classify_agency
 
 from . import level as LV
 
-# Вид ветки. Три, а не два: «перерыв» — не потеря людей, но и не особенность
-# счёта. Это человек, которого нет в отчётном месяце и который был месяц назад;
-# в сезонной яме таких много, и смешивать их и с уходом, и с методологией
-# одинаково неверно.
-REAL, METHOD, GAP = "real", "method", "gap"
+# Вид ветки. ДВА, а не три, и вопрос к каждой ветке один: остался ли человек
+# получателем зарплаты в сегменте — по определению заказчика, то есть по
+# зарплатным кодам и выше порога?
+#
+#   LOSS   — не остался. Получателя не стало, и неважно, ушёл он из банка, ушёл в
+#            другой сегмент или перестал зачислять по зарплатным кодам. Ветка
+#            говорит лишь КУДА он делся.
+#   INSIDE — остался, но посчитан иначе: перешёл в другую бюджетную организацию,
+#            в другое подразделение или сократил число мест работы. Для сегмента
+#            это движение внутри, а не убыль.
+#
+# Раньше веток было три, и в среднюю — «особенности счёта» — попадали порог и
+# коды вне списка. Это было неверно: порог и список кодов заданы заказчиком как
+# ОПРЕДЕЛЕНИЕ получателя, а не как погрешность измерения. Человек, переставший
+# зачислять по зарплатному коду, для зарплатного подразделения пропал, и прятать
+# его в «методологию» значило занижать потерю.
+LOSS, INSIDE = "loss", "inside"
 
-KIND_TITLE = {
-    REAL:   "реальное движение",
-    METHOD: "счёт, а не люди",
-    GAP:    "перерыв в выплатах",
+# Подписи зависят от стороны: одна и та же «остался в сегменте» на потерях читается
+# как «не потеряли», а на приходе — как «не привели нового».
+KIND_TAG = {
+    ("lost", LOSS):     "потеря",
+    ("lost", INSIDE):   "остался в сегменте",
+    ("gained", LOSS):   "новый приход",
+    ("gained", INSIDE): "перешёл внутри сегмента",
 }
 
 # --------------------------------------------------------------------------- #
@@ -46,106 +61,73 @@ KIND_TITLE = {
 # превратилась бы в «по Орг. нет зачислений». Пишем «номер организации».
 CAUSES: dict[str, tuple[str, str, str]] = {
     "left_bank": (
-        "Человек ушёл из банка",
-        "Ни одного зачисления в банке ни в отчётном месяце, ни в предыдущие. "
-        "Единственная ветка, где потерян сам человек.", REAL),
-    "left_rgs": (
-        "Ушёл из бюджетной сферы",
-        "Зарплата в банке идёт, но организация уже не бюджетная: сегмент "
-        "потерял получателя, банк — нет.", REAL),
-    "inn_gone": (
-        "Организация исчезла из ведомостей",
-        "По номеру организации нет ни одного зачисления: зарплатный проект "
-        "потерян целиком.", REAL),
-    "liquidated": (
-        "Организация ликвидирована",
-        "По номеру организации в справочнике ЕПК не осталось ни одной активной "
-        "записи. Получатели потеряны, но к конкуренту они не уходили — "
-        "организации больше нет.", REAL),
-    "gap_only": (
-        "Перерыв, а не уход",
-        "В отчётном месяце зачислений нет, но в предыдущие они были. В сезонной "
-        "яме это обычное дело: человек на месте, месяц пропущен.", GAP),
+        "Ушёл из банка совсем",
+        "Ни одного зачисления в банке — ни зарплатного, ни любого другого.", LOSS),
+    "other_codes": (
+        "Получает не по зарплатным кодам",
+        "Деньги от бюджетной организации идут, но кодами вне зарплатного списка. "
+        "Для зарплатного подразделения получателя нет; чем именно заменились "
+        "зачисления — в разделе «Куда делись люди».", LOSS),
+    "left_segment": (
+        "Ушёл в другой сегмент",
+        "Зарплата в банке идёт, но организация уже не бюджетная.", LOSS),
     "below_threshold": (
-        "Сумма ниже порога",
-        "Тот же человек, та же организация, нужные коды — но сумма за месяц не "
-        "превысила порог. Человек на месте.", METHOD),
-    "code_out_of_list": (
-        "Код зачисления вне списка",
-        "Тот же человек, та же организация, деньги идут — но кодом, которого "
-        "нет в списке. Человек на месте.", METHOD),
-    "gosb_moved": (
-        "Переведён в другое подразделение",
-        "Та же организация, другое подразделение банка. Получатель считается "
-        "по подразделению, поэтому перевод выглядит потерей, не будучи ею.",
-        METHOD),
-    "multi_collapsed": (
-        "Схлопнулось совместительство",
-        "Человек получал в нескольких организациях, остался в меньшем числе. "
-        "Ни один человек не потерян.", METHOD),
-    "moved_within_rgs": (
-        "Сменил бюджетную организацию",
-        "Перешёл в другую организацию сегмента. Для сегмента потери нет — "
-        "получатель переехал.", METHOD),
+        "Зарплата ниже порога",
+        "Зарплатные зачисления от бюджетной организации есть, но за месяц не "
+        "превысили порог. По определению получателя это не получатель.", LOSS),
+    "stayed_in_segment": (
+        "Остался в бюджетном сегменте",
+        "Получателем быть не перестал: сменил организацию, подразделение или "
+        "число мест работы. Сегмент никого не потерял, и чем именно этот переход "
+        "был, для сегмента неважно.", INSIDE),
 }
 
 GAINS: dict[str, tuple[str, str, str]] = {
-    "person_new_to_bank": (
-        "Новый человек в банке",
-        "В базовом месяце его не было в ведомостях банка вовсе.", REAL),
-    "returned_to_rgs": (
-        "Вернулся в бюджетную сферу",
-        "В банке был, в бюджетной сфере не был.", REAL),
-    "inn_new": (
-        "Новая организация сегмента",
-        "У организации в базовом месяце не было ни одного получателя.", REAL),
-    "crossed_threshold": (
-        "Перешагнул порог",
-        "Был здесь же и раньше, но сумма за месяц не дотягивала до порога. "
-        "Новых людей это не добавило.", METHOD),
-    "code_came_into_list": (
-        "Код вошёл в список",
-        "Был здесь же и раньше, но получал кодом вне списка.", METHOD),
-    "gosb_moved_in": (
-        "Переведён из другого подразделения",
-        "Та же организация, другое подразделение банка.", METHOD),
-    "multi_new": (
-        "Новое совместительство",
-        "Добавил организацию к уже имевшимся. Человек тот же.", METHOD),
-    "moved_in": (
-        "Пришёл из другой бюджетной организации",
-        "Был в сегменте, сменил организацию.", METHOD),
+    "new_to_bank": (
+        "Новый в банке совсем",
+        "В базовом месяце его не было в ведомостях банка вовсе.", LOSS),
+    "back_to_codes": (
+        "Начал получать по зарплатным кодам",
+        "Деньги от бюджетной организации шли и раньше, но кодами вне списка.", LOSS),
+    "from_segment": (
+        "Пришёл из другого сегмента",
+        "В банке был, зарплату получал в небюджетной организации.", LOSS),
+    "above_threshold": (
+        "Зарплата поднялась выше порога",
+        "Зарплатные зачисления шли и раньше, но за месяц не дотягивали до порога.",
+        LOSS),
+    "stayed_in_segment": (
+        "Был в сегменте и раньше",
+        "Получателем бюджетного сегмента он уже был: сменил организацию, "
+        "подразделение или число мест работы. Нового получателя сегмент не "
+        "привёл.", INSIDE),
 }
 
 # --------------------------------------------------------------------------- #
 # Ветки лестниц: ЛЮДИ
 # --------------------------------------------------------------------------- #
-# Веток меньше, и это главное. «Схлопнулось совместительство», «сменил
-# организацию» и «переведён в другое подразделение» на уровне человека НЕ
-# СУЩЕСТВУЮТ — там не потерян никто. Разница между двумя лестницами и есть цена
-# методологии счёта, выраженная в людях.
+# Здесь ровно те ТРИ СИТУАЦИИ, которые различает зарплатное подразделение, плюс
+# уход в другой сегмент:
+#   есть зарплатные зачисления, но мало  -> ниже порога
+#   есть зачисления, но не зарплатные    -> другие коды
+#   нет зачислений вовсе                 -> ушёл из банка
+#   зарплата есть, организация не наша   -> другой сегмент
+#
+# Ветки «остался в сегменте» здесь нет по построению: человек, который остался
+# получателем, не потерян вовсе и в лестницу не попадает. Разница между двумя
+# лестницами ровно на эту ветку и есть цена того, что метрика считает не людей.
 EPK_CAUSES: dict[str, tuple[str, str, str]] = {
-    "left_bank":        CAUSES["left_bank"],
-    "gap_only":         CAUSES["gap_only"],
-    "left_rgs":         CAUSES["left_rgs"],
-    "below_threshold": (
-        "Сумма ниже порога",
-        "Бюджетные зачисления идут, но ни по одной организации сумма не "
-        "превысила порог.", METHOD),
-    "code_out_of_list": (
-        "Код зачисления вне списка",
-        "Бюджетные зачисления идут, но кодами вне списка.", METHOD),
+    "left_bank":       CAUSES["left_bank"],
+    "other_codes":     CAUSES["other_codes"],
+    "left_segment":    CAUSES["left_segment"],
+    "below_threshold": CAUSES["below_threshold"],
 }
 
 EPK_GAINS: dict[str, tuple[str, str, str]] = {
-    "person_new_to_bank": GAINS["person_new_to_bank"],
-    "returned_to_rgs":    GAINS["returned_to_rgs"],
-    "crossed_threshold": (
-        "Перешагнул порог",
-        "Бюджетные зачисления шли и раньше, но ниже порога.", METHOD),
-    "code_came_into_list": (
-        "Код вошёл в список",
-        "Бюджетные зачисления шли и раньше, но кодами вне списка.", METHOD),
+    "new_to_bank":     GAINS["new_to_bank"],
+    "back_to_codes":   GAINS["back_to_codes"],
+    "from_segment":    GAINS["from_segment"],
+    "above_threshold": GAINS["above_threshold"],
 }
 
 # Чем заполняются незаполненные атрибуты организации. Это ЗАГЛУШКИ, а не
@@ -201,12 +183,12 @@ def _key(s: pd.Series) -> pd.Series:
 
 
 def _kinds(df: pd.DataFrame, book: dict, value_col: str) -> dict:
-    """Сумма по видам веток: реальное движение, счёт, перерыв."""
-    out = {REAL: 0.0, METHOD: 0.0, GAP: 0.0}
+    """Сумма по видам веток: потеря/приход и движение внутри сегмента."""
+    out = {LOSS: 0.0, INSIDE: 0.0}
     if df.empty or "cause" not in df:
         return out
     for cause, val in zip(df["cause"], _num(df, value_col)):
-        kind = book.get(cause, ("", "", REAL))[2]
+        kind = book.get(cause, ("", "", LOSS))[2]
         out[kind] = out.get(kind, 0.0) + float(val)
     return out
 
@@ -268,16 +250,21 @@ def totals(month_totals: pd.DataFrame, lost: pd.DataFrame, gained: pd.DataFrame,
     lk = _kinds(lost, CAUSES, "n_triples")
     gk = _kinds(gained, GAINS, "n_triples")
     res["lost_kinds"], res["gained_kinds"] = lk, gk
-    res["net_real"] = gk[REAL] - lk[REAL]
-    res["net_method"] = gk[METHOD] - lk[METHOD]
-    res["net_gap"] = gk[GAP] - lk[GAP]
+    # РЕАЛЬНЫЕ потери и РЕАЛЬНЫЙ приход — то, что просили показать. Всё, что не
+    # реально, — это переходы внутри сегмента: получатель остался, изменилось
+    # только то, каким числом строк он посчитан.
+    res["real_lost"], res["real_gained"] = lk[LOSS], gk[LOSS]
+    res["inside_lost"], res["inside_gained"] = lk[INSIDE], gk[INSIDE]
+    res["net_real"] = gk[LOSS] - lk[LOSS]
+    res["net_inside"] = gk[INSIDE] - lk[INSIDE]
 
     lke = _kinds(lost_epk, EPK_CAUSES, "n_epk")
     gke = _kinds(gained_epk, EPK_GAINS, "n_epk")
     res["lost_kinds_epk"], res["gained_kinds_epk"] = lke, gke
-    res["net_real_epk"] = gke[REAL] - lke[REAL]
-    res["net_method_epk"] = gke[METHOD] - lke[METHOD]
-    res["net_gap_epk"] = gke[GAP] - lke[GAP]
+    # На уровне человека движений внутри сегмента нет по построению, поэтому
+    # реальная потеря людей равна всей потере людей.
+    res["real_lost_epk"], res["real_gained_epk"] = lke[LOSS], gke[LOSS]
+    res["net_real_epk"] = gke[LOSS] - lke[LOSS]
     return res
 
 
@@ -303,10 +290,10 @@ def check_additive(t: dict, lost: pd.DataFrame, gained: pd.DataFrame,
          t["epk_base"] - t["lost_epk"] + t["gained_epk"], t["epk_cur"])
     _add("Падение получателей = вклад людей + вклад совместительства",
          t["d_by_people"] + t["d_by_multi"], t["d_triples"])
-    _add("Изменение получателей = реальное движение + счёт + перерыв",
-         t["net_real"] + t["net_method"] + t["net_gap"], t["d_triples"])
-    _add("Изменение людей = реальное движение + счёт + перерыв",
-         t["net_real_epk"] + t["net_method_epk"] + t["net_gap_epk"], t["d_epk"])
+    _add("Изменение получателей = реальное движение + переходы внутри сегмента",
+         t["net_real"] + t["net_inside"], t["d_triples"])
+    _add("Изменение людей = реальное движение (внутри сегмента людей не теряют)",
+         t["net_real_epk"], t["d_epk"])
 
     for df, book, what in ((lost, CAUSES, "потерь"), (gained, GAINS, "прихода"),
                            (lost_epk, EPK_CAUSES, "потерь по людям"),
@@ -327,9 +314,9 @@ def ladder(df: pd.DataFrame, book: dict, value_col: str) -> pd.DataFrame:
     if df.empty or "cause" not in df:
         return pd.DataFrame()
     out = df.copy()
-    out["title"] = [book.get(c, (c, "", REAL))[0] for c in out["cause"]]
-    out["descr"] = [book.get(c, ("", "", REAL))[1] for c in out["cause"]]
-    out["kind"] = [book.get(c, ("", "", REAL))[2] for c in out["cause"]]
+    out["title"] = [book.get(c, (c, "", LOSS))[0] for c in out["cause"]]
+    out["descr"] = [book.get(c, ("", "", LOSS))[1] for c in out["cause"]]
+    out["kind"] = [book.get(c, ("", "", LOSS))[2] for c in out["cause"]]
     total = float(_num(out, value_col).sum()) or 1.0
     out["share"] = _num(out, value_col) / total
     order = {c: i for i, c in enumerate(book)}
@@ -510,64 +497,125 @@ def threshold(sens: pd.DataFrame, base_month, report_month) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("threshold").reset_index(drop=True)
 
 
-def code_split(df: pd.DataFrame, base_month, report_month) -> pd.DataFrame:
-    """Зарплатные коды против всех остальных.
+def seasonality(df: pd.DataFrame, report_month, prev_month) -> dict:
+    """Сезонность, подтверждённая ПОВТОРОМ год к году.
 
-    Перечень кодов по одному оказался вредным: его верх занимают массовые
-    социальные коды, которых метрика не считала НИКОГДА, и по ним делается вывод
-    про метрику — ровно эта ошибка попала в первый прогон. Значение имеет одно:
-    держится ли объём зарплатных кодов. Если держится, перемены среди прочих
-    кодов метрику не задевают ПО ПОСТРОЕНИЮ, а не по совпадению.
+    Определение узкое нарочно. «Получал в июле, не получает в августе» — это ещё
+    не сезон, а просто пропажа: доказать, что человек вернётся, нечем, следующего
+    месяца в данных нет. Сезонным поведение становится, когда ПОВТОРЯЕТСЯ:
+    человек получал в предыдущем месяце ОБОИХ лет и не получал в отчётном
+    ОБОИХ лет.
+
+    Такие люди в сравнении год к году не участвуют вовсе — их нет ни в базовом
+    месяце, ни в отчётном. Но именно они объясняют, почему отчётный месяц ниже
+    предыдущего, и без них этот провал читается как потеря.
     """
-    if df.empty:
+    if df is None or df.empty:
+        return {}
+    r = df.iloc[0]
+    both = float(r.get("n_prev_both", 0) or 0)
+    gone_cur = float(r.get("n_gone_cur", 0) or 0)
+    seasonal = float(r.get("n_seasonal", 0) or 0)
+    return {
+        "prev_month": pd.Timestamp(prev_month), "report_month": pd.Timestamp(report_month),
+        "n_prev_both": both,
+        "n_gone_cur": gone_cur,
+        "n_gone_base": float(r.get("n_gone_base", 0) or 0),
+        "n_seasonal": seasonal,
+        # Доля от тех, кто пропал в отчётном месяце: сколько из них пропадали и
+        # год назад. Это и есть мера сезонности провала.
+        "share_of_gone": seasonal / gone_cur if gone_cur else 0.0,
+    }
+
+
+def code_months(df: pd.DataFrame, base_month, prev_month, report_month,
+                top_n: int = 20) -> pd.DataFrame:
+    """Зарплатные коды: сколько людей получает каждый вид выплаты, и как он изменился.
+
+    Отвечает на вопрос, который не виден ни в одной другой таблице: КАКОЙ ИМЕННО
+    ВИД ВЫПЛАТЫ просел. Метрика складывается из восемнадцати кодов, и провал
+    одного из них — стипендии в каникулы, премии в конце квартала — выглядит в
+    итоге как падение численности, хотя ни один человек никуда не ушёл: у него
+    просто в этом месяце нет выплаты этого вида.
+
+    Считаются ТОЛЬКО зарплатные коды: остальные на метрику не влияют по
+    построению, а в таблице занимали бы весь верх и сбивали бы вывод.
+
+    Сортировка по МЕСЯЧНОМУ изменению, а не по объёму: вопрос, ради которого
+    таблица написана, — что просело между соседними месяцами.
+    """
+    if df is None or df.empty:
         return pd.DataFrame()
     d = df.copy()
     d["report_dt"] = pd.to_datetime(d["report_dt"])
-    b, c = pd.Timestamp(base_month), pd.Timestamp(report_month)
-    rows = []
-    for grp, title in (("in", "Зарплатные коды — входят в метрику"),
-                       ("out", "Все остальные коды — в метрику не входят")):
-        sb = d[(d["report_dt"] == b) & (d["grp"] == grp)]
-        sc = d[(d["report_dt"] == c) & (d["grp"] == grp)]
-        n_b = float(sb["n_epk"].sum()) if not sb.empty else 0.0
-        n_c = float(sc["n_epk"].sum()) if not sc.empty else 0.0
-        a_b = float(sb["amt"].sum()) if not sb.empty else 0.0
-        a_c = float(sc["amt"].sum()) if not sc.empty else 0.0
-        rows.append({"grp": grp, "title": title, "epk_base": n_b, "epk_cur": n_c,
-                     "d_epk": n_c - n_b,
-                     "d_epk_pct": (n_c - n_b) / n_b if n_b else np.nan,
-                     "amt_base": a_b, "amt_cur": a_c,
-                     "d_amt_pct": (a_c - a_b) / a_b if a_b else np.nan})
-    return pd.DataFrame(rows)
+    d["n_epk"] = _num(d, "n_epk")
 
+    # Показывается НАЗВАНИЕ, а не код: код — внутренний идентификатор. Кодам без
+    # внятной расшифровки (в витрине там встречается сам номер строкой) название
+    # собирается из номера, иначе строка выглядела бы безымянной.
+    def _name(row) -> str:
+        nm = str(row["code_name"] or "").strip()
+        return nm if nm and not nm.isdigit() else f"Код {int(row['code'])}"
 
-def vanished_codes(code_mix: pd.DataFrame, base_month, report_month,
-                   codes_in: tuple[int, ...],
-                   min_epk: float = 1000) -> pd.DataFrame:
-    """Коды, исчезнувшие из витрины целиком — СПРАВКА, а не объяснение.
-
-    Код, обнулившийся за год, — крупная перемена в данных, и молчать о ней
-    нельзя. Но если он не входит в список зарплатных, на метрику он не влияет
-    ПО ПОСТРОЕНИЮ, и таблица обязана говорить это сама, отдельной колонкой, а не
-    подразумевать.
-    """
-    if code_mix.empty:
-        return pd.DataFrame()
-    df = code_mix.copy()
-    df["report_dt"] = pd.to_datetime(df["report_dt"])
-    b, c = pd.Timestamp(base_month), pd.Timestamp(report_month)
-    piv = df.pivot_table(index=["code", "code_name"], columns="report_dt",
-                         values="n_epk", aggfunc="sum").fillna(0.0)
-    piv = piv.rename(columns={b: "base", c: "cur"})
-    for col in ("base", "cur"):
+    d["name"] = d.apply(_name, axis=1)
+    piv = d.pivot_table(index="name", columns="report_dt", values="n_epk",
+                        aggfunc="sum").fillna(0.0)
+    b, pm, c = (pd.Timestamp(base_month), pd.Timestamp(prev_month),
+                pd.Timestamp(report_month))
+    for col in (b, pm, c):
         if col not in piv:
             piv[col] = 0.0
-    piv = piv.reset_index()
-    gone = piv[(piv["base"] >= min_epk) & (piv["cur"] == 0)].copy()
-    if gone.empty:
-        return gone
-    gone["in_list"] = gone["code"].isin(codes_in)
-    return gone.sort_values("base", ascending=False).reset_index(drop=True)
+    out = pd.DataFrame({
+        "name": piv.index,
+        "base": piv[b].values, "prev": piv[pm].values, "cur": piv[c].values,
+    })
+    out["d_month"] = out["cur"] - out["prev"]
+    out["d_year"] = out["cur"] - out["base"]
+    out["d_month_pct"] = out["d_month"] / out["prev"].replace(0, np.nan)
+    out["d_year_pct"] = out["d_year"] / out["base"].replace(0, np.nan)
+    out = out.sort_values("d_month").reset_index(drop=True)
+    return out.head(top_n) if top_n else out
+
+
+def left_segment(df: pd.DataFrame, seg_big: str) -> pd.DataFrame:
+    """В какой сегмент ушли те, кто ушёл из бюджетного.
+
+    Строка «ушёл из сегмента» без адреса — половина ответа. Забрал ли человека
+    коммерческий клиент, малый бизнес или он сменил бюджетную работу на
+    небюджетную — разные истории с разными выводами.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out["n_epk"] = _num(out, "n_epk")
+    total = float(out["n_epk"].sum()) or 1.0
+    out["share"] = out["n_epk"] / total
+    # Свой же сегмент в этом списке означал бы, что человек никуда не уходил, —
+    # такого быть не может по построению ветки, и если он появился, это ошибка
+    # разметки, а не данные.
+    out = out[out["segment_name"] != seg_big]
+    return out.sort_values("n_epk", ascending=False).reset_index(drop=True)
+
+
+def left_codes(df: pd.DataFrame, top_n: int = 12) -> pd.DataFrame:
+    """Чем заменились зарплатные зачисления у тех, кто перестал их получать.
+
+    Это НЕ разбор кодов витрины — тот выброшен как вредный: его верх занимали
+    массовые социальные коды, которых метрика не считала никогда, и по ним
+    делался вывод про метрику. Здесь другое: детализация ОДНОЙ ситуации из трёх —
+    «зачисления есть, но не по зарплатным кодам».
+
+    Сама ситуация уже посчитана потерей, и таблица её не оправдывает, а
+    объясняет: пенсия означает выход на пенсию, пособие на детей — декрет, расчёт
+    при увольнении — увольнение. Решения по ним разные вплоть до противоположных.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out["n_epk"] = _num(out, "n_epk")
+    total = float(out["n_epk"].sum()) or 1.0
+    out["share"] = out["n_epk"] / total
+    return out.sort_values("n_epk", ascending=False).head(top_n).reset_index(drop=True)
 
 
 def migration(mig: pd.DataFrame, lost_by_inn: pd.DataFrame,
@@ -618,7 +666,7 @@ def tenure_table(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     out = df.copy()
     out["n_epk"] = _num(out, "n_epk")
-    out["title"] = [EPK_CAUSES.get(c, (c, "", REAL))[0] for c in out["cause"]]
+    out["title"] = [EPK_CAUSES.get(c, (c, "", LOSS))[0] for c in out["cause"]]
     piv = out.pivot_table(index="bucket", columns="title", values="n_epk",
                           aggfunc="sum").fillna(0.0)
     piv = piv.reindex([b for b in TENURE_ORDER if b in piv.index])
@@ -727,7 +775,7 @@ def by_dim(df: pd.DataFrame, dim: str, top_n: int = 12) -> pd.DataFrame:
     g = df.groupby(dim, dropna=False)
     out = pd.DataFrame({"n_triples": g["n_triples"].sum(),
                         "n_inn": g["inn"].nunique()})
-    for kind in (REAL, METHOD, GAP):
+    for kind in (LOSS, INSIDE):
         causes = [c for c, v in CAUSES.items() if v[2] == kind]
         sub = df[df["cause"].isin(causes)].groupby(dim)["n_triples"].sum()
         out[kind] = sub.reindex(out.index).fillna(0.0)
@@ -767,5 +815,5 @@ def top_orgs(df: pd.DataFrame, gained_inn: pd.DataFrame,
     top_cause = (df.sort_values("n_triples", ascending=False)
                  .drop_duplicates("inn").set_index("inn")["cause"])
     out["cause"] = top_cause.reindex(out.index)
-    out["cause_title"] = [CAUSES.get(c, (c, "", REAL))[0] for c in out["cause"]]
+    out["cause_title"] = [CAUSES.get(c, (c, "", LOSS))[0] for c in out["cause"]]
     return out.sort_values("net").head(top_n).reset_index()
