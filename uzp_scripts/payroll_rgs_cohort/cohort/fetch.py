@@ -54,23 +54,29 @@ class Workspace:
     """
 
     def __init__(self, engine, conn, code_col: str, params: dict,
-                 use_temp: bool = True) -> None:
+                 use_temp: bool = True,
+                 amt_scope: str = LQ.AMT_SCOPE_INN) -> None:
         self.engine = engine
         self.conn = conn
         self.code_col = code_col
         self.params = params
         self.use_temp = use_temp
+        self.amt_scope = amt_scope
         self.built: list[str] = []
         self._plain_ddl = False
+        # Показанные читателю запросы: имя -> (текст, параметры). Заполняется
+        # ФАКТИЧЕСКИМ исполнением, см. `sql()`.
+        self.shown: dict[str, tuple[str, dict]] = {}
 
     # -- подготовка ---------------------------------------------------------- #
     def _body(self, body: str) -> str:
-        """Тело выборки с подставленным именем колонки кода.
+        """Тело выборки с подставленными именем колонки кода и условием порога.
 
         `{schema}` НЕ трогаем — его подставит слой БД. Поэтому format здесь
         применить нельзя, и подстановка идёт заменой по имени.
         """
-        return body.replace("{code_col}", self.code_col)
+        return (body.replace("{code_col}", self.code_col)
+                    .replace("{amt_cond}", LQ.AMT_COND[self.amt_scope]))
 
     def build(self) -> None:
         """Материализовать рабочий набор. В режиме CTE — ничего не делает."""
@@ -174,9 +180,15 @@ class Workspace:
         `KeyError: 'code_col'` уже в слое БД. Ловушка срабатывала только на
         запасном пути — то есть только там, где отладить её нельзя.
         """
+        args = {**self.params, **(params or {})}
         text = self._body(self._prelude(sql) if not self.use_temp else sql)
-        df = db.read_sql(self.engine, text, {**self.params, **(params or {})},
-                         conn=self.conn)
+        # Читателю показывается СЕБЯ-ДОСТАТОЧНАЯ форма — с подставленными CTE,
+        # даже когда исполнялась форма по временным таблицам. Текст `FROM t_pairs`
+        # выполнить негде: таблица жила внутри чужой сессии, и значок «как
+        # проверить цифру» обещал бы проверку, которой нет. Определение выборок
+        # одно и то же, поэтому показанный запрос считает ровно то же число.
+        self.shown[name] = (db.render(self._body(self._prelude(sql))), args)
+        df = db.read_sql(self.engine, text, args, conn=self.conn)
         return guard_rows(df, name, limit)
 
 
@@ -191,44 +203,77 @@ def _opt(ws: Workspace, name: str, sql: str, params: dict | None = None) -> pd.D
 
 
 # --------------------------------------------------------------------------- #
+# Выгрузки разбора.
+#
+# Имя, под которым выборка кладётся в `ws.shown`, — это же имя показывается
+# читателю рядом с блоком отчёта. Оно должно называть ВОПРОС, а не таблицу:
+# «lost_totals» читатель соотнесёт с разделом, «q7» — нет.
+# --------------------------------------------------------------------------- #
 def month_totals(ws: Workspace) -> pd.DataFrame:
-    """Итоги двух опорных месяцев: пары, люди, организации, сумма."""
+    """Итоги опорных месяцев: получатели, люди, организации, сумма."""
     df = ws.sql("month_totals", LQ.MONTH_TOTALS)
     if len(df) < 2:
         raise RuntimeError(
-            "в рабочем наборе меньше двух месяцев — сравнивать год к году не с чем. "
-            "Проверьте, что оба месяца есть в витрине и что сегмент размечен.")
+            "в рабочем наборе меньше двух месяцев — сравнивать не с чем. "
+            "Проверьте, что опорные месяцы есть в витрине и сегмент размечен.")
     for r in df.itertuples():
-        progress.done(f"{pd.Timestamp(r.report_dt):%m.%Y}: пар {int(r.n_pairs):,}, "
-                      f"людей {int(r.n_epk):,}, организаций {int(r.n_inn):,}")
+        progress.done(f"{pd.Timestamp(r.report_dt):%m.%Y}: получателей "
+                      f"{int(r.n_triples):,}, людей {int(r.n_epk):,}, "
+                      f"организаций {int(r.n_inn):,}")
     return df
 
 
-def lost(ws: Workspace) -> pd.DataFrame:
-    """Потерянные пары по причинам — ядро разбора."""
-    df = ws.sql("lost_totals", LQ.LOST_TOTALS)
-    progress.done(f"потеряно пар: {int(df['n_pairs'].sum()):,} "
+def lost(ws: Workspace, base: str, tag: str = "") -> pd.DataFrame:
+    """Потерянные получатели по причинам — ядро разбора."""
+    df = ws.sql(f"lost_totals{tag}", LQ.LOST_TOTALS, {"d_base": base})
+    progress.done(f"потеряно получателей: {int(df['n_triples'].sum()):,} "
                   f"по {len(df)} причинам")
     return df
 
 
-def gained(ws: Workspace) -> pd.DataFrame:
-    """Пришедшие пары по причинам."""
-    df = ws.sql("gained_totals", LQ.GAINED_TOTALS)
-    progress.done(f"пришло пар: {int(df['n_pairs'].sum()):,}")
+def gained(ws: Workspace, base: str, tag: str = "") -> pd.DataFrame:
+    """Пришедшие получатели по причинам."""
+    df = ws.sql(f"gained_totals{tag}", LQ.GAINED_TOTALS, {"d_base": base})
+    progress.done(f"пришло получателей: {int(df['n_triples'].sum()):,}")
     return df
 
 
-def lost_by_inn(ws: Workspace) -> pd.DataFrame:
+def lost_epk(ws: Workspace, base: str, tag: str = "") -> pd.DataFrame:
+    """Потерянные ЛЮДИ по причинам — вторая, аддитивная по людям лестница."""
+    df = ws.sql(f"lost_epk{tag}", LQ.LOST_EPK_TOTALS, {"d_base": base})
+    progress.done(f"потеряно людей: {int(df['n_epk'].sum()):,} "
+                  f"по {len(df)} причинам")
+    return df
+
+
+def gained_epk(ws: Workspace, base: str, tag: str = "") -> pd.DataFrame:
+    """Пришедшие ЛЮДИ по причинам."""
+    df = ws.sql(f"gained_epk{tag}", LQ.GAINED_EPK_TOTALS, {"d_base": base})
+    progress.done(f"пришло людей: {int(df['n_epk'].sum()):,}")
+    return df
+
+
+def lost_by_inn(ws: Workspace, base: str) -> pd.DataFrame:
     """Потери в разрезе организации, с составом причин."""
-    df = ws.sql("lost_by_inn", LQ.LOST_BY_INN)
+    df = ws.sql("lost_by_inn", LQ.LOST_BY_INN, {"d_base": base})
     progress.done(f"потери по организациям: {len(df):,} строк, "
                   f"{df['inn'].nunique() if len(df) else 0:,} организаций")
     return df
 
 
-def gained_by_inn(ws: Workspace) -> pd.DataFrame:
-    return _opt(ws, "gained_by_inn", LQ.GAINED_BY_INN)
+def gained_by_inn(ws: Workspace, base: str) -> pd.DataFrame:
+    """Приход в разрезе организации — без него таблица крупнейших потерь врёт."""
+    return _opt(ws, "gained_by_inn", LQ.GAINED_BY_INN, {"d_base": base})
+
+
+def tenure(ws: Workspace, base: str, d_from: str) -> pd.DataFrame:
+    """Стаж ушедших: сколько месяцев человек был в сегменте до ухода."""
+    progress.step("Стаж ушедших")
+    df = _opt(ws, "tenure", LQ.TENURE, {"d_base": base, "d_from": d_from})
+    if not df.empty:
+        progress.done(f"стаж: {len(df)} корзин, "
+                      f"{int(df['n_epk'].sum()):,} человек разобрано")
+    return df
 
 
 def seg_attrs(ws: Workspace) -> pd.DataFrame:
@@ -243,8 +288,9 @@ def monthly(ws: Workspace, d_from: str, d_to: str) -> pd.DataFrame:
     progress.step(f"Помесячный ряд: {d_from} … {d_to}")
     df = _opt(ws, "monthly", LQ.MONTHLY, {"d_from": d_from, "d_to": d_to})
     if not df.empty:
-        progress.done(f"ряд: {len(df)} мес., пар от {int(df['n_pairs'].min()):,} "
-                      f"до {int(df['n_pairs'].max()):,}")
+        progress.done(f"ряд: {len(df)} мес., получателей от "
+                      f"{int(df['n_triples'].min()):,} до "
+                      f"{int(df['n_triples'].max()):,}")
     return df
 
 
@@ -258,10 +304,10 @@ def monthly_all(ws: Workspace, d_from: str, d_to: str) -> pd.DataFrame:
     return _opt(ws, "monthly_all", LQ.MONTHLY_ALL, {"d_from": d_from, "d_to": d_to})
 
 
-def survival(ws: Workspace) -> pd.DataFrame:
+def survival(ws: Workspace, base: str) -> pd.DataFrame:
     """Кривая дожития когорты базового месяца."""
     progress.step("Дожитие когорты базового месяца")
-    df = _opt(ws, "survival", LQ.SURVIVAL)
+    df = _opt(ws, "survival", LQ.SURVIVAL, {"d_base": base})
     if not df.empty:
         progress.done(f"дожитие: {len(df)} точек, "
                       f"осталось {int(df['n_alive'].iloc[-1]):,} из "
@@ -274,32 +320,47 @@ def threshold_sens(ws: Workspace) -> pd.DataFrame:
     return _opt(ws, "threshold_sens", LQ.THRESHOLD_SENS)
 
 
-def code_mix(ws: Workspace) -> pd.DataFrame:
-    """Смесь кодов зачисления в двух опорных месяцах, включая коды ВНЕ списка.
+def code_split(ws: Workspace) -> pd.DataFrame:
+    """Зарплатные коды против всех остальных — по людям и по объёму."""
+    return _opt(ws, "code_split", LQ.CODE_SPLIT)
 
-    Даты не передаются: опорные месяцы уже лежат в параметрах рабочего набора.
-    """
+
+def code_mix(ws: Workspace) -> pd.DataFrame:
+    """Коды по отдельности — справка, из которой видны исчезнувшие целиком."""
     return _opt(ws, "code_mix", LQ.CODE_MIX)
 
 
-def inn_migration(ws: Workspace, min_movers: int) -> pd.DataFrame:
-    """Куда переехали люди, потерявшие свой ИНН."""
-    df = _opt(ws, "inn_migration", LQ.INN_MIGRATION, {"min_movers": min_movers})
+def inn_migration(ws: Workspace, base: str, min_movers: int) -> pd.DataFrame:
+    """Куда переехали люди, потерявшие свою организацию."""
+    df = _opt(ws, "inn_migration", LQ.INN_MIGRATION,
+              {"d_base": base, "min_movers": min_movers})
     if not df.empty:
-        progress.done(f"миграция ИНН: {len(df):,} пар «откуда→куда» "
+        progress.done(f"миграция организаций: {len(df):,} пар «откуда→куда» "
                       f"с порогом {min_movers} человек")
     return df
 
 
+def tb_dim(ws: Workspace) -> pd.DataFrame:
+    """ТБ по номеру из ведомостей. Территория держится на нём, а не на ГОСБ."""
+    return _opt(ws, "tb_dim", LQ.TB_DIM)
+
+
 def gosb_dim(ws: Workspace) -> pd.DataFrame:
-    """Справочник территории: ГОСБ → ТБ → регион."""
+    """Справочник ГОСБ — обоими ключами сразу, выбор делает разведка."""
     df = _opt(ws, "gosb_dim", LQ.GOSB_DIM)
     if not df.empty:
         n_reg = int(df["region_name"].notna().sum()) if "region_name" in df else 0
-        progress.done(f"справочник территории: {len(df)} ГОСБ, регион известен у {n_reg}")
+        progress.done(f"справочник территории: {len(df)} строк, "
+                      f"регион известен у {n_reg}")
     return df
 
 
-def gosb_map(ws: Workspace) -> pd.DataFrame:
-    """Соответствие старых ГОСБ новым — тем же запросом, что в дэше."""
-    return _opt(ws, "gosb_map", LQ.GOSB_MAP)
+def gosb_match(ws: Workspace) -> pd.DataFrame:
+    """Каким ключом справочника опознаётся ГОСБ ведомостей.
+
+    На проме первый прогон показал, что не опознаётся никаким, и весь
+    территориальный разрез схлопнулся в одну строку-заглушку. Угадывать ключ
+    нельзя: ошибка не видна по результату, она видна только по тому, что разрез
+    состоит из одной строки — а это легко принять за свойство данных.
+    """
+    return _opt(ws, "gosb_match", LQ.GOSB_MATCH)

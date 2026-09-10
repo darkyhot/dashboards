@@ -7,6 +7,11 @@
 сдвигает разбор: запуск третьего числа возьмёт уже начавшийся месяц вместо
 предыдущего, и заметить это по готовому файлу невозможно.
 
+Лестница считается ДВАЖДЫ: отчётный месяц к тому же месяцу год назад и он же к
+предыдущему месяцу. Второе сравнение обязательно потому, что отчётный месяц
+может быть сезонной ямой: тогда годовое падение целиком повторяет обычный
+месячный провал, и по одному сравнению эти два случая неразличимы.
+
 Соединение держится ОДНО на весь прогон (`db.session`): на нём живёт рабочий
 набор. Без этого каждая выборка открывала бы своё соединение, временные таблицы
 исчезали бы между запросами, и разбор либо падал бы, либо — хуже — находил
@@ -34,26 +39,42 @@ DEFAULTS = dict(
     report_month="2026-08",
     # На сколько месяцев назад брать базу сравнения. 12 — год к году.
     base_offset_months=12,
-    # Глубина помесячного ряда, мес. Ряд обязан покрывать оба опорных месяца.
+    # Второе сравнение: отчётный месяц к месяцу на столько назад. 1 — к
+    # предыдущему. Ноль отключает второе сравнение вовсе.
+    prev_offset_months=1,
+    # Сколько месяцев перед отчётным считать «недавними» для ветки «перерыв».
+    # Каждый месяц сверх уже опорных — лишний скан партиции.
+    gap_window_months=2,
+    # Глубина помесячного ряда, мес. Ряд обязан покрывать оба опорных месяца, а
+    # для отделения сезонности — хотя бы 15 месяцев.
     history_months=25,
-    # Сколько строк показывать в разрезах.
+    # Порог: 'inn' — сумма за месяц по организации (так задано постановкой),
+    # 'inn_gosb' — сумма по подразделению. Разведка печатает оба числа.
+    amt_scope=LQ.AMT_SCOPE_INN,
+    # Стаж ушедших — самый дорогой запрос отчёта (скан всего ряда). Выключается
+    # первым, если прогон на проме окажется долгим.
+    with_tenure=True,
+    # Сколько строк показывать в разрезах и в списке организаций.
     top_n=12,
-    # Сколько организаций показывать в списке крупнейших потерь.
     top_orgs=15,
-    # Минимальное число людей, переехавших из одного номера в другой, чтобы пара
-    # «откуда→куда» вообще попала в разбор миграции. Меньше — это шум.
+    # Минимальное число людей, переехавших из одной организации в другую, чтобы
+    # пара «откуда→куда» вообще попала в разбор миграции. Меньше — это шум.
     migration_min_movers=5,
-    # Минимальная ДОЛЯ потерь организации, ушедшая в один приёмник, чтобы назвать
-    # это реорганизацией. Числом людей это не измерить: двадцать из двадцати и
-    # двадцать из двух тысяч — разные события.
+    # Минимальная ДОЛЯ потерь организации, ушедшая в одного приёмника, чтобы
+    # назвать это переоформлением. Числом людей это не измерить: двадцать из
+    # двадцати и двадцать из двух тысяч — разные события.
     migration_min_share=0.30,
-    # Потолок вызовов LLM на весь разбор: разделов четыре.
-    llm_max_calls=5,
+    # Потолок вызовов LLM на весь разбор: разделов пять.
+    llm_max_calls=6,
 )
 
 
-def _month_end(value: str) -> pd.Timestamp:
+def _month_end(value) -> pd.Timestamp:
     return pd.Timestamp(value).to_period("M").to_timestamp("M")
+
+
+def _shift(month: pd.Timestamp, back: int) -> pd.Timestamp:
+    return _month_end(month - pd.DateOffset(months=int(back)))
 
 
 def run(conn: str | None = None, out_dir: str | Path | None = None,
@@ -76,103 +97,155 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
 
     # --- опорные даты ---
     cur = _month_end(str(opts["report_month"]))
-    base = _month_end(cur - pd.DateOffset(months=int(opts["base_offset_months"])))
-    first = _month_end(cur - pd.DateOffset(months=int(opts["history_months"]) - 1))
+    base = _shift(cur, opts["base_offset_months"])
+    prev = _shift(cur, opts["prev_offset_months"]) if int(opts["prev_offset_months"]) else None
+    first = _shift(cur, int(opts["history_months"]) - 1)
     if first > base:
         # Ряд обязан покрывать базовый месяц: иначе дожитие когорты начиналось бы
         # не с той точки, а «когда» отвечалось бы по куску периода.
         progress.warn(f"история {opts['history_months']} мес. не покрывает базовый "
                       f"месяц {base:%m.%Y} — ряд расширен до него")
         first = base
-    d_cur, d_base, d_from = (cur.date().isoformat(), base.date().isoformat(),
-                             first.date().isoformat())
 
-    progress.step(f"Численность {LQ.SEG_BIG}: {base:%m.%Y} → {cur:%m.%Y} · "
-                  f"контур {config.CONTOUR} · схема {config.SCHEMA}")
+    # Месяцы рабочего набора и «недавние» месяцы для ветки «перерыв». Те, что уже
+    # опорные, достаются бесплатно; каждый лишний — отдельный скан партиции.
+    recent = [_shift(cur, k) for k in range(1, int(opts["gap_window_months"]) + 1)]
+    anchors = [base, cur] + ([prev] if prev is not None else [])
+    months = sorted({m for m in anchors + recent})
+    d = {m: m.date().isoformat() for m in months}
+    d_cur, d_base, d_from = d[cur], d[base], first.date().isoformat()
+
+    progress.step(f"Численность {LQ.SEG_BIG}: {base:%m.%Y} → {cur:%m.%Y}"
+                  + (f" (и {prev:%m.%Y} → {cur:%m.%Y})" if prev is not None else "")
+                  + f" · контур {config.CONTOUR} · схема {config.SCHEMA}")
     engine = db.get_engine(config.db_url(conn))
     db.ping(engine)
 
+    month_strs = [d[m] for m in months]
     with db.session(engine) as conn_live:
-        pr = probe.run(engine, conn_live, d_base, d_cur, d_from, out_dir)
+        pr = probe.run(engine, conn_live, month_strs, d_base, d_cur, d_from, out_dir)
 
         ws = fetch.Workspace(
             engine, conn_live, pr["code_column"],
             {"seg": LQ.SEG_BIG, "codes": list(LQ.CODES), "amt_min": LQ.AMT_MIN,
+             "months": month_strs,
+             "seen_months": month_strs,
+             "recent_months": [d[m] for m in recent],
              "d_base": d_base, "d_cur": d_cur},
-            use_temp=bool(pr["temp_tables"]))
+            use_temp=bool(pr["temp_tables"]),
+            amt_scope=str(opts["amt_scope"]))
         try:
             ws.build()
 
             progress.step("Выгрузка разбора")
             mt = fetch.month_totals(ws)
-            lost = fetch.lost(ws)
-            gained = fetch.gained(ws)
-            lost_inn = fetch.lost_by_inn(ws)
+
+            # --- основное сравнение: год к году ---
+            lost = fetch.lost(ws, d_base)
+            gained = fetch.gained(ws, d_base)
+            lost_e = fetch.lost_epk(ws, d_base)
+            gained_e = fetch.gained_epk(ws, d_base)
+            lost_inn = fetch.lost_by_inn(ws, d_base)
+            gained_inn = fetch.gained_by_inn(ws, d_base)
+
+            # --- второе сравнение: к предыдущему месяцу ---
+            prev_pack = None
+            if prev is not None:
+                progress.step(f"Сравнение с предыдущим месяцем {prev:%m.%Y}")
+                prev_pack = {
+                    "lost": fetch.lost(ws, d[prev], "_prev"),
+                    "gained": fetch.gained(ws, d[prev], "_prev"),
+                    "lost_epk": fetch.lost_epk(ws, d[prev], "_prev"),
+                    "gained_epk": fetch.gained_epk(ws, d[prev], "_prev"),
+                }
+
             attrs = fetch.seg_attrs(ws)
             monthly = fetch.monthly(ws, d_from, d_cur)
             monthly_all = fetch.monthly_all(ws, d_from, d_cur)
-            surv = fetch.survival(ws)
+            surv = fetch.survival(ws, d_base)
             thr_raw = fetch.threshold_sens(ws)
+            split_raw = fetch.code_split(ws)
             codes_raw = fetch.code_mix(ws)
-            mig_raw = fetch.inn_migration(ws, int(opts["migration_min_movers"]))
+            mig_raw = fetch.inn_migration(ws, d_base, int(opts["migration_min_movers"]))
+            tb = fetch.tb_dim(ws)
             gosb = fetch.gosb_dim(ws)
-            gmap = fetch.gosb_map(ws)
+            gosb_key = probe.pick_gosb_key(fetch.gosb_match(ws), pr)
+            ten_raw = (fetch.tenure(ws, d_base, d_from)
+                       if opts["with_tenure"] else pd.DataFrame())
+            shown = dict(ws.shown)
         finally:
-            # Уборка обязательна и в случае падения: соединение возвращается в
-            # пул, и оставленная временная таблица досталась бы следующему
-            # прогону — с ЧУЖИМИ датами внутри и правдоподобными числами.
+            # Уборка обязательна и при падении: соединение возвращается в пул, и
+            # оставленная временная таблица досталась бы следующему прогону — с
+            # ЧУЖИМИ датами внутри и правдоподобными числами.
             ws.drop()
 
     # --- расчёты ---
     progress.step("Расчёты")
-    t = A.totals(mt, lost, gained)
-    checks = A.check_additive(t, lost, gained)
-    causes = A.causes_table(lost, t["lost"])
-    gains = A.gains_table(gained)
+    t = A.totals(mt, lost, gained, lost_e, gained_e, base, cur)
+    checks = A.check_additive(t, lost, gained, lost_e, gained_e)
+    causes = A.ladder(lost, A.CAUSES, "n_triples")
+    gains = A.ladder(gained, A.GAINS, "n_triples")
+    causes_e = A.ladder(lost_e, A.EPK_CAUSES, "n_epk")
+    gains_e = A.ladder(gained_e, A.EPK_GAINS, "n_epk")
+    both = A.side_by_side(causes, lost_e)
+
+    t_prev, causes_prev = None, pd.DataFrame()
+    if prev_pack is not None:
+        t_prev = A.totals(mt, prev_pack["lost"], prev_pack["gained"],
+                          prev_pack["lost_epk"], prev_pack["gained_epk"], prev, cur)
+        checks += A.check_additive(t_prev, prev_pack["lost"], prev_pack["gained"],
+                                   prev_pack["lost_epk"], prev_pack["gained_epk"])
+        causes_prev = A.ladder(prev_pack["lost"], A.CAUSES, "n_triples")
 
     tr = A.trend(monthly)
-    st = A.steps(tr)
-    surv_c = A.survival_curve(surv, t["pairs_base"])
+    st, measured = A.steps(tr)
+    cmp_months = A.month_compare(tr, cur, int(opts["gap_window_months"]))
+    surv_c = A.survival_curve(surv, t["triples_base"])
     load = A.load_health(monthly_all)
 
-    thr = A.threshold(thr_raw)
-    codes = A.code_shift(codes_raw, t["base_month"], t["report_month"], LQ.CODES)
-    marked, meta = A.enrich(lost_inn, attrs, gosb, gmap)
+    thr = A.threshold(thr_raw, base, cur)
+    split = A.code_split(split_raw, base, cur)
+    gone = A.vanished_codes(codes_raw, base, cur, LQ.CODES)
+    marked, meta = A.enrich(lost_inn, attrs, tb, gosb, gosb_key)
     mig = A.migration(mig_raw, lost_inn, attrs, float(opts["migration_min_share"]))
+    ten = A.tenure_table(ten_raw)
 
     dims = ["holding_name", "agency", "level", "industry_name", "tb_short_name",
             "region_name"]
-    cuts = {d: A.by_dim(marked, d, int(opts["top_n"])) for d in dims}
+    cuts = {dim: A.by_dim(marked, dim, int(opts["top_n"])) for dim in dims}
     cuts = {k: v for k, v in cuts.items() if v is not None and not v.empty}
-    orgs = A.top_orgs(marked, int(opts["top_orgs"]))
+    orgs = A.top_orgs(marked, gained_inn, int(opts["top_orgs"]))
 
-    progress.done(f"падение {t['d_pairs']:,.0f} пар: людей "
-                  f"{t['d_by_people']:,.0f}, совместительство "
-                  f"{t['d_by_multi']:,.0f}; из потерь не отток "
-                  f"{t['lost_not_real']:,.0f} из {t['lost']:,.0f}")
+    progress.done(
+        f"получателей {t['d_triples']:+,.0f}, людей {t['d_epk']:+,.0f}; "
+        f"из изменения получателей реальное движение {t['net_real']:+,.0f}, "
+        f"счёт {t['net_method']:+,.0f}, перерыв {t['net_gap']:+,.0f}")
 
     # --- тексты ---
     progress.step("Текстовые выводы")
-    texts = _narrate(t, causes, tr, st, surv_c, thr, codes, mig, cuts, opts)
+    texts = _narrate(t, causes, gains, causes_e, tr, st, measured, cmp_months,
+                     surv_c, thr, split, gone, mig, cuts, opts)
 
     # --- сборка ---
     progress.step("Сборка HTML")
     warnings = list(pr["warnings"])
     blocks = [
         V.head_kpi(t),
-        V.metric_block(t),
-        V.causes_block(causes, gains, t, *texts["overview"]),
-        V.when_block(tr, st, surv_c, load, *texts["when"]),
-        V.why_block(thr, codes, mig, *texts["why"]),
-        V.where_block(cuts, orgs, meta, *texts["where"]),
-        V.limits_block(warnings, checks, pr),
+        V.metric_block(t, shown),
+        V.net_block(t, gains, gains_e, shown, *texts["net"]),
+        V.causes_block(causes, both, t, shown, *texts["overview"]),
+        V.when_block(tr, st, measured, cmp_months, surv_c, load, t_prev,
+                     causes_prev, shown, *texts["when"]),
+        V.why_block(thr, split, gone, mig, shown, *texts["why"]),
+        V.where_block(cuts, orgs, ten, meta, shown, *texts["where"]),
+        V.limits_block(warnings, checks, pr, meta),
     ]
     footer = (f"Сформировано {datetime.now():%d.%m.%Y %H:%M} · контур "
               f"{config.CONTOUR} · модель {model} · источники: ведомости, "
               f"справочник ЕПК, справочник ГОСБ")
     html = V.page(
         f"Численность бюджетной сферы · {base:%m.%Y} → {cur:%m.%Y}",
-        "Разбор падения до физического лица: сколько, когда, где и почему",
+        "Разбор до физического лица: сколько, выросли ли, когда, где и почему",
         blocks, footer)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -181,17 +254,24 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
 
     # --- обезличенный документ ---
     progress.step("Обезличенный документ")
-    doc, leaks = RT.build(t, causes, gains, tr, st, surv_c, thr, codes, mig, cuts,
-                          orgs, checks, warnings, pr,
-                          {k: v[0] for k, v in texts.items()})
+    doc, leaks = RT.build(
+        t=t, t_prev=t_prev, causes=causes, gains=gains, causes_epk=causes_e,
+        gains_epk=gains_e, both=both, tr=tr, st=st, measured=measured,
+        cmp_months=cmp_months, surv=surv_c, thr=thr, split=split, gone=gone,
+        mig=mig, cuts=cuts, orgs=orgs, tenure=ten, checks=checks,
+        warnings=warnings, probe=pr, meta=meta, shown=shown,
+        texts={k: v[0] for k, v in texts.items()})
     doc_path = out_dir / f"payroll_rgs_cohort_{cur:%Y%m}_{ts}.md"
     doc_ok = RT.write(doc_path, doc, leaks)
 
     (out_dir / "run_config.json").write_text(
         json.dumps({**opts, "report_month": f"{cur:%Y-%m}",
-                    "base_month": f"{base:%Y-%m}", "d_from": d_from,
+                    "base_month": f"{base:%Y-%m}",
+                    "prev_month": f"{prev:%Y-%m}" if prev is not None else "",
+                    "months": month_strs, "d_from": d_from,
                     "contour": config.CONTOUR, "model": model,
                     "code_column": pr["code_column"],
+                    "gosb_key": gosb_key or "",
                     "temp_tables": pr["temp_tables"]},
                    ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
@@ -204,14 +284,18 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
             progress.warn(f"проверка не сошлась: {c['name']}")
 
     return {"path": str(path), "doc": str(doc_path) if doc_ok else "",
-            "doc_leaks": leaks, "probe": pr, "totals": t, "causes": causes,
-            "gains": gains, "trend": tr, "steps": st, "survival": surv_c,
-            "load": load, "threshold": thr, "codes": codes, "migration": mig,
-            "cuts": cuts, "orgs": orgs, "marked": marked, "checks": checks,
-            "warnings": warnings, "meta": meta}
+            "doc_leaks": leaks, "probe": pr, "totals": t, "totals_prev": t_prev,
+            "causes": causes, "gains": gains, "causes_epk": causes_e,
+            "gains_epk": gains_e, "both": both, "trend": tr, "steps": st,
+            "measured": measured, "month_compare": cmp_months,
+            "survival": surv_c, "load": load, "threshold": thr,
+            "code_split": split, "vanished_codes": gone, "migration": mig,
+            "cuts": cuts, "orgs": orgs, "tenure": ten, "marked": marked,
+            "checks": checks, "warnings": warnings, "meta": meta, "shown": shown}
 
 
-def _narrate(t, causes, tr, st, surv, thr, codes, mig, cuts, opts) -> dict:
+def _narrate(t, causes, gains, causes_e, tr, st, measured, cmp_months, surv,
+             thr, split, gone, mig, cuts, opts) -> dict:
     """Тексты разделов. Названия организаций и территорий уходят в модель токенами.
 
     Псевдонимы заводятся на КАЖДЫЙ раздел заново: словарь живёт ровно один вызов,
@@ -221,12 +305,15 @@ def _narrate(t, causes, tr, st, surv, thr, codes, mig, cuts, opts) -> dict:
     bm, cm = f"{t['base_month']:%m.%Y}", f"{t['report_month']:%m.%Y}"
     out: dict = {}
 
-    # Обзор и «когда» названий не содержат вовсе — маскировать нечего.
+    # Обзор, «выросли ли» и «когда» названий не содержат вовсе — маскировать нечего.
     out["overview"] = nar.section(
-        "обзор", P.overview(bm, cm, t, causes),
-        N.fb_overview(bm, cm, t, causes))
+        "обзор", P.overview(bm, cm, t, causes, causes_e),
+        N.fb_overview(bm, cm, t, causes, causes_e))
+    out["net"] = nar.section(
+        "рост", P.net(bm, cm, t, gains), N.fb_net(bm, cm, t))
     out["when"] = nar.section(
-        "когда", P.when(cm, tr, st, surv), N.fb_when(tr, st, surv))
+        "когда", P.when(cm, tr, st, measured, cmp_months, surv),
+        N.fb_when(tr, st, measured, cmp_months, surv))
 
     # «Почему» и «где» несут названия — они уходят токенами, и промпт проверяется
     # на утечку. Нашлась хоть одна — раздел уходит в фолбэк целиком: отказ шлюза
@@ -234,11 +321,10 @@ def _narrate(t, causes, tr, st, surv, thr, codes, mig, cuts, opts) -> dict:
     al = N.Aliases()
     mig_m = N.mask_frame(N.mask_frame(mig, "name_from", "Орг", al),
                          "name_to", "Орг", al)
-    prompt = P.why(thr, codes, mig_m)
     forbidden = ([str(v) for v in mig.get("name_from", [])]
                  + [str(v) for v in mig.get("name_to", [])]) if not mig.empty else []
-    out["why"] = _guarded(nar, "почему", prompt, N.fb_why(thr, codes, mig),
-                          forbidden, al)
+    out["why"] = _guarded(nar, "почему", P.why(thr, split, gone, mig_m),
+                          N.fb_why(thr, split, gone, mig), forbidden, al)
 
     al2 = N.Aliases()
     cuts_m, forbidden2 = {}, []

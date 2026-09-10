@@ -87,6 +87,17 @@ def session(engine: Engine):
         conn.close()
 
 
+def render(sql: str) -> str:
+    """Подставить имена схем — ровно так, как это делается перед исполнением.
+
+    Отдельная функция нужна отчётам, которые показывают читателю запрос, которым
+    посчитана цифра. Собирать текст для показа вторым способом нельзя: он молча
+    разъедется с исполняемым, и отчёт начнёт предъявлять запрос, которым цифра
+    не считалась, — то есть будет обещать проверку, которой нет.
+    """
+    return sql.format(schema=config.SCHEMA, schema_t=config.SCHEMA_T)
+
+
 def execute(engine: Engine, sql: str, params: dict | None = None,
             conn: Connection | None = None) -> None:
     """Выполнить оператор без результата (CREATE TEMP TABLE, ANALYZE, DROP).
@@ -95,7 +106,7 @@ def execute(engine: Engine, sql: str, params: dict | None = None,
     падает на попытке прочитать курсор, и ошибка выглядит как проблема с данными,
     а не с тем, что запрос вообще ничего не возвращает.
     """
-    sql = sql.format(schema=config.SCHEMA, schema_t=config.SCHEMA_T)
+    sql = render(sql)
     progress.sql(sql, params)
     try:
         if conn is not None:
@@ -123,7 +134,7 @@ def read_sql(engine: Engine, sql: str, params: dict | None = None,
     `conn` — необязательное готовое соединение из `session()`. Без него
     поведение прежнее: соединение берётся из пула на один запрос.
     """
-    sql = sql.format(schema=config.SCHEMA, schema_t=config.SCHEMA_T)
+    sql = render(sql)
     progress.sql(sql, params)
     try:
         if conn is not None:

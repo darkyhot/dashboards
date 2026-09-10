@@ -39,6 +39,10 @@ CODE_COLUMNS = ("enrollment_type", "enrollment_type_id")
 # организациям надо читать с оговоркой.
 INN_OK_MIN = 0.95
 
+# Ниже этой доли опознанных подразделений территориальный разрез по регионам не
+# строится вовсе: половина строк в «Регион неизвестен» — это не разрез.
+GOSB_MATCH_MIN = 0.60
+
 
 def _df(engine, sql: str, params: dict | None = None, conn=None) -> pd.DataFrame:
     """Запрос разведки. Отсутствие таблицы — не повод падать: раздел отключится."""
@@ -92,10 +96,11 @@ def temp_tables_allowed(engine, conn) -> bool:
         return False
 
 
-def run(engine, conn, d_base: str, d_cur: str, d_from: str,
+def run(engine, conn, months: list[str], d_base: str, d_cur: str, d_from: str,
         out_dir: Path) -> dict:
     """Разведка. Возвращает словарь; он же пишется в out_dir/probe.json."""
-    res: dict = {"warnings": [], "d_base": str(d_base), "d_cur": str(d_cur),
+    res: dict = {"warnings": [], "months": [str(m) for m in months],
+                 "d_base": str(d_base), "d_cur": str(d_cur),
                  "d_from": str(d_from), "seg": LQ.SEG_BIG,
                  "codes": list(LQ.CODES), "amt_min": LQ.AMT_MIN}
 
@@ -160,21 +165,24 @@ def run(engine, conn, d_base: str, d_cur: str, d_from: str,
             "подчинения выводить не из чего, оба разреза будут пустыми")
 
     # --- глубина ряда ведомостей ---
-    months = _df(engine, LQ.PROBE_MONTHS, {"d_from": d_from, "d_to": d_cur}, conn=conn)
-    if months.empty:
+    # Имя НЕ `months`: параметр функции называется так же, и локальный кадр
+    # затенил бы список опорных месяцев. Проверка ниже пошла бы по названиям
+    # колонок кадра и объявила бы, что в витрине нет месяца «report_dt».
+    have_df = _df(engine, LQ.PROBE_MONTHS, {"d_from": d_from, "d_to": d_cur},
+                  conn=conn)
+    if have_df.empty:
         raise RuntimeError(
             f"в {TABLE} нет ни одной строки за {d_from} … {d_cur}. Проверьте "
             f"отчётный месяц (params['report_month']) и права на витрину.")
-    have = {str(pd.Timestamp(d).date()) for d in months["report_dt"]}
-    res["months"] = sorted(have)
+    have = {str(pd.Timestamp(d).date()) for d in have_df["report_dt"]}
+    res["months_in_mart"] = sorted(have)
     res["month_rows"] = {str(pd.Timestamp(d).date()): int(n)
-                         for d, n in zip(months["report_dt"], months["n_rows"])}
-    for label, d in (("базовый", d_base), ("отчётный", d_cur)):
+                         for d, n in zip(have_df["report_dt"], have_df["n_rows"])}
+    for d in months:
         if str(d) not in have:
             raise RuntimeError(
-                f"в {TABLE} нет {label} месяца {d}. Есть месяцы: "
-                f"{', '.join(res['months'][:5])}… "
-                f"Сравнивать год к году не с чем.")
+                f"в {TABLE} нет опорного месяца {d}. Есть месяцы: "
+                f"{', '.join(sorted(have)[:5])}… Сравнивать не с чем.")
     progress.done(f"ведомости: {len(have)} мес. ({min(have)} … {max(have)}), "
                   f"строк за отчётный месяц {res['month_rows'][str(d_cur)]:,}")
 
@@ -192,8 +200,7 @@ def run(engine, conn, d_base: str, d_cur: str, d_from: str,
             f"падение в этих точках объясняется загрузкой, а не людьми")
 
     # --- пригодность ИНН к джойну ---
-    mask = _df(engine, LQ.PROBE_INN_MASK,
-               {"d_base": d_base, "d_cur": d_cur}, conn=conn)
+    mask = _df(engine, LQ.PROBE_INN_MASK, {"months": list(months)}, conn=conn)
     if not mask.empty:
         mask["share_ok"] = mask["n_castable"] / mask["n_rows"].clip(lower=1)
         res["inn_mask"] = [
@@ -222,6 +229,30 @@ def run(engine, conn, d_base: str, d_cur: str, d_from: str,
                     f"{(1 - min(s_base, s_cur)) * 100:.1f}% — разрезы по "
                     f"организациям считаются без этих строк")
 
+    # --- два варианта порога: сверить с отчётностью до, а не после разбора ---
+    sc = _df(engine, LQ.PROBE_AMT_SCOPE,
+             {"months": list(months), "seg": LQ.SEG_BIG, "codes": list(LQ.CODES),
+              "amt_min": LQ.AMT_MIN}, conn=conn)
+    if not sc.empty:
+        sc = sc.copy()
+        sc["report_dt"] = pd.to_datetime(sc["report_dt"]).dt.date.astype(str)
+        res["amt_scope"] = sc.to_dict("records")
+        for r in sc.itertuples():
+            progress.done(
+                f"{r.report_dt}: получателей при пороге на организацию "
+                f"{int(r.n_scope_inn):,}, при пороге на подразделение "
+                f"{int(r.n_scope_triple):,}; людей {int(r.n_epk_inn):,}")
+        cur_row = sc[sc["report_dt"] == str(d_cur)]
+        if not cur_row.empty:
+            a = int(cur_row.iloc[0]["n_scope_inn"])
+            b = int(cur_row.iloc[0]["n_scope_triple"])
+            if a != b:
+                res["warnings"].append(
+                    f"порог на организацию и порог на подразделение дают разные "
+                    f"числа получателей ({a:,} против {b:,}). Разбор считает по "
+                    f"первому — так задано постановкой. Если отчётность сходится "
+                    f"со вторым, поменяйте params['amt_scope']")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "probe.json"
     path.write_text(json.dumps(res, ensure_ascii=False, indent=2, default=str),
@@ -230,3 +261,42 @@ def run(engine, conn, d_base: str, d_cur: str, d_from: str,
     for w in res["warnings"]:
         progress.warn(w)
     return res
+
+
+def pick_gosb_key(match: pd.DataFrame, res: dict) -> str | None:
+    """Каким ключом справочника опознаётся ГОСБ ведомостей — или ничем.
+
+    Вызывается ПОСЛЕ сборки рабочего набора: сравниваются те ГОСБ, что реально
+    встретились в разборе, а не все подряд.
+
+    Угадывать ключ нельзя. На проме первый прогон подставил один из двух, не
+    сошёлся ни одной строкой, и весь территориальный разрез схлопнулся в
+    единственную строку-заглушку — которую отчёт вдобавок показал как настоящее
+    подразделение. Ошибка не видна по цифрам: разрез из одной строки легко
+    принять за свойство данных.
+    """
+    if match is None or match.empty:
+        res["warnings"].append(
+            "не удалось проверить, каким ключом справочника опознаётся "
+            "подразделение — разрез по регионам не строится")
+        return None
+    r = match.iloc[0]
+    n_used = int(r.get("n_used", 0) or 0)
+    n_old = int(r.get("n_old", 0) or 0)
+    n_new = int(r.get("n_new", 0) or 0)
+    res["gosb_match"] = {"n_used": n_used, "n_old": n_old, "n_new": n_new}
+    if not n_used:
+        return None
+    best, n_best = ("old_gosb_id", n_old) if n_old >= n_new else ("new_gosb_id", n_new)
+    share = n_best / n_used
+    if share < GOSB_MATCH_MIN:
+        res["warnings"].append(
+            f"подразделения ведомостей не сходятся со справочником: по "
+            f"old_gosb_id опознано {n_old} из {n_used}, по new_gosb_id — {n_new}. "
+            f"Разрез по регионам не строится — показывать заглушку под видом "
+            f"подразделения хуже, чем не показывать разрез")
+        return None
+    progress.done(f"подразделения опознаются по «{best}»: {n_best} из {n_used} "
+                  f"({share:.0%})")
+    res["gosb_key"] = best
+    return best

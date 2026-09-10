@@ -207,6 +207,20 @@ PAYROLL_INN_ORPHAN_SHARE = 0.020  # ИНН, которого нет в uzp_data_
 # Доля небюджетных организаций, попадающих в ведомости: нужна, чтобы ветка «ушёл
 # в другой сегмент» была отличима от «ушёл из банка».
 PAYROLL_RGS_SCALE = 0.50          # масштаб численности бюджетных организаций
+
+# --- Инварианты этапа 2 ---
+# Получатель считается ТРОЙКОЙ (человек, ИНН, ГОСБ), поэтому часть организаций
+# обязана платить через НЕСКОЛЬКО подразделений: иначе тройка неотличима от пары
+# и весь новый грейн уедет на пром непроверенным.
+PAYROLL_MULTI_GOSB_SHARE = 0.18   # доля организаций, платящих через два ГОСБ
+PAYROLL_GOSB_MOVE_SHARE = 0.05    # доля пар, переезжающих в другой ГОСБ того же ИНН
+PAYROLL_GOSB_MOVE_BACK = 4        # мес. назад от конца: когда происходит перевод
+
+# Сезонная яма отчётного месяца. Ради неё и заведена ветка «перерыв»: в яме
+# человек пропадает из ведомостей на месяц, ничего при этом не потеряв, и отчёт
+# обязан отличать это от ухода. Без ямы в синтетике ветка не сработает ни разу.
+PAYROLL_DIP_MONTHS = (1, 8)       # номера месяцев-ям (январь и август)
+PAYROLL_DIP_SHARE = 0.12          # доля людей, выпадающих из ведомостей в яме
 PAYROLL_OTHER_SEG_ORGS = 0.25     # доля небюджетных организаций в ведомостях
 PAYROLL_OTHER_SEG_SCALE = 0.15    # и они меньше по численности, чем бюджетные
 
@@ -905,6 +919,15 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
     org_seg = tab["seg"].to_numpy()
     org_sal = tab["avg_salary"].to_numpy(dtype=float)
 
+    # --- подразделения: часть организаций платит через два ГОСБ ---
+    # Тройка (человек, ИНН, ГОСБ) отличается от пары только здесь. Организация с
+    # одним подразделением этой разницы не покажет, и грейн остался бы
+    # непроверенным.
+    second_gosb = {}
+    for idx in tab.index:
+        if RNG.random() < PAYROLL_MULTI_GOSB_SHARE:
+            second_gosb[idx] = int(tab.at[idx, "gosb_id"]) + 100000
+
     # --- расписание жизни пары ---
     start = np.zeros(n_pairs, dtype=np.int16)
     end = np.full(n_pairs, last + 1, dtype=np.int16)     # конец исключительно
@@ -986,6 +1009,37 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
         org_of_pair = pairs_org
         n_pairs = len(pairs_org)
 
+    # --- подразделение у каждой пары, и перевод между подразделениями ---
+    # Базовое подразделение — организации; часть пар многоподразделенческих
+    # организаций сидит во втором. Перевод в другое подразделение — отдельный
+    # сценарий: получатель считается по тройке, поэтому перевод УБАВЛЯЕТ одну
+    # тройку и ДОБАВЛЯЕТ другую, не трогая ни одного человека. Отчёт обязан
+    # назвать это переводом, а не потерей.
+    org_gosb = tab["gosb_id"].to_numpy()
+    pair_gosb = org_gosb[org_of_pair].astype(np.int64).copy()
+    alt = np.array([second_gosb.get(int(i), -1) for i in org_of_pair], dtype=np.int64)
+    has_alt = alt > 0
+    split = has_alt & (RNG.random(n_pairs) < 0.45)
+    pair_gosb[split] = alt[split]
+
+    gosb_move_m = np.full(n_pairs, last + 1, dtype=np.int16)
+    movable = np.flatnonzero(has_alt)
+    if len(movable):
+        n_move_g = int(len(movable) * PAYROLL_GOSB_MOVE_SHARE / max(
+            PAYROLL_MULTI_GOSB_SHARE, 1e-9))
+        n_move_g = min(n_move_g, len(movable))
+        pick_g = RNG.choice(movable, size=n_move_g, replace=False)
+        gosb_move_m[pick_g] = last - PAYROLL_GOSB_MOVE_BACK
+    # Куда переводят: в «другое» подразделение той же организации.
+    pair_gosb_after = np.where(pair_gosb == alt, org_gosb[org_of_pair], alt)
+    pair_gosb_after = np.where(has_alt, pair_gosb_after, pair_gosb)
+
+    # --- сезонная яма: человек выпадает из ведомостей на месяц ---
+    # Ради этого и заведена ветка «перерыв». В яме человек не уходит никуда — он
+    # просто не получает зачислений в этом месяце, и отчёт обязан отличать это от
+    # ухода. Без ямы ветка не сработает ни разу и уедет на пром непроверенной.
+    person_dips = RNG.random(n_persons) < PAYROLL_DIP_SHARE
+
     # --- суммы и постоянные атрибуты ---
     base_amt = (org_sal[org_of_pair] * RNG.uniform(0.35, 0.75, n_pairs)).round(0)
     base_amt = np.maximum(base_amt, PAYROLL_AMT_MIN * 1.3)
@@ -995,9 +1049,8 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
     base_amt[near] = PAYROLL_AMT_MIN + RNG.integers(50, 900, int(near.sum()))
 
     epk_person = 1_126_000_000_000_000_000 + pairs_person.astype(np.int64)
-    acc_num = np.array([f"40817810{int(g):04d}{i:08d}"
-                        for g, i in zip(tab["gosb_id"].to_numpy()[org_of_pair],
-                                        np.arange(n_pairs))])
+    acc_num = np.array([f"40817810{int(g) % 10000:04d}{i:08d}"
+                        for g, i in zip(pair_gosb, np.arange(n_pairs))])
 
     inn_txt = tab["inn_txt"].to_numpy()[org_of_pair]
     # у пар-приёмников реорганизации ИНН СВОЙ, отличный от исходного
@@ -1006,7 +1059,6 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
         inn_txt = inn_txt.copy()
         inn_txt[tail] = [str(int(v)) for v in moved_to[tail]]
 
-    gosb_arr = tab["gosb_id"].to_numpy()[org_of_pair]
     tb_arr = tab["tb_id"].to_numpy()[org_of_pair]
     name_arr = np.array([f"ОРГ {int(v)}" for v in tab["inn_out"].to_numpy()])[org_of_pair]
 
@@ -1020,16 +1072,25 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
         "cliff_inns": sorted(str(tab.at[i, "inn_txt"]) for i in cliff_orgs),
         "reorg_map": {str(tab.at[i, "inn_txt"]): str(reorg_dst_inn[int(tab.at[i, "inn_out"])])
                       for i in reorg_src},
+        "gosb_move_month": str(months[last - PAYROLL_GOSB_MOVE_BACK].date()),
+        "dip_months": list(PAYROLL_DIP_MONTHS),
         "n_pairs_built": int(n_pairs),
         "n_persons": int(n_persons),
+        "n_multi_gosb_orgs": int(len(second_gosb)),
         "pairs_by_month": {},
+        "people_by_month": {},
     }
 
     def frames():
         for m, dt in enumerate(months):
+            in_dip = dt.month in PAYROLL_DIP_MONTHS
             alive = ((start <= m) & (m < end)
                      & (person_start[pairs_person] <= m)
                      & (m < person_left[pairs_person]))
+            if in_dip:
+                # Сезонная яма: часть людей в этом месяце зачислений не получает
+                # вовсе. Из ведомостей они пропадают целиком, как на проме.
+                alive = alive & ~person_dips[pairs_person]
             idx = np.flatnonzero(alive)
             if not len(idx):
                 continue
@@ -1038,6 +1099,9 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
             below = drift[idx] <= m
             amt[below] = RNG.integers(400, PAYROLL_AMT_MIN - 200, int(below.sum()))
             out_code = switch[idx] <= m
+            # Подразделение месяца: до перевода — своё, после — другое.
+            gosb_m = np.where(gosb_move_m[idx] <= m,
+                              pair_gosb_after[idx], pair_gosb[idx])
 
             # Строк на пару — две (зарплата и аванс) либо одна: грейн витрины
             # тоньше метрики, и разбор обязан суммировать, а не считать строки.
@@ -1059,8 +1123,8 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                                                  for c in code],
                     "epk_id": epk_person[idx][take],
                     "document_info_sha1": epk_person[idx][take],
-                    "gosb_id": gosb_arr[idx][take],
-                    "sys_gosb_id": gosb_arr[idx][take],
+                    "gosb_id": gosb_m[take],
+                    "sys_gosb_id": gosb_m[take],
                     "inn": inn_txt[idx][take],
                     "tb_id": tb_arr[idx][take],
                     "sys_tb_id": tb_arr[idx][take],
@@ -1069,10 +1133,18 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                     "modified_dttm": dt,
                 }))
             df = pd.concat(rows, ignore_index=True)
-            # получателей месяца считаем ровно так же, как отчёт: сумма по паре
-            g = df[df["enrollment_type"].isin(PAYROLL_CODES_IN)].groupby(
-                ["epk_id", "inn"])["amt"].sum()
-            expect["pairs_by_month"][str(dt.date())] = int((g > PAYROLL_AMT_MIN).sum())
+            # Получателей месяца считаем ровно так же, как отчёт: порог по сумме
+            # в ОРГАНИЗАЦИИ, а счёт — по ТРОЙКАМ. Считать порог по тройке было бы
+            # другим числом, и ожидания разошлись бы с разбором на ровном месте.
+            fil = df[df["enrollment_type"].isin(PAYROLL_CODES_IN)]
+            by_inn = fil.groupby(["epk_id", "inn"])["amt"].sum()
+            ok = set(by_inn[by_inn > PAYROLL_AMT_MIN].index)
+            tri = fil.groupby(["epk_id", "inn", "gosb_id"]).size().reset_index()
+            keep = [(e, i) in ok for e, i in zip(tri["epk_id"], tri["inn"])]
+            expect["pairs_by_month"][str(dt.date())] = int(sum(keep))
+            expect["people_by_month"][str(dt.date())] = int(
+                fil[[(e, i) in ok for e, i in zip(fil["epk_id"], fil["inn"])]]
+                ["epk_id"].nunique())
             yield df
 
     return frames, expect
