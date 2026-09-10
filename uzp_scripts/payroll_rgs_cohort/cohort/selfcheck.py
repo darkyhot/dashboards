@@ -486,6 +486,66 @@ def check_by_dim() -> None:
     _ok("разрезы: доля от целого, состав по видам внутри строки верен")
 
 
+def check_join_key_dtypes() -> None:
+    """Соединения по идентификатору обязаны работать при РАЗНЫХ типах ключа.
+
+    Драйвер отдаёт один и тот же smallint то как int, то как Decimal, а колонка
+    с единственным NULL приезжает object целиком. Дальше происходит одно из двух,
+    и второе хуже первого:
+
+    * `merge` падает — шумно, сразу, но после многих минут прогона (так и вышло
+      на проме: одиннадцать минут выгрузки и ValueError на разметке);
+    * `map` и `reindex` НЕ падают, а молча дают NaN. Разрез не исчезает, а
+      схлопывается в одну строку-заглушку и читается как свойство данных.
+
+    Поэтому проверка кормит расчёты кадрами с НАМЕРЕННО разными типами ключей и
+    требует, чтобы соединение всё равно состоялось.
+    """
+    # Ключи слева — строки и Decimal, справа — int. Ровно то, что приходит с прома.
+    lost = pd.DataFrame({
+        "inn": ["7701", "7702"], "cause": ["left_bank", "left_bank"],
+        "gosb_id": ["38", "38"], "tb_id": ["17", "17"],
+        "n_triples": [100.0, 50.0]})
+    attrs = pd.DataFrame({
+        "inn": [7701, 7702],
+        "company_name": ["МБОУ СОШ № 1", "ГБУЗ БОЛЬНИЦА № 2"],
+        "holding_name": [None, None], "industry_name": [None, None],
+        "is_educational": [True, False], "is_military": [False, False],
+        "is_liquidated": [False, False]})
+    tb = pd.DataFrame({"tb_id": [17], "tb_short_name": ["СРБ"]})
+    gosb = pd.DataFrame({"old_gosb_id": [38], "new_gosb_id": [38],
+                         "tb_id": [17], "tb_short_name": ["СРБ"],
+                         "gosb_name": ["ГОСБ-1"], "region_name": ["Регион-1"]})
+
+    marked, meta = A.enrich(lost, attrs, tb, gosb, "old_gosb_id")
+    if marked.empty:
+        raise CheckFailed("разметка потеряла все строки на разных типах ключа")
+    if marked["company_name"].isna().any():
+        raise CheckFailed("соединение со справочником организаций не состоялось: "
+                          "ключ строкой слева и числом справа")
+    if float(meta.get("tb_known", 0)) <= 0:
+        raise CheckFailed("ТБ не определился — соединение по tb_id не состоялось")
+    if float(meta.get("region_known", 0)) <= 0:
+        raise CheckFailed("регион не определился — map по gosb_id дал NaN молча, "
+                          "и разрез схлопнулся бы в заглушку")
+
+    # Тот же разнобой в топе организаций и в миграции.
+    gained = pd.DataFrame({"inn": [7701.0], "n_triples": [40.0], "n_real": [40.0]})
+    top = A.top_orgs(marked, gained, top_n=5)
+    if float(top[top["inn"] == 7701].iloc[0]["gained"]) != 40.0:
+        raise CheckFailed("приход не подтянулся к организации: ключ float против int")
+
+    mig = pd.DataFrame({"inn_from": ["7701"], "inn_to": ["7799"], "n_epk": [90.0]})
+    out = A.migration(mig, lost, attrs, min_share=0.5)
+    if out.empty:
+        raise CheckFailed("миграция не нашла переоформление: доля не посчиталась "
+                          "из-за типов ключа")
+    if pd.isna(out.iloc[0].get("name_from")):
+        raise CheckFailed("название организации-источника не подтянулось")
+    _ok("соединения по идентификатору: разные типы ключа сводятся, "
+        "молчаливого NaN не остаётся")
+
+
 def check_top_orgs_net() -> None:
     """Топ организаций сортируется по НЕТТО, а не по потерям.
 
@@ -820,7 +880,7 @@ ALL = [
     check_causes_exhaustive, check_ladder_priority, check_additive,
     check_epk_ladder_shorter, check_ladder_table,
     check_steps_seasonal, check_steps_short_series, check_month_compare,
-    check_by_dim, check_top_orgs_net, check_code_split, check_tenure,
+    check_by_dim, check_join_key_dtypes, check_top_orgs_net, check_code_split, check_tenure,
     check_shown_self_contained, check_shown_recorded,
     check_anonymize_doc, check_llm_fallback, check_row_limit,
     check_level_rules, check_empty_frames,

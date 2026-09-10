@@ -179,6 +179,27 @@ def _num(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
 
+def _key(s: pd.Series) -> pd.Series:
+    """Ключ соединения — к ОДНОМУ числовому типу с обеих сторон.
+
+    Идентификаторы приезжают из разных витрин разными типами: драйвер отдаёт
+    `smallint` то как int, то как Decimal, а колонка с единственным NULL
+    становится object целиком. Дальше происходит одно из двух, и второе хуже
+    первого:
+
+    * `merge` падает с «You are trying to merge on object and int64 columns» —
+      шумно, сразу, после одиннадцати минут прогона;
+    * `map` и `reindex` НЕ падают, а молча возвращают NaN. Разрез при этом не
+      исчезает, а схлопывается в одну строку-заглушку и выглядит как свойство
+      данных. Ровно так на проме и пропала вся территория.
+
+    Поэтому каждый идентификатор перед соединением проходит здесь, а не там, где
+    его тип случайно совпал. `Int64` (с большой буквы) — нullable, поэтому
+    пропуски переживают приведение и не превращаются в мусорные нули.
+    """
+    return pd.to_numeric(s, errors="coerce").astype("Int64")
+
+
 def _kinds(df: pd.DataFrame, book: dict, value_col: str) -> dict:
     """Сумма по видам веток: реальное движение, счёт, перерыв."""
     out = {REAL: 0.0, METHOD: 0.0, GAP: 0.0}
@@ -559,21 +580,27 @@ def migration(mig: pd.DataFrame, lost_by_inn: pd.DataFrame,
     """
     if mig.empty:
         return pd.DataFrame()
-    lost_tot = (lost_by_inn.groupby("inn")["n_triples"].sum()
-                if not lost_by_inn.empty else pd.Series(dtype=float))
+    lost_tot = pd.Series(dtype=float)
+    if not lost_by_inn.empty:
+        lt = lost_by_inn.copy()
+        lt["inn"] = _key(lt["inn"])
+        lost_tot = lt.groupby("inn")["n_triples"].sum()
     df = mig.copy()
+    df["inn_from"], df["inn_to"] = _key(df["inn_from"]), _key(df["inn_to"])
     df["lost_from"] = df["inn_from"].map(lost_tot).fillna(0.0)
     df["share"] = _num(df, "n_epk") / df["lost_from"].replace(0, np.nan)
     df = df[df["share"] >= min_share]
     if df.empty:
         return df
     if not attrs.empty and "inn" in attrs:
-        names = attrs.set_index("inn")["company_name"]
+        at = attrs.copy()
+        at["inn"] = _key(at["inn"])
+        names = at.drop_duplicates("inn").set_index("inn")["company_name"]
         df["name_from"] = df["inn_from"].map(names)
         df["name_to"] = df["inn_to"].map(names)
         # Организация-приёмник часто ещё не размечена как бюджетная — имени у неё
         # нет, и это не пробел, а сам признак свежего переоформления.
-        df["to_in_segment"] = df["inn_to"].isin(set(attrs["inn"]))
+        df["to_in_segment"] = df["inn_to"].isin(set(at["inn"].dropna()))
     return df.sort_values("n_epk", ascending=False).reset_index(drop=True)
 
 
@@ -624,7 +651,10 @@ def enrich(lost_by_inn: pd.DataFrame, attrs: pd.DataFrame, tb: pd.DataFrame,
         return lost_by_inn, meta
 
     df = lost_by_inn.copy()
+    df["inn"] = _key(df["inn"])
     if not attrs.empty:
+        attrs = attrs.copy()
+        attrs["inn"] = _key(attrs["inn"])
         df = df.merge(attrs, on="inn", how="left")
 
     df["agency"] = classify_agency(df, name_col="company_name",
@@ -641,6 +671,9 @@ def enrich(lost_by_inn: pd.DataFrame, attrs: pd.DataFrame, tb: pd.DataFrame,
 
     # --- территория: ТБ из ведомостей ---
     if not tb.empty and "tb_id" in df:
+        tb = tb.copy()
+        tb["tb_id"] = _key(tb["tb_id"])
+        df["tb_id"] = _key(df["tb_id"])
         df = df.merge(tb.drop_duplicates("tb_id"), on="tb_id", how="left")
     meta["tb_known"] = (float(_num(df[df["tb_short_name"].notna()], "n_triples").sum())
                         if "tb_short_name" in df else 0.0)
@@ -650,11 +683,21 @@ def enrich(lost_by_inn: pd.DataFrame, attrs: pd.DataFrame, tb: pd.DataFrame,
     meta["gosb_key"] = gosb_key
     meta["region_known"] = 0.0
     if gosb_key and not gosb.empty and gosb_key in gosb:
-        g = gosb.dropna(subset=[gosb_key]).drop_duplicates(gosb_key).set_index(gosb_key)
-        df["region_name"] = df["gosb_id"].map(g["region_name"])
-        df["gosb_name"] = df["gosb_id"].map(g["gosb_name"])
+        g = gosb.dropna(subset=[gosb_key]).copy()
+        g[gosb_key] = _key(g[gosb_key])
+        g = g.drop_duplicates(gosb_key).set_index(gosb_key)
+        gid = _key(df["gosb_id"])
+        df["region_name"] = gid.map(g["region_name"])
+        df["gosb_name"] = gid.map(g["gosb_name"])
         meta["region_known"] = float(
             _num(df[df["region_name"].notna()], "n_triples").sum())
+        # Соответствие проверено запросом, а разрез всё равно пуст — значит
+        # сломалось не в данных, а по дороге. Молчать об этом нельзя: пустой
+        # разрез читается как «в регионах ничего не потеряно».
+        if meta["region_known"] == 0:
+            progress.warn(
+                f"подразделения опознаны справочником по «{gosb_key}», но ни одна "
+                f"строка потерь не получила региона — проверьте типы ключа")
 
     for col, fill in FILL.items():
         df[col] = df[col].fillna(fill) if col in df else fill
@@ -703,10 +746,14 @@ def top_orgs(df: pd.DataFrame, gained_inn: pd.DataFrame,
     """
     if df.empty:
         return pd.DataFrame()
+    df = df.copy()
+    df["inn"] = _key(df["inn"])
     g = df.groupby("inn", dropna=False)
     out = pd.DataFrame({"lost": g["n_triples"].sum()})
     if gained_inn is not None and not gained_inn.empty and "inn" in gained_inn:
-        gi = gained_inn.drop_duplicates("inn").set_index("inn")["n_triples"]
+        gn = gained_inn.copy()
+        gn["inn"] = _key(gn["inn"])
+        gi = gn.drop_duplicates("inn").set_index("inn")["n_triples"]
         out["gained"] = pd.to_numeric(gi.reindex(out.index), errors="coerce").fillna(0.0)
     else:
         out["gained"] = 0.0
