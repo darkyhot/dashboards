@@ -164,6 +164,10 @@ HOLDING_KNOWN_SHARE = 0.55        # у остальных холдинг не з
 # его ветки. Ожидаемые доли собираются в _payroll_expect и печатаются при сборке.
 PAYROLL_MONTHS = 25               # авг-24 … авг-26 на проме; здесь — 25 мес. до конца ряда
 PAYROLL_AMT_MIN = 2500            # порог получателя: строго БОЛЬШЕ этой суммы
+# Сдвиг «старого» номера подразделения в ведомостях. Витрина хранит ДВА номера,
+# и на проме со справочником сходится только системный; старый живёт своей
+# жизнью. Сдвиг взаимно-однозначный: тройки от него не склеиваются.
+PAYROLL_LEGACY_GOSB_SHIFT = 900000
 
 # Коды зачисления, которые считает разбор (список задан заказчиком).
 PAYROLL_CODES_IN = (1, 2, 16, 18, 19, 26, 28, 33, 38, 39, 40, 42, 49,
@@ -1117,6 +1121,14 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
             # Подразделение месяца: до перевода — своё, после — другое.
             gosb_m = np.where(gosb_move_m[idx] <= m,
                               pair_gosb_after[idx], pair_gosb[idx])
+            # СТАРЫЕ номера подразделения и ТБ РАЗВЕДЕНЫ с системными — так на
+            # проме. Там `gosb_id` со справочником не сходится, а `tb_id` пуст, и
+            # отчёт, построенный на них, показывал единственную строку «ТБ
+            # неизвестен» — не падая и ничего не сообщая. Пока синтетика писала
+            # в обе колонки одно и то же, открытый контур эту поломку не видел.
+            # Сдвиг взаимно-однозначный: тройки не склеиваются, ожидания
+            # генератора остаются теми же числами.
+            gosb_legacy_m = gosb_m + PAYROLL_LEGACY_GOSB_SHIFT
 
             # Строк на пару — две (зарплата и аванс) либо одна: грейн витрины
             # тоньше метрики, и разбор обязан суммировать, а не считать строки.
@@ -1140,10 +1152,10 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                                                  for c in code],
                     "epk_id": epk_person[idx][take],
                     "document_info_sha1": epk_person[idx][take],
-                    "gosb_id": gosb_m[take],
+                    "gosb_id": gosb_legacy_m[take],
                     "sys_gosb_id": gosb_m[take],
                     "inn": inn_txt[idx][take],
-                    "tb_id": tb_arr[idx][take],
+                    "tb_id": None,
                     "sys_tb_id": tb_arr[idx][take],
                     "report_dt": dt.date(),
                     "transaction_qty": 1,
@@ -1161,10 +1173,10 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                         PAYROLL_STIPEND_CODE, ""),
                     "epk_id": epk_person[idx][take_s],
                     "document_info_sha1": epk_person[idx][take_s],
-                    "gosb_id": gosb_m[take_s],
+                    "gosb_id": gosb_legacy_m[take_s],
                     "sys_gosb_id": gosb_m[take_s],
                     "inn": inn_txt[idx][take_s],
-                    "tb_id": tb_arr[idx][take_s],
+                    "tb_id": None,
                     "sys_tb_id": tb_arr[idx][take_s],
                     "report_dt": dt.date(),
                     "transaction_qty": 1,
@@ -1177,7 +1189,11 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
             fil = df[df["enrollment_type"].isin(PAYROLL_CODES_IN)]
             by_inn = fil.groupby(["epk_id", "inn"])["amt"].sum()
             ok = set(by_inn[by_inn > PAYROLL_AMT_MIN].index)
-            tri = fil.groupby(["epk_id", "inn", "gosb_id"]).size().reset_index()
+            # Тройка считается по СИСТЕМНОМУ номеру — тому же, на котором стоит
+            # грейн отчёта. По старому номеру число вышло бы то же (сдвиг
+            # взаимно-однозначный), но ожидание обязано повторять разбор, а не
+            # совпадать с ним случайно.
+            tri = fil.groupby(["epk_id", "inn", "sys_gosb_id"]).size().reset_index()
             keep = [(e, i) in ok for e, i in zip(tri["epk_id"], tri["inn"])]
             expect["pairs_by_month"][str(dt.date())] = int(sum(keep))
             expect["people_by_month"][str(dt.date())] = int(

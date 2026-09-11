@@ -618,6 +618,54 @@ def left_codes(df: pd.DataFrame, top_n: int = 12) -> pd.DataFrame:
     return out.sort_values("n_epk", ascending=False).head(top_n).reset_index(drop=True)
 
 
+def left_codes_inn(df: pd.DataFrame, attrs: pd.DataFrame,
+                   to_codes: pd.DataFrame) -> pd.DataFrame:
+    """Кто именно перешёл на каждый вид зачисления.
+
+    Дополнение к `left_codes`, отвечающее на вопрос, который тот оставлял без
+    ответа: «пособие на детей — четыре тысячи человек» решения не подсказывает,
+    пока неизвестно, одна это организация или двести.
+
+    Показываются только те коды, что показаны в таблице выше. Иначе список
+    уезжает в хвост из редких кодов: их организаций больше всего по количеству
+    строк, а людей за ними единицы.
+
+    Название организации подтягивается ЗДЕСЬ, а не в SQL: в .md номер организации
+    удаляется (`report_text.ID_COLUMNS`), и без названия наружу уехала бы таблица
+    из одних чисел.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out["inn"] = _key(out["inn"])
+    out["n_epk"] = _num(out, "n_epk")
+
+    if to_codes is not None and not to_codes.empty and "code" in to_codes:
+        shown = set(pd.to_numeric(to_codes["code"], errors="coerce").dropna())
+        out = out[pd.to_numeric(out["code"], errors="coerce").isin(shown)]
+    if out.empty:
+        return pd.DataFrame()
+
+    if attrs is not None and not attrs.empty and "company_name" in attrs:
+        a = attrs.copy()
+        a["inn"] = _key(a["inn"])
+        name = a.drop_duplicates("inn").set_index("inn")["company_name"]
+        out["company_name"] = out["inn"].map(name)
+
+    # Доля — от людей ЭТОГО кода, а не от всех перешедших: вопрос здесь «какую
+    # часть кода занимает организация», и доля от общего итога на него не отвечает.
+    tot = out.groupby("code")["n_epk"].transform("sum").replace(0, np.nan)
+    out["share"] = out["n_epk"] / tot
+
+    # Порядок кодов — ТОТ ЖЕ, что в таблице выше (по числу людей), а не по номеру
+    # кода: две таблицы про одно и то же, читаемые сверху вниз в разном порядке,
+    # читатель сопоставляет вручную.
+    out["_rank"] = -tot
+    return (out.sort_values(["_rank", "code", "n_epk"],
+                            ascending=[True, True, False])
+            .drop(columns="_rank").reset_index(drop=True))
+
+
 def migration(mig: pd.DataFrame, lost_by_inn: pd.DataFrame,
               attrs: pd.DataFrame, min_share: float = 0.3) -> pd.DataFrame:
     """Реорганизации: организации, чьи люди дружно оказались в одной новой.
@@ -688,11 +736,11 @@ def enrich(lost_by_inn: pd.DataFrame, attrs: pd.DataFrame, tb: pd.DataFrame,
     показывается — приписать их к массовой группе значило бы завысить её потерю
     на неизвестную величину.
 
-    ТБ берётся ПРЯМО ИЗ ВЕДОМОСТЕЙ. На проме `gosb_id` ведомостей со справочником
-    не сошёлся вовсе, и весь территориальный разрез схлопнулся в одну строку
-    «ТБ неизвестен», которую обезличивание вдобавок выдало за настоящее
-    подразделение. Номер ТБ в ведомостях заполнен всегда, и разрез по нему есть
-    даже тогда, когда ГОСБ не опознан.
+    ТБ берётся ПРЯМО ИЗ ВЕДОМОСТЕЙ — системным номером `sys_tb_id`. Разрез по нему
+    есть даже тогда, когда ГОСБ справочником не опознан, а старый `tb_id` в
+    рабочем наборе прома пуст вовсе: на нём весь территориальный разрез
+    схлопывался в одну строку «ТБ неизвестен», которую обезличивание вдобавок
+    выдавало за настоящее подразделение.
     """
     meta: dict = {}
     if lost_by_inn.empty:
@@ -725,6 +773,13 @@ def enrich(lost_by_inn: pd.DataFrame, attrs: pd.DataFrame, tb: pd.DataFrame,
         df = df.merge(tb.drop_duplicates("tb_id"), on="tb_id", how="left")
     meta["tb_known"] = (float(_num(df[df["tb_short_name"].notna()], "n_triples").sum())
                         if "tb_short_name" in df else 0.0)
+    # Справочник прочитан, а территории нет ни у одной строки — значит ключ не
+    # сошёлся. Молчать об этом нельзя: заглушка «ТБ неизвестен» со стопроцентной
+    # долей читается как настоящее подразделение, и ровно так на проме и вышло.
+    if not tb.empty and meta["tb_known"] == 0:
+        progress.warn("номер ТБ ведомостей не опознан справочником — "
+                      "территориальный разрез схлопнулся в заглушку "
+                      "«ТБ неизвестен»; проверьте sys_tb_id и типы ключа")
 
     # ГОСБ — только если разведка нашла ключ, которым он опознаётся. Иначе разрез
     # не строится вовсе: заглушка под видом подразделения хуже отсутствия разреза.

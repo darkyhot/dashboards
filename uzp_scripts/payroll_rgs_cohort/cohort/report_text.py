@@ -243,7 +243,8 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
           st: pd.DataFrame, measured: str, cmp_months: pd.DataFrame,
           surv: pd.DataFrame, thr: pd.DataFrame, seas: dict,
           codes_m: pd.DataFrame,
-          to_seg: pd.DataFrame, to_codes: pd.DataFrame, mig: pd.DataFrame,
+          to_seg: pd.DataFrame, to_codes: pd.DataFrame,
+          to_codes_inn: pd.DataFrame, mig: pd.DataFrame,
           cuts: dict, orgs: pd.DataFrame, tenure: pd.DataFrame,
           checks: list[dict], warnings: list[str], probe: dict, meta: dict,
           shown: dict, texts: dict) -> tuple[str, list[str]]:
@@ -256,13 +257,17 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
     al = Aliases()
     m_cuts = {k: mask(v, al) for k, v in cuts.items()}
     m_orgs, m_mig = mask(orgs, al), mask(mig, al)
+    # Номер организации `mask` не заменяет токеном, а УДАЛЯЕТ (ID_COLUMNS).
+    # Поэтому в рамке обязано быть название: без него наружу уехала бы таблица
+    # из одних чисел, по которой ничего не сверить.
+    m_codes_inn = mask(to_codes_inn, al)
 
     # Настоящие названия собираются ДО сборки текста: ими маскируются и абзацы
     # выводов, и по ним же потом идёт проверка утечки. Один и тот же словарь на
     # оба шага — иначе маскирование и проверка разъедутся, и документ, прошедший
     # проверку, окажется замаскирован не полностью.
     names = collect_names([causes, gains, tr, thr, to_seg, to_codes, codes_m,
-                           mig, orgs, *cuts.values()])
+                           to_codes_inn, mig, orgs, *cuts.values()])
     # Тексты выводов приходят с ВОССТАНОВЛЕННЫМИ названиями — они нужны такими в
     # HTML, но не здесь. Прогоняем их через те же токены, что и таблицы.
     texts = {k: mask_text(v, al, names) for k, v in (texts or {}).items()}
@@ -446,6 +451,14 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
 
 {_table(to_codes, ['code', 'code_name', 'n_epk', 'share'],
         ['Код', 'Вид зачисления', 'Человек', 'Доля'], limit=15)}
+### Кто именно перешёл на каждый вид зачисления
+
+Доля считается ВНУТРИ вида зачисления: вопрос здесь — какую часть перешедших даёт
+одна организация. Верх из одной-двух — это адрес, куда идти; ровный список — фон
+по всему сегменту.
+
+{_table(m_codes_inn, ['code_name', 'company_name', 'n_epk', 'share'],
+        ['Вид зачисления', 'Организация', 'Человек', 'Доля вида'], limit=60)}
 ### Похоже на переоформление
 
 {_table(m_mig, ['name_from', 'name_to', 'n_epk', 'share', 'to_in_segment'],

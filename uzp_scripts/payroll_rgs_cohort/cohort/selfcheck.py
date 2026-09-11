@@ -143,14 +143,21 @@ def check_triple_grain() -> None:
     тройке, база разойдётся с отчётностью — и разойдётся правдоподобно.
     """
     body = LQ._T_PAIRS                                          # noqa: SLF001
-    if "GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id" not in body:
+    if ("GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.sys_gosb_id"
+            not in body):
         raise CheckFailed("t_pairs группируется не по тройке (человек, ИНН, ГОСБ)")
     if "OVER (PARTITION BY p.report_dt, p.epk_id" not in body:
         raise CheckFailed("сумма по организации не считается оконной функцией — "
                           "порог по организации при группировке по тройке иначе "
                           "не взять, HAVING фильтрует только свою группу")
-    if "min(p.gosb_id)" in body:
+    # Схлопывание ищется по ГРЕЙНОВОЙ колонке. `min(p.gosb_id)` рядом — это
+    # диагностический старый номер, он ни во что не считается и грейн не трогает.
+    if "min(p.sys_gosb_id)" in body:
         raise CheckFailed("ГОСБ схлопывается через min() — грейн снова стал парой")
+    if "p.sys_tb_id" not in body:
+        raise CheckFailed("ТБ берётся не системным номером — на проме старый "
+                          "tb_id со справочником не сходится, и территория "
+                          "схлопывается в заглушку")
     for scope, cond in LQ.AMT_COND.items():
         if not cond.startswith("x."):
             raise CheckFailed(f"условие порога «{scope}» ссылается не на выборку x")
@@ -615,8 +622,35 @@ def check_join_key_dtypes() -> None:
                           "из-за типов ключа")
     if pd.isna(out.iloc[0].get("name_from")):
         raise CheckFailed("название организации-источника не подтянулось")
+
+    # Ключ ТБ не сошёлся ВОВСЕ. Разрез при этом не исчезает — он схлопывается в
+    # заглушку «ТБ неизвестен» со стопроцентной долей и читается как настоящее
+    # подразделение. Единственное, что отличает эту картину от честного разреза, —
+    # предупреждение; если его не будет, на проме это снова пройдёт незамеченным.
+    import io
+    from contextlib import redirect_stdout
+
+    from uzp_dash import progress
+
+    buf = io.StringIO()
+    was = progress.ENABLED
+    progress.ENABLED = True          # в проверках вывод выключен, а ловим мы его
+    try:
+        with redirect_stdout(buf):
+            _, meta_bad = A.enrich(lost, attrs,
+                                   pd.DataFrame({"tb_id": [99],
+                                                 "tb_short_name": ["ЮЗБ"]}),
+                                   gosb, "old_gosb_id")
+    finally:
+        progress.ENABLED = was
+    if float(meta_bad.get("tb_known", 0)) != 0:
+        raise CheckFailed("ТБ опознался ключом, которого в потерях нет")
+    if "не опознан справочником" not in buf.getvalue():
+        raise CheckFailed("ТБ не сошёлся, а предупреждения нет — заглушка "
+                          "«ТБ неизвестен» уедет в отчёт как подразделение")
     _ok("соединения по идентификатору: разные типы ключа сводятся, "
-        "молчаливого NaN не остаётся")
+        "молчаливого NaN не остаётся, несошедшийся ТБ сопровождается "
+        "предупреждением")
 
 
 def check_top_orgs_net() -> None:

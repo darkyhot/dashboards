@@ -274,6 +274,38 @@ def run(engine, conn, months: list[str], d_base: str, d_cur: str, d_from: str,
     return res
 
 
+def check_tb(match: pd.DataFrame, res: dict) -> None:
+    """Опознаётся ли номер ТБ ведомостей справочником.
+
+    Ничего не выбирает и ничего не отключает: ТБ берётся из ведомостей одной
+    колонкой, выбирать тут не из чего. Функция ставит ЧИСЛО туда, где раньше была
+    тишина. На проме разрез по территории состоял из единственной строки «ТБ
+    неизвестен», и по отчёту нельзя было отличить «справочник не сошёлся» от
+    «в этих ТБ никто ничего не потерял».
+    """
+    if match is None or match.empty:
+        return
+    r = match.iloc[0]
+    n_used = int(r.get("n_used", 0) or 0)
+    n_matched = int(r.get("n_matched", 0) or 0)
+    n_null = int(r.get("n_null_rows", 0) or 0)
+    n_rows = int(r.get("n_rows", 0) or 0)
+    res["tb_match"] = {"n_used": n_used, "n_matched": n_matched,
+                       "n_null_rows": n_null, "n_rows": n_rows}
+    null_share = n_null / n_rows if n_rows else 0.0
+    progress.done(f"сверка ТБ: номеров в наборе {n_used}, опознано справочником "
+                  f"{n_matched}; строк без номера {null_share:.1%}")
+    if n_used and not n_matched:
+        res["warnings"].append(
+            f"номера ТБ ведомостей не опознаются справочником ({n_used} номеров, "
+            f"ни одного совпадения) — территориальный разрез схлопнется в "
+            f"заглушку «ТБ неизвестен»")
+    elif null_share > 0.5:
+        res["warnings"].append(
+            f"у {null_share:.0%} строк рабочего набора нет номера ТБ — "
+            f"территориальный разрез покажет лишь часть потерь")
+
+
 def pick_gosb_key(match: pd.DataFrame, res: dict) -> str | None:
     """Каким ключом справочника опознаётся ГОСБ ведомостей — или ничем.
 
@@ -295,7 +327,19 @@ def pick_gosb_key(match: pd.DataFrame, res: dict) -> str | None:
     n_used = int(r.get("n_used", 0) or 0)
     n_old = int(r.get("n_old", 0) or 0)
     n_new = int(r.get("n_new", 0) or 0)
-    res["gosb_match"] = {"n_used": n_used, "n_old": n_old, "n_new": n_new}
+    # Старый номер ведомостей меряется рядом и НИ ВО ЧТО не считается. Он нужен
+    # ровно для одного: когда разрез не строится, по одной строке лога видно, в
+    # чём дело — в ключе справочника или в самой колонке ведомостей.
+    n_used_l = int(r.get("n_used_legacy", 0) or 0)
+    n_old_l = int(r.get("n_old_legacy", 0) or 0)
+    n_new_l = int(r.get("n_new_legacy", 0) or 0)
+    res["gosb_match"] = {"n_used": n_used, "n_old": n_old, "n_new": n_new,
+                         "n_used_legacy": n_used_l, "n_old_legacy": n_old_l,
+                         "n_new_legacy": n_new_l}
+    progress.done(
+        f"сверка подразделений: sys_gosb_id — {n_used} номеров, из них по "
+        f"old_gosb_id {n_old}, по new_gosb_id {n_new}; старый gosb_id — "
+        f"{n_used_l} номеров, {n_old_l} и {n_new_l} соответственно")
     if not n_used:
         return None
     best, n_best = ("old_gosb_id", n_old) if n_old >= n_new else ("new_gosb_id", n_new)
@@ -303,7 +347,8 @@ def pick_gosb_key(match: pd.DataFrame, res: dict) -> str | None:
     if share < GOSB_MATCH_MIN:
         res["warnings"].append(
             f"подразделения ведомостей не сходятся со справочником: по "
-            f"old_gosb_id опознано {n_old} из {n_used}, по new_gosb_id — {n_new}. "
+            f"old_gosb_id опознано {n_old} из {n_used}, по new_gosb_id — {n_new} "
+            f"(старый gosb_id: {n_old_l} и {n_new_l} из {n_used_l}). "
             f"Разрез по регионам не строится — показывать заглушку под видом "
             f"подразделения хуже, чем не показывать разрез")
         return None

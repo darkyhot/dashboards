@@ -351,6 +351,16 @@ def left_codes(ws: Workspace, base: str) -> pd.DataFrame:
     return df
 
 
+def left_codes_inn(ws: Workspace, base: str, per_code: int) -> pd.DataFrame:
+    """Кто именно перешёл на каждый вид зачисления — топ организаций по коду."""
+    df = _opt(ws, "left_codes_inn", LQ.LEFT_CODES_INN,
+              {"d_base": base, "per_code": per_code})
+    if not df.empty:
+        progress.done(f"организации по видам зачисления: {len(df):,} строк, "
+                      f"по {per_code} на код")
+    return df
+
+
 def inn_migration(ws: Workspace, base: str, min_movers: int) -> pd.DataFrame:
     """Куда переехали люди, потерявшие свою организацию."""
     df = _opt(ws, "inn_migration", LQ.INN_MIGRATION,
@@ -374,6 +384,17 @@ def gosb_dim(ws: Workspace) -> pd.DataFrame:
         progress.done(f"справочник территории: {len(df)} строк, "
                       f"регион известен у {n_reg}")
     return df
+
+
+def tb_match(ws: Workspace) -> pd.DataFrame:
+    """Опознаётся ли номер ТБ ведомостей справочником.
+
+    Вопрос, которого раньше не задавали. ТБ считался колонкой, заполненной
+    всегда, и когда на проме он не сошёлся, отчёт показал разрез из одной
+    заглушки «ТБ неизвестен» — без предупреждения и без числа, по которому это
+    можно было бы заметить.
+    """
+    return _opt(ws, "tb_match", LQ.TB_MATCH)
 
 
 def gosb_match(ws: Workspace) -> pd.DataFrame:

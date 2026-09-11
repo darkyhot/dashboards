@@ -56,6 +56,9 @@ DEFAULTS = dict(
     # Сколько строк показывать в разрезах и в списке организаций.
     top_n=12,
     top_orgs=15,
+    # Сколько организаций показывать по КАЖДОМУ виду зачисления, на который
+    # перешли лишившиеся зарплатных зачислений. Ноль отключает таблицу.
+    codes_top_inn=5,
     # Минимальное число людей, переехавших из одной организации в другую, чтобы
     # пара «откуда→куда» вообще попала в разбор миграции. Меньше — это шум.
     migration_min_movers=5,
@@ -170,10 +173,14 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
             codes_m_raw = fetch.code_months(ws)
             seg_raw = fetch.left_segment(ws, d_base)
             codes_raw = fetch.left_codes(ws, d_base)
+            codes_inn_raw = (fetch.left_codes_inn(ws, d_base,
+                                                  int(opts["codes_top_inn"]))
+                             if int(opts["codes_top_inn"]) else pd.DataFrame())
             mig_raw = fetch.inn_migration(ws, d_base, int(opts["migration_min_movers"]))
             tb = fetch.tb_dim(ws)
             gosb = fetch.gosb_dim(ws)
             gosb_key = probe.pick_gosb_key(fetch.gosb_match(ws), pr)
+            probe.check_tb(fetch.tb_match(ws), pr)
             ten_raw = (fetch.tenure(ws, d_base, d_from)
                        if opts["with_tenure"] else pd.DataFrame())
             shown = dict(ws.shown)
@@ -211,6 +218,7 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
     seas = A.seasonality(seas_raw, cur, prev) if prev is not None else {}
     to_seg = A.left_segment(seg_raw, LQ.SEG_BIG)
     to_codes = A.left_codes(codes_raw)
+    to_codes_inn = A.left_codes_inn(codes_inn_raw, attrs, to_codes)
     codes_m = A.code_months(codes_m_raw, base, prev or base, cur)
     marked, meta = A.enrich(lost_inn, attrs, tb, gosb, gosb_key)
     mig = A.migration(mig_raw, lost_inn, attrs, float(opts["migration_min_share"]))
@@ -241,7 +249,8 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
         V.metric_block(t, thr, shown),
         V.net_block(t, causes, gains, causes_e, gains_e, shown, *texts["net"]),
         V.both_block(both, t, shown),
-        V.where_gone_block(to_seg, to_codes, mig, ten, shown, *texts["gone"]),
+        V.where_gone_block(to_seg, to_codes, to_codes_inn, mig, ten, shown,
+                           *texts["gone"]),
         V.when_block(tr, st, measured, cmp_months, surv_c, load, seas, codes_m,
                      t_prev, causes_prev, shown, *texts["when"]),
         V.where_block(cuts, orgs, meta, shown, *texts["where"]),
@@ -266,7 +275,8 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
         gains_epk=gains_e, both=both, tr=tr, st=st, measured=measured,
         cmp_months=cmp_months, surv=surv_c, thr=thr, seas=seas,
         codes_m=codes_m, to_seg=to_seg,
-        to_codes=to_codes, mig=mig, cuts=cuts, orgs=orgs, tenure=ten,
+        to_codes=to_codes, to_codes_inn=to_codes_inn,
+        mig=mig, cuts=cuts, orgs=orgs, tenure=ten,
         checks=checks, warnings=warnings, probe=pr, meta=meta, shown=shown,
         texts={k: v[0] for k, v in texts.items()})
     doc_path = out_dir / f"payroll_rgs_cohort_{cur:%Y%m}_{ts}.md"
@@ -299,6 +309,7 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
             "survival": surv_c, "load": load, "threshold": thr,
             "seasonality": seas, "code_months": codes_m,
             "left_segment": to_seg, "left_codes": to_codes,
+            "left_codes_inn": to_codes_inn,
             "migration": mig,
             "cuts": cuts, "orgs": orgs, "tenure": ten, "marked": marked,
             "checks": checks, "warnings": warnings, "meta": meta, "shown": shown}

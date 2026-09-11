@@ -380,6 +380,7 @@ def both_block(both: pd.DataFrame, t: dict, shown: dict) -> str:
 
 
 def where_gone_block(to_seg: pd.DataFrame, to_codes: pd.DataFrame,
+                     to_codes_inn: pd.DataFrame,
                      mig: pd.DataFrame, tenure: pd.DataFrame, shown: dict,
                      text: str = "", fb: bool = False) -> str:
     """Куда именно делись люди: сегмент, вид выплат, переоформление, стаж.
@@ -407,6 +408,27 @@ def where_gone_block(to_seg: pd.DataFrame, to_codes: pd.DataFrame,
                     "это уже посчитано потерей. Таблица говорит, что с ними "
                     "случилось: пенсия означает выход на пенсию, пособие на "
                     "детей — декрет, расчёт при увольнении — увольнение."))
+    if to_codes_inn is not None and not to_codes_inn.empty:
+        rows = [[C.esc(str(r.code_name or r.code)),
+                 C.esc(str(getattr(r, "company_name", None) or r.inn)),
+                 # ИНН — идентификатор, а не число: разряды пробелами здесь
+                 # мешают его сверить и скопировать.
+                 C.esc("" if pd.isna(r.inn) else str(int(r.inn))),
+                 _n(r.n_epk), _pct(r.share, 0)]
+                for r in to_codes_inn.itertuples()]
+        parts.append(
+            "<h3>Кто именно перешёл на каждый вид зачисления</h3>"
+            # Колонка названа «Номер», а не тремя буквами, которых в готовом
+            # HTML всё равно не останется: `html.sanitize` вычищает это слово
+            # как отдельное (оно блокирует пересылку отчёта), и заголовок
+            # превратился бы в «Орг.» рядом с колонкой «Организация».
+            + C.table(["Вид зачисления", "Организация", "Номер", "Человек",
+                       "Доля вида"], rows, num_cols=[3, 4])
+            + _note("Доля считается ВНУТРИ вида зачисления: вопрос здесь — какую "
+                    "часть перешедших на пенсию или на пособие даёт одна "
+                    "организация. Если верх занимает одна-две — это адрес, куда "
+                    "идти; если список ровный — это фон по всему сегменту, и "
+                    "идти некуда."))
     if not mig.empty:
         rows = []
         for r in mig.head(12).itertuples():
@@ -683,8 +705,22 @@ def limits_block(warnings: list[str], checks: list[dict], probe: dict,
         items.append(
             f"<li>Подразделения ведомостей не опознаются справочником "
             f"(по old_gosb_id {m.get('n_old', 0)} из {m.get('n_used', 0)}, по "
-            f"new_gosb_id {m.get('n_new', 0)}) — разрез по регионам не строился. "
+            f"new_gosb_id {m.get('n_new', 0)}; старый номер gosb_id — "
+            f"{m.get('n_old_legacy', 0)} и {m.get('n_new_legacy', 0)} из "
+            f"{m.get('n_used_legacy', 0)}) — разрез по регионам не строился. "
             f"Территория показана по номеру ТБ из самих ведомостей.</li>")
+    tbm = probe.get("tb_match") or {}
+    if tbm and tbm.get("n_used") and not tbm.get("n_matched"):
+        items.append(
+            f"<li>Номера ТБ ведомостей не опознаются справочником "
+            f"({tbm['n_matched']} из {tbm['n_used']}) — территориальный разрез "
+            f"состоит из заглушки и подразделением не является.</li>")
+    elif tbm.get("n_rows") and tbm.get("n_null_rows"):
+        share = tbm["n_null_rows"] / tbm["n_rows"]
+        if share > 0.01:
+            items.append(
+                f"<li>У {_pct(share, 0)} строк рабочего набора номера ТБ нет — "
+                f"эти потери попадают в строку «ТБ неизвестен».</li>")
     if probe.get("temp_tables") is False:
         items.append("<li>Временные таблицы в сессии недоступны: разбор шёл "
                      "запасным путём через CTE. На числа это не влияет.</li>")

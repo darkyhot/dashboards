@@ -185,7 +185,8 @@ _SEG_INN = """
 PROBE_AMT_SCOPE = """
 WITH seg AS (""" + _SEG_INN + """),
 pairs AS (
-  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
+  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn,
+         p.sys_gosb_id AS gosb_id,
          sum(p.amt) AS amt,
          sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
                                             CAST(p.inn AS bigint)) AS amt_inn
@@ -194,7 +195,7 @@ pairs AS (
     AND p.{code_col} = ANY(:codes)
     AND p.epk_id IS NOT NULL
     AND """ + INN_OK + """
-  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
+  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.sys_gosb_id
 )
 SELECT x.report_dt,
        count(*) FILTER (WHERE x.amt_inn > :amt_min) AS n_scope_inn,
@@ -256,14 +257,25 @@ _T_SEG_ALL = """
 # предыдущий год назад. Последний нужен для проверки сезонности — она требует
 # СРАВНИТЬ поведение человека в двух парах месяцев, и по трём месяцам этого не
 # сделать.
+#
+# ПОДРАЗДЕЛЕНИЕ И ТБ БЕРУТСЯ СИСТЕМНЫМИ НОМЕРАМИ — `sys_gosb_id` и `sys_tb_id`, а
+# не `gosb_id` / `tb_id`. На проме «старые» колонки со справочником `uzp_dim_gosb`
+# не сходятся, и разрезы по ТБ и региону схлопывались в одну строку-заглушку: ни
+# ошибки, ни пустой таблицы, просто «ТБ неизвестен» со стопроцентной долей.
+# Системный номер — третий элемент ТРОЙКИ, поэтому смена ключа меняет и саму
+# численность получателей; старый номер едет рядом колонкой `gosb_id_legacy` —
+# он ни во что не считается, но разведка по нему показывает, какой из двух ключей
+# опознаётся справочником, и «не строится» перестаёт быть загадкой.
 _T_PAIRS = """
-  SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.tb_id, x.amt
+  SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.gosb_id_legacy,
+         x.tb_id, x.amt
   FROM (
     SELECT p.report_dt,
            p.epk_id,
            CAST(p.inn AS bigint) AS inn,
-           p.gosb_id,
-           min(p.tb_id)          AS tb_id,
+           p.sys_gosb_id         AS gosb_id,
+           min(p.sys_tb_id)      AS tb_id,
+           min(p.gosb_id)        AS gosb_id_legacy,
            sum(p.amt)            AS amt,
            sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
                                               CAST(p.inn AS bigint)) AS amt_inn
@@ -272,7 +284,7 @@ _T_PAIRS = """
       AND p.{code_col} = ANY(:codes)
       AND p.epk_id IS NOT NULL
       AND """ + INN_OK + """
-    GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
+    GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.sys_gosb_id
   ) x
   JOIN t_seg s ON s.inn = x.inn
   WHERE {amt_cond}
@@ -291,7 +303,7 @@ _T_SEEN = """
   SELECT p.report_dt,
          p.epk_id,
          CAST(p.inn AS bigint) AS inn,
-         p.gosb_id,
+         p.sys_gosb_id         AS gosb_id,
          sum(p.amt)            AS amt_all,
          sum(CASE WHEN p.{code_col} = ANY(:codes) THEN p.amt ELSE 0 END) AS amt_codes
   FROM {schema}.uzp_data_payroll_m p
@@ -299,7 +311,7 @@ _T_SEEN = """
   WHERE p.report_dt = ANY(CAST(:seen_months AS date[]))
     AND p.epk_id IS NOT NULL
     AND """ + INN_OK + """
-  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
+  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.sys_gosb_id
 """
 
 # Человек в ведомостях банка вообще — по месяцам.
@@ -579,6 +591,43 @@ GROUP BY p.{code_col}
 ORDER BY count(DISTINCT p.epk_id) DESC
 """
 
+# КТО ИМЕННО перешёл на каждый вид зачисления — топ-N организаций по коду.
+#
+# Таблица выше отвечает «что это за выплата» и молчит про «у кого». Строка
+# «пособие на детей — четыре тысячи человек» без организаций в действие не
+# превращается: непонятно, идти в одну школу или это ровный фон по сегменту.
+#
+# Популяция — ТА ЖЕ, что в LEFT_CODES, до последнего условия: разойдись они, и
+# доли внутри кода перестали бы складываться в его итог.
+#
+# Верхушка режется оконной функцией, а не отдельным запросом на каждый код:
+# row_number() считается ПОСЛЕ группировки, на ядре 9.4 это работает, а витрина
+# читается один раз. Второй ключ сортировки — номер организации: без него порядок
+# при равном числе людей меняется от прогона к прогону, и диффы отчётов врут.
+LEFT_CODES_INN = """
+WITH lost AS (""" + _LOST_EPK_BASE + """)
+SELECT x.code, x.code_name, x.inn, x.n_epk, x.amt
+FROM (
+  SELECT p.{code_col}                    AS code,
+         min(p.enrollment_transcription) AS code_name,
+         CAST(p.inn AS bigint)           AS inn,
+         count(DISTINCT p.epk_id)        AS n_epk,
+         sum(p.amt)                      AS amt,
+         row_number() OVER (PARTITION BY p.{code_col}
+                            ORDER BY count(DISTINCT p.epk_id) DESC,
+                                     CAST(p.inn AS bigint)) AS rn
+  FROM {schema}.uzp_data_payroll_m p
+  JOIN (SELECT epk_id FROM lost WHERE cause = 'other_codes') l ON l.epk_id = p.epk_id
+  JOIN t_seg s ON s.inn = CAST(p.inn AS bigint)
+  WHERE p.report_dt = CAST(:d_cur AS date)
+    AND NOT (p.{code_col} = ANY(:codes))
+    AND """ + INN_OK + """
+  GROUP BY p.{code_col}, CAST(p.inn AS bigint)
+) x
+WHERE x.rn <= :per_code
+ORDER BY x.n_epk DESC
+"""
+
 # ЗАРПЛАТНЫЕ КОДЫ по месяцам — только те, что входят в метрику.
 #
 # Отвечает на вопрос, который не виден ни в одной другой таблице: КАКОЙ ИМЕННО ВИД
@@ -661,7 +710,8 @@ SELECT * FROM t_seg
 # событие, плавное снижение — текучесть. По двум точкам года они неразличимы.
 MONTHLY = """
 WITH pairs AS (
-  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
+  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn,
+         p.sys_gosb_id AS gosb_id,
          sum(p.amt) AS amt,
          sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
                                             CAST(p.inn AS bigint)) AS amt_inn
@@ -671,7 +721,7 @@ WITH pairs AS (
     AND p.{code_col} = ANY(:codes)
     AND p.epk_id IS NOT NULL
     AND """ + INN_OK + """
-  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
+  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.sys_gosb_id
 )
 SELECT x.report_dt,
        count(*)                  AS n_triples,
@@ -703,7 +753,8 @@ WITH cohort AS (
   WHERE report_dt = CAST(:d_base AS date)
 ),
 pairs AS (
-  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
+  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn,
+         p.sys_gosb_id AS gosb_id,
          sum(p.amt) AS amt,
          sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
                                             CAST(p.inn AS bigint)) AS amt_inn
@@ -713,7 +764,7 @@ pairs AS (
     AND p.{code_col} = ANY(:codes)
     AND p.epk_id IS NOT NULL
     AND """ + INN_OK + """
-  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
+  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.sys_gosb_id
 )
 SELECT x.report_dt, count(*) AS n_alive, count(DISTINCT x.epk_id) AS n_epk_alive
 FROM pairs x JOIN cohort c ON c.epk_id = x.epk_id AND c.inn = x.inn
@@ -728,7 +779,8 @@ ORDER BY x.report_dt
 # пороге 0, порог ни при чём.
 THRESHOLD_SENS = """
 WITH pairs AS (
-  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn, p.gosb_id,
+  SELECT p.report_dt, p.epk_id, CAST(p.inn AS bigint) AS inn,
+         p.sys_gosb_id AS gosb_id,
          sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
                                             CAST(p.inn AS bigint)) AS amt_inn
   FROM {schema}.uzp_data_payroll_m p
@@ -736,7 +788,7 @@ WITH pairs AS (
     AND p.{code_col} = ANY(:codes)
     AND p.epk_id IS NOT NULL
     AND """ + INN_OK + """
-  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.gosb_id
+  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), p.sys_gosb_id
 )
 SELECT x.report_dt,
        count(*) FILTER (WHERE x.amt_inn > 0)     AS t0,
@@ -802,9 +854,10 @@ FROM lost l LEFT JOIN ten t ON t.epk_id = l.epk_id
 GROUP BY l.cause, 2
 """
 
-# Территория: ТБ берётся ПРЯМО ИЗ ВЕДОМОСТЕЙ, а не выводится через справочник
-# ГОСБ. На проме первый прогон показал, что gosb_id ведомостей со справочником не
-# сошёлся, и весь территориальный разрез схлопнулся в одну строку-заглушку.
+# Территория: ТБ берётся ПРЯМО ИЗ ВЕДОМОСТЕЙ (системным номером `sys_tb_id`, см.
+# _T_PAIRS), а не выводится через справочник ГОСБ. На проме подразделение
+# ведомостей со справочником не сходится, и разрез, построенный через ГОСБ,
+# схлопывался в одну строку-заглушку.
 TB_DIM = """
 SELECT d.tb_id, min(d.tb_short_name) AS tb_short_name
 FROM {schema}.uzp_dim_gosb d
@@ -825,14 +878,62 @@ GROUP BY d.old_gosb_id, d.new_gosb_id
 
 # Каким ключом справочника опознаётся ГОСБ ведомостей. Угадывать нельзя: ошибка
 # не видна по результату — разрез из одной строки легко принять за свойство данных.
+#
+# Сравниваются ЧЕТЫРЕ сочетания: номер ведомостей (системный `sys_gosb_id`, на
+# котором теперь стоит грейн, и старый `gosb_id`, который едет рядом только ради
+# этой проверки) против двух ключей справочника. Двух чисел было мало: когда
+# разрез не строился, из них нельзя было понять, дело в ключе справочника или в
+# самой колонке ведомостей.
+# Номера дедуплицируются В ВЫБОРКАХ, а не через count(DISTINCT ...): на ядре 9.4
+# несколько DISTINCT-агрегатов по РАЗНЫМ колонкам в одном запросе не считаются.
 GOSB_MATCH = """
-WITH used AS (SELECT DISTINCT gosb_id FROM t_pairs),
+WITH sys_used AS (
+  SELECT DISTINCT gosb_id AS id FROM t_pairs WHERE gosb_id IS NOT NULL
+),
+old_used AS (
+  SELECT DISTINCT gosb_id_legacy AS id FROM t_pairs WHERE gosb_id_legacy IS NOT NULL
+),
 dim AS (
   SELECT old_gosb_id, new_gosb_id FROM {schema}.uzp_dim_gosb
   WHERE """ + Q._NO_CA + """
+),
+sys_m AS (
+  SELECT count(*)                                                  AS n_used,
+         count(*) FILTER (WHERE u.id IN (SELECT old_gosb_id FROM dim)) AS n_old,
+         count(*) FILTER (WHERE u.id IN (SELECT new_gosb_id FROM dim)) AS n_new
+  FROM sys_used u
+),
+old_m AS (
+  SELECT count(*)                                                  AS n_used,
+         count(*) FILTER (WHERE u.id IN (SELECT old_gosb_id FROM dim)) AS n_old,
+         count(*) FILTER (WHERE u.id IN (SELECT new_gosb_id FROM dim)) AS n_new
+  FROM old_used u
 )
-SELECT count(*)                                                      AS n_used,
-       count(*) FILTER (WHERE u.gosb_id IN (SELECT old_gosb_id FROM dim)) AS n_old,
-       count(*) FILTER (WHERE u.gosb_id IN (SELECT new_gosb_id FROM dim)) AS n_new
-FROM used u
+SELECT s.n_used, s.n_old, s.n_new,
+       o.n_used AS n_used_legacy, o.n_old AS n_old_legacy, o.n_new AS n_new_legacy
+FROM sys_m s, old_m o
+"""
+
+# Опознаётся ли номер ТБ ведомостей справочником. Раньше этого вопроса не
+# задавали вовсе: ТБ считался колонкой, которая «заполнена всегда», и когда на
+# проме разрез схлопнулся в «ТБ неизвестен», в отчёте не было ни предупреждения,
+# ни числа, по которому это можно было бы заметить.
+TB_MATCH = """
+WITH used AS (SELECT DISTINCT tb_id FROM t_pairs WHERE tb_id IS NOT NULL),
+dim AS (
+  SELECT DISTINCT tb_id FROM {schema}.uzp_dim_gosb
+  WHERE """ + Q._NO_CA + """
+),
+m AS (
+  SELECT count(*)                                                  AS n_used,
+         count(*) FILTER (WHERE u.tb_id IN (SELECT tb_id FROM dim)) AS n_matched
+  FROM used u
+),
+r AS (
+  SELECT count(*)                                   AS n_rows,
+         count(*) FILTER (WHERE tb_id IS NULL)      AS n_null_rows
+  FROM t_pairs
+)
+SELECT m.n_used, m.n_matched, r.n_null_rows, r.n_rows
+FROM m, r
 """
