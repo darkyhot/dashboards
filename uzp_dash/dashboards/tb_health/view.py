@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 
 from ...registry import Context, dashboard
@@ -16,6 +18,38 @@ from ... import progress
 from . import analyze, bank, prompts, segments
 
 SEG_ORDER = segments.ORDER   # короткие названия сегментов (КСБ, РГС, …)
+
+# Оформление отчёта собрано пользователем и лежит рядом, в assets/:
+#   ux.css / ux.js — его стиль и скрипт, скопированы из его файла БАЙТ В БАЙТ. Скрипт
+#     перестраивает готовую страницу (боковая колонка, поля выбора ТБ/ГОСБ, сворачивание
+#     разделов) и ищет разделы по заголовкам — поэтому заголовки ниже совпадают с его
+#     SECTION_DESCRIPTIONS посимвольно. Руками эти файлы не причёсываем: новая версия
+#     дизайна заменяется простой перезаписью.
+#   help.* — памятка «Как пользоваться дэшбордом», всплывающее окно при открытии.
+_ASSETS = Path(__file__).with_name("assets")
+TITLE = "Прогноз портфеля, причины невыполнения"
+
+# Легенда под шапкой — из дизайна пользователя дословно
+_LEGEND = (
+    '<div class="legend">\n'
+    '<span class="lg-item"><span class="lg-dot good"></span><b>план выполняется</b></span>\n'
+    '<span class="lg-item"><span class="lg-dot warn"></span><b>план выполняется, но есть '
+    'слабый сегмент</b></span>\n'
+    '<span class="lg-item"><span class="lg-dot bad"></span><b>план не выполняется</b></span>\n'
+    '<span class="lg-item"><span class="lg-arrow">→</span>карточка кликабельна — открывает '
+    'подробный разбор</span>\n'
+    '<span class="lg-item"><span class="lg-arrow" style="border-radius:50%">▸</span>'
+    'раскрывающийся список — клик показывает организации</span>\n'
+    '</div>\n'
+)
+
+
+def _asset(name: str) -> str:
+    """Файл оформления как есть. newline="" — чтобы копия не отличалась от оригинала."""
+    # open(), а не Path.read_text(newline=...): аргумент newline у read_text появился
+    # только в Python 3.13, а на DataLab стоит версия старше
+    with open(_ASSETS / name, encoding="utf-8", newline="") as f:
+        return f.read()
 
 
 @dashboard("tb_health")
@@ -79,9 +113,14 @@ def build(ctx: Context) -> str:
         for i, (a, story) in enumerate(levels))
     d = sb.dates or {}
     return page(
-        title="Здоровье сети — СБ и территориальные банки",
+        title=TITLE,
         subtitle=f"Прогноз на {C.esc(d.get('label', sb.ref_date))}",
-        body=_tabs([a for a, _ in levels]) + bodies + _GD_JS + _LVL_JS,
+        body=_LEGEND + _tabs([a for a, _ in levels]) + bodies + _GD_JS + _LVL_JS,
+        css=_asset("ux.css") + _asset("help.css"),
+        # скрипт дизайна — ПОСЛЕ .wrap: он переносит её содержимое в новую раскладку и
+        # оборачивает gdOpen, поэтому идёт после всех остальных скриптов
+        tail=(f'<script>{_asset("ux.js")}</script>\n'
+              f'{_asset("help.html")}<script>\n{_asset("help.js")}</script>'),
     )
 
 
@@ -100,7 +139,7 @@ def _level_body(a: analyze.Analysis, story: dict, idx: int) -> str:
     `idx` уходит в id элементов: в одном документе живут 13 отчётов, и повторяющийся
     id сломал бы и оверлеи, и списки организаций (по id их находит скрипт).
     """
-    back = ('<div class="lvl-back"><button onclick="lvlGo(0)">← К отчёту по банку</button>'
+    back = ('<div class="lvl-back"><button onclick="lvlGo(0)">← Главный экран</button>'
             f'<span>{C.esc(a.tb_full)}</span></div>' if idx else "")
     body = (
         back
@@ -133,9 +172,9 @@ def _hero(a: analyze.Analysis) -> str:
                   else f'ранг ТБ {r["rank"]}/{r["n_tb"]} за закрытый месяц '
                        f'{C.esc(d.get("closed_label", ""))}')
     inner = (
-        f'<div class="eyebrow">Прогноз по получателям на {C.esc(d.get("label", ""))}</div>'
+        f'<div class="eyebrow">Прогноз выполнения на {C.esc(d.get("label", ""))}</div>'
         f'<div class="verdict">{C.esc(word)} · '
-        f'<span class="big">{(r["exec"] or 0)*100:.0f}%</span> плана по прогнозу</div>'
+        f'<span class="big">{(r["exec"] or 0)*100:.0f}%</span></div>'
         f'<div>{C.badge("−" + C.fmt_num(a.gap_rcp) + " получателей до плана", st)}</div>'
         + C.meter(r["exec"])
         + f'<div class="row2">ФОТ: {(a.verdict["fot"]["exec"] or 0)*100:.0f}% плана · '
@@ -267,7 +306,7 @@ def _portfolio_block(a: analyze.Analysis, ai: str | None = None) -> str:
                      C.card('<h3>Портфель, потери и приход</h3>' + note + body
                             + total + upside)
                      + _ai(ai),
-                     eyebrow="Факт")
+                     eyebrow="Справочно")
 
 
 def _matrix(a: analyze.Analysis, ai: str | None = None) -> str:
@@ -287,16 +326,15 @@ def _matrix(a: analyze.Analysis, ai: str | None = None) -> str:
              for row in m.itertuples()}
     heat = C.card(
         '<h3>Прогноз выполнения плана по получателям, %</h3>'
-        '<p class="sub" style="font-size:14px;margin:-4px 0 12px">'
-        'красное — сильнее отстаёт от плана ТЕКУЩЕГО месяца по прогнозу</p>'
         + C.heat_matrix(rows_id_label, segs, cells))
     top = [(f'{r.unit_name} · {r.seg_name}',
             C.badge(f'{r.execution_percent*100:.0f}%', C.status_of(r.execution_percent)),
             C.fmt_num(r.nedobor), f'{r.share*100:.0f}%') for r in a.top_cells.itertuples()]
-    top_tbl = C.card('<h3>Наибольший вклад в недобор</h3>'
-                     + C.table(["Провальная зона", "Выполн.", "Недобор, чел", "Доля разрыва"],
+    # «ГОСБхСегмент» — и на уровне банка тоже: так в дизайне пользователя
+    top_tbl = C.card(f'<h3>ТОП {a.unit_label} по невыполнению</h3>'
+                     + C.table(["ГОСБхСегмент", "Выполн.", "Недобор, чел", "Доля разрыва"],
                                top, num_cols=[2, 3]))
-    return C.section(f"Где провал — {a.unit_label} × сегмент",
+    return C.section(f"Матрица выполнения {a.unit_label}/сегмент",
                      f'<div class="grid cols-2">{heat}{top_tbl}</div>' + _ai(ai),
                      eyebrow="Диагностика по прогнозу")
 
@@ -640,8 +678,8 @@ def _problem_gosb(a: analyze.Analysis, ai: str | None = None, idx: int = 0) -> s
         if det:
             dialogs.append(_gosb_dialog(c, det, d, uid, unit))
     grid = f'<div class="gcards">{"".join(cards)}</div>{"".join(dialogs)}'
-    return C.section(f"{unit} — что сделать по каждому", grid + _ai(ai),
-                     eyebrow=f"Все {unit} · клик открывает разбор прогноза")
+    return C.section(f"Детализация по {unit}", grid + _ai(ai),
+                     eyebrow=f"Детализация по {unit} · клик открывает разбор до организаций")
 
 
 # Открытие/закрытие оверлея. Нативный <dialog>: Esc работает сам, фокус
@@ -765,8 +803,8 @@ def _orgs(a: analyze.Analysis, ai: str | None = None, idx: int = 0) -> str:
             f'({C.esc(", ".join(bad_segs)) or "—"}), по величине эффекта, пока разрыв '
             f'сегмента не закрыт · переключатель «Цель» задаёт перевыполнение · '
             f'{cand}{hold}</p>')
-    return C.section("Организации к работе", C.card(head + explorer) + _ai(ai),
-                     eyebrow="Список к отработке")
+    return C.section("Потенциал организаций", C.card(head + explorer) + _ai(ai),
+                     eyebrow="Потенциал организаций")
 
 
 def _log_llm_stats(a: analyze.Analysis) -> None:
