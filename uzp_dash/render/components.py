@@ -94,16 +94,10 @@ def heat_bg(exec_pct: float | None) -> str:
     return f"color-mix(in srgb, var(--bad) {int(46*(1-x))+8}%, transparent)"
 
 
-def heat_matrix(rows_id_label: list[tuple], seg_names: list[str], cells: dict,
-                first_col: str = "Отделение") -> str:
-    """Тепловая карта «единица × сегмент».
-
-    rows_id_label — [(row_key, label), ...]; cells[(row_key, seg)] = (exec, nedobor).
-    Заголовок первой колонки задаётся: на экране банка строки — это банки, на экране
-    банка — отделения, и подпись «ГОСБ» на верхнем уровне была бы неправдой.
-    """
-    head = (f'<th>{esc(first_col)}</th>'
-            + "".join(f'<th class="num">{esc(s)}</th>' for s in seg_names))
+def heat_matrix(rows_id_label: list[tuple], seg_names: list[str], cells: dict) -> str:
+    """Тепловая карта ГОСБ×сегмент.
+    rows_id_label — [(row_key, label), ...]; cells[(row_key, seg)] = (exec, nedobor)."""
+    head = '<th>ГОСБ</th>' + "".join(f'<th class="num">{esc(s)}</th>' for s in seg_names)
     rows = []
     for key, label in rows_id_label:
         tds = [f'<td>{esc(label)}</td>']
@@ -118,7 +112,7 @@ def heat_matrix(rows_id_label: list[tuple], seg_names: list[str], cells: dict,
                 # выполненной, хотя план недобран (и в карточке ГОСБ она красная)
                 pct = f"{ex*100:.1f}%" if 0.995 <= ex < 1 else f"{ex*100:.0f}%"
                 tds.append(
-                    f'<td class="num heat" style="background:{bg}" title="не хватает {ned:.0f} чел">'
+                    f'<td class="num heat" style="background:{bg}" title="недобор {ned:.0f}">'
                     f'{pct}</td>'
                 )
         rows.append(f'<tr>{"".join(tds)}</tr>')
@@ -126,130 +120,50 @@ def heat_matrix(rows_id_label: list[tuple], seg_names: list[str], cells: dict,
             f'<thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>')
 
 
-def crumbs(items: list[tuple[str, str | None]]) -> str:
-    """Путь «Банк › ЮЗБ»: где читатель сейчас и как вернуться выше.
+def projection_bar(attract: float, retention: float, gap: float) -> str:
+    """Как закрывается НЕДОБОР (масштаб = разрыв до плана, не весь план).
+    Подписи — в легенде под полосой (сегменты бывают узкими)."""
+    attract = max(0.0, attract); retention = max(0.0, retention); gap = max(gap, 1.0)
+    covered = attract + retention
+    scale = max(gap, covered)
+    def w(x): return f"{x / scale * 100:.2f}%"
 
-    Элемент с ссылкой (второй элемент кортежа — JS-переход) кликабелен, последний
-    без ссылки — текущее место. Заменяет прежний ряд вкладок: вкладки показывали
-    список уровней, но не показывали, что уровни вложены друг в друга.
-    """
-    out = []
-    for i, (label, go) in enumerate(items):
-        if i:
-            out.append('<span class="crumb-sep">›</span>')
-        if go:
-            out.append(f'<button class="crumb" onclick="{go}">{esc(label)}</button>')
-        else:
-            out.append(f'<span class="crumb on">{esc(label)}</span>')
-    return f'<nav class="crumbs">{"".join(out)}</nav>'
-
-
-def slide(sid: str, question: str, body: str, hint: str = "",
-          foot: str = "", cls: str = "") -> str:
-    """Слайд — РОВНО один экран: шапка, прокручиваемое тело, подвал с кнопками.
-
-    Высоту задаёт CSS (100vh + scroll-snap), поэтому здесь важна только структура:
-    заголовок-вопрос и подвал закреплены, прокручивается только `.slide-body`.
-    Иначе длинный разбор отделения растянул бы слайд и сломал листание.
-
-    `sid` — якорь: по нему кнопки рейтинга листают к нужному слайду.
-    """
-    h = f'<p class="slide-hint">{hint}</p>' if hint else ""
-    f = f'<div class="slide-foot">{foot}</div>' if foot else ""
-    return (f'<section class="slide {esc(cls)}" id="{esc(sid)}">'
-            f'<div class="slide-head"><h2 class="slide-q">{esc(question)}</h2>{h}</div>'
-            f'<div class="slide-body">{body}</div>{f}</section>')
-
-
-def big_stat(value: str, kind: str, caption: str, sub: str = "") -> str:
-    """Одно главное число слайда: крупно, цветом статуса, с фразой под ним.
-
-    Цвет никогда не единственный носитель смысла — рядом всегда стоит слово
-    («выполняется» / «не выполняется»), иначе на печати и при дальтонизме
-    показатель нечитаем.
-    """
-    color = {"good": "var(--good)", "warn": "var(--warn)", "bad": "var(--bad)"}.get(
-        kind, "var(--text)")
-    sub_html = f'<div class="stat-sub">{sub}</div>' if sub else ""
-    return (f'<div class="stat"><div class="stat-v" style="color:{color}">{value}</div>'
-            f'<div class="stat-c">{caption}</div>{sub_html}</div>')
-
-
-def hero_pair(left: dict, right: dict) -> str:
-    """Два ГЛАВНЫХ числа экрана одного кегля: процент плана и сколько не хватает.
-
-    Раньше «не хватает» стояло мелкой подписью под процентом, и руководитель видел
-    только процент. Это два ответа на один вопрос: «насколько» и «сколько людей», и
-    по важности они равны — значит и по размеру тоже.
-
-    Каждый элемент: {value, kind, caption, sub}.
-    """
-    def one(d):
-        color = {"good": "var(--good)", "warn": "var(--warn)",
-                 "bad": "var(--bad)"}.get(d.get("kind", ""), "var(--text)")
-        sub = f'<div class="hero-sub">{d["sub"]}</div>' if d.get("sub") else ""
-        return (f'<div class="hero-one">'
-                f'<div class="hero-v" style="color:{color}">{d["value"]}</div>'
-                f'<div class="hero-c">{d["caption"]}</div>{sub}</div>')
-    return f'<div class="hero2">{one(left)}{one(right)}</div>'
-
-
-def dots(items: list[tuple[str, str]]) -> str:
-    """Точки-индикатор справа: сколько всего слайдов и где читатель сейчас.
-
-    Заодно оглавление: клик листает к слайду, подпись всплывает при наведении.
-    Без индикатора при жёстком листании непонятно, кончилась ли колода.
-    """
-    li = "".join(f'<button class="dot" data-for="{esc(sid)}" title="{esc(title)}" '
-                 f'onclick="slideGo(\'{esc(sid)}\')"><i></i></button>'
-                 for sid, title in items)
-    return f'<nav class="dots">{li}</nav>'
-
-
-def stat_row(items: list[dict]) -> str:
-    """Несколько равнозначных чисел в ряд: {value, caption, sub, kind}.
-
-    Ряд, а не таблица: числа независимы друг от друга, и таблица навязала бы им
-    несуществующую арифметику (сложить их нельзя — см. блок портфеля).
-    """
-    cells = "".join(
-        big_stat(i["value"], i.get("kind", ""), i.get("caption", ""), i.get("sub", ""))
-        for i in items)
-    return f'<div class="stats">{cells}</div>'
-
-
-def rank_row(name: str, sub: str, pct: float | None, kind: str, right: str,
-             action: str = "") -> str:
-    """Строка рейтинга единиц: имя · полоса · процент · чего не хватает · действие.
-
-    Рейтинг, а не сетка карточек: руководителю нужен порядок «кто хуже», а сетка
-    заставляет сравнивать карточки глазами. Порядок строк задаёт вызывающий.
-    """
-    color = {"good": "var(--good)", "warn": "var(--warn)", "bad": "var(--bad)"}.get(
-        kind, "var(--text-2)")
-    w = 0 if pct is None else max(0.0, min(pct, 1.2)) * 100 / 1.2
-    p = "—" if pct is None else f"{pct * 100:.0f}%"
-    return (
-        f'<div class="rk-name">{esc(name)}'
-        + (f'<span class="rk-sub">{esc(sub)}</span>' if sub else "") + '</div>'
-        f'<div class="rk-bar"><span style="width:{w:.1f}%;background:{color}"></span></div>'
-        f'<div class="rk-pct" style="color:{color}">{p}</div>'
-        f'<div class="rk-right">{right}</div>'
-        f'<div class="rk-act">{action}</div>'
+    segs = (f'<div class="proj-seg attract" style="width:{w(attract)}" title="Привлечь"></div>'
+            f'<div class="proj-seg retention" style="width:{w(retention)}" title="Вернуть"></div>')
+    legend = [("attract", "Привлечь", attract), ("retention", "Вернуть", retention)]
+    if covered < gap:                    # разрыв закрыт не полностью
+        segs += f'<div class="proj-seg rest" style="width:{w(gap-covered)}"></div>'
+        legend.append(("rest", "не хватает", gap - covered))
+        tail = ""
+    else:                                # закрыт с запасом
+        tail = f' · с запасом +{fmt_num(covered - gap)}'
+    plan_pos = f"{gap / scale * 100:.2f}%"
+    leg_html = "".join(
+        f'<span class="lg"><i class="{cls}"></i>{esc(name)} <b>+{fmt_num(val)}</b></span>'
+        if cls != "rest" else
+        f'<span class="lg"><i class="{cls}"></i>{esc(name)} <b>{fmt_num(val)}</b></span>'
+        for cls, name, val in legend
     )
+    return (f'<div class="proj">{segs}'
+            f'<div class="proj-plan" style="left:{plan_pos}"><span>план</span></div></div>'
+            f'<div class="proj-legend">{leg_html}<span class="lg-note">масштаб = недобор {fmt_num(gap)} чел{tail}</span></div>')
 
 
-def disclosure(summary: str, body: str, label: str = "Показать разбор",
-               cls: str = "") -> str:
-    """Раскрывающийся блок, о котором видно, что он раскрывается.
-
-    Нативный `<details>`: работает без JS, раскрывается при печати, доступен с
-    клавиатуры. Подпись со стрелкой обязательна и меняется на «Скрыть» —
-    треугольник сам по себе замечают не все.
-    """
-    return (f'<details class="disc {esc(cls)}"><summary>{summary}'
-            f'<span class="disc-tog" data-open="Скрыть разбор">{esc(label)}</span>'
-            f'</summary><div class="disc-body">{body}</div></details>')
+def hbars(items: list[tuple[str, float]], unit: str = "") -> str:
+    """Мини горизонтальные полоски (напр. активности по типу/статусу)."""
+    if not items:
+        return '<div class="sub" style="font-size:14px">нет данных</div>'
+    mx = max((v for _, v in items), default=1) or 1
+    rows = []
+    for label, val in items:
+        rows.append(
+            '<div class="hbar">'
+            f'<div class="hbar-l">{esc(label)}</div>'
+            f'<div class="hbar-track"><span style="width:{val/mx*100:.1f}%"></span></div>'
+            f'<div class="hbar-v">{fmt_num(val, unit)}</div>'
+            '</div>'
+        )
+    return "".join(rows)
 
 
 def narrative_html(text: str) -> str:
@@ -399,7 +313,7 @@ def orgs_explorer(table_id: str, rows: list[dict], gosb_options: list[str],
       const cls=r.lever==='Привлечь'?'good':'bad';
       const act=r.action?' · <span style="color:var(--text-2)">'+esc(r.action)+'</span>':'';
       return '<tr><td><div>'+esc(r.company||('Орг. '+r.inn))+'</div>'
-        +'<div style="font-size:15px;color:var(--text-2)">Орг. '+r.inn+'</div></td>'
+        +'<div style="font-size:12px;color:var(--text-2)">Орг. '+r.inn+'</div></td>'
         +'<td><span class="badge '+cls+'">'+r.lever+'</span></td>'
         +'<td>'+esc(r.gosb)+'</td><td>'+esc(r.emp||'—')+'</td><td>'+esc(r.seg)+'</td>'
         +'<td class="num">'+fmt(r.fl)+'</td><td class="num">'+fmt(r.fot)+'</td>'
