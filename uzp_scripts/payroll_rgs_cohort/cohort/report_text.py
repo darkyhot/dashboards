@@ -550,7 +550,7 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
 заметить заранее.
 
 {_table(why.get('pat'), ['pattern', 'n_epk', 'share', 'ratio'],
-        ['Как', 'Человек', 'Доля', 'Последние месяцы к прежним'])}
+        ['Как', 'Человек', 'Доля', 'Последние месяцы к прежним (в среднем)'])}
 ### В каком месяце уходили
 
 {_table(why.get('gone_m'), ['gone_month', 'n_epk', 'share'],

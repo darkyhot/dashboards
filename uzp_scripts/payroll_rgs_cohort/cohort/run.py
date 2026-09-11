@@ -201,16 +201,16 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
             gosb_key = probe.pick_gosb_key(fetch.gosb_match(ws), pr)
             probe.check_tb(fetch.tb_match(ws), pr)
             # --- почему ушли: поверх рабочего набора, без новых сканов витрины ---
-            dest_raw = fetch.stayed_dest(ws, d_base)
+            dest_raw = fetch.stayed_dest(ws, d_base, gosb_key)
             org_raw = fetch.org_status(ws, d_base)
             pay_raw = fetch.pay_level(ws, d_base, int(opts["pay_min_org"]))
-            lso_raw = fetch.left_segment_orgs(ws, d_base)
+            lso_raw = fetch.left_segment_orgs(ws, d_base, int(opts["top_orgs"]))
             below_raw = fetch.below_depth(ws, d_base)
             ten_raw = (fetch.tenure(ws, d_base, d_from)
                        if opts["with_tenure"] else pd.DataFrame())
             # Самый дорогой запрос блока «почему» — последним: если он не уложится
             # в таймаут, всё остальное уже выгружено.
-            exit_raw = (fetch.exit_pattern(ws, d_base, d_pre)
+            exit_raw = (fetch.exit_pattern(ws, d_base, d_pre, float(opts["exit_drop"]))
                         if opts["with_exit_pattern"] else pd.DataFrame())
             shown = dict(ws.shown)
         finally:
@@ -255,7 +255,7 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
 
     dims = ["holding_name", "agency", "level", "industry_name", "tb_short_name",
             "region_name"]
-    split = A.stayed_split(dest_raw, marked, gosb, gosb_key)
+    split = A.stayed_split(dest_raw, marked)
     cuts = {dim: A.by_dim(marked, dim, int(opts["top_n"]), split.get(dim))
             for dim in dims}
     cuts = {k: v for k, v in cuts.items() if v is not None and not v.empty}
@@ -264,13 +264,13 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
     org_sum, org_agr, org_top, org_meta = A.org_exit(
         org_raw, lost_inn, attrs, int(opts["org_min_base"]),
         float(opts["org_mass_share"]), int(opts["top_orgs"]))
-    pat, gone_m = A.exit_pattern(exit_raw, float(opts["exit_drop"]))
+    pat, gone_m = A.exit_pattern(exit_raw)
     why = {"org_sum": org_sum, "org_agr": org_agr, "org_top": org_top,
            "org_meta": org_meta, "pat": pat, "gone_m": gone_m,
            "pay": A.pay_level(pay_raw)}
-    lso, lso_meta = A.left_segment_orgs(lso_raw, int(opts["top_orgs"]))
+    lso, lso_meta = A.left_segment_orgs(lso_raw)
     gone_x = {"lso": lso, "lso_meta": lso_meta,
-              "below": A.below_depth(below_raw, LQ.AMT_MIN)}
+              "below": A.below_depth(below_raw)}
 
     progress.done(
         f"получателей {t['d_triples']:+,.0f}, людей {t['d_epk']:+,.0f}; "

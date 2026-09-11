@@ -928,17 +928,14 @@ def cut_columns(dim: str, df: pd.DataFrame) -> list[tuple[str, str]]:
 SPLIT_DIMS = ("tb_short_name", "holding_name", "region_name")
 
 
-def stayed_split(dest: pd.DataFrame, marked: pd.DataFrame, gosb: pd.DataFrame,
-                 gosb_key: str | None) -> dict[str, pd.DataFrame]:
+def stayed_split(dest: pd.DataFrame, marked: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """Оставшиеся в сегменте: сколько осталось В ТОЙ ЖЕ строке разреза.
 
-    Правила «той же строки»:
-    * ТБ — номер ТБ новой тройки тот же, что у потерянной;
-    * холдинг — тот же холдинг; у организации БЕЗ холдинга «тот же» значит
-      «та же организация»: строка «Холдинг не указан» собирает несвязанные
-      организации, и переход между ними переходом «внутри холдинга» не является;
-    * регион — регион подразделения новой тройки тот же (только если справочник
-      подразделений опознан; иначе разбивки по регионам нет).
+    `dest` приходит свёрнутым до организации (`STAYED_DEST`): число оставшихся
+    и сколько из них в том же ТБ, холдинге и регионе. Признаки считает SQL — на
+    проме направлений переходов больше лимита выборки. Правила «той же строки» —
+    в комментарии к запросу; регион есть, только если справочник подразделений
+    опознан.
 
     Строка разреза, к которой относится организация, — та же, что в `marked`
     (там ТБ — один на организацию и причину). Доля «той же строки» считается по
@@ -949,43 +946,24 @@ def stayed_split(dest: pd.DataFrame, marked: pd.DataFrame, gosb: pd.DataFrame,
     if dest is None or dest.empty or marked is None or marked.empty:
         return out
     d = dest.copy()
-    for c in ("inn", "gosb_from", "gosb_to", "tb_from", "tb_to"):
-        if c in d:
-            d[c] = _key(d[c])
-    w = _num(d, "n_triples")
-
+    d["inn"] = _key(d["inn"])
+    d = d.groupby("inn").sum(numeric_only=True)
     st = marked[marked["cause"] == STAYED].copy()
     if st.empty:
         return out
     st["inn"] = _key(st["inn"])
     st = st.drop_duplicates("inn").set_index("inn")
-
-    same: dict[str, pd.Series] = {}
-    same["tb_short_name"] = w.where((d["tb_from"] == d["tb_to"]).fillna(False), 0.0)
-    if "holding_name" in st:
-        no_holding = d["inn"].map(st["holding_name"].eq(FILL["holding_name"]))
-        no_holding = no_holding.fillna(True).astype(bool)
-        same["holding_name"] = pd.Series(
-            np.where(no_holding, _num(d, "n_same_inn"), _num(d, "n_same_holding")),
-            index=d.index)
-    if gosb_key and gosb is not None and not gosb.empty and gosb_key in gosb:
-        g = gosb.dropna(subset=[gosb_key]).copy()
-        g[gosb_key] = _key(g[gosb_key])
-        reg = g.drop_duplicates(gosb_key).set_index(gosb_key)["region_name"]
-        r_from, r_to = d["gosb_from"].map(reg), d["gosb_to"].map(reg)
-        same["region_name"] = w.where((r_from.notna() & (r_from == r_to)), 0.0)
-
-    tot = w.groupby(d["inn"]).sum()
-    for dim, sw in same.items():
-        if dim not in st:
+    tot = _num(d, "n_triples").replace(0, np.nan)
+    for dim, col in (("tb_short_name", "n_same_tb"), ("holding_name", "n_same_holding"),
+                     ("region_name", "n_same_region")):
+        if col not in d or dim not in st:
             continue
-        frac = (sw.groupby(d["inn"]).sum() / tot.replace(0, np.nan)).fillna(0.0).clip(0.0, 1.0)
+        frac = (_num(d, col) / tot).fillna(0.0).clip(0.0, 1.0)
         per_inn = (_num(st.reset_index(), "n_triples").to_numpy()
                    * frac.reindex(st.index).fillna(0.0).to_numpy())
         out[dim] = (pd.DataFrame({dim: st[dim].to_numpy(), "inside_same": per_inn})
                     .groupby(dim, as_index=False)["inside_same"].sum())
     return out
-
 
 # --------------------------------------------------------------------------- #
 # Почему ушли
@@ -1106,17 +1084,20 @@ PAT_AMT = "Постепенно: суммы падали"
 PAT_QTY = "Постепенно: зачислений становилось меньше"
 PAT_SHORT = "Слишком короткая история"
 PAT_ORDER = [PAT_ABRUPT, PAT_AMT, PAT_QTY, PAT_SHORT]
+# Коды, которыми шаблон приходит из SQL, — в названия.
+PAT_CODES = {"abrupt": PAT_ABRUPT, "amt": PAT_AMT, "qty": PAT_QTY, "short": PAT_SHORT}
 
 
-def exit_pattern(df: pd.DataFrame, drop: float = 0.7) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Как уходили из банка: обрывом или постепенно.
+def exit_pattern(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Как уходили из банка: обрывом или постепенно — из готовой свёртки SQL.
 
-    Сравниваются два последних активных месяца с тремя до них. Сумма упала
-    больше чем на 1 − `drop` — человек частично уводил зарплату (аванс в одном
-    банке, зарплата в другом) или сокращал ставку и только потом ушёл: такого
-    клиента можно было заметить и удержать. Сумма ровная, но зачислений меньше —
-    часть выплат уже шла в другой банк. Всё ровно — обрыв: увольнение или
-    разовый перевод зарплаты целиком.
+    Разметку делает `EXIT_PATTERN` (на проме ушедших полтора миллиона, строка на
+    человека не проходит лимит): два последних активных месяца против трёх до
+    них. Сумма упала ниже `exit_drop` от прежней — человек частично уводил
+    зарплату (аванс в одном банке, зарплата в другом) или сокращал ставку и
+    только потом ушёл: такого клиента можно было заметить и удержать. Сумма
+    ровная, но зачислений меньше — часть выплат уже шла в другой банк. Всё
+    ровно — обрыв: увольнение или разовый перевод зарплаты целиком.
 
     Второй кадр — месяц ухода (следующий за последним активным): всплеск в одном
     месяце — событие организации, ровный фон — текучесть людей.
@@ -1124,17 +1105,14 @@ def exit_pattern(df: pd.DataFrame, drop: float = 0.7) -> tuple[pd.DataFrame, pd.
     if df is None or df.empty:
         return pd.DataFrame(), pd.DataFrame()
     d = df.copy()
-    for c in ("amt_last", "amt_prev", "qty_last", "qty_prev"):
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    short = d["amt_prev"].isna() | (d["amt_prev"] <= 0)
-    amt_drop = d["amt_last"] < drop * d["amt_prev"]
-    qty_drop = d["qty_last"] < drop * d["qty_prev"]
-    d["pattern"] = np.select([short, amt_drop, qty_drop], [PAT_SHORT, PAT_AMT, PAT_QTY],
-                             default=PAT_ABRUPT)
-    d["ratio"] = d["amt_last"] / d["amt_prev"]
-    total = float(len(d)) or 1.0
+    d["n_epk"] = _num(d, "n_epk")
+    d["sum_ratio"] = _num(d, "sum_ratio").fillna(0.0)
+    d["n_ratio"] = _num(d, "n_ratio").fillna(0.0)
+    d["pattern"] = d["pattern"].map(PAT_CODES).fillna(d["pattern"])
+    total = float(d["n_epk"].sum()) or 1.0
     g = d.groupby("pattern")
-    pat = pd.DataFrame({"n_epk": g.size().astype(float), "ratio": g["ratio"].median()})
+    pat = pd.DataFrame({"n_epk": g["n_epk"].sum(),
+                        "ratio": g["sum_ratio"].sum() / g["n_ratio"].sum().replace(0, np.nan)})
     pat["share"] = pat["n_epk"] / total
     pat = pat.reindex([p for p in PAT_ORDER if p in pat.index])
     pat.index.name = "pattern"
@@ -1142,10 +1120,9 @@ def exit_pattern(df: pd.DataFrame, drop: float = 0.7) -> tuple[pd.DataFrame, pd.
 
     last = pd.to_datetime(d["last_dt"], errors="coerce")
     d["gone_month"] = (last + pd.offsets.MonthEnd(1)).dt.normalize()
-    mon = d.groupby("gone_month").size().rename("n_epk").astype(float).reset_index()
+    mon = d.groupby("gone_month")["n_epk"].sum().reset_index()
     mon["share"] = mon["n_epk"] / total
     return pat, mon.sort_values("gone_month").reset_index(drop=True)
-
 
 PAY_BUCKETS = {1: "меньше 0,5 средней", 2: "0,5–0,8 средней", 3: "0,8–1,2 средней",
                4: "1,2–2 средних", 5: "больше 2 средних"}
@@ -1185,13 +1162,15 @@ def pay_level(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def left_segment_orgs(df: pd.DataFrame, top_n: int = 15) -> tuple[pd.DataFrame, dict]:
+def left_segment_orgs(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """В какие организации ушли те, кто ушёл в другой сегмент.
 
-    Итоги отвечают на вопрос «событие или фон»: высокая доля десяти крупнейших
-    приёмников — людей забирают конкретные организации, с ними и надо работать;
-    низкая — обычная смена работы. Доля «то же подразделение» — остался ли
-    человек в том же городе: переезд работодателя против переезда человека.
+    Приходит уже топ приёмников, а итоги — колонками, посчитанными в SQL по ВСЕМ
+    приёмникам: их на проме может быть больше лимита выборки. Итоги отвечают на
+    вопрос «событие или фон»: высокая доля десяти крупнейших — людей забирают
+    конкретные организации, с ними и надо работать; низкая — обычная смена
+    работы. Доля «то же подразделение» — остался ли человек в том же городе:
+    переезд работодателя против переезда человека.
     """
     if df is None or df.empty:
         return pd.DataFrame(), {}
@@ -1199,47 +1178,43 @@ def left_segment_orgs(df: pd.DataFrame, top_n: int = 15) -> tuple[pd.DataFrame, 
     d["inn"] = _key(d["inn"])
     d["n_epk"] = _num(d, "n_epk")
     d["n_same_gosb"] = _num(d, "n_same_gosb")
-    total = float(d["n_epk"].sum()) or 1.0
-    d = d.sort_values(["n_epk", "inn"], ascending=[False, True]).reset_index(drop=True)
+    total = float(_num(d, "total").iloc[0]) or 1.0
     d["share"] = d["n_epk"] / total
     d["same_gosb_share"] = d["n_same_gosb"] / d["n_epk"].replace(0, np.nan)
-    meta = {"total": total, "n_orgs": int(len(d)),
-            "top10_share": float(d["n_epk"].head(10).sum()) / total,
-            "same_gosb_share": float(d["n_same_gosb"].sum()) / total}
-    return d.head(top_n), meta
-
+    meta = {"total": total, "n_orgs": int(_num(d, "n_orgs").iloc[0]),
+            "top10_share": float(_num(d, "top10").iloc[0]) / total,
+            "same_gosb_share": float(_num(d, "total_same_gosb").iloc[0]) / total}
+    keep = ["inn", "segment_name", "company_name", "industry_name", "n_epk",
+            "n_same_gosb", "share", "same_gosb_share"]
+    return (d.sort_values(["n_epk", "inn"], ascending=[False, True])
+            [[c for c in keep if c in d]].reset_index(drop=True)), meta
 
 DEPTH_LEVEL = ["80–100% порога", "40–80% порога", "меньше 40% порога"]
 DEPTH_CHANGE = ["почти не изменилась (≥ 80% прежней)", "упала на 20–50%",
                 "упала больше чем вдвое"]
 
 
-def below_depth(df: pd.DataFrame, amt_min: float) -> pd.DataFrame:
+def below_depth(df: pd.DataFrame) -> pd.DataFrame:
     """Насколько ниже порога — по уровню и по изменению к базовому месяцу.
 
-    «80–100% порога» вместе с «почти не изменилась» — артефакт порога: зарплата
-    была чуть выше и стала чуть ниже, человек никуда не делся. «Упала больше чем
-    вдвое» — неполная ставка, простой, частичная выплата.
+    Диапазоны считает `BELOW_DEPTH` (коды 1–3 по каждой оси), здесь только
+    подписи и доли. «80–100% порога» вместе с «почти не изменилась» — артефакт
+    порога: зарплата была чуть выше и стала чуть ниже, человек никуда не делся.
+    «Упала больше чем вдвое» — неполная ставка, простой, частичная выплата.
     """
     if df is None or df.empty:
         return pd.DataFrame()
     d = df.copy()
-    base = pd.to_numeric(d["amt_base"], errors="coerce")
-    cur = pd.to_numeric(d["amt_cur"], errors="coerce").fillna(0.0)
-    lvl = cur / float(amt_min or 1)
-    d["level"] = np.select([lvl >= 0.8, lvl >= 0.4], DEPTH_LEVEL[:2], default=DEPTH_LEVEL[2])
-    ch = cur / base.replace(0, np.nan)
-    d["change"] = np.select([ch >= 0.8, ch >= 0.5], DEPTH_CHANGE[:2], default=DEPTH_CHANGE[2])
-    total = float(len(d)) or 1.0
+    d["n_epk"] = _num(d, "n_epk")
+    total = float(d["n_epk"].sum()) or 1.0
     rows = []
-    for axis, col, order in (("Уровень", "level", DEPTH_LEVEL),
-                             ("Изменение", "change", DEPTH_CHANGE)):
-        cnt = d[col].value_counts()
-        for b in order:
-            n = float(cnt.get(b, 0))
+    for axis, col, order in (("Уровень", "lvl", DEPTH_LEVEL),
+                             ("Изменение", "chg", DEPTH_CHANGE)):
+        cnt = d.groupby(pd.to_numeric(d[col], errors="coerce"))["n_epk"].sum()
+        for i, b in enumerate(order, start=1):
+            n = float(cnt.get(i, 0.0))
             rows.append({"axis": axis, "bucket": b, "n_epk": n, "share": n / total})
     return pd.DataFrame(rows)
-
 
 def top_orgs(df: pd.DataFrame, gained_inn: pd.DataFrame,
              top_n: int = 15) -> pd.DataFrame:

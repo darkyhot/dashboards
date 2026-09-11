@@ -388,12 +388,24 @@ def inn_migration(ws: Workspace, base: str, min_movers: int) -> pd.DataFrame:
     return df
 
 
-def stayed_dest(ws: Workspace, base: str) -> pd.DataFrame:
-    """Куда перешли оставшиеся в сегменте — для разбивки «та же строка / другая»."""
-    df = _opt(ws, "stayed_dest", LQ.STAYED_DEST, {"d_base": base})
+# Ключи справочника подразделений, которые можно подставить в текст запроса.
+# Имя колонки параметром не передать, а подстановка из белого списка не даёт
+# чему-то постороннему попасть в SQL.
+_GOSB_KEYS = ("old_gosb_id", "new_gosb_id")
+
+
+def stayed_dest(ws: Workspace, base: str, gosb_key: str | None) -> pd.DataFrame:
+    """Оставшиеся в сегменте по организациям: сколько в том же ТБ, холдинге, регионе."""
+    if gosb_key in _GOSB_KEYS:
+        sql = LQ.STAYED_DEST_REGION.replace("__GOSB_KEY__", gosb_key)
+    else:
+        sql = LQ.STAYED_DEST
+    df = _opt(ws, "stayed_dest", sql, {"d_base": base})
     if not df.empty:
         progress.done(f"переходы внутри сегмента: {float(df['n_triples'].sum()):,.0f} "
-                      f"получателей, {len(df):,} направлений")
+                      f"получателей в {len(df):,} организациях"
+                      + ("" if "n_same_region" in df else "; без регионов — "
+                         "подразделения справочником не опознаны"))
     return df
 
 
@@ -409,12 +421,14 @@ def org_status(ws: Workspace, base: str) -> pd.DataFrame:
     return df
 
 
-def exit_pattern(ws: Workspace, base: str, pre: str) -> pd.DataFrame:
-    """Помесячная история ушедших из банка — обрыв или постепенно."""
+def exit_pattern(ws: Workspace, base: str, pre: str, drop: float) -> pd.DataFrame:
+    """Помесячная история ушедших из банка — обрыв или постепенно, свёрнуто в SQL."""
     progress.step(f"История ушедших из банка: {pre} … отчётный месяц")
-    df = _opt(ws, "exit_pattern", LQ.EXIT_PATTERN, {"d_base": base, "d_pre": pre})
+    df = _opt(ws, "exit_pattern", LQ.EXIT_PATTERN,
+              {"d_base": base, "d_pre": pre, "exit_drop": drop})
     if not df.empty:
-        progress.done(f"история ухода: {len(df):,} человек")
+        progress.done(f"история ухода: {int(df['n_epk'].sum()):,} человек, "
+                      f"{len(df)} строк свёртки")
     return df
 
 
@@ -427,12 +441,13 @@ def pay_level(ws: Workspace, base: str, min_org: int) -> pd.DataFrame:
     return df
 
 
-def left_segment_orgs(ws: Workspace, base: str) -> pd.DataFrame:
-    """Организации, куда ушли ушедшие в другой сегмент."""
-    df = _opt(ws, "left_segment_orgs", LQ.LEFT_SEGMENT_ORGS, {"d_base": base})
+def left_segment_orgs(ws: Workspace, base: str, top_n: int) -> pd.DataFrame:
+    """Топ организаций, куда ушли ушедшие в другой сегмент, и итоги по всем."""
+    df = _opt(ws, "left_segment_orgs", LQ.LEFT_SEGMENT_ORGS,
+              {"d_base": base, "top_n": top_n})
     if not df.empty:
-        progress.done(f"приёмники в других сегментах: {len(df):,} организаций, "
-                      f"{int(df['n_epk'].sum()):,} человек")
+        progress.done(f"приёмники в других сегментах: {int(df['n_orgs'].iloc[0]):,} "
+                      f"организаций, {int(df['total'].iloc[0]):,} человек")
     return df
 
 
@@ -440,7 +455,7 @@ def below_depth(ws: Workspace, base: str) -> pd.DataFrame:
     """Насколько ниже порога оказались выпавшие по порогу."""
     df = _opt(ws, "below_depth", LQ.BELOW_DEPTH, {"d_base": base})
     if not df.empty:
-        progress.done(f"ниже порога: {len(df):,} человек")
+        progress.done(f"ниже порога: {int(df['n_epk'].sum()):,} человек")
     return df
 
 

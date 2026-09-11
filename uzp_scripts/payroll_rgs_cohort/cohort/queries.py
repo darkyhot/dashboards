@@ -955,7 +955,7 @@ FROM m, r
 # Вес назначения — 1/n: у совместителя в отчётном месяце несколько троек, и без
 # веса один потерянный получатель посчитался бы дважды. С весом сумма по строкам
 # ровно равна числу оставшихся — разрез остаётся аддитивным.
-STAYED_DEST = """
+_STAYED_HEAD = """
 WITH lost AS (""" + _LOST_BASE + """),
 st AS (
   SELECT epk_id, inn, gosb_id, tb_id FROM lost WHERE cause = 'stayed_in_segment'
@@ -964,19 +964,49 @@ dest AS (
   SELECT epk_id, inn, gosb_id, tb_id,
          count(*) OVER (PARTITION BY epk_id) AS n_dest
   FROM t_pairs WHERE report_dt = CAST(:d_cur AS date)
-)
-SELECT s.inn, s.gosb_id AS gosb_from, s.tb_id AS tb_from,
-       d.gosb_id AS gosb_to, d.tb_id AS tb_to,
+)"""
+
+# Признаки «та же строка» считаются здесь же, в SQL, и в ядро уезжает строка на
+# ОРГАНИЗАЦИЮ, а не на направление перехода: на проме направлений больше лимита.
+# У организации без холдинга «тот же холдинг» — та же организация: строка
+# «Холдинг не указан» собирает несвязанные организации.
+_STAYED_SAME = """
        sum(1.0 / d.n_dest)                                         AS n_triples,
-       sum(CASE WHEN d.inn = s.inn THEN 1.0 / d.n_dest ELSE 0 END) AS n_same_inn,
-       sum(CASE WHEN hf.holding_name IS NOT NULL
-                 AND ht.holding_name = hf.holding_name
-                THEN 1.0 / d.n_dest ELSE 0 END)                    AS n_same_holding
+       sum(CASE WHEN d.tb_id = s.tb_id THEN 1.0 / d.n_dest ELSE 0 END) AS n_same_tb,
+       sum(CASE WHEN NULLIF(btrim(hf.holding_name), '') IS NULL
+                THEN CASE WHEN d.inn = s.inn THEN 1.0 / d.n_dest ELSE 0 END
+                WHEN ht.holding_name = hf.holding_name THEN 1.0 / d.n_dest
+                ELSE 0 END)                                        AS n_same_holding"""
+
+STAYED_DEST = _STAYED_HEAD + """
+SELECT s.inn,""" + _STAYED_SAME + """
 FROM st s
 JOIN dest d ON d.epk_id = s.epk_id
 LEFT JOIN t_seg hf ON hf.inn = s.inn
 LEFT JOIN t_seg ht ON ht.inn = d.inn
-GROUP BY s.inn, s.gosb_id, s.tb_id, d.gosb_id, d.tb_id
+GROUP BY s.inn
+"""
+
+# Тот же запрос с регионом — когда разведка опознала ключ справочника
+# подразделений. Ключ подставляется в `fetch` из белого списка, а не приходит
+# параметром: имя колонки параметром не передать.
+STAYED_DEST_REGION = _STAYED_HEAD + """,
+reg AS (
+  SELECT d.__GOSB_KEY__ AS gid, min(NULLIF(btrim(d.region_name), '')) AS region
+  FROM {schema}.uzp_dim_gosb d
+  WHERE """ + Q._NO_CA + """
+  GROUP BY d.__GOSB_KEY__
+)
+SELECT s.inn,""" + _STAYED_SAME + """,
+       sum(CASE WHEN rf.region IS NOT NULL AND rf.region = rt.region
+                THEN 1.0 / d.n_dest ELSE 0 END)                    AS n_same_region
+FROM st s
+JOIN dest d ON d.epk_id = s.epk_id
+LEFT JOIN t_seg hf ON hf.inn = s.inn
+LEFT JOIN t_seg ht ON ht.inn = d.inn
+LEFT JOIN reg rf ON rf.gid = s.gosb_id
+LEFT JOIN reg rt ON rt.gid = d.gosb_id
+GROUP BY s.inn
 """
 
 # Судьба ОРГАНИЗАЦИИ, а не человека. Главный вопрос «почему»: ушла ли
@@ -1032,8 +1062,10 @@ LEFT JOIN agc ON agc.inn = b.inn
 # у ушедших сразу после базы нет предыстории) до отчётного.
 #
 # ЕДИНСТВЕННЫЙ новый скан витрины в этом блоке — самый дорогой запрос раздела,
-# выключается параметром `with_exit_pattern`. Свёртка до человека идёт в SQL:
-# в ядро уезжает строка на человека, а не на человеко-месяц.
+# выключается параметром `with_exit_pattern`. Разметка «обрыв / постепенно» и
+# свёртка идут В SQL: на проме ушедших из банка полтора миллиона, и строка на
+# человека упёрлась в лимит выборки. В ядро уезжает «шаблон × месяц» — десятки
+# строк. Порог падения — параметр `:exit_drop`.
 EXIT_PATTERN = """
 WITH lost AS (""" + _LOST_EPK_BASE + """),
 lb AS (SELECT epk_id FROM lost WHERE cause = 'left_bank'),
@@ -1051,15 +1083,26 @@ r AS (
   SELECT report_dt, epk_id, amt, qty,
          row_number() OVER (PARTITION BY epk_id ORDER BY report_dt DESC) AS k
   FROM m WHERE amt > 0
+),
+per AS (
+  SELECT epk_id,
+         max(report_dt)                                AS last_dt,
+         avg(CASE WHEN k <= 2 THEN amt END)            AS amt_last,
+         avg(CASE WHEN k BETWEEN 3 AND 5 THEN amt END) AS amt_prev,
+         avg(CASE WHEN k <= 2 THEN qty END)            AS qty_last,
+         avg(CASE WHEN k BETWEEN 3 AND 5 THEN qty END) AS qty_prev
+  FROM r GROUP BY epk_id
 )
-SELECT epk_id,
-       max(report_dt)                                AS last_dt,
-       count(*)                                      AS n_active,
-       avg(CASE WHEN k <= 2 THEN amt END)            AS amt_last,
-       avg(CASE WHEN k BETWEEN 3 AND 5 THEN amt END) AS amt_prev,
-       avg(CASE WHEN k <= 2 THEN qty END)            AS qty_last,
-       avg(CASE WHEN k BETWEEN 3 AND 5 THEN qty END) AS qty_prev
-FROM r GROUP BY epk_id
+SELECT CASE WHEN amt_prev IS NULL OR amt_prev <= 0     THEN 'short'
+            WHEN amt_last < :exit_drop * amt_prev      THEN 'amt'
+            WHEN qty_last < :exit_drop * qty_prev      THEN 'qty'
+            ELSE 'abrupt' END                          AS pattern,
+       last_dt,
+       count(*)                                        AS n_epk,
+       sum(CASE WHEN amt_prev > 0 THEN amt_last / amt_prev END) AS sum_ratio,
+       count(CASE WHEN amt_prev > 0 THEN 1 END)        AS n_ratio
+FROM per
+GROUP BY 1, 2
 """
 
 # Сколько получал ушедший ОТНОСИТЕЛЬНО КОЛЛЕГ по той же организации. Уходят
@@ -1095,6 +1138,10 @@ GROUP BY 1, 2
 #
 # Приёмник у человека один — тот, кто платит больше всех: иначе совместитель
 # посчитался бы в двух организациях, и доли перестали бы складываться.
+#
+# В ядро уезжает только топ приёмников, а итоги (сколько всего, доля десяти
+# крупнейших, доля того же подразделения) считаются в SQL по ВСЕМ: приёмников на
+# проме может быть больше лимита выборки.
 LEFT_SEGMENT_ORGS = """
 WITH lost AS (""" + _LOST_EPK_BASE + """),
 ls AS (SELECT epk_id FROM lost WHERE cause = 'left_segment'),
@@ -1110,24 +1157,40 @@ d AS (
   JOIN ls ON ls.epk_id = t.epk_id
   LEFT JOIN t_seg s ON s.inn = t.inn
   WHERE t.report_dt = CAST(:d_cur AS date) AND s.inn IS NULL AND t.amt_all > 0
+),
+g AS (
+  SELECT d.inn,
+         min(COALESCE(sa.segment_name, 'Организация не в справочнике')) AS segment_name,
+         min(sa.company_name)                                           AS company_name,
+         min(sa.industry_name)                                          AS industry_name,
+         count(*)                                                       AS n_epk,
+         count(bg.epk_id)                                               AS n_same_gosb
+  FROM d
+  LEFT JOIN t_seg_all sa ON sa.inn = d.inn
+  LEFT JOIN bg ON bg.epk_id = d.epk_id AND bg.gosb_id = d.gosb_id
+  WHERE d.rn = 1
+  GROUP BY d.inn
+),
+r AS (SELECT g.*, row_number() OVER (ORDER BY g.n_epk DESC, g.inn) AS k FROM g),
+t AS (
+  SELECT count(*)                                      AS n_orgs,
+         sum(n_epk)                                    AS total,
+         sum(n_same_gosb)                              AS total_same_gosb,
+         sum(CASE WHEN k <= 10 THEN n_epk ELSE 0 END)  AS top10
+  FROM r
 )
-SELECT d.inn,
-       min(COALESCE(sa.segment_name, 'Организация не в справочнике')) AS segment_name,
-       min(sa.company_name)                                           AS company_name,
-       min(sa.industry_name)                                          AS industry_name,
-       count(*)                                                       AS n_epk,
-       count(bg.epk_id)                                               AS n_same_gosb
-FROM d
-LEFT JOIN t_seg_all sa ON sa.inn = d.inn
-LEFT JOIN bg ON bg.epk_id = d.epk_id AND bg.gosb_id = d.gosb_id
-WHERE d.rn = 1
-GROUP BY d.inn
+SELECT r.inn, r.segment_name, r.company_name, r.industry_name, r.n_epk,
+       r.n_same_gosb, t.n_orgs, t.total, t.total_same_gosb, t.top10
+FROM r, t
+WHERE r.k <= :top_n
+ORDER BY r.k
 """
 
 # НАСКОЛЬКО ниже порога. Упала вдвое — неполная ставка или простой; не дотягивает
 # сотню рублей — артефакт порога: зарплаты индексируются, порог стоит на месте.
 # Сумма берётся ПО ОРГАНИЗАЦИИ, как и сам порог, и по лучшей из организаций
-# человека — ровно так, как решалось, получатель он или нет.
+# человека — ровно так, как решалось, получатель он или нет. Диапазоны считаются
+# в SQL: строка на человека на проме упиралась бы в лимит выборки.
 BELOW_DEPTH = """
 WITH lost AS (""" + _LOST_EPK_BASE + """),
 bt AS (SELECT epk_id FROM lost WHERE cause = 'below_threshold'),
@@ -1146,6 +1209,13 @@ c AS (
   JOIN bt ON bt.epk_id = y.epk_id
   GROUP BY y.epk_id
 )
-SELECT b.epk_id, b.amt_base, c.amt_cur
+SELECT CASE WHEN COALESCE(c.amt_cur, 0) >= 0.8 * :amt_min THEN 1
+            WHEN COALESCE(c.amt_cur, 0) >= 0.4 * :amt_min THEN 2
+            ELSE 3 END                                         AS lvl,
+       CASE WHEN COALESCE(c.amt_cur, 0) >= 0.8 * b.amt_base THEN 1
+            WHEN COALESCE(c.amt_cur, 0) >= 0.5 * b.amt_base THEN 2
+            ELSE 3 END                                         AS chg,
+       count(*)                                                AS n_epk
 FROM b LEFT JOIN c ON c.epk_id = b.epk_id
+GROUP BY 1, 2
 """

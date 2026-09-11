@@ -583,13 +583,12 @@ def check_why() -> None:
         "tb_short_name": ["СРБ", "СРБ", "СРБ", "ЮЗБ", "ЮЗБ", "ЮЗБ"],
         "holding_name": ["Х1", "Х1", "Х1", A.FILL["holding_name"],
                          A.FILL["holding_name"], "Х1"]})
-    # Совместитель: у org1 шесть оставшихся, четыре в том же ТБ и два в другом.
-    dest = pd.DataFrame({
-        "inn": ["1", "1", "2"], "gosb_from": [10, 10, 20], "tb_from": [38, 38, 52],
-        "gosb_to": [10, 30, 30], "tb_to": [38, 55, 38],
-        "n_triples": [4.0, 2.0, 4.0], "n_same_inn": [4.0, 0.0, 1.0],
-        "n_same_holding": [4.0, 2.0, 0.0]})
-    split = A.stayed_split(dest, marked, pd.DataFrame(), None)
+    # Свёртка до организации, как её отдаёт STAYED_DEST: у org1 шесть
+    # оставшихся, четыре в том же ТБ; у org2 (без холдинга) один в той же
+    # организации.
+    dest = pd.DataFrame({"inn": ["1", "2"], "n_triples": [6.0, 4.0],
+                         "n_same_tb": [4.0, 0.0], "n_same_holding": [6.0, 1.0]})
+    split = A.stayed_split(dest, marked)
     for dim in ("tb_short_name", "holding_name"):
         cut = A.by_dim(marked, dim, 10, split.get(dim))
         if not np.allclose(cut[A.LOSS_CAUSES].sum(axis=1), cut[A.LOSS]):
@@ -603,7 +602,16 @@ def check_why() -> None:
     srb = A.by_dim(marked, "tb_short_name", 10, split["tb_short_name"])
     srb = srb[srb["tb_short_name"] == "СРБ"].iloc[0]
     if abs(srb["inside_same"] - 4.0) > 1e-9:
-        raise CheckFailed("совместитель посчитан в двух ТБ сразу — вес 1/n потерян")
+        raise CheckFailed("«тот же ТБ» перенесён в разрез неверно")
+    # Вес 1/n и правило «без холдинга — та же организация» живут в SQL: без них
+    # совместитель посчитался бы в двух ТБ сразу.
+    for name in ("STAYED_DEST", "STAYED_DEST_REGION"):
+        body = getattr(LQ, name)
+        if "1.0 / d.n_dest" not in body or "GROUP BY s.inn" not in body:
+            raise CheckFailed(f"{name}: нет веса 1/n или свёртки до организации")
+        if "d.inn = s.inn" not in body:
+            raise CheckFailed(f"{name}: у организации без холдинга «тот же холдинг» "
+                              f"перестал значить «та же организация»")
     # У организации без холдинга «тот же холдинг» — это та же организация.
     nh = split["holding_name"].set_index("holding_name")["inside_same"]
     if abs(nh[A.FILL["holding_name"]] - 1.0) > 1e-9:
@@ -635,32 +643,45 @@ def check_why() -> None:
     if abs(summ["share_lb"].sum() - 1.0) > 1e-9:
         raise CheckFailed("доли ушедших из банка по классам не дают единицы")
 
+    # Свёртка «шаблон × месяц», как её отдаёт EXIT_PATTERN.
     ex = pd.DataFrame({
-        "epk_id": [1, 2, 3, 4], "last_dt": pd.to_datetime(["2026-03-31"] * 4),
-        "n_active": [6, 6, 6, 2], "amt_last": [100, 40, 100, 100],
-        "amt_prev": [100, 100, 100, np.nan], "qty_last": [2, 2, 1, 1],
-        "qty_prev": [2, 2, 2, np.nan]})
+        "pattern": ["abrupt", "amt", "qty", "short", "abrupt"],
+        "last_dt": pd.to_datetime(["2026-03-31"] * 4 + ["2026-05-31"]),
+        "n_epk": [3, 1, 1, 1, 2], "sum_ratio": [3.0, 0.4, 1.0, 0.0, 2.0],
+        "n_ratio": [3, 1, 1, 0, 2]})
     pat, mon = A.exit_pattern(ex)
-    if list(pat["pattern"]) != A.PAT_ORDER or not (pat["n_epk"] == 1).all():
-        raise CheckFailed(f"шаблоны ухода определены неверно: {list(pat['pattern'])}")
+    if list(pat["pattern"]) != A.PAT_ORDER:
+        raise CheckFailed(f"шаблоны ухода подписаны неверно: {list(pat['pattern'])}")
+    if float(pat.loc[pat["pattern"] == A.PAT_ABRUPT, "n_epk"].iloc[0]) != 5.0:
+        raise CheckFailed("шаблон не свёрнут по месяцам — обрывы посчитаны не все")
     if str(mon["gone_month"].iloc[0].date()) != "2026-04-30":
         raise CheckFailed("месяц ухода — не следующий за последним активным")
+    if abs(mon["share"].sum() - 1.0) > 1e-9:
+        raise CheckFailed("доли месяцев ухода не дают единицы")
+    # Разметка и свёртка обязаны быть в SQL: строка на человека на проме — это
+    # полтора миллиона строк, больше лимита выборки.
+    for name in ("EXIT_PATTERN", "BELOW_DEPTH"):
+        if "GROUP BY 1, 2" not in getattr(LQ, name):
+            raise CheckFailed(f"{name} отдаёт строку на человека, а не свёртку — "
+                              f"на проме упрётся в лимит выборки")
+    if ":top_n" not in LQ.LEFT_SEGMENT_ORGS:
+        raise CheckFailed("LEFT_SEGMENT_ORGS отдаёт всех приёмников, а не топ")
 
     pay = A.pay_level(pd.DataFrame({
         "fate": ["retained", "retained", "left_bank"], "bucket": [1, 3, 5],
         "n_triples": [30.0, 70.0, 10.0]}))
     if not np.allclose(pay[[f"b{k}" for k in A.PAY_BUCKETS]].sum(axis=1), 1.0):
         raise CheckFailed("доли зарплатных диапазонов в группе не дают единицы")
-    below = A.below_depth(pd.DataFrame({"amt_base": [3000, 3000, 6000],
-                                        "amt_cur": [2400, 1500, 500]}), 2500)
+    below = A.below_depth(pd.DataFrame({"lvl": [1, 2, 3], "chg": [1, 3, 3],
+                                        "n_epk": [5.0, 3.0, 2.0]}))
     for axis, g in below.groupby("axis"):
         if abs(g["share"].sum() - 1.0) > 1e-9:
             raise CheckFailed(f"глубина порога: доли по оси «{axis}» не дают единицы")
 
     e = pd.DataFrame()
-    if (A.stayed_split(e, marked, e, None) or not A.org_exit(e, e, e)[0].empty
+    if (A.stayed_split(e, marked) or not A.org_exit(e, e, e)[0].empty
             or not A.exit_pattern(e)[0].empty or not A.pay_level(e).empty
-            or not A.left_segment_orgs(e)[0].empty or not A.below_depth(e, 2500).empty):
+            or not A.left_segment_orgs(e)[0].empty or not A.below_depth(e).empty):
         raise CheckFailed("разборы «почему» на пустых кадрах вернули непустое")
     _ok("разрезы по причинам складываются, «почему»: классы организаций, договор, "
         "шаблоны ухода и доли верны")
