@@ -388,6 +388,62 @@ def inn_migration(ws: Workspace, base: str, min_movers: int) -> pd.DataFrame:
     return df
 
 
+def stayed_dest(ws: Workspace, base: str) -> pd.DataFrame:
+    """Куда перешли оставшиеся в сегменте — для разбивки «та же строка / другая»."""
+    df = _opt(ws, "stayed_dest", LQ.STAYED_DEST, {"d_base": base})
+    if not df.empty:
+        progress.done(f"переходы внутри сегмента: {float(df['n_triples'].sum()):,.0f} "
+                      f"получателей, {len(df):,} направлений")
+    return df
+
+
+def org_status(ws: Workspace, base: str) -> pd.DataFrame:
+    """Судьба организаций: сколько было и стало, платит ли, жив ли договор."""
+    df = _opt(ws, "org_status", LQ.ORG_STATUS, {"d_base": base})
+    if not df.empty:
+        n_gone = int(((df["n_cur"] == 0) & (df["amt_cur_all"] <= 0)).sum())
+        has_agr = float((df["n_agr_base"] > 0).mean())
+        progress.done(f"организации: {len(df):,} в базовом месяце, без единого "
+                      f"зачисления в отчётном {n_gone:,}; номер договора есть у "
+                      f"{has_agr:.0%}")
+    return df
+
+
+def exit_pattern(ws: Workspace, base: str, pre: str) -> pd.DataFrame:
+    """Помесячная история ушедших из банка — обрыв или постепенно."""
+    progress.step(f"История ушедших из банка: {pre} … отчётный месяц")
+    df = _opt(ws, "exit_pattern", LQ.EXIT_PATTERN, {"d_base": base, "d_pre": pre})
+    if not df.empty:
+        progress.done(f"история ухода: {len(df):,} человек")
+    return df
+
+
+def pay_level(ws: Workspace, base: str, min_org: int) -> pd.DataFrame:
+    """Зарплата ушедших относительно коллег по организации."""
+    df = _opt(ws, "pay_level", LQ.PAY_LEVEL, {"d_base": base, "pay_min_org": min_org})
+    if not df.empty:
+        progress.done(f"уровень зарплаты: {float(df['n_triples'].sum()):,.0f} "
+                      f"получателей в организациях от {min_org} человек")
+    return df
+
+
+def left_segment_orgs(ws: Workspace, base: str) -> pd.DataFrame:
+    """Организации, куда ушли ушедшие в другой сегмент."""
+    df = _opt(ws, "left_segment_orgs", LQ.LEFT_SEGMENT_ORGS, {"d_base": base})
+    if not df.empty:
+        progress.done(f"приёмники в других сегментах: {len(df):,} организаций, "
+                      f"{int(df['n_epk'].sum()):,} человек")
+    return df
+
+
+def below_depth(ws: Workspace, base: str) -> pd.DataFrame:
+    """Насколько ниже порога оказались выпавшие по порогу."""
+    df = _opt(ws, "below_depth", LQ.BELOW_DEPTH, {"d_base": base})
+    if not df.empty:
+        progress.done(f"ниже порога: {len(df):,} человек")
+    return df
+
+
 def tb_dim(ws: Workspace) -> pd.DataFrame:
     """ТБ по номеру из ведомостей. Территория держится на нём, а не на ГОСБ."""
     return _opt(ws, "tb_dim", LQ.TB_DIM)

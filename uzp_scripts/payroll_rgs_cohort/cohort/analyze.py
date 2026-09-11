@@ -43,6 +43,13 @@ from . import level as LV
 # зачислять по зарплатному коду, для зарплатного подразделения пропал, и прятать
 # его в «методологию» значило занижать потерю.
 LOSS, INSIDE = "loss", "inside"
+STAYED = "stayed_in_segment"
+
+# Причины-потери В ПОРЯДКЕ показа: сначала «ушёл из банка» — это то, что банк
+# потерял совсем; затем «в другой сегмент» — клиент банка, но не наш; затем две
+# ситуации «перестал получать зарплату», которые не сливаются: «другие коды» —
+# пенсия, декрет, расчёт, а «ниже порога» — размер зарплаты. Решения разные.
+LOSS_CAUSES = ["left_bank", "left_segment", "other_codes", "below_threshold"]
 
 # Подписи зависят от стороны: одна и та же «остался в сегменте» на потерях читается
 # как «не потеряли», а на приходе — как «не привели нового».
@@ -81,6 +88,9 @@ CAUSES: dict[str, tuple[str, str, str]] = {
         "число мест работы. Сегмент никого не потерял, и чем именно этот переход "
         "был, для сегмента неважно.", INSIDE),
 }
+
+assert set(LOSS_CAUSES) == {c for c, v in CAUSES.items() if v[2] == LOSS}, \
+    "список причин-потерь разъехался со справочником причин"
 
 GAINS: dict[str, tuple[str, str, str]] = {
     "new_to_bank": (
@@ -846,29 +856,389 @@ def enrich(lost_by_inn: pd.DataFrame, attrs: pd.DataFrame, tb: pd.DataFrame,
     return df, meta
 
 
-def by_dim(df: pd.DataFrame, dim: str, top_n: int = 12) -> pd.DataFrame:
-    """Потери в разрезе, с составом по видам внутри каждой строки.
+def by_dim(df: pd.DataFrame, dim: str, top_n: int = 12,
+           stayed: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Потери в разрезе, по причинам внутри каждой строки.
 
-    Состав здесь не украшение. «Утекло образование» без него остаётся
-    утверждением без содержания: неизвестно, ушли ли люди, закрылись ли школы,
-    сменился ли код зачисления или их просто перевели в другое подразделение — а
-    это разные выводы и разные решения.
+    «Выбыло» (`n_triples`) — сколько получателей не стало В ЭТОЙ СТРОКЕ. Это не
+    потеря сегмента: сюда входят и те, кто перешёл в другую бюджетную
+    организацию. Реальная потеря — сумма четырёх причин-потерь, и она же
+    раскладывается по причинам: «ушёл из банка», «в другой сегмент», «не
+    зарплатными кодами», «ниже порога». Одной колонкой «потеря» на вопрос
+    «куда делись» не ответить.
 
-    Строк возвращается top_n, но итог считается по ВСЕМ: доля обязана быть долей
-    от целого, а не от показанного куска.
+    `stayed` — разбивка оставшихся в сегменте на «в этой же строке» и «в другую»
+    (из `stayed_split`). Для ТБ и холдинга переход в другую строку — потеря
+    строки, хоть сегмент человека и сохранил.
+
+    Сортировка и доля — по РЕАЛЬНОЙ потере: по «выбыло» наверх поднималась строка
+    с сильной внутренней ротацией, ничего не терявшая. Итог доли — по всем
+    строкам, а не по показанным.
     """
     if df.empty or dim not in df:
         return pd.DataFrame()
-    total = float(_num(df, "n_triples").sum()) or 1.0
     g = df.groupby(dim, dropna=False)
     out = pd.DataFrame({"n_triples": g["n_triples"].sum(),
                         "n_inn": g["inn"].nunique()})
-    for kind in (LOSS, INSIDE):
-        causes = [c for c, v in CAUSES.items() if v[2] == kind]
-        sub = df[df["cause"].isin(causes)].groupby(dim)["n_triples"].sum()
-        out[kind] = sub.reindex(out.index).fillna(0.0)
-    out["share"] = out["n_triples"] / total
-    return out.sort_values("n_triples", ascending=False).head(top_n).reset_index()
+    for cause in LOSS_CAUSES + [STAYED]:
+        sub = df[df["cause"] == cause].groupby(dim)["n_triples"].sum()
+        out[cause] = sub.reindex(out.index).fillna(0.0)
+    out[LOSS] = out[LOSS_CAUSES].sum(axis=1)
+    out[INSIDE] = out[STAYED]
+    out = out.drop(columns=STAYED)
+    total = float(out[LOSS].sum()) or 1.0
+    out["share"] = out[LOSS] / total
+    if stayed is not None and not stayed.empty and dim in stayed:
+        same = stayed.set_index(dim)["inside_same"]
+        out["inside_same"] = same.reindex(out.index).fillna(0.0).clip(upper=out[INSIDE])
+        out["inside_other"] = out[INSIDE] - out["inside_same"]
+    return out.sort_values(LOSS, ascending=False).head(top_n).reset_index()
+
+
+# Короткие заголовки причин для таблиц разрезов — одни на HTML и документ.
+CAUSE_SHORT = {"left_bank": "Ушли из банка", "left_segment": "В другой сегмент",
+               "other_codes": "Не зарплатными кодами", "below_threshold": "Ниже порога"}
+# Как назвать «ту же строку» и «другую» в разрезе.
+SAME_TITLES = {"tb_short_name": ("в том же ТБ", "в другой ТБ"),
+               "holding_name": ("в том же холдинге", "в другой холдинг"),
+               "region_name": ("в том же регионе", "в другой регион")}
+
+
+def cut_columns(dim: str, df: pd.DataFrame) -> list[tuple[str, str]]:
+    """Колонки таблицы разреза парами (колонка, заголовок) — только те, что есть.
+
+    Один описатель на HTML и на документ: заголовки, разъехавшись, дали бы два
+    отчёта, в которых одна и та же цифра подписана по-разному.
+    """
+    cols = [(LOSS, "Реальная потеря"), ("share", "Доля реальной потери")]
+    cols += [(c, CAUSE_SHORT[c]) for c in LOSS_CAUSES]
+    same = SAME_TITLES.get(dim)
+    if same and "inside_same" in df:
+        cols += [("inside_same", f"Остались {same[0]}"),
+                 ("inside_other", f"Перешли {same[1]}")]
+    else:
+        cols += [(INSIDE, "Остались в сегменте")]
+    cols += [("n_triples", "Выбыло из строки всего"), ("n_inn", "Организаций")]
+    return [(c, h) for c, h in cols if c in df]
+
+
+# Для каких разрезов оставшиеся в сегменте делятся на «та же строка» и «другая».
+# Ведомство, уровень и отрасль — классы, а не единицы учёта: переход из одной
+# школы в другую — это «та же строка» почти всегда, и разбивка там ничего не даст.
+SPLIT_DIMS = ("tb_short_name", "holding_name", "region_name")
+
+
+def stayed_split(dest: pd.DataFrame, marked: pd.DataFrame, gosb: pd.DataFrame,
+                 gosb_key: str | None) -> dict[str, pd.DataFrame]:
+    """Оставшиеся в сегменте: сколько осталось В ТОЙ ЖЕ строке разреза.
+
+    Правила «той же строки»:
+    * ТБ — номер ТБ новой тройки тот же, что у потерянной;
+    * холдинг — тот же холдинг; у организации БЕЗ холдинга «тот же» значит
+      «та же организация»: строка «Холдинг не указан» собирает несвязанные
+      организации, и переход между ними переходом «внутри холдинга» не является;
+    * регион — регион подразделения новой тройки тот же (только если справочник
+      подразделений опознан; иначе разбивки по регионам нет).
+
+    Строка разреза, к которой относится организация, — та же, что в `marked`
+    (там ТБ — один на организацию и причину). Доля «той же строки» считается по
+    тройкам и применяется к числу оставшихся из `marked`: так разбивка остаётся
+    аддитивной даже у организации, работающей в двух ТБ.
+    """
+    out: dict[str, pd.DataFrame] = {}
+    if dest is None or dest.empty or marked is None or marked.empty:
+        return out
+    d = dest.copy()
+    for c in ("inn", "gosb_from", "gosb_to", "tb_from", "tb_to"):
+        if c in d:
+            d[c] = _key(d[c])
+    w = _num(d, "n_triples")
+
+    st = marked[marked["cause"] == STAYED].copy()
+    if st.empty:
+        return out
+    st["inn"] = _key(st["inn"])
+    st = st.drop_duplicates("inn").set_index("inn")
+
+    same: dict[str, pd.Series] = {}
+    same["tb_short_name"] = w.where((d["tb_from"] == d["tb_to"]).fillna(False), 0.0)
+    if "holding_name" in st:
+        no_holding = d["inn"].map(st["holding_name"].eq(FILL["holding_name"]))
+        no_holding = no_holding.fillna(True).astype(bool)
+        same["holding_name"] = pd.Series(
+            np.where(no_holding, _num(d, "n_same_inn"), _num(d, "n_same_holding")),
+            index=d.index)
+    if gosb_key and gosb is not None and not gosb.empty and gosb_key in gosb:
+        g = gosb.dropna(subset=[gosb_key]).copy()
+        g[gosb_key] = _key(g[gosb_key])
+        reg = g.drop_duplicates(gosb_key).set_index(gosb_key)["region_name"]
+        r_from, r_to = d["gosb_from"].map(reg), d["gosb_to"].map(reg)
+        same["region_name"] = w.where((r_from.notna() & (r_from == r_to)), 0.0)
+
+    tot = w.groupby(d["inn"]).sum()
+    for dim, sw in same.items():
+        if dim not in st:
+            continue
+        frac = (sw.groupby(d["inn"]).sum() / tot.replace(0, np.nan)).fillna(0.0).clip(0.0, 1.0)
+        per_inn = (_num(st.reset_index(), "n_triples").to_numpy()
+                   * frac.reindex(st.index).fillna(0.0).to_numpy())
+        out[dim] = (pd.DataFrame({dim: st[dim].to_numpy(), "inside_same": per_inn})
+                    .groupby(dim, as_index=False)["inside_same"].sum())
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Почему ушли
+# --------------------------------------------------------------------------- #
+ORG_SMALL = "Малая организация"
+ORG_GONE = "Ушла из банка целиком"
+ORG_MASS = "Массовый уход из банка"
+ORG_REORG = "Перестала платить, люди остались в банке"
+ORG_POINT = "Точечные уходы"
+ORG_ORDER = [ORG_GONE, ORG_MASS, ORG_REORG, ORG_POINT, ORG_SMALL]
+
+AGR_NODATA = "договора нет в данных"
+AGR_GONE = "организация не платит"
+AGR_SAME = "договор тот же"
+AGR_NEW = "договор сменился"
+AGR_ORDER = [AGR_SAME, AGR_NEW, AGR_GONE, AGR_NODATA]
+
+
+def org_exit(status: pd.DataFrame, lost_inn: pd.DataFrame, attrs: pd.DataFrame,
+             min_base: int = 10, mass_share: float = 0.5,
+             top_n: int = 15) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """Ушла организация или уходят люди. Главный вопрос «почему».
+
+    Класс организации (только если в базовом месяце у неё не меньше `min_base`
+    получателей — у маленькой «ушли все» может значить двух человек):
+    * «Ушла из банка целиком» — в отчётном месяце нет ни одного получателя и
+      вообще ни одного зачисления от неё бывшим получателям, И из банка ушла не
+      меньше `mass_share` её людей: зарплатный проект уведён. Потеря в B2B —
+      вопрос к менеджеру организации.
+    * «Перестала платить, люди остались в банке» — организация исчезла из
+      ведомостей, но её люди получают деньги в банке (другая бюджетная или
+      небюджетная организация, новый ИНН): реорганизация или переоформление, а не
+      уход клиента. Без этого класса реорганизация выглядела бы уведённым проектом.
+    * «Массовый уход» — организация платит, но из банка ушла не меньше
+      `mass_share` её базовых получателей: скорее всего, проект уводится частями
+      или сменился основной банк.
+    * «Точечные уходы» — остальное: люди уходят сами — переводят зарплату по
+      заявлению или увольняются.
+
+    Договор — по набору номеров: «тот же», если хоть один договор базового месяца
+    жив в отчётном; «сменился», если живых нет, а новые есть.
+
+    Возвращает (свод по классам, свод класс × договор, топ организаций, итоги).
+    """
+    empty = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {})
+    if status is None or status.empty:
+        return empty
+    st = status.copy()
+    st["inn"] = _key(st["inn"])
+    for c in ("n_base", "n_cur", "amt_cur_all", "n_agr_base", "n_agr_kept", "n_agr_cur"):
+        st[c] = _num(st, c)
+
+    if lost_inn is not None and not lost_inn.empty:
+        li = lost_inn.copy()
+        li["inn"] = _key(li["inn"])
+        li["n_triples"] = _num(li, "n_triples")
+        piv = li.pivot_table(index="inn", columns="cause", values="n_triples",
+                             aggfunc="sum").fillna(0.0)
+        piv.columns = [str(c) for c in piv.columns]
+        st = st.merge(piv, left_on="inn", right_index=True, how="left")
+    for c in LOSS_CAUSES + [STAYED]:
+        st[c] = _num(st, c).fillna(0.0) if c in st else 0.0
+    st[LOSS] = st[LOSS_CAUSES].sum(axis=1)
+    st["lb_share"] = st["left_bank"] / st["n_base"].replace(0, np.nan)
+
+    small = st["n_base"] < min_base
+    stopped = (st["n_cur"] <= 0) & (st["amt_cur_all"] <= 0)
+    mass = st["lb_share"].fillna(0.0) >= mass_share
+    st["org_class"] = np.select(
+        [small, stopped & mass, stopped, mass],
+        [ORG_SMALL, ORG_GONE, ORG_REORG, ORG_MASS], default=ORG_POINT)
+    st["agr"] = np.select(
+        [st["n_agr_base"] <= 0, stopped, st["n_agr_kept"] > 0, st["n_agr_cur"] > 0],
+        [AGR_NODATA, AGR_GONE, AGR_SAME, AGR_NEW], default=AGR_GONE)
+
+    tot_lb = float(st["left_bank"].sum()) or 1.0
+    tot_loss = float(st[LOSS].sum()) or 1.0
+    g = st.groupby("org_class")
+    summ = pd.DataFrame({"n_org": g["inn"].nunique(), "n_base": g["n_base"].sum(),
+                         "left_bank": g["left_bank"].sum(), LOSS: g[LOSS].sum()})
+    summ["share_lb"] = summ["left_bank"] / tot_lb
+    summ["share_loss"] = summ[LOSS] / tot_loss
+    summ = summ.reindex([c for c in ORG_ORDER if c in summ.index])
+    summ.index.name = "org_class"
+    summ = summ.reset_index()
+
+    cross = (st[~small].groupby(["org_class", "agr"])
+             .agg(n_org=("inn", "nunique"), loss=(LOSS, "sum")).reset_index())
+    if not cross.empty:
+        cross["_o"] = cross["org_class"].map({c: i for i, c in enumerate(ORG_ORDER)})
+        cross["_a"] = cross["agr"].map({c: i for i, c in enumerate(AGR_ORDER)})
+        cross = (cross.sort_values(["_o", "_a"]).drop(columns=["_o", "_a"])
+                 .reset_index(drop=True))
+
+    top = st[st["org_class"].isin([ORG_GONE, ORG_MASS])].copy()
+    if attrs is not None and not attrs.empty and "company_name" in attrs:
+        a = attrs.copy()
+        a["inn"] = _key(a["inn"])
+        top["company_name"] = top["inn"].map(
+            a.drop_duplicates("inn").set_index("inn")["company_name"])
+    cols = (["inn"] + (["company_name"] if "company_name" in top else [])
+            + ["org_class", "agr", "n_base", "n_cur", "left_bank", LOSS, "lb_share"])
+    top = top.sort_values(LOSS, ascending=False).head(top_n)[cols].reset_index(drop=True)
+
+    lb_org = float(st.loc[st["org_class"].isin([ORG_GONE, ORG_MASS]), "left_bank"].sum())
+    meta = {"share_lb_org": lb_org / tot_lb,
+            "n_gone": int((st["org_class"] == ORG_GONE).sum()),
+            "n_mass": int((st["org_class"] == ORG_MASS).sum()),
+            "n_reorg": int((st["org_class"] == ORG_REORG).sum()),
+            "agr_known": float((st["n_agr_base"] > 0).mean()) if len(st) else 0.0,
+            "n_agr_new": int(((st["agr"] == AGR_NEW) & ~small).sum()),
+            "min_base": min_base, "mass_share": mass_share}
+    return summ, cross, top, meta
+
+
+PAT_ABRUPT = "Обрыв: суммы ровные до последнего месяца"
+PAT_AMT = "Постепенно: суммы падали"
+PAT_QTY = "Постепенно: зачислений становилось меньше"
+PAT_SHORT = "Слишком короткая история"
+PAT_ORDER = [PAT_ABRUPT, PAT_AMT, PAT_QTY, PAT_SHORT]
+
+
+def exit_pattern(df: pd.DataFrame, drop: float = 0.7) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Как уходили из банка: обрывом или постепенно.
+
+    Сравниваются два последних активных месяца с тремя до них. Сумма упала
+    больше чем на 1 − `drop` — человек частично уводил зарплату (аванс в одном
+    банке, зарплата в другом) или сокращал ставку и только потом ушёл: такого
+    клиента можно было заметить и удержать. Сумма ровная, но зачислений меньше —
+    часть выплат уже шла в другой банк. Всё ровно — обрыв: увольнение или
+    разовый перевод зарплаты целиком.
+
+    Второй кадр — месяц ухода (следующий за последним активным): всплеск в одном
+    месяце — событие организации, ровный фон — текучесть людей.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    d = df.copy()
+    for c in ("amt_last", "amt_prev", "qty_last", "qty_prev"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    short = d["amt_prev"].isna() | (d["amt_prev"] <= 0)
+    amt_drop = d["amt_last"] < drop * d["amt_prev"]
+    qty_drop = d["qty_last"] < drop * d["qty_prev"]
+    d["pattern"] = np.select([short, amt_drop, qty_drop], [PAT_SHORT, PAT_AMT, PAT_QTY],
+                             default=PAT_ABRUPT)
+    d["ratio"] = d["amt_last"] / d["amt_prev"]
+    total = float(len(d)) or 1.0
+    g = d.groupby("pattern")
+    pat = pd.DataFrame({"n_epk": g.size().astype(float), "ratio": g["ratio"].median()})
+    pat["share"] = pat["n_epk"] / total
+    pat = pat.reindex([p for p in PAT_ORDER if p in pat.index])
+    pat.index.name = "pattern"
+    pat = pat.reset_index()
+
+    last = pd.to_datetime(d["last_dt"], errors="coerce")
+    d["gone_month"] = (last + pd.offsets.MonthEnd(1)).dt.normalize()
+    mon = d.groupby("gone_month").size().rename("n_epk").astype(float).reset_index()
+    mon["share"] = mon["n_epk"] / total
+    return pat, mon.sort_values("gone_month").reset_index(drop=True)
+
+
+PAY_BUCKETS = {1: "меньше 0,5 средней", 2: "0,5–0,8 средней", 3: "0,8–1,2 средней",
+               4: "1,2–2 средних", 5: "больше 2 средних"}
+FATE_TITLES = {"retained": "Остались на месте",
+               STAYED: "Перешли внутри сегмента",
+               "left_bank": "Ушли из банка", "left_segment": "Ушли в другой сегмент",
+               "other_codes": "Не зарплатными кодами", "below_threshold": "Ниже порога"}
+
+
+def pay_level(df: pd.DataFrame) -> pd.DataFrame:
+    """Зарплата ушедших относительно коллег по той же организации.
+
+    Строка — судьба получателя, колонки — доля его группы в каждом диапазоне
+    «зарплата / средняя по организации». Сравнивать надо со строкой «остались на
+    месте»: сдвиг влево — уходят низкооплачиваемые (текучка, сокращения),
+    вправо — высокооплачиваемые (их переманивают, самая дорогая потеря).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    d["n_triples"] = _num(d, "n_triples")
+    d["bucket"] = pd.to_numeric(d["bucket"], errors="coerce")
+    piv = d.pivot_table(index="fate", columns="bucket", values="n_triples",
+                        aggfunc="sum").fillna(0.0)
+    tot = piv.sum(axis=1)
+    out = piv.div(tot.replace(0, np.nan), axis=0).fillna(0.0)
+    out.columns = [f"b{int(c)}" for c in out.columns]
+    for k in PAY_BUCKETS:
+        if f"b{k}" not in out:
+            out[f"b{k}"] = 0.0
+    out = out[[f"b{k}" for k in PAY_BUCKETS]]
+    out.insert(0, "n_triples", tot)
+    out = out.reindex([f for f in FATE_TITLES if f in out.index])
+    out.index.name = "fate"
+    out = out.reset_index()
+    out.insert(1, "fate_title", out["fate"].map(FATE_TITLES))
+    return out
+
+
+def left_segment_orgs(df: pd.DataFrame, top_n: int = 15) -> tuple[pd.DataFrame, dict]:
+    """В какие организации ушли те, кто ушёл в другой сегмент.
+
+    Итоги отвечают на вопрос «событие или фон»: высокая доля десяти крупнейших
+    приёмников — людей забирают конкретные организации, с ними и надо работать;
+    низкая — обычная смена работы. Доля «то же подразделение» — остался ли
+    человек в том же городе: переезд работодателя против переезда человека.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(), {}
+    d = df.copy()
+    d["inn"] = _key(d["inn"])
+    d["n_epk"] = _num(d, "n_epk")
+    d["n_same_gosb"] = _num(d, "n_same_gosb")
+    total = float(d["n_epk"].sum()) or 1.0
+    d = d.sort_values(["n_epk", "inn"], ascending=[False, True]).reset_index(drop=True)
+    d["share"] = d["n_epk"] / total
+    d["same_gosb_share"] = d["n_same_gosb"] / d["n_epk"].replace(0, np.nan)
+    meta = {"total": total, "n_orgs": int(len(d)),
+            "top10_share": float(d["n_epk"].head(10).sum()) / total,
+            "same_gosb_share": float(d["n_same_gosb"].sum()) / total}
+    return d.head(top_n), meta
+
+
+DEPTH_LEVEL = ["80–100% порога", "40–80% порога", "меньше 40% порога"]
+DEPTH_CHANGE = ["почти не изменилась (≥ 80% прежней)", "упала на 20–50%",
+                "упала больше чем вдвое"]
+
+
+def below_depth(df: pd.DataFrame, amt_min: float) -> pd.DataFrame:
+    """Насколько ниже порога — по уровню и по изменению к базовому месяцу.
+
+    «80–100% порога» вместе с «почти не изменилась» — артефакт порога: зарплата
+    была чуть выше и стала чуть ниже, человек никуда не делся. «Упала больше чем
+    вдвое» — неполная ставка, простой, частичная выплата.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    base = pd.to_numeric(d["amt_base"], errors="coerce")
+    cur = pd.to_numeric(d["amt_cur"], errors="coerce").fillna(0.0)
+    lvl = cur / float(amt_min or 1)
+    d["level"] = np.select([lvl >= 0.8, lvl >= 0.4], DEPTH_LEVEL[:2], default=DEPTH_LEVEL[2])
+    ch = cur / base.replace(0, np.nan)
+    d["change"] = np.select([ch >= 0.8, ch >= 0.5], DEPTH_CHANGE[:2], default=DEPTH_CHANGE[2])
+    total = float(len(d)) or 1.0
+    rows = []
+    for axis, col, order in (("Уровень", "level", DEPTH_LEVEL),
+                             ("Изменение", "change", DEPTH_CHANGE)):
+        cnt = d[col].value_counts()
+        for b in order:
+            n = float(cnt.get(b, 0))
+            rows.append({"axis": axis, "bucket": b, "n_epk": n, "share": n / total})
+    return pd.DataFrame(rows)
 
 
 def top_orgs(df: pd.DataFrame, gained_inn: pd.DataFrame,

@@ -59,6 +59,22 @@ DEFAULTS = dict(
     # Сколько организаций показывать по КАЖДОМУ виду зачисления, на который
     # перешли лишившиеся зарплатных зачислений. Ноль отключает таблицу.
     codes_top_inn=5,
+    # --- Почему ушли ---
+    # Помесячная история ушедших из банка: обрыв или постепенно. Единственный
+    # новый скан витрины в блоке «почему» — выключается первым, если прогон долгий.
+    with_exit_pattern=True,
+    # Организация меньше этого числа получателей в базовом месяце в классы «ушла
+    # целиком / массовый уход» не попадает: у маленькой «ушли все» — это двое.
+    org_min_base=10,
+    # Какая доля базовых получателей организации должна уйти из банка, чтобы
+    # назвать это массовым уходом, а не точечными.
+    org_mass_share=0.5,
+    # Сравнение зарплаты ушедшего с коллегами — только в организациях от стольких
+    # получателей: средняя по трём людям ничего не значит.
+    pay_min_org=5,
+    # Во сколько раз должна упасть сумма перед уходом, чтобы назвать уход
+    # постепенным: 0.7 — последние месяцы меньше 70% прежних.
+    exit_drop=0.7,
     # Минимальное число людей, переехавших из одной организации в другую, чтобы
     # пара «откуда→куда» вообще попала в разбор миграции. Меньше — это шум.
     migration_min_movers=5,
@@ -66,8 +82,8 @@ DEFAULTS = dict(
     # назвать это переоформлением. Числом людей это не измерить: двадцать из
     # двадцати и двадцать из двух тысяч — разные события.
     migration_min_share=0.30,
-    # Потолок вызовов LLM на весь разбор: разделов пять.
-    llm_max_calls=6,
+    # Потолок вызовов LLM на весь разбор: разделов шесть, один вызов в запас.
+    llm_max_calls=7,
 )
 
 
@@ -118,6 +134,9 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
     months = sorted(set(anchors))
     d = {m: m.date().isoformat() for m in months}
     d_cur, d_base, d_from = d[cur], d[base], first.date().isoformat()
+    # История ушедших начинается за три месяца ДО базового: иначе у ушедших сразу
+    # после базы нет предыстории, и обрыв не отличить от постепенного ухода.
+    d_pre = _shift(base, 3).date().isoformat()
 
     progress.step(f"Численность {LQ.SEG_BIG}: {base:%m.%Y} → {cur:%m.%Y}"
                   + (f" (и {prev:%m.%Y} → {cur:%m.%Y})" if prev is not None else "")
@@ -181,8 +200,18 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
             gosb = fetch.gosb_dim(ws)
             gosb_key = probe.pick_gosb_key(fetch.gosb_match(ws), pr)
             probe.check_tb(fetch.tb_match(ws), pr)
+            # --- почему ушли: поверх рабочего набора, без новых сканов витрины ---
+            dest_raw = fetch.stayed_dest(ws, d_base)
+            org_raw = fetch.org_status(ws, d_base)
+            pay_raw = fetch.pay_level(ws, d_base, int(opts["pay_min_org"]))
+            lso_raw = fetch.left_segment_orgs(ws, d_base)
+            below_raw = fetch.below_depth(ws, d_base)
             ten_raw = (fetch.tenure(ws, d_base, d_from)
                        if opts["with_tenure"] else pd.DataFrame())
+            # Самый дорогой запрос блока «почему» — последним: если он не уложится
+            # в таймаут, всё остальное уже выгружено.
+            exit_raw = (fetch.exit_pattern(ws, d_base, d_pre)
+                        if opts["with_exit_pattern"] else pd.DataFrame())
             shown = dict(ws.shown)
         finally:
             # Уборка обязательна и при падении: соединение возвращается в пул, и
@@ -226,9 +255,22 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
 
     dims = ["holding_name", "agency", "level", "industry_name", "tb_short_name",
             "region_name"]
-    cuts = {dim: A.by_dim(marked, dim, int(opts["top_n"])) for dim in dims}
+    split = A.stayed_split(dest_raw, marked, gosb, gosb_key)
+    cuts = {dim: A.by_dim(marked, dim, int(opts["top_n"]), split.get(dim))
+            for dim in dims}
     cuts = {k: v for k, v in cuts.items() if v is not None and not v.empty}
     orgs = A.top_orgs(marked, gained_inn, int(opts["top_orgs"]))
+
+    org_sum, org_agr, org_top, org_meta = A.org_exit(
+        org_raw, lost_inn, attrs, int(opts["org_min_base"]),
+        float(opts["org_mass_share"]), int(opts["top_orgs"]))
+    pat, gone_m = A.exit_pattern(exit_raw, float(opts["exit_drop"]))
+    why = {"org_sum": org_sum, "org_agr": org_agr, "org_top": org_top,
+           "org_meta": org_meta, "pat": pat, "gone_m": gone_m,
+           "pay": A.pay_level(pay_raw)}
+    lso, lso_meta = A.left_segment_orgs(lso_raw, int(opts["top_orgs"]))
+    gone_x = {"lso": lso, "lso_meta": lso_meta,
+              "below": A.below_depth(below_raw, LQ.AMT_MIN)}
 
     progress.done(
         f"получателей {t['d_triples']:+,.0f}, людей {t['d_epk']:+,.0f}; "
@@ -239,7 +281,7 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
     # --- тексты ---
     progress.step("Текстовые выводы")
     texts = _narrate(t, causes, gains, causes_e, tr, st, measured, cmp_months,
-                     surv_c, seas, codes_m, to_seg, to_codes, mig, cuts, opts)
+                     surv_c, seas, codes_m, to_seg, to_codes, mig, cuts, opts, why)
 
     # --- сборка ---
     progress.step("Сборка HTML")
@@ -250,7 +292,8 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
         V.net_block(t, causes, gains, causes_e, gains_e, shown, *texts["net"]),
         V.both_block(both, t, shown),
         V.where_gone_block(to_seg, to_codes, to_codes_inn, mig, ten, shown,
-                           *texts["gone"]),
+                           *texts["gone"], extra=gone_x),
+        V.why_block(why, shown, *texts["why"]),
         V.when_block(tr, st, measured, cmp_months, surv_c, load, seas, codes_m,
                      t_prev, causes_prev, shown, *texts["when"]),
         V.where_block(cuts, orgs, meta, shown, *texts["where"]),
@@ -275,7 +318,7 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
         gains_epk=gains_e, both=both, tr=tr, st=st, measured=measured,
         cmp_months=cmp_months, surv=surv_c, thr=thr, seas=seas,
         codes_m=codes_m, to_seg=to_seg,
-        to_codes=to_codes, to_codes_inn=to_codes_inn,
+        to_codes=to_codes, to_codes_inn=to_codes_inn, why=why, gone_x=gone_x,
         mig=mig, cuts=cuts, orgs=orgs, tenure=ten,
         checks=checks, warnings=warnings, probe=pr, meta=meta, shown=shown,
         texts={k: v[0] for k, v in texts.items()})
@@ -309,14 +352,15 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
             "survival": surv_c, "load": load, "threshold": thr,
             "seasonality": seas, "code_months": codes_m,
             "left_segment": to_seg, "left_codes": to_codes,
-            "left_codes_inn": to_codes_inn,
+            "left_codes_inn": to_codes_inn, "why": why, "gone_x": gone_x,
             "migration": mig,
             "cuts": cuts, "orgs": orgs, "tenure": ten, "marked": marked,
             "checks": checks, "warnings": warnings, "meta": meta, "shown": shown}
 
 
 def _narrate(t, causes, gains, causes_e, tr, st, measured, cmp_months, surv,
-             seas, codes_m, to_seg, to_codes, mig, cuts, opts) -> dict:
+             seas, codes_m, to_seg, to_codes, mig, cuts, opts,
+             why: dict | None = None) -> dict:
     """Тексты разделов. Названия организаций и территорий уходят в модель токенами.
 
     Псевдонимы заводятся на КАЖДЫЙ раздел заново: словарь живёт ровно один вызов,
@@ -363,6 +407,16 @@ def _narrate(t, causes, gains, causes_e, tr, st, measured, cmp_months, surv,
             cuts_m[dim] = df
     out["where"] = _guarded(nar, "где", P.where(cuts_m), N.fb_where(cuts),
                             forbidden2, al2)
+
+    # «Почему» несёт названия организаций в топе ушедших — тоже токенами.
+    why = why or {}
+    al3 = N.Aliases()
+    top = why.get("org_top", pd.DataFrame())
+    has_names = top is not None and not top.empty and "company_name" in top
+    top_m = N.mask_frame(top, "company_name", "Орг", al3) if has_names else top
+    forbidden3 = [str(v) for v in top["company_name"].dropna()] if has_names else []
+    out["why"] = _guarded(nar, "почему", P.why({**why, "org_top": top_m}),
+                          N.fb_why(why), forbidden3, al3)
 
     progress.done(f"тексты: вызовов LLM {nar.calls}/{nar.max_calls}, "
                   f"на фолбэке разделов {len(nar.used_fallback)}"

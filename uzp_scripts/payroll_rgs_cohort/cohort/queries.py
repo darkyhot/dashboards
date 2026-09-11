@@ -237,7 +237,9 @@ _T_SEG = _SEG_INN
 # коммерческий клиент, малый бизнес или он просто сменил бюджетную работу на
 # небюджетную. Справочник маленький, отдельная выборка ничего не стоит.
 _T_SEG_ALL = """
-  SELECT e.inn, min(e.segment_name) AS segment_name
+  SELECT e.inn, min(e.segment_name) AS segment_name,
+         min(e.company_name) AS company_name,
+         min(e.industry_name) AS industry_name
   FROM {schema}.uzp_data_epk_consolidation e
   WHERE e.inn IS NOT NULL
   GROUP BY e.inn
@@ -268,7 +270,7 @@ _T_SEG_ALL = """
 # опознаётся справочником, и «не строится» перестаёт быть загадкой.
 _T_PAIRS = """
   SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.gosb_id_legacy,
-         x.tb_id, x.amt
+         x.tb_id, x.agrmnt_num, x.amt
   FROM (
     SELECT p.report_dt,
            p.epk_id,
@@ -276,6 +278,7 @@ _T_PAIRS = """
            p.sys_gosb_id         AS gosb_id,
            min(p.sys_tb_id)      AS tb_id,
            min(p.gosb_id)        AS gosb_id_legacy,
+           min(p.agrmnt_num)     AS agrmnt_num,
            sum(p.amt)            AS amt,
            sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
                                               CAST(p.inn AS bigint)) AS amt_inn
@@ -936,4 +939,213 @@ r AS (
 )
 SELECT m.n_used, m.n_matched, r.n_null_rows, r.n_rows
 FROM m, r
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Почему ушли. Всё, кроме EXIT_PATTERN, считается поверх рабочего набора — без
+# новых сканов витрины: на проме помесячный ряд и так упирается в таймаут.
+# --------------------------------------------------------------------------- #
+
+# КУДА перешли те, кто остался в сегменте. Для сегмента это не потеря, а для
+# строки разреза — может быть: человек, ушедший из школы ТБ-1 в школу ТБ-2,
+# сегмент не покинул, но ТБ-1 его потерял. Без этой выборки колонка «остались в
+# сегменте» не отвечает, потеря это для строки или нет.
+#
+# Вес назначения — 1/n: у совместителя в отчётном месяце несколько троек, и без
+# веса один потерянный получатель посчитался бы дважды. С весом сумма по строкам
+# ровно равна числу оставшихся — разрез остаётся аддитивным.
+STAYED_DEST = """
+WITH lost AS (""" + _LOST_BASE + """),
+st AS (
+  SELECT epk_id, inn, gosb_id, tb_id FROM lost WHERE cause = 'stayed_in_segment'
+),
+dest AS (
+  SELECT epk_id, inn, gosb_id, tb_id,
+         count(*) OVER (PARTITION BY epk_id) AS n_dest
+  FROM t_pairs WHERE report_dt = CAST(:d_cur AS date)
+)
+SELECT s.inn, s.gosb_id AS gosb_from, s.tb_id AS tb_from,
+       d.gosb_id AS gosb_to, d.tb_id AS tb_to,
+       sum(1.0 / d.n_dest)                                         AS n_triples,
+       sum(CASE WHEN d.inn = s.inn THEN 1.0 / d.n_dest ELSE 0 END) AS n_same_inn,
+       sum(CASE WHEN hf.holding_name IS NOT NULL
+                 AND ht.holding_name = hf.holding_name
+                THEN 1.0 / d.n_dest ELSE 0 END)                    AS n_same_holding
+FROM st s
+JOIN dest d ON d.epk_id = s.epk_id
+LEFT JOIN t_seg hf ON hf.inn = s.inn
+LEFT JOIN t_seg ht ON ht.inn = d.inn
+GROUP BY s.inn, s.gosb_id, s.tb_id, d.gosb_id, d.tb_id
+"""
+
+# Судьба ОРГАНИЗАЦИИ, а не человека. Главный вопрос «почему»: ушла ли
+# организация целиком (увела зарплатный проект — потеря в B2B), или от неё
+# точечно уходят люди (переводят зарплату по заявлению, увольняются). По одной
+# строке «ушёл из банка» эти истории неразличимы, а решения по ним разные.
+#
+# Договор сравнивается по НАБОРУ номеров: у организации их бывает несколько, и
+# сравнение одного min() с другим объявило бы переоформлением обычный второй
+# договор. `n_agr_kept` — сколько договоров базового месяца живы в отчётном.
+ORG_STATUS = """
+WITH b AS (
+  SELECT inn, count(*) AS n_base FROM t_pairs
+  WHERE report_dt = CAST(:d_base AS date) GROUP BY inn
+),
+c AS (
+  SELECT inn, count(*) AS n_cur FROM t_pairs
+  WHERE report_dt = CAST(:d_cur AS date) GROUP BY inn
+),
+s AS (
+  SELECT inn, sum(amt_all) AS amt_cur_all FROM t_seen
+  WHERE report_dt = CAST(:d_cur AS date) GROUP BY inn
+),
+ab AS (
+  SELECT DISTINCT inn, agrmnt_num FROM t_pairs
+  WHERE report_dt = CAST(:d_base AS date) AND agrmnt_num IS NOT NULL
+),
+ac AS (
+  SELECT DISTINCT inn, agrmnt_num FROM t_pairs
+  WHERE report_dt = CAST(:d_cur AS date) AND agrmnt_num IS NOT NULL
+),
+ag AS (
+  SELECT ab.inn, count(*) AS n_agr_base, count(ac.inn) AS n_agr_kept
+  FROM ab LEFT JOIN ac ON ac.inn = ab.inn AND ac.agrmnt_num = ab.agrmnt_num
+  GROUP BY ab.inn
+),
+agc AS (SELECT inn, count(*) AS n_agr_cur FROM ac GROUP BY inn)
+SELECT b.inn, b.n_base,
+       COALESCE(c.n_cur, 0)        AS n_cur,
+       COALESCE(s.amt_cur_all, 0)  AS amt_cur_all,
+       COALESCE(ag.n_agr_base, 0)  AS n_agr_base,
+       COALESCE(ag.n_agr_kept, 0)  AS n_agr_kept,
+       COALESCE(agc.n_agr_cur, 0)  AS n_agr_cur
+FROM b
+LEFT JOIN c   ON c.inn = b.inn
+LEFT JOIN s   ON s.inn = b.inn
+LEFT JOIN ag  ON ag.inn = b.inn
+LEFT JOIN agc ON agc.inn = b.inn
+"""
+
+# КАК уходили из банка: обрывом или постепенно. Суммы и число зачислений по
+# месяцам у тех, кто ушёл из банка совсем, — от трёх месяцев ДО базового (иначе
+# у ушедших сразу после базы нет предыстории) до отчётного.
+#
+# ЕДИНСТВЕННЫЙ новый скан витрины в этом блоке — самый дорогой запрос раздела,
+# выключается параметром `with_exit_pattern`. Свёртка до человека идёт в SQL:
+# в ядро уезжает строка на человека, а не на человеко-месяц.
+EXIT_PATTERN = """
+WITH lost AS (""" + _LOST_EPK_BASE + """),
+lb AS (SELECT epk_id FROM lost WHERE cause = 'left_bank'),
+m AS (
+  SELECT p.report_dt, p.epk_id,
+         sum(p.amt)             AS amt,
+         sum(p.transaction_qty) AS qty
+  FROM {schema}.uzp_data_payroll_m p
+  JOIN lb ON lb.epk_id = p.epk_id
+  WHERE p.report_dt >= CAST(:d_pre AS date)
+    AND p.report_dt <= CAST(:d_cur AS date)
+  GROUP BY p.report_dt, p.epk_id
+),
+r AS (
+  SELECT report_dt, epk_id, amt, qty,
+         row_number() OVER (PARTITION BY epk_id ORDER BY report_dt DESC) AS k
+  FROM m WHERE amt > 0
+)
+SELECT epk_id,
+       max(report_dt)                                AS last_dt,
+       count(*)                                      AS n_active,
+       avg(CASE WHEN k <= 2 THEN amt END)            AS amt_last,
+       avg(CASE WHEN k BETWEEN 3 AND 5 THEN amt END) AS amt_prev,
+       avg(CASE WHEN k <= 2 THEN qty END)            AS qty_last,
+       avg(CASE WHEN k BETWEEN 3 AND 5 THEN qty END) AS qty_prev
+FROM r GROUP BY epk_id
+"""
+
+# Сколько получал ушедший ОТНОСИТЕЛЬНО КОЛЛЕГ по той же организации. Уходят
+# низкооплачиваемые — похоже на текучку и сокращения; высокооплачиваемые — на то,
+# что их переманивают, и это самая дорогая потеря. Сравнение с СОБСТВЕННОЙ
+# организацией, а не с сегментом: средняя зарплата школы и министерства разная,
+# и сравнение с общей средней мерило бы структуру сегмента, а не уход.
+PAY_LEVEL = """
+WITH lost AS (""" + _LOST_BASE + """),
+b AS (
+  SELECT epk_id, inn, gosb_id, amt,
+         avg(amt) OVER (PARTITION BY inn) AS org_avg,
+         count(*) OVER (PARTITION BY inn) AS org_n
+  FROM t_pairs WHERE report_dt = CAST(:d_base AS date)
+)
+SELECT COALESCE(l.cause, 'retained') AS fate,
+       CASE WHEN b.amt < 0.5 * b.org_avg THEN 1
+            WHEN b.amt < 0.8 * b.org_avg THEN 2
+            WHEN b.amt < 1.2 * b.org_avg THEN 3
+            WHEN b.amt < 2.0 * b.org_avg THEN 4
+            ELSE 5 END                   AS bucket,
+       count(*)                          AS n_triples
+FROM b
+LEFT JOIN lost l ON l.epk_id = b.epk_id AND l.inn = b.inn AND l.gosb_id = b.gosb_id
+WHERE b.org_n >= :pay_min_org
+GROUP BY 1, 2
+"""
+
+# В КАКИЕ ОРГАНИЗАЦИИ ушли те, кто ушёл в другой сегмент. Сегмент уже показан;
+# организация отвечает, что это было: много людей в одну коммерческую компанию
+# того же подразделения — переезд работодателя или вывод функции на аутсорсинг,
+# вразнобой — обычная смена работы.
+#
+# Приёмник у человека один — тот, кто платит больше всех: иначе совместитель
+# посчитался бы в двух организациях, и доли перестали бы складываться.
+LEFT_SEGMENT_ORGS = """
+WITH lost AS (""" + _LOST_EPK_BASE + """),
+ls AS (SELECT epk_id FROM lost WHERE cause = 'left_segment'),
+bg AS (
+  SELECT DISTINCT epk_id, gosb_id FROM t_pairs
+  WHERE report_dt = CAST(:d_base AS date)
+),
+d AS (
+  SELECT t.epk_id, t.inn, t.gosb_id,
+         row_number() OVER (PARTITION BY t.epk_id
+                            ORDER BY t.amt_all DESC, t.inn) AS rn
+  FROM t_seen t
+  JOIN ls ON ls.epk_id = t.epk_id
+  LEFT JOIN t_seg s ON s.inn = t.inn
+  WHERE t.report_dt = CAST(:d_cur AS date) AND s.inn IS NULL AND t.amt_all > 0
+)
+SELECT d.inn,
+       min(COALESCE(sa.segment_name, 'Организация не в справочнике')) AS segment_name,
+       min(sa.company_name)                                           AS company_name,
+       min(sa.industry_name)                                          AS industry_name,
+       count(*)                                                       AS n_epk,
+       count(bg.epk_id)                                               AS n_same_gosb
+FROM d
+LEFT JOIN t_seg_all sa ON sa.inn = d.inn
+LEFT JOIN bg ON bg.epk_id = d.epk_id AND bg.gosb_id = d.gosb_id
+WHERE d.rn = 1
+GROUP BY d.inn
+"""
+
+# НАСКОЛЬКО ниже порога. Упала вдвое — неполная ставка или простой; не дотягивает
+# сотню рублей — артефакт порога: зарплаты индексируются, порог стоит на месте.
+# Сумма берётся ПО ОРГАНИЗАЦИИ, как и сам порог, и по лучшей из организаций
+# человека — ровно так, как решалось, получатель он или нет.
+BELOW_DEPTH = """
+WITH lost AS (""" + _LOST_EPK_BASE + """),
+bt AS (SELECT epk_id FROM lost WHERE cause = 'below_threshold'),
+b AS (
+  SELECT x.epk_id, max(x.amt_inn) AS amt_base
+  FROM (SELECT epk_id, inn, sum(amt) AS amt_inn FROM t_pairs
+        WHERE report_dt = CAST(:d_base AS date) GROUP BY epk_id, inn) x
+  JOIN bt ON bt.epk_id = x.epk_id
+  GROUP BY x.epk_id
+),
+c AS (
+  SELECT y.epk_id, max(y.amt_inn) AS amt_cur
+  FROM (SELECT t.epk_id, t.inn, sum(t.amt_codes) AS amt_inn
+        FROM t_seen t JOIN t_seg s ON s.inn = t.inn
+        WHERE t.report_dt = CAST(:d_cur AS date) GROUP BY t.epk_id, t.inn) y
+  JOIN bt ON bt.epk_id = y.epk_id
+  GROUP BY y.epk_id
+)
+SELECT b.epk_id, b.amt_base, c.amt_cur
+FROM b LEFT JOIN c ON c.epk_id = b.epk_id
 """

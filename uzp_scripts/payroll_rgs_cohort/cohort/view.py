@@ -384,7 +384,8 @@ def both_block(both: pd.DataFrame, t: dict, shown: dict) -> str:
 def where_gone_block(to_seg: pd.DataFrame, to_codes: pd.DataFrame,
                      to_codes_inn: pd.DataFrame,
                      mig: pd.DataFrame, tenure: pd.DataFrame, shown: dict,
-                     text: str = "", fb: bool = False) -> str:
+                     text: str = "", fb: bool = False,
+                     extra: dict | None = None) -> str:
     """Куда именно делись люди: сегмент, вид выплат, переоформление, стаж.
 
     Строка «ушёл» без адреса — половина ответа. Забрал ли человека коммерческий
@@ -431,6 +432,44 @@ def where_gone_block(to_seg: pd.DataFrame, to_codes: pd.DataFrame,
                     "организация. Если верх занимает одна-две — это адрес, куда "
                     "идти; если список ровный — это фон по всему сегменту, и "
                     "идти некуда."))
+    extra = extra or {}
+    lso, lm = extra.get("lso", pd.DataFrame()), extra.get("lso_meta", {}) or {}
+    if lso is not None and not lso.empty:
+        rows = [[C.esc(str(getattr(r, "company_name", None) or "нет в справочнике")),
+                 C.esc("" if pd.isna(r.inn) else str(int(r.inn))),
+                 C.esc(str(r.segment_name or "")),
+                 C.esc(str(getattr(r, "industry_name", None) or "")),
+                 _n(r.n_epk), _pct(r.share, 0), _pct(r.same_gosb_share, 0)]
+                for r in lso.itertuples()]
+        parts.append(
+            "<h3>В какие организации ушли в другой сегмент</h3>"
+            + f'<p>Ушли в {_n(lm.get("n_orgs", 0))} организаций. Десять крупнейших '
+              f'приёмников забрали {_pct(lm.get("top10_share", 0), 0)} ушедших; '
+              f'в том же подразделении банка осталось '
+              f'{_pct(lm.get("same_gosb_share", 0), 0)}.</p>'
+            + C.table(["Организация", "Номер", "Сегмент", "Отрасль", "Человек",
+                       "Доля ушедших", "В том же подразделении"], rows,
+                      num_cols=[4, 5, 6])
+            + _note("Приёмник у человека один — тот, кто платит больше всех. "
+                    "Высокая доля крупнейших — людей забирают конкретные "
+                    "организации, с ними и надо работать; низкая — обычная смена "
+                    "работы. «То же подразделение» — человек остался в своём "
+                    "городе: переехал работодатель или функцию вывели на "
+                    "аутсорсинг, а не переехал человек."))
+    below = extra.get("below", pd.DataFrame())
+    if below is not None and not below.empty:
+        rows = [[C.esc(r.axis), C.esc(r.bucket), _n(r.n_epk), _pct(r.share, 0)]
+                for r in below.itertuples()]
+        parts.append(
+            "<h3>Ниже порога — насколько</h3>"
+            + C.table(["Что меряем", "Диапазон", "Человек", "Доля"], rows,
+                      num_cols=[2, 3])
+            + _note("Уровень — лучшая сумма по зарплатным кодам в одной организации "
+                    "против порога. Изменение — к сумме базового месяца. «80–100% "
+                    "порога» вместе с «почти не изменилась» — артефакт порога: "
+                    "зарплата была чуть выше и стала чуть ниже, человек никуда не "
+                    "делся. «Упала больше чем вдвое» — неполная ставка, простой, "
+                    "частичная выплата."))
     if not mig.empty:
         rows = []
         for r in mig.head(12).itertuples():
@@ -465,9 +504,122 @@ def where_gone_block(to_seg: pd.DataFrame, to_codes: pd.DataFrame,
         "Куда делись люди",
         C.card(_fallback_mark(fb) + (C.narrative_html(text) if text else "")
                + "".join(parts)
-               + sql_info(shown, "left_segment", "left_codes", "inn_migration",
-                          "tenure")),
+               + sql_info(shown, "left_segment", "left_segment_orgs", "left_codes",
+                          "below_depth", "inn_migration", "tenure")),
         eyebrow="ответ на «куда»")
+
+
+def why_block(why: dict, shown: dict, text: str = "", fb: bool = False) -> str:
+    """Почему ушли: организация или человек, договор, как уходили, кто уходил.
+
+    Отвечает не на «куда», а на «почему» — насколько это возможно по трём
+    разрешённым витринам. Мотивы людей (цена, бонусы конкурента, увольнение
+    против смены работы) из данных не видны, и блок их не выдумывает: он
+    отделяет решения организаций от решений людей и показывает, можно ли было
+    уход заметить заранее.
+    """
+    why = why or {}
+    parts = []
+    summ, cross = why.get("org_sum", pd.DataFrame()), why.get("org_agr", pd.DataFrame())
+    top, meta = why.get("org_top", pd.DataFrame()), why.get("org_meta", {}) or {}
+    if summ is not None and not summ.empty:
+        rows = [[C.esc(r.org_class), _n(r.n_org), _n(r.n_base), _n(r.left_bank),
+                 _pct(r.share_lb, 0), _n(r.loss), _pct(r.share_loss, 0)]
+                for r in summ.itertuples()]
+        parts.append(
+            "<h3>Ушла организация или уходят люди</h3>"
+            + f'<p>Из организаций, которые увели зарплатный проект целиком или '
+              f'массово, пришло <b>{_pct(meta.get("share_lb_org", 0), 0)}</b> всех '
+              f'ушедших из банка.</p>'
+            + C.table(["Организации", "Сколько", "Получателей в базовом месяце",
+                       "Ушли из банка", "Доля всех ушедших из банка",
+                       "Реальная потеря", "Доля реальной потери"], rows,
+                      num_cols=[1, 2, 3, 4, 5, 6])
+            + _note(f"«Ушла целиком» — в отчётном месяце ни одного получателя и ни "
+                    f"одного зачисления бывшим получателям: зарплатный проект уведён, "
+                    f"это потеря в B2B и вопрос к менеджеру организации. «Массовый "
+                    f"уход» — организация платит, но из банка ушло не меньше "
+                    f"{_pct(meta.get('mass_share', 0.5), 0)} её получателей. «Перестала "
+                    f"платить, люди остались в банке» — организации в ведомостях нет, но "
+                    f"её люди получают деньги в банке: реорганизация или новый ИНН, а не "
+                    f"уход клиента; куда именно — в таблице переоформлений. «Точечные» "
+                    f"— люди уходят сами: переводят зарплату по заявлению или "
+                    f"увольняются. Организации меньше {meta.get('min_base', 10)} "
+                    f"получателей в классы не делятся: у маленькой «ушли все» — "
+                    f"это двое."))
+    if cross is not None and not cross.empty:
+        rows = [[C.esc(r.org_class), C.esc(r.agr), _n(r.n_org), _n(r.loss)]
+                for r in cross.itertuples()]
+        parts.append(
+            "<h3>Договор зарплатного проекта</h3>"
+            + C.table(["Организации", "Договор", "Сколько", "Реальная потеря"], rows,
+                      num_cols=[2, 3])
+            + _note(f"Номер договора известен у {_pct(meta.get('agr_known', 0), 0)} "
+                    f"организаций. «Договор сменился» — ни один договор базового "
+                    f"месяца не жив в отчётном, но есть новый: переоформление у нас. "
+                    f"Потери у таких организаций — повод проверить, не ушла ли часть "
+                    f"людей при переоформлении."))
+    if top is not None and not top.empty:
+        rows = [[C.esc(str(getattr(r, "company_name", None) or "")),
+                 C.esc("" if pd.isna(r.inn) else str(int(r.inn))),
+                 C.esc(r.org_class), C.esc(r.agr), _n(r.n_base), _n(r.n_cur),
+                 _n(r.left_bank), _n(r.loss), _pct(r.lb_share, 0)]
+                for r in top.itertuples()]
+        parts.append(
+            "<h3>Организации, которые увели проект целиком или массово</h3>"
+            + C.table(["Организация", "Номер", "Что произошло", "Договор", "Было",
+                       "Стало", "Ушли из банка", "Реальная потеря",
+                       "Доля ушедших из банка"], rows, num_cols=[4, 5, 6, 7, 8])
+            + _note("Это адресный список: по каждой организации есть конкретный "
+                    "вопрос к её менеджеру. Сортировка по реальной потере."))
+    pat, gone_m = why.get("pat", pd.DataFrame()), why.get("gone_m", pd.DataFrame())
+    if pat is not None and not pat.empty:
+        rows = [[C.esc(r.pattern), _n(r.n_epk), _pct(r.share, 0), _pct(r.ratio, 0)]
+                for r in pat.itertuples()]
+        parts.append(
+            "<h3>Как уходили из банка: обрывом или постепенно</h3>"
+            + C.table(["Как", "Человек", "Доля", "Последние месяцы к прежним (медиана)"],
+                      rows, num_cols=[1, 2, 3])
+            + _note("Два последних месяца с зачислениями против трёх до них. "
+                    "Постепенный уход — человек сначала уводил часть зарплаты (аванс "
+                    "в одном банке, зарплата в другом) или ему сокращали ставку: "
+                    "такого клиента можно было заметить и удержать заранее. Обрыв — "
+                    "увольнение или разовый перевод зарплаты целиком."))
+    if gone_m is not None and not gone_m.empty:
+        rows = [[C.esc(f"{pd.Timestamp(r.gone_month):%m.%Y}"), _n(r.n_epk),
+                 _pct(r.share, 0)] for r in gone_m.itertuples()]
+        parts.append(
+            "<h3>В каком месяце уходили</h3>"
+            + C.table(["Месяц ухода", "Человек", "Доля"], rows, num_cols=[1, 2])
+            + _note("Месяц ухода — следующий за последним месяцем с зачислениями. "
+                    "Всплеск в одном месяце — событие: организация увела проект. "
+                    "Ровный фон — текучесть людей."))
+    pay = why.get("pay", pd.DataFrame())
+    if pay is not None and not pay.empty:
+        heads = [A.PAY_BUCKETS[k] for k in A.PAY_BUCKETS]
+        rows = [[C.esc(str(r.fate_title)), _n(r.n_triples)]
+                + [_pct(getattr(r, f"b{k}"), 0) for k in A.PAY_BUCKETS]
+                for r in pay.itertuples()]
+        parts.append(
+            "<h3>Сколько получали ушедшие по сравнению с коллегами</h3>"
+            + C.table(["Группа", "Получателей"] + heads, rows,
+                      num_cols=list(range(1, len(heads) + 2)))
+            + _note("Зарплата получателя против средней по ЕГО организации в базовом "
+                    "месяце. Сравнивать со строкой «Остались на месте»: сдвиг влево — "
+                    "уходят низкооплачиваемые (текучка, сокращения), вправо — "
+                    "высокооплачиваемые (их переманивают, самая дорогая потеря)."))
+    if not parts:
+        return _empty("Почему ушли", "ни один разбор не дал результата")
+    return C.section(
+        "Почему ушли",
+        C.card(_fallback_mark(fb) + (C.narrative_html(text) if text else "")
+               + "".join(parts)
+               + _src("Мотивы людей — цена обслуживания, бонусы конкурента, "
+                      "увольнение против смены работы — в разрешённых источниках не "
+                      "видны. Блок отделяет решения организаций от решений людей и "
+                      "показывает, можно ли было уход заметить заранее.")
+               + sql_info(shown, "org_status", "exit_pattern", "pay_level")),
+        eyebrow="ответ на «почему»")
 
 
 def when_block(tr: pd.DataFrame, st: pd.DataFrame, measured: str,
@@ -630,16 +782,22 @@ def where_block(cuts: dict, orgs: pd.DataFrame, meta: dict, shown: dict,
     for dim, df in cuts.items():
         if df is None or df.empty:
             continue
-        rows = []
-        for r in df.itertuples():
-            rows.append([
-                C.esc(str(getattr(r, dim))), _n(r.n_triples), _pct(r.share, 0),
-                _n(r.n_inn), _n(getattr(r, A.LOSS)), _n(getattr(r, A.INSIDE))])
+        spec = A.cut_columns(dim, df)
+        rows = [[C.esc(str(getattr(r, dim)))]
+                + [_pct(getattr(r, c), 0) if c == "share" else _n(getattr(r, c))
+                   for c, _ in spec]
+                for r in df.itertuples()]
         parts.append(f"<h3>{C.esc(titles.get(dim, dim))}</h3>"
-                     + C.table([titles.get(dim, dim), "Потеряно", "Доля потерь",
-                                "Организаций", "Реальная потеря",
-                                "Остались в сегменте"], rows,
-                               num_cols=[1, 2, 3, 4, 5]))
+                     + C.table([titles.get(dim, dim)] + [h for _, h in spec], rows,
+                               num_cols=list(range(1, len(spec) + 1))))
+    if parts:
+        parts.append(_note(
+            "Реальная потеря = ушли из банка + в другой сегмент + не зарплатными "
+            "кодами + ниже порога; строки отсортированы по ней. «Выбыло из строки» = "
+            "реальная потеря + оставшиеся в сегменте. Для ТБ, холдингов и регионов "
+            "оставшиеся разделены: перешедшие в другой ТБ или холдинг для своей "
+            "строки — убыль, хоть сегмент их и сохранил. Счёт — в получателях "
+            "(тройках): совместитель, потерявший две работы, даёт двух."))
 
     if not orgs.empty:
         rows = [[C.esc(str(r.company_name or r.inn)), _signed(r.net), _n(r.lost),
@@ -671,7 +829,7 @@ def where_block(cuts: dict, orgs: pd.DataFrame, meta: dict, shown: dict,
         "Где это произошло",
         C.card(_fallback_mark(fb) + (C.narrative_html(text) if text else "")
                + "".join(parts) + cov
-               + sql_info(shown, "lost_by_inn", "gained_by_inn")),
+               + sql_info(shown, "lost_by_inn", "gained_by_inn", "stayed_dest")),
         eyebrow="ответ на «где»")
 
 

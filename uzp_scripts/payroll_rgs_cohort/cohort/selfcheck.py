@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 
+import numpy as np
 import pandas as pd
 
 from . import analyze as A
@@ -566,6 +567,105 @@ def check_by_dim() -> None:
     _ok("разрезы: доля от целого, состав по видам внутри строки верен")
 
 
+def check_why() -> None:
+    """Разрезы по причинам и разборы «почему»: аддитивность и классы.
+
+    Разрез обязан складываться: причины — в реальную потерю, реальная потеря и
+    оставшиеся — в «выбыло», оставшиеся «здесь» и «в другую строку» — в
+    оставшихся. Разъехавшись, таблица показала бы цифры, которые читатель
+    сложит и не получит итога, — и перестанет верить остальным.
+    """
+    marked = pd.DataFrame({
+        "inn": [1, 1, 1, 2, 2, 3],
+        "cause": ["left_bank", "stayed_in_segment", "below_threshold",
+                  "left_segment", "stayed_in_segment", "other_codes"],
+        "n_triples": [10.0, 6.0, 2.0, 5.0, 4.0, 3.0],
+        "tb_short_name": ["СРБ", "СРБ", "СРБ", "ЮЗБ", "ЮЗБ", "ЮЗБ"],
+        "holding_name": ["Х1", "Х1", "Х1", A.FILL["holding_name"],
+                         A.FILL["holding_name"], "Х1"]})
+    # Совместитель: у org1 шесть оставшихся, четыре в том же ТБ и два в другом.
+    dest = pd.DataFrame({
+        "inn": ["1", "1", "2"], "gosb_from": [10, 10, 20], "tb_from": [38, 38, 52],
+        "gosb_to": [10, 30, 30], "tb_to": [38, 55, 38],
+        "n_triples": [4.0, 2.0, 4.0], "n_same_inn": [4.0, 0.0, 1.0],
+        "n_same_holding": [4.0, 2.0, 0.0]})
+    split = A.stayed_split(dest, marked, pd.DataFrame(), None)
+    for dim in ("tb_short_name", "holding_name"):
+        cut = A.by_dim(marked, dim, 10, split.get(dim))
+        if not np.allclose(cut[A.LOSS_CAUSES].sum(axis=1), cut[A.LOSS]):
+            raise CheckFailed(f"{dim}: причины не складываются в реальную потерю")
+        if not np.allclose(cut[A.LOSS] + cut[A.INSIDE], cut["n_triples"]):
+            raise CheckFailed(f"{dim}: потеря и оставшиеся не дают «выбыло»")
+        if not np.allclose(cut["inside_same"] + cut["inside_other"], cut[A.INSIDE]):
+            raise CheckFailed(f"{dim}: «здесь» и «в другую» не дают оставшихся")
+        if not cut[A.LOSS].is_monotonic_decreasing:
+            raise CheckFailed(f"{dim}: разрез отсортирован не по реальной потере")
+    srb = A.by_dim(marked, "tb_short_name", 10, split["tb_short_name"])
+    srb = srb[srb["tb_short_name"] == "СРБ"].iloc[0]
+    if abs(srb["inside_same"] - 4.0) > 1e-9:
+        raise CheckFailed("совместитель посчитан в двух ТБ сразу — вес 1/n потерян")
+    # У организации без холдинга «тот же холдинг» — это та же организация.
+    nh = split["holding_name"].set_index("holding_name")["inside_same"]
+    if abs(nh[A.FILL["holding_name"]] - 1.0) > 1e-9:
+        raise CheckFailed("переход между несвязанными организациями без холдинга "
+                          "засчитан как «внутри холдинга»")
+
+    # Пятая — реорганизация: платить перестала, но из банка ушли единицы, остальные
+    # получают деньги под новым ИНН. «Ушла целиком» здесь было бы неправдой.
+    status = pd.DataFrame({
+        "inn": [1, 2, 3, 4, 5], "n_base": [100, 50, 20, 3, 40],
+        "n_cur": [0, 30, 18, 0, 0], "amt_cur_all": [0, 5e5, 1e5, 0, 0],
+        "n_agr_base": [1, 1, 1, 0, 1], "n_agr_kept": [0, 0, 1, 0, 0],
+        "n_agr_cur": [0, 1, 1, 0, 0]})
+    lost_inn = pd.DataFrame({"inn": ["1", "2", "3", "4", "5", "5"],
+                             "cause": ["left_bank"] * 5 + ["left_segment"],
+                             "n_triples": [90.0, 30.0, 2.0, 3.0, 4.0, 36.0]})
+    summ, cross, top, meta = A.org_exit(status, lost_inn, pd.DataFrame(),
+                                        min_base=10, mass_share=0.5)
+    got = dict(zip(summ["org_class"], summ["n_org"]))
+    want = {A.ORG_GONE: 1, A.ORG_MASS: 1, A.ORG_REORG: 1, A.ORG_POINT: 1,
+            A.ORG_SMALL: 1}
+    if got != want:
+        raise CheckFailed(f"классы организаций определены неверно: {got}")
+    agr = dict(zip(cross["org_class"], cross["agr"]))
+    if agr.get(A.ORG_MASS) != A.AGR_NEW or agr.get(A.ORG_POINT) != A.AGR_SAME:
+        raise CheckFailed(f"статус договора определён неверно: {agr}")
+    if A.ORG_REORG in set(top["org_class"]):
+        raise CheckFailed("реорганизация попала в список уведённых проектов")
+    if abs(summ["share_lb"].sum() - 1.0) > 1e-9:
+        raise CheckFailed("доли ушедших из банка по классам не дают единицы")
+
+    ex = pd.DataFrame({
+        "epk_id": [1, 2, 3, 4], "last_dt": pd.to_datetime(["2026-03-31"] * 4),
+        "n_active": [6, 6, 6, 2], "amt_last": [100, 40, 100, 100],
+        "amt_prev": [100, 100, 100, np.nan], "qty_last": [2, 2, 1, 1],
+        "qty_prev": [2, 2, 2, np.nan]})
+    pat, mon = A.exit_pattern(ex)
+    if list(pat["pattern"]) != A.PAT_ORDER or not (pat["n_epk"] == 1).all():
+        raise CheckFailed(f"шаблоны ухода определены неверно: {list(pat['pattern'])}")
+    if str(mon["gone_month"].iloc[0].date()) != "2026-04-30":
+        raise CheckFailed("месяц ухода — не следующий за последним активным")
+
+    pay = A.pay_level(pd.DataFrame({
+        "fate": ["retained", "retained", "left_bank"], "bucket": [1, 3, 5],
+        "n_triples": [30.0, 70.0, 10.0]}))
+    if not np.allclose(pay[[f"b{k}" for k in A.PAY_BUCKETS]].sum(axis=1), 1.0):
+        raise CheckFailed("доли зарплатных диапазонов в группе не дают единицы")
+    below = A.below_depth(pd.DataFrame({"amt_base": [3000, 3000, 6000],
+                                        "amt_cur": [2400, 1500, 500]}), 2500)
+    for axis, g in below.groupby("axis"):
+        if abs(g["share"].sum() - 1.0) > 1e-9:
+            raise CheckFailed(f"глубина порога: доли по оси «{axis}» не дают единицы")
+
+    e = pd.DataFrame()
+    if (A.stayed_split(e, marked, e, None) or not A.org_exit(e, e, e)[0].empty
+            or not A.exit_pattern(e)[0].empty or not A.pay_level(e).empty
+            or not A.left_segment_orgs(e)[0].empty or not A.below_depth(e, 2500).empty):
+        raise CheckFailed("разборы «почему» на пустых кадрах вернули непустое")
+    _ok("разрезы по причинам складываются, «почему»: классы организаций, договор, "
+        "шаблоны ухода и доли верны")
+
+
 def check_join_key_dtypes() -> None:
     """Соединения по идентификатору обязаны работать при РАЗНЫХ типах ключа.
 
@@ -1048,7 +1148,8 @@ ALL = [
     check_epk_ladder_shorter, check_ladder_table,
     check_steps_seasonal, check_steps_short_series,
     check_seasonality_definition, check_month_compare,
-    check_by_dim, check_join_key_dtypes, check_opt_rollback, check_top_orgs_net,
+    check_by_dim, check_why, check_join_key_dtypes, check_opt_rollback,
+    check_top_orgs_net,
     check_code_months, check_tenure,
     check_shown_self_contained, check_shown_recorded,
     check_anonymize_doc, check_llm_fallback, check_row_limit,

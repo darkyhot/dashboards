@@ -168,6 +168,10 @@ PAYROLL_AMT_MIN = 2500            # порог получателя: строг�
 # и на проме со справочником сходится только системный; старый живёт своей
 # жизнью. Сдвиг взаимно-однозначный: тройки от него не склеиваются.
 PAYROLL_LEGACY_GOSB_SHIFT = 900000
+# Доля организаций, у которых посреди ряда меняется номер договора зарплатного
+# проекта. Без неё разбор «договор сменился» в открытом контуре был бы пуст всегда,
+# и проверить его было бы нечем.
+PAYROLL_AGR_CHANGE_SHARE = 0.06
 
 # Коды зачисления, которые считает разбор (список задан заказчиком).
 PAYROLL_CODES_IN = (1, 2, 16, 18, 19, 26, 28, 33, 38, 39, 40, 42, 49,
@@ -1077,6 +1081,10 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
         inn_txt[tail] = [str(int(v)) for v in moved_to[tail]]
 
     tb_arr = tab["tb_id"].to_numpy()[org_of_pair]
+    # Договор зарплатного проекта: номер от ИНН организации; у части организаций
+    # он переоформляется в случайный месяц ряда — со второго номера.
+    org_agr_change = RNG.random(len(tab)) < PAYROLL_AGR_CHANGE_SHARE
+    org_agr_month = RNG.integers(1, len(months), len(tab))
     name_arr = np.array([f"ОРГ {int(v)}" for v in tab["inn_out"].to_numpy()])[org_of_pair]
 
     expect = {
@@ -1121,6 +1129,10 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
             # Подразделение месяца: до перевода — своё, после — другое.
             gosb_m = np.where(gosb_move_m[idx] <= m,
                               pair_gosb_after[idx], pair_gosb[idx])
+            org_i = org_of_pair[idx]
+            agr_ver = np.where(org_agr_change[org_i] & (org_agr_month[org_i] <= m), 2, 1)
+            agr_m = np.char.add(np.char.add(inn_txt[idx].astype(str), "/"),
+                                agr_ver.astype(str))
             # СТАРЫЕ номера подразделения и ТБ РАЗВЕДЕНЫ с системными — так на
             # проме. Там `gosb_id` со справочником не сходится, а `tb_id` пуст, и
             # отчёт, построенный на них, показывал единственную строку «ТБ
@@ -1154,6 +1166,7 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                     "document_info_sha1": epk_person[idx][take],
                     "gosb_id": gosb_legacy_m[take],
                     "sys_gosb_id": gosb_m[take],
+                    "agrmnt_num": agr_m[take],
                     "inn": inn_txt[idx][take],
                     "tb_id": None,
                     "sys_tb_id": tb_arr[idx][take],
@@ -1175,6 +1188,7 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                     "document_info_sha1": epk_person[idx][take_s],
                     "gosb_id": gosb_legacy_m[take_s],
                     "sys_gosb_id": gosb_m[take_s],
+                    "agrmnt_num": agr_m[take_s],
                     "inn": inn_txt[idx][take_s],
                     "tb_id": None,
                     "sys_tb_id": tb_arr[idx][take_s],

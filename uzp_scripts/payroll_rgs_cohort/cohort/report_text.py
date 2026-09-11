@@ -194,7 +194,9 @@ def check_leak(text: str, names) -> list[str]:
 # печатается как «0.4040» и читается как число получателей: документ уезжает
 # наружу на разбор, и там переспросить будет не у кого.
 PCT_COLUMNS = frozenset({"share", "delta_pct", "d_pairs_pct",
-                         "d_month_pct", "d_year_pct", "d_triples_pct"})
+                         "d_month_pct", "d_year_pct", "d_triples_pct",
+                         "share_lb", "share_loss", "lb_share", "same_gosb_share",
+                         "ratio", "b1", "b2", "b3", "b4", "b5"})
 # Колонки, где дробь — это коэффициент, а не доля: печатается как есть.
 RATIO_COLUMNS = frozenset({"multi", "score"})
 
@@ -247,7 +249,8 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
           to_codes_inn: pd.DataFrame, mig: pd.DataFrame,
           cuts: dict, orgs: pd.DataFrame, tenure: pd.DataFrame,
           checks: list[dict], warnings: list[str], probe: dict, meta: dict,
-          shown: dict, texts: dict) -> tuple[str, list[str]]:
+          shown: dict, texts: dict, why: dict | None = None,
+          gone_x: dict | None = None) -> tuple[str, list[str]]:
     """Собрать документ. Возвращает (текст, список утечек).
 
     Утечки возвращаются, а не бросаются исключением: решение, что делать с
@@ -261,13 +264,22 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
     # Поэтому в рамке обязано быть название: без него наружу уехала бы таблица
     # из одних чисел, по которой ничего не сверить.
     m_codes_inn = mask(to_codes_inn, al)
+    why, gone_x = why or {}, gone_x or {}
+    lso = gone_x.get("lso", pd.DataFrame())
+    org_top = why.get("org_top", pd.DataFrame())
+    m_lso = mask(lso, al) if lso is not None and not lso.empty else pd.DataFrame()
+    m_org_top = (mask(org_top, al) if org_top is not None and not org_top.empty
+                 else pd.DataFrame())
+    below = gone_x.get("below", pd.DataFrame())
+    lm = gone_x.get("lso_meta", {}) or {}
 
     # Настоящие названия собираются ДО сборки текста: ими маскируются и абзацы
     # выводов, и по ним же потом идёт проверка утечки. Один и тот же словарь на
     # оба шага — иначе маскирование и проверка разъедутся, и документ, прошедший
     # проверку, окажется замаскирован не полностью.
     names = collect_names([causes, gains, tr, thr, to_seg, to_codes, codes_m,
-                           to_codes_inn, mig, orgs, *cuts.values()])
+                           to_codes_inn, mig, orgs, lso, org_top,
+                           *cuts.values()])
     # Тексты выводов приходят с ВОССТАНОВЛЕННЫМИ названиями — они нужны такими в
     # HTML, но не здесь. Прогоняем их через те же токены, что и таблицы.
     texts = {k: mask_text(v, al, names) for k, v in (texts or {}).items()}
@@ -459,6 +471,24 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
 
 {_table(m_codes_inn, ['code_name', 'company_name', 'n_epk', 'share'],
         ['Вид зачисления', 'Организация', 'Человек', 'Доля вида'], limit=60)}
+### В какие организации ушли в другой сегмент
+
+Ушли в {_n(lm.get('n_orgs', 0))} организаций; десять крупнейших приёмников забрали
+{_pct(lm.get('top10_share', 0))} ушедших, в том же подразделении банка осталось
+{_pct(lm.get('same_gosb_share', 0))}. Приёмник у человека один — тот, кто платит
+больше всех.
+
+{_table(m_lso, ['company_name', 'segment_name', 'industry_name', 'n_epk', 'share',
+                'same_gosb_share'],
+        ['Организация', 'Сегмент', 'Отрасль', 'Человек', 'Доля ушедших',
+         'В том же подразделении'], limit=15)}
+### Ниже порога — насколько
+
+«80–100% порога» вместе с «почти не изменилась» — артефакт порога: зарплата была
+чуть выше и стала чуть ниже. «Упала больше чем вдвое» — неполная ставка, простой.
+
+{_table(below, ['axis', 'bucket', 'n_epk', 'share'],
+        ['Что меряем', 'Диапазон', 'Человек', 'Доля'], limit=10)}
 ### Похоже на переоформление
 
 {_table(m_mig, ['name_from', 'name_to', 'n_epk', 'share', 'to_in_segment'],
@@ -478,6 +508,60 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
 добавлять получателей. Если падение сохраняется при пороге 0, порог ни при чём.
 """)
 
+    meta_o = why.get("org_meta", {}) or {}
+    parts.append(f"""## Почему ушли
+
+{texts.get('why', '')}
+
+Мотивы людей — цена, бонусы конкурента, увольнение против смены работы — в
+разрешённых источниках не видны. Раздел отделяет решения организаций от решений
+людей и показывает, можно ли было уход заметить заранее.
+
+### Ушла организация или уходят люди
+
+Из организаций, которые увели зарплатный проект целиком или массово, пришло
+**{_pct(meta_o.get('share_lb_org', 0))}** всех ушедших из банка. «Ушла целиком» —
+в отчётном месяце ни одного получателя и ни одного зачисления; «массовый уход» —
+из банка ушло не меньше {_pct(meta_o.get('mass_share', 0.5))} получателей;
+«перестала платить, люди остались в банке» — реорганизация или новый ИНН, а не уход
+клиента; организации меньше {meta_o.get('min_base', 10)} получателей в классы не
+делятся.
+
+{_table(why.get('org_sum'), ['org_class', 'n_org', 'n_base', 'left_bank', 'share_lb',
+                             'loss', 'share_loss'],
+        ['Организации', 'Сколько', 'Получателей в базовом', 'Ушли из банка',
+         'Доля ушедших из банка', 'Реальная потеря', 'Доля реальной потери'])}
+### Договор зарплатного проекта
+
+Номер договора известен у {_pct(meta_o.get('agr_known', 0))} организаций.
+
+{_table(why.get('org_agr'), ['org_class', 'agr', 'n_org', 'loss'],
+        ['Организации', 'Договор', 'Сколько', 'Реальная потеря'])}
+### Организации, которые увели проект целиком или массово
+
+{_table(m_org_top, ['company_name', 'org_class', 'agr', 'n_base', 'n_cur',
+                    'left_bank', 'loss', 'lb_share'],
+        ['Организация', 'Что произошло', 'Договор', 'Было', 'Стало',
+         'Ушли из банка', 'Реальная потеря', 'Доля ушедших из банка'], limit=15)}
+### Как уходили из банка
+
+Два последних месяца с зачислениями против трёх до них. Постепенный уход — сначала
+уводилась часть зарплаты или сокращалась ставка: такого клиента можно было
+заметить заранее.
+
+{_table(why.get('pat'), ['pattern', 'n_epk', 'share', 'ratio'],
+        ['Как', 'Человек', 'Доля', 'Последние месяцы к прежним'])}
+### В каком месяце уходили
+
+{_table(why.get('gone_m'), ['gone_month', 'n_epk', 'share'],
+        ['Месяц ухода', 'Человек', 'Доля'], limit=16)}
+### Сколько получали ушедшие по сравнению с коллегами
+
+Зарплата против средней по своей организации в базовом месяце.
+
+{_table(why.get('pay'), ['fate_title', 'n_triples', 'b1', 'b2', 'b3', 'b4', 'b5'],
+        ['Группа', 'Получателей'] + list(A.PAY_BUCKETS.values()))}""")
+
     where_parts = []
     titles = {"holding_name": "Холдинги", "agency": "Ведомства (по наименованию)",
               "level": "Уровень подчинения", "industry_name": "Отрасль справочника",
@@ -485,11 +569,11 @@ def build(t: dict, t_prev: dict | None, causes: pd.DataFrame,
     for dim, df in m_cuts.items():
         if df is None or df.empty:
             continue
+        spec = A.cut_columns(dim, df)
         where_parts.append(
             f"### {titles.get(dim, dim)}\n\n"
-            + _table(df, [dim, "n_triples", "share", "n_inn", "loss", "inside"],
-                     [titles.get(dim, dim), "Потеряно", "Доля", "Организаций",
-                      "Реальная потеря", "Остались в сегменте"]))
+            + _table(df, [dim] + [c for c, _ in spec],
+                     [titles.get(dim, dim)] + [h for _, h in spec]))
     parts.append(f"""## Где
 
 {texts.get('where', '')}

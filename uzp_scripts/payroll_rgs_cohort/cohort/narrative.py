@@ -151,12 +151,57 @@ def fb_where(cuts: dict) -> str:
         if df is None or df.empty:
             continue
         top = df.iloc[0]
-        tot = float(top.get("n_triples", 0)) or 1.0
         loss = float(top.get("loss", 0))
-        parts.append(
-            f"По {titles.get(dim, dim)} больше всего потеряла группа "
-            f"«{top[dim]}» — {_n(tot)} получателей ({_pct(top.get('share', 0), 0)} "
-            f"всех потерь), из них настоящей потерей является {_pct(loss / tot, 0)}.")
+        causes = ", ".join(
+            f"{name} {_n(top.get(col, 0))}" for col, name in (
+                ("left_bank", "ушли из банка"), ("left_segment", "в другой сегмент"),
+                ("other_codes", "не зарплатными кодами"),
+                ("below_threshold", "ниже порога")))
+        text = (f"По {titles.get(dim, dim)} больше всего реально потеряла группа "
+                f"«{top[dim]}» — {_n(loss)} получателей "
+                f"({_pct(top.get('share', 0), 0)} всех реальных потерь): {causes}.")
+        other = float(top.get("inside_other", 0) or 0)
+        if other > 0:
+            text += (f" Ещё {_n(other)} остались в сегменте, но перешли в другую "
+                     f"строку — для неё это тоже убыль.")
+        parts.append(text)
         if len(parts) >= 3:
             break
     return " ".join(parts) or "Разрезы не построились."
+
+
+def fb_why(w: dict) -> str:
+    """Почему ушли — правилами."""
+    w = w or {}
+    parts = []
+    m = w.get("org_meta", {}) or {}
+    if m:
+        parts.append(
+            f"Из организаций, которые увели зарплатный проект целиком "
+            f"({m.get('n_gone', 0)}) или массово ({m.get('n_mass', 0)}), пришло "
+            f"{_pct(m.get('share_lb_org', 0), 0)} всех ушедших из банка; остальные "
+            f"уходили по одному.")
+        if m.get("n_reorg"):
+            parts.append(f"Ещё {m['n_reorg']} организаций перестали платить, но их "
+                         f"люди остались в банке — это реорганизация или новый ИНН, "
+                         f"а не уход клиента.")
+        if m.get("n_agr_new"):
+            parts.append(f"Договор зарплатного проекта сменился у организаций: "
+                         f"{m['n_agr_new']}.")
+    pat = w.get("pat")
+    if pat is not None and not pat.empty:
+        grad = float(pat[pat["pattern"].str.startswith("Постепенно")]["share"].sum())
+        parts.append(f"Постепенно — с падением сумм или числа зачислений перед "
+                     f"уходом — ушли {_pct(grad, 0)} ушедших из банка: их можно было "
+                     f"заметить заранее.")
+    pay = w.get("pay")
+    if pay is not None and not pay.empty and "retained" in set(pay["fate"]):
+        base = pay.set_index("fate")
+        if "left_bank" in base.index:
+            lo_r, lo_l = float(base.at["retained", "b1"]), float(base.at["left_bank", "b1"])
+            hi_r, hi_l = float(base.at["retained", "b5"]), float(base.at["left_bank", "b5"])
+            parts.append(
+                f"Среди ушедших из банка зарплату меньше половины средней по "
+                f"организации получали {_pct(lo_l, 0)} (у оставшихся — {_pct(lo_r, 0)}), "
+                f"больше двух средних — {_pct(hi_l, 0)} (у оставшихся — {_pct(hi_r, 0)}).")
+    return " ".join(parts) or "Почему ушли, разборы не показали."
