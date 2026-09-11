@@ -170,9 +170,25 @@ def _src(text: str) -> str:
 # Разделы
 # --------------------------------------------------------------------------- #
 
+def _stats(items: list[dict]) -> str:
+    """Равнозначные числа в ряд: {value, caption, sub, kind}.
+
+    Общие `stat_row` / `big_stat` и их CSS удалены из компонентов рефакторингом
+    отрисовки (679b22e). Ряд собирается из уцелевших `kpi` в сетке темы: подпись
+    числа уходит в `delta`, цвет статуса — в `delta_kind`, так что слово рядом с
+    цветом остаётся и смысл карточек не меняется.
+    """
+    cols = min(max(len(items), 1), 4)
+    cards = "".join(
+        C.kpi(i.get("caption", ""), C.esc(i["value"]), i.get("sub", ""),
+              i.get("kind", "") or "text-2")
+        for i in items)
+    return f'<div class="grid cols-{cols}">{cards}</div>'
+
+
 def head_kpi(month, base_fl, out_qty, ret_qty, out_kept, n_org) -> str:
     rate = out_kept / max(base_fl, 1)
-    return C.stat_row([
+    return _stats([
         {"value": _n(base_fl), "caption": "получателей в бюджетной сфере",
          "sub": f"{_n(n_org)} организаций"},
         {"value": _n(out_qty), "caption": "ушло за месяц", "kind": "bad"},
@@ -285,7 +301,11 @@ def causes_block(drop: float, staff: float, comp: float, window: int,
         _fallback_mark(fb) + C.narrative_html(text) +
         C.card(f"<p>За {window} мес. численность упала на <b>{_n(drop)}</b> "
                f"человек.</p>" + bar) +
-        C.card(t1) + C.disclosure("Разрез по регионам", t2, "Показать регионы") +
+        C.card(t1) +
+        # Общий `disclosure` удалён из компонентов; нативный <details> работает
+        # без JS и без CSS и раскрывается с клавиатуры.
+        C.card(f"<details><summary>Разрез по регионам — показать</summary>"
+               f"{t2}</details>") +
         _src(method),
         eyebrow=f"окно {window} мес.")
 
@@ -366,7 +386,7 @@ def outlook_block(fc: pd.DataFrame, end: pd.DataFrame, diag: dict, month,
               "Приход выведен из динамики численности, а не взят колонкой витрины.")
     return C.section(
         "Прогноз численности до конца года",
-        _fallback_mark(fb) + C.narrative_html(text) + C.stat_row(stats) +
+        _fallback_mark(fb) + C.narrative_html(text) + _stats(stats) +
         C.card(chart) + note + _src(method),
         eyebrow=f"горизонт {len(diag.get('horizon', []))} мес.")
 

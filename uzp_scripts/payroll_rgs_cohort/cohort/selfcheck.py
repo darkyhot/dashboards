@@ -653,6 +653,38 @@ def check_join_key_dtypes() -> None:
         "предупреждением")
 
 
+def check_opt_rollback() -> None:
+    """Упавшая необязательная выборка откатывает транзакцию сессии.
+
+    Без отката таймаут одной выборки превращает ВСЕ следующие в «current
+    transaction is aborted»: на проме так пропали и виды зачислений, и территория,
+    хотя сами их запросы были исправны.
+    """
+    from . import fetch
+
+    class _Conn:
+        rolled = 0
+
+        def rollback(self):
+            self.rolled += 1
+
+    class _Ws:
+        conn = _Conn()
+
+        def sql(self, *_a, **_k):
+            raise RuntimeError("canceling statement due to statement timeout")
+
+    ws = _Ws()
+    out = fetch._opt(ws, "monthly", "SELECT 1")                 # noqa: SLF001
+    if not out.empty:
+        raise CheckFailed("упавшая выборка вернула не пустой кадр")
+    if ws.conn.rolled != 1:
+        raise CheckFailed("после упавшей выборки транзакция не откачена — "
+                          "все следующие запросы сессии упадут следом")
+    _ok("необязательная выборка: при падении транзакция откатывается, "
+        "следующие разделы не уносит")
+
+
 def check_top_orgs_net() -> None:
     """Топ организаций сортируется по НЕТТО, а не по потерям.
 
@@ -1016,7 +1048,7 @@ ALL = [
     check_epk_ladder_shorter, check_ladder_table,
     check_steps_seasonal, check_steps_short_series,
     check_seasonality_definition, check_month_compare,
-    check_by_dim, check_join_key_dtypes, check_top_orgs_net,
+    check_by_dim, check_join_key_dtypes, check_opt_rollback, check_top_orgs_net,
     check_code_months, check_tenure,
     check_shown_self_contained, check_shown_recorded,
     check_anonymize_doc, check_llm_fallback, check_row_limit,

@@ -243,20 +243,22 @@ def head_kpi(t: dict) -> str:
     метрика может падать, когда людей столько же, — ради этого разбор и затеян.
     """
     net, de = t["net_real"], t["d_epk"]
-    return C.stat_row([
-        {"value": _n(t["real_lost"]), "caption": "реально потеряно получателей",
-         "kind": "bad",
-         "sub": f"{_n(t['real_lost_epk'])} человек"},
-        {"value": _n(t["real_gained"]), "caption": "реально пришло получателей",
-         "kind": "good",
-         "sub": f"{_n(t['real_gained_epk'])} человек"},
-        {"value": _signed(net), "caption": "чистое изменение по получателям",
-         "kind": "bad" if net < 0 else "good",
-         "sub": f"из {_n(t['triples_base'])} в {t['base_month']:%m.%Y}"},
-        {"value": _signed(de), "caption": "чистое изменение по ЛЮДЯМ",
-         "kind": "bad" if de < 0 else "good",
-         "sub": f"{_n(t['epk_cur'])} человек, {_pct(de / (t['epk_base'] or 1))}"},
-    ])
+    # Общий `stat_row` удалён из компонентов рефакторингом отрисовки (679b22e).
+    # Ряд собирается из уцелевших `kpi` в сетке темы: подпись числа уходит в
+    # `delta`, её цвет — в `delta_kind`, так что смысл карточек не меняется.
+    cards = [
+        C.kpi("реально потеряно получателей", C.esc(_n(t["real_lost"])),
+              f"{_n(t['real_lost_epk'])} человек", "bad"),
+        C.kpi("реально пришло получателей", C.esc(_n(t["real_gained"])),
+              f"{_n(t['real_gained_epk'])} человек", "good"),
+        C.kpi("чистое изменение по получателям", C.esc(_signed(net)),
+              f"из {_n(t['triples_base'])} в {t['base_month']:%m.%Y}",
+              "bad" if net < 0 else "good"),
+        C.kpi("чистое изменение по ЛЮДЯМ", C.esc(_signed(de)),
+              f"{_n(t['epk_cur'])} человек, {_pct(de / (t['epk_base'] or 1))}",
+              "bad" if de < 0 else "good"),
+    ]
+    return f'<div class="grid cols-4">{"".join(cards)}</div>'
 
 
 def metric_block(t: dict, thr: pd.DataFrame, shown: dict) -> str:

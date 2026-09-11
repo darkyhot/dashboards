@@ -727,6 +727,34 @@ def tenure_table(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Где
 # --------------------------------------------------------------------------- #
+def _tb_trace(df: pd.DataFrame, tb: pd.DataFrame) -> None:
+    """Напечатать, что происходит с ТБ на каждом шаге соединения."""
+    if tb is None or tb.empty:
+        progress.warn("ТБ: справочник пуст — выборка tb_dim не прочиталась "
+                      "(причина — в предупреждении «tb_dim не читается» выше). "
+                      "Территориальный разрез будет из одной заглушки")
+        return
+    dim_ids = sorted(_key(tb["tb_id"]).dropna().astype(int).unique().tolist())
+    progress.done(f"ТБ: справочник {len(tb)} строк, тип ключа "
+                  f"{tb['tb_id'].dtype}, номера {dim_ids}")
+    if "tb_id" not in df:
+        progress.warn("ТБ: в потерях нет колонки tb_id — LOST_BY_INN её не вернул")
+        return
+    raw = df["tb_id"]
+    keys = _key(raw)
+    n_null = int(keys.isna().sum())
+    lost_ids = sorted(keys.dropna().astype(int).unique().tolist())
+    sample = raw.dropna().head(3).tolist()
+    progress.done(f"ТБ: в потерях {len(df):,} строк, тип ключа {raw.dtype} "
+                  f"(примеры {sample!r}), без номера {n_null:,}, "
+                  f"номера {lost_ids}")
+    hit = sorted(set(lost_ids) & set(dim_ids))
+    miss = sorted(set(lost_ids) - set(dim_ids))
+    (progress.done if hit else progress.warn)(
+        f"ТБ: совпало номеров {len(hit)} из {len(lost_ids)}"
+        + (f"; нет в справочнике: {miss}" if miss else ""))
+
+
 def enrich(lost_by_inn: pd.DataFrame, attrs: pd.DataFrame, tb: pd.DataFrame,
            gosb: pd.DataFrame, gosb_key: str | None) -> tuple[pd.DataFrame, dict]:
     """Разметить потери атрибутами организации и территории.
@@ -766,6 +794,11 @@ def enrich(lost_by_inn: pd.DataFrame, attrs: pd.DataFrame, tb: pd.DataFrame,
         _num(df[df["level"] == LV.UNKNOWN], "n_triples").sum())
 
     # --- территория: ТБ из ведомостей ---
+    # Каждый шаг печатается. На проме ТБ пропадал трижды по трём разным причинам
+    # (пустая колонка, чужая кодировка, выборка справочника не прочиталась из-за
+    # упавшей транзакции), и по итоговому отчёту их не различить: везде одна и та
+    # же строка «ТБ неизвестен». По этим строкам лога — различить.
+    _tb_trace(df, tb)
     if not tb.empty and "tb_id" in df:
         tb = tb.copy()
         tb["tb_id"] = _key(tb["tb_id"])
