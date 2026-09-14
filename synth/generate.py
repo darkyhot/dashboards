@@ -223,6 +223,8 @@ PAYROLL_RGS_SCALE = 0.50          # масштаб численности бюд
 PAYROLL_MULTI_GOSB_SHARE = 0.18   # доля организаций, платящих через два ГОСБ
 PAYROLL_GOSB_MOVE_SHARE = 0.05    # доля пар, переезжающих в другой ГОСБ того же ИНН
 PAYROLL_GOSB_MOVE_BACK = 4        # мес. назад от конца: когда происходит перевод
+PAYROLL_SPLIT_PAY_SHARE = 0.35    # доля пар многоГОСБ-организаций, где аванс идёт через второй ГОСБ
+PAYROLL_SPLIT_PAY_BACK = 7        # мес. назад от конца: выплаты сводятся в один ГОСБ
 
 # Сезонная яма отчётного месяца. Ради неё и заведена ветка «перерыв»: в яме
 # человек пропадает из ведомостей на месяц, ничего при этом не потеряв, и отчёт
@@ -1049,6 +1051,16 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
     pair_gosb_after = np.where(pair_gosb == alt, org_gosb[org_of_pair], alt)
     pair_gosb_after = np.where(has_alt, pair_gosb_after, pair_gosb)
 
+    # --- аванс через второй ГОСБ, затем сведение в один ---
+    # Один человек, одна организация, но аванс идёт через другой ГОСБ: метрика
+    # считает его ДВУМЯ получателями. Когда организация сводит выплаты в один
+    # ГОСБ, получатель пропадает, хотя человек ничего не менял. Это ситуация
+    # «одна организация через несколько ГОСБ» раздела про совместителей — без неё
+    # она на синтетике не срабатывает ни разу.
+    split_pay = (has_alt & (gosb_move_m > last)
+                 & (RNG.random(n_pairs) < PAYROLL_SPLIT_PAY_SHARE))
+    split_pay_m = last - PAYROLL_SPLIT_PAY_BACK
+
     # --- стипендия: зарплатный код, пропадающий в яме ---
     # Человек при этом из ведомостей НЕ исчезает: он получает по другим кодам.
     # Значит в лестнице он не потеряется, а в таблице видов выплат провал будет
@@ -1104,6 +1116,8 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
         "n_pairs_built": int(n_pairs),
         "n_persons": int(n_persons),
         "n_multi_gosb_orgs": int(len(second_gosb)),
+        "split_pay_pairs": int(split_pay.sum()),
+        "split_pay_month": str(months[split_pay_m].date()),
         "pairs_by_month": {},
         "people_by_month": {},
     }
@@ -1155,6 +1169,11 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                 code = np.where(out_code[take],
                                 PAYROLL_CODES_OUT[-1],
                                 PAYROLL_CODES_IN[0] if part == 0 else PAYROLL_CODES_IN[2])
+                # Аванс (вторая строка) до сведения — через второй ГОСБ.
+                sys_g = gosb_m[take]
+                if part == 1:
+                    sp = split_pay[idx][take] & (m < split_pay_m)
+                    sys_g = np.where(sp, pair_gosb_after[idx][take], sys_g)
                 rows.append(pd.DataFrame({
                     "acc_num": acc_num[idx][take],
                     "amt": (amt[take] * share[take]).round(2),
@@ -1164,8 +1183,8 @@ def _payroll(orgs: pd.DataFrame, liquidated: set):
                                                  for c in code],
                     "epk_id": epk_person[idx][take],
                     "document_info_sha1": epk_person[idx][take],
-                    "gosb_id": gosb_legacy_m[take],
-                    "sys_gosb_id": gosb_m[take],
+                    "gosb_id": sys_g + PAYROLL_LEGACY_GOSB_SHIFT,
+                    "sys_gosb_id": sys_g,
                     "agrmnt_num": agr_m[take],
                     "inn": inn_txt[idx][take],
                     "tb_id": None,

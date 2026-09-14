@@ -480,8 +480,9 @@ FROM lost l GROUP BY l.inn, l.cause
 # выглядит катастрофой, не потеряв ничего.
 GAINED_BY_INN = """
 WITH gained AS (""" + _GAINED_BASE + """)
-SELECT g.inn, count(*) AS n_triples
-FROM gained g GROUP BY g.inn
+SELECT g.inn, g.cause, min(g.gosb_id) AS gosb_id, min(g.tb_id) AS tb_id,
+       count(*) AS n_triples
+FROM gained g GROUP BY g.inn, g.cause
 """
 
 
@@ -872,8 +873,7 @@ GOSB_DIM = """
 SELECT d.old_gosb_id, d.new_gosb_id,
        min(d.tb_id)          AS tb_id,
        min(d.tb_short_name)  AS tb_short_name,
-       min(d.new_gosb_name)  AS gosb_name,
-       min(NULLIF(btrim(d.region_name), '')) AS region_name
+       min(NULLIF(btrim(d.new_gosb_name), '')) AS gosb_name
 FROM {schema}.uzp_dim_gosb d
 WHERE """ + Q._NO_CA + """
 GROUP BY d.old_gosb_id, d.new_gosb_id
@@ -968,6 +968,8 @@ dest AS (
 
 # Признаки «та же строка» считаются здесь же, в SQL, и в ядро уезжает строка на
 # ОРГАНИЗАЦИЮ, а не на направление перехода: на проме направлений больше лимита.
+# «Тот же ГОСБ» — прямое сравнение номера ведомостей откуда/куда: справочник для
+# этого не нужен, поэтому признак считается всегда.
 # У организации без холдинга «тот же холдинг» — та же организация: строка
 # «Холдинг не указан» собирает несвязанные организации.
 _STAYED_SAME = """
@@ -976,7 +978,9 @@ _STAYED_SAME = """
        sum(CASE WHEN NULLIF(btrim(hf.holding_name), '') IS NULL
                 THEN CASE WHEN d.inn = s.inn THEN 1.0 / d.n_dest ELSE 0 END
                 WHEN ht.holding_name = hf.holding_name THEN 1.0 / d.n_dest
-                ELSE 0 END)                                        AS n_same_holding"""
+                ELSE 0 END)                                        AS n_same_holding,
+       sum(CASE WHEN d.gosb_id = s.gosb_id THEN 1.0 / d.n_dest ELSE 0 END)
+                                                                   AS n_same_gosb"""
 
 STAYED_DEST = _STAYED_HEAD + """
 SELECT s.inn,""" + _STAYED_SAME + """
@@ -984,28 +988,6 @@ FROM st s
 JOIN dest d ON d.epk_id = s.epk_id
 LEFT JOIN t_seg hf ON hf.inn = s.inn
 LEFT JOIN t_seg ht ON ht.inn = d.inn
-GROUP BY s.inn
-"""
-
-# Тот же запрос с регионом — когда разведка опознала ключ справочника
-# подразделений. Ключ подставляется в `fetch` из белого списка, а не приходит
-# параметром: имя колонки параметром не передать.
-STAYED_DEST_REGION = _STAYED_HEAD + """,
-reg AS (
-  SELECT d.__GOSB_KEY__ AS gid, min(NULLIF(btrim(d.region_name), '')) AS region
-  FROM {schema}.uzp_dim_gosb d
-  WHERE """ + Q._NO_CA + """
-  GROUP BY d.__GOSB_KEY__
-)
-SELECT s.inn,""" + _STAYED_SAME + """,
-       sum(CASE WHEN rf.region IS NOT NULL AND rf.region = rt.region
-                THEN 1.0 / d.n_dest ELSE 0 END)                    AS n_same_region
-FROM st s
-JOIN dest d ON d.epk_id = s.epk_id
-LEFT JOIN t_seg hf ON hf.inn = s.inn
-LEFT JOIN t_seg ht ON ht.inn = d.inn
-LEFT JOIN reg rf ON rf.gid = s.gosb_id
-LEFT JOIN reg rt ON rt.gid = d.gosb_id
 GROUP BY s.inn
 """
 
@@ -1218,4 +1200,119 @@ SELECT CASE WHEN COALESCE(c.amt_cur, 0) >= 0.8 * :amt_min THEN 1
        count(*)                                                AS n_epk
 FROM b LEFT JOIN c ON c.epk_id = b.epk_id
 GROUP BY 1, 2
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Почему стало меньше совместителей
+# --------------------------------------------------------------------------- #
+#
+# Получатель = ФЛ + «лишние» получатели совместителя. Разница между изменением
+# получателей и изменением ФЛ — это изменение совместительства, и на проме оно
+# оказалось почти двумя третями падения. Всё ниже — поверх рабочего набора, без
+# новых сканов витрины.
+
+# Как устроено совместительство в каждом месяце. «Лишние» получатели делятся на
+# два принципиально разных вида: несколько ОРГАНИЗАЦИЙ у ФЛ (настоящее
+# совместительство) и одна организация через несколько ГОСБ (особенность счёта:
+# человек ничего не менял, а метрика считает его дважды).
+MULTI_STRUCTURE = """
+SELECT m.report_dt,
+       count(*)                                      AS n_epk,
+       sum(m.n_triples)                              AS n_triples,
+       sum(m.n_inn - 1)                              AS extra_inn,
+       sum(m.n_triples - m.n_inn)                    AS extra_gosb,
+       count(*) FILTER (WHERE m.n_inn = 1)           AS epk_inn1,
+       count(*) FILTER (WHERE m.n_inn = 2)           AS epk_inn2,
+       count(*) FILTER (WHERE m.n_inn >= 3)          AS epk_inn3,
+       count(*) FILTER (WHERE m.n_triples > m.n_inn) AS epk_multi_gosb
+FROM t_epk_month m
+WHERE m.report_dt IN (CAST(:d_base AS date), CAST(:d_cur AS date))
+GROUP BY m.report_dt
+ORDER BY m.report_dt
+"""
+
+# Исчезнувшие и появившиеся получатели у ФЛ, которые ПРОДОЛЖАЮТ получать
+# зарплату в РГС. Их разность по всем ситуациям ровно равна третьей строке
+# разложения («совместители стали получать в меньшем числе организаций»).
+#
+# Ситуация — одна на получателя, первая сработавшая:
+#   same_org    — у ФЛ та же организация в другом месяце, но через другой ГОСБ;
+#   org_stopped — организация в другом месяце не платит зарплату в РГС никому
+#                 (закрытие, слияние, увела проект / новая организация);
+#   below       — организация платит этому ФЛ зарплату, но до порога;
+#   other_codes — только незарплатные выплаты от этой организации;
+#   no_pay      — от организации этому ФЛ ничего, а другим она платит
+#                 (ушёл с этого места работы / новое место работы).
+# «Другой месяц» для исчезнувших — отчётный, для появившихся — базовый.
+_MULTI_SIDE = """
+  SELECT '__SIDE__' AS side, x.epk_id, x.inn,
+         CASE
+           WHEN so.epk_id IS NOT NULL                 THEN 'same_org'
+           WHEN oo.inn IS NULL                        THEN 'org_stopped'
+           WHEN COALESCE(sn.amt_codes, 0) > 0         THEN 'below'
+           WHEN COALESCE(sn.amt_all, 0) > 0           THEN 'other_codes'
+           ELSE 'no_pay'
+         END AS situation
+  FROM __SRC__ x
+  LEFT JOIN (SELECT DISTINCT epk_id, inn FROM t_pairs
+             WHERE report_dt = CAST(:__OTHER__ AS date)) so
+         ON so.epk_id = x.epk_id AND so.inn = x.inn
+  LEFT JOIN (SELECT DISTINCT inn FROM t_pairs
+             WHERE report_dt = CAST(:__OTHER__ AS date)) oo
+         ON oo.inn = x.inn
+  LEFT JOIN (SELECT epk_id, inn, sum(amt_all) AS amt_all, sum(amt_codes) AS amt_codes
+             FROM t_seen WHERE report_dt = CAST(:__OTHER__ AS date)
+             GROUP BY epk_id, inn) sn
+         ON sn.epk_id = x.epk_id AND sn.inn = x.inn
+  WHERE x.cause = 'stayed_in_segment'"""
+
+_MULTI_HEAD = """
+WITH lost AS (""" + _LOST_BASE + """),
+gained AS (""" + _GAINED_BASE + """),
+rows_ AS (""" + _MULTI_SIDE.replace("__SIDE__", "lost").replace("__SRC__", "lost") \
+    .replace("__OTHER__", "d_cur") + """
+  UNION ALL""" + _MULTI_SIDE.replace("__SIDE__", "gained").replace("__SRC__", "gained") \
+    .replace("__OTHER__", "d_base") + """
+)"""
+
+MULTI_ROWS = _MULTI_HEAD + """
+SELECT side, situation, count(*) AS n_triples, count(DISTINCT epk_id) AS n_epk
+FROM rows_
+GROUP BY side, situation
+"""
+
+# Организации ситуаций «организация больше не платит зарплату в РГС» и «ушёл с
+# этого места работы» — адресные списки. Для первой — куда ушло больше всего её
+# ФЛ: там, где ФЛ продолжает получать в отчётном месяце, организация с наибольшей
+# суммой. Итоги по всем организациям считаются в SQL, в ядро уезжает топ.
+MULTI_ORGS = _MULTI_HEAD + """,
+src AS (
+  SELECT situation, inn, count(*) AS n_triples
+  FROM rows_ WHERE side = 'lost' AND situation IN ('org_stopped', 'no_pay')
+  GROUP BY situation, inn
+),
+dst AS (
+  SELECT r.situation, r.inn AS inn_from, c.inn AS inn_to,
+         count(DISTINCT r.epk_id) AS n_epk,
+         row_number() OVER (PARTITION BY r.situation, r.inn
+                            ORDER BY count(DISTINCT r.epk_id) DESC, c.inn) AS rn
+  FROM rows_ r
+  JOIN t_pairs c ON c.report_dt = CAST(:d_cur AS date) AND c.epk_id = r.epk_id
+  WHERE r.side = 'lost' AND r.situation = 'org_stopped'
+  GROUP BY r.situation, r.inn, c.inn
+),
+k AS (
+  SELECT s.*, row_number() OVER (PARTITION BY s.situation
+                                 ORDER BY s.n_triples DESC, s.inn) AS pos
+  FROM src s
+)
+SELECT k.situation, k.inn, k.n_triples, sa.company_name,
+       d.inn_to, st.company_name AS company_to, d.n_epk AS n_epk_to
+FROM k
+LEFT JOIN t_seg_all sa ON sa.inn = k.inn
+LEFT JOIN dst d ON d.situation = k.situation AND d.inn_from = k.inn AND d.rn = 1
+LEFT JOIN t_seg_all st ON st.inn = d.inn_to
+WHERE k.pos <= :top_n
+ORDER BY k.situation, k.pos
 """

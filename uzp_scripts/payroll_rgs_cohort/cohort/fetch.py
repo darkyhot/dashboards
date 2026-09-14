@@ -283,6 +283,25 @@ def gained_by_inn(ws: Workspace, base: str) -> pd.DataFrame:
     return _opt(ws, "gained_by_inn", LQ.GAINED_BY_INN, {"d_base": base})
 
 
+def multi_structure(ws: Workspace, base: str) -> pd.DataFrame:
+    """Совместительство в базовом и отчётном месяце: организации против ГОСБ."""
+    return _opt(ws, "multi_structure", LQ.MULTI_STRUCTURE, {"d_base": base})
+
+
+def multi_rows(ws: Workspace, base: str) -> pd.DataFrame:
+    """Почему у ФЛ, продолжающих получать в РГС, стало меньше мест работы."""
+    df = _opt(ws, "multi_rows", LQ.MULTI_ROWS, {"d_base": base})
+    if not df.empty:
+        progress.done(f"совместители: {int(df['n_triples'].sum()):,} исчезнувших и "
+                      f"появившихся получателей у продолжающих получать в РГС")
+    return df
+
+
+def multi_orgs(ws: Workspace, base: str, top_n: int) -> pd.DataFrame:
+    """Организации, где совместители потеряли место работы."""
+    return _opt(ws, "multi_orgs", LQ.MULTI_ORGS, {"d_base": base, "top_n": top_n})
+
+
 def tenure(ws: Workspace, base: str, d_from: str) -> pd.DataFrame:
     """Стаж ушедших: сколько месяцев человек был в сегменте до ухода."""
     progress.step("Стаж ушедших")
@@ -388,24 +407,14 @@ def inn_migration(ws: Workspace, base: str, min_movers: int) -> pd.DataFrame:
     return df
 
 
-# Ключи справочника подразделений, которые можно подставить в текст запроса.
-# Имя колонки параметром не передать, а подстановка из белого списка не даёт
-# чему-то постороннему попасть в SQL.
-_GOSB_KEYS = ("old_gosb_id", "new_gosb_id")
-
-
-def stayed_dest(ws: Workspace, base: str, gosb_key: str | None) -> pd.DataFrame:
-    """Оставшиеся в сегменте по организациям: сколько в том же ТБ, холдинге, регионе."""
-    if gosb_key in _GOSB_KEYS:
-        sql = LQ.STAYED_DEST_REGION.replace("__GOSB_KEY__", gosb_key)
-    else:
-        sql = LQ.STAYED_DEST
-    df = _opt(ws, "stayed_dest", sql, {"d_base": base})
+def stayed_dest(ws: Workspace, base: str) -> pd.DataFrame:
+    """Продолжающие получать зарплату в РГС, по организациям: сколько из них в том
+    же ТБ, холдинге и ГОСБ."""
+    df = _opt(ws, "stayed_dest", LQ.STAYED_DEST, {"d_base": base})
     if not df.empty:
-        progress.done(f"переходы внутри сегмента: {float(df['n_triples'].sum()):,.0f} "
-                      f"получателей в {len(df):,} организациях"
-                      + ("" if "n_same_region" in df else "; без регионов — "
-                         "подразделения справочником не опознаны"))
+        progress.done(f"продолжают получать в РГС в другой строке: "
+                      f"{float(df['n_triples'].sum()):,.0f} получателей в "
+                      f"{len(df):,} организациях")
     return df
 
 
@@ -468,9 +477,9 @@ def gosb_dim(ws: Workspace) -> pd.DataFrame:
     """Справочник ГОСБ — обоими ключами сразу, выбор делает разведка."""
     df = _opt(ws, "gosb_dim", LQ.GOSB_DIM)
     if not df.empty:
-        n_reg = int(df["region_name"].notna().sum()) if "region_name" in df else 0
+        n_named = int(df["gosb_name"].notna().sum()) if "gosb_name" in df else 0
         progress.done(f"справочник территории: {len(df)} строк, "
-                      f"регион известен у {n_reg}")
+                      f"название ГОСБ известно у {n_named}")
     return df
 
 

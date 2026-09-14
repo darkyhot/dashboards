@@ -83,7 +83,7 @@ DEFAULTS = dict(
     # двадцати и двадцать из двух тысяч — разные события.
     migration_min_share=0.30,
     # Потолок вызовов LLM на весь разбор: разделов шесть, один вызов в запас.
-    llm_max_calls=7,
+    llm_max_calls=8,
 )
 
 
@@ -200,8 +200,12 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
             gosb = fetch.gosb_dim(ws)
             gosb_key = probe.pick_gosb_key(fetch.gosb_match(ws), pr)
             probe.check_tb(fetch.tb_match(ws), pr)
+            # --- совместители: поверх рабочего набора ---
+            multi_st_raw = fetch.multi_structure(ws, d_base)
+            multi_rows_raw = fetch.multi_rows(ws, d_base)
+            multi_orgs_raw = fetch.multi_orgs(ws, d_base, int(opts["top_orgs"]))
             # --- почему ушли: поверх рабочего набора, без новых сканов витрины ---
-            dest_raw = fetch.stayed_dest(ws, d_base, gosb_key)
+            dest_raw = fetch.stayed_dest(ws, d_base)
             org_raw = fetch.org_status(ws, d_base)
             pay_raw = fetch.pay_level(ws, d_base, int(opts["pay_min_org"]))
             lso_raw = fetch.left_segment_orgs(ws, d_base, int(opts["top_orgs"]))
@@ -233,8 +237,11 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
     if prev_pack is not None:
         t_prev = A.totals(mt, prev_pack["lost"], prev_pack["gained"],
                           prev_pack["lost_epk"], prev_pack["gained_epk"], prev, cur)
-        checks += A.check_additive(t_prev, prev_pack["lost"], prev_pack["gained"],
-                                   prev_pack["lost_epk"], prev_pack["gained_epk"])
+        checks += [{**c, "name": f"К {prev:%m.%Y}: {c['name']}"}
+                   for c in A.check_additive(t_prev, prev_pack["lost"],
+                                             prev_pack["gained"],
+                                             prev_pack["lost_epk"],
+                                             prev_pack["gained_epk"])]
         causes_prev = A.ladder(prev_pack["lost"], A.CAUSES, "n_triples")
 
     tr = A.trend(monthly)
@@ -250,16 +257,46 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
     to_codes_inn = A.left_codes_inn(codes_inn_raw, attrs, to_codes)
     codes_m = A.code_months(codes_m_raw, base, prev or base, cur)
     marked, meta = A.enrich(lost_inn, attrs, tb, gosb, gosb_key)
+    meta["top_n"] = int(opts["top_n"])
     mig = A.migration(mig_raw, lost_inn, attrs, float(opts["migration_min_share"]))
     ten = A.tenure_table(ten_raw)
 
     dims = ["holding_name", "agency", "level", "industry_name", "tb_short_name",
-            "region_name"]
+            "gosb_name"]
     split = A.stayed_split(dest_raw, marked)
-    cuts = {dim: A.by_dim(marked, dim, int(opts["top_n"]), split.get(dim))
+    gmarked = (A.enrich(gained_inn, attrs, tb, gosb, gosb_key)[0]
+               if gained_inn is not None and not gained_inn.empty else None)
+    # Разрез — ВСЕ группы: верх по «перестали» и верх по изменению — разные
+    # наборы, отбираются при показе (`A.top_cut`).
+    cuts = {dim: A.by_dim(marked, dim, None, split.get(dim), gmarked)
             for dim in dims}
     cuts = {k: v for k, v in cuts.items() if v is not None and not v.empty}
     orgs = A.top_orgs(marked, gained_inn, int(opts["top_orgs"]))
+    for dim, df in cuts.items():
+        if A.DELTA in df:
+            checks.append({"name": f"Разрез «{V.CUT_TITLES.get(dim, dim)}»: сумма "
+                                   f"изменения по группам = изменению в шапке",
+                           "left": round(float(df[A.DELTA].sum()), 2),
+                           "right": round(float(t["d_triples"]), 2),
+                           "ok": abs(float(df[A.DELTA].sum()) - t["d_triples"]) < 0.5})
+            break
+
+    multi = A.multi_split(t, causes, causes_e, gains, gains_e)
+    multi["structure"] = A.multi_structure(multi_st_raw, base, cur)
+    multi["rows"] = A.multi_rows(multi_rows_raw)
+    multi["orgs"] = A.multi_orgs(multi_orgs_raw)
+    if not multi["structure"].empty:
+        ex = float(multi["structure"].set_index("key").at["extra", "delta"])
+        checks.append({"name": "Совместители: изменение лишних получателей = "
+                               "изменение получателей − изменение ФЛ",
+                       "left": round(ex, 2), "right": round(multi["d_multi"], 2),
+                       "ok": abs(ex - multi["d_multi"]) < 0.5})
+    if not multi["rows"].empty:
+        net = float(multi["rows"]["net"].sum())
+        checks.append({"name": "Совместители: появилось − исчезло по ситуациям = "
+                               "третьей строке шапки",
+                       "left": round(net, 2), "right": round(t["net_inside"], 2),
+                       "ok": abs(net - t["net_inside"]) < 0.5})
 
     org_sum, org_agr, org_top, org_meta = A.org_exit(
         org_raw, lost_inn, attrs, int(opts["org_min_base"]),
@@ -273,29 +310,29 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
               "below": A.below_depth(below_raw)}
 
     progress.done(
-        f"получателей {t['d_triples']:+,.0f}, людей {t['d_epk']:+,.0f}; "
-        f"реально потеряно {t['real_lost']:,.0f}, реально пришло "
-        f"{t['real_gained']:,.0f} (чисто {t['net_real']:+,.0f}); "
-        f"переходов внутри сегмента {t['inside_lost']:,.0f}")
+        f"получателей {t['d_triples']:+,.0f}, ФЛ {t['d_epk']:+,.0f}; "
+        f"перестали получать {t['real_lost']:,.0f}, начали {t['real_gained']:,.0f}, "
+        f"совместители {t['net_inside']:+,.0f}")
 
     # --- тексты ---
     progress.step("Текстовые выводы")
-    texts = _narrate(t, causes, gains, causes_e, tr, st, measured, cmp_months,
-                     surv_c, seas, codes_m, to_seg, to_codes, mig, cuts, opts, why)
+    texts = _narrate(t, causes, gains, causes_e, gains_e, tr, st, measured, cmp_months,
+                     surv_c, seas, codes_m, to_seg, to_codes, mig, cuts, opts, why,
+                     multi)
 
     # --- сборка ---
     progress.step("Сборка HTML")
     warnings = list(pr["warnings"])
     blocks = [
         V.head_kpi(t),
-        V.metric_block(t, thr, shown),
         V.net_block(t, causes, gains, causes_e, gains_e, shown, *texts["net"]),
-        V.both_block(both, t, shown),
+        V.multi_block(multi, t, shown, *texts["multi"]),
+        V.metric_block(t, thr, shown),
         V.where_gone_block(to_seg, to_codes, to_codes_inn, mig, ten, shown,
                            *texts["gone"], extra=gone_x),
         V.why_block(why, shown, *texts["why"]),
         V.when_block(tr, st, measured, cmp_months, surv_c, load, seas, codes_m,
-                     t_prev, causes_prev, shown, *texts["when"]),
+                     t_prev, causes_prev, shown, *texts["when"], t=t),
         V.where_block(cuts, orgs, meta, shown, *texts["where"]),
         V.limits_block(warnings, checks, pr, meta),
     ]
@@ -319,7 +356,7 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
         cmp_months=cmp_months, surv=surv_c, thr=thr, seas=seas,
         codes_m=codes_m, to_seg=to_seg,
         to_codes=to_codes, to_codes_inn=to_codes_inn, why=why, gone_x=gone_x,
-        mig=mig, cuts=cuts, orgs=orgs, tenure=ten,
+        mig=mig, cuts=cuts, orgs=orgs, tenure=ten, multi=multi,
         checks=checks, warnings=warnings, probe=pr, meta=meta, shown=shown,
         texts={k: v[0] for k, v in texts.items()})
     doc_path = out_dir / f"payroll_rgs_cohort_{cur:%Y%m}_{ts}.md"
@@ -355,12 +392,13 @@ def run(conn: str | None = None, out_dir: str | Path | None = None,
             "left_codes_inn": to_codes_inn, "why": why, "gone_x": gone_x,
             "migration": mig,
             "cuts": cuts, "orgs": orgs, "tenure": ten, "marked": marked,
+            "multi": multi,
             "checks": checks, "warnings": warnings, "meta": meta, "shown": shown}
 
 
-def _narrate(t, causes, gains, causes_e, tr, st, measured, cmp_months, surv,
+def _narrate(t, causes, gains, causes_e, gains_e, tr, st, measured, cmp_months, surv,
              seas, codes_m, to_seg, to_codes, mig, cuts, opts,
-             why: dict | None = None) -> dict:
+             why: dict | None = None, multi: dict | None = None) -> dict:
     """Тексты разделов. Названия организаций и территорий уходят в модель токенами.
 
     Псевдонимы заводятся на КАЖДЫЙ раздел заново: словарь живёт ровно один вызов,
@@ -371,12 +409,13 @@ def _narrate(t, causes, gains, causes_e, tr, st, measured, cmp_months, surv,
     out: dict = {}
 
     # Обзор, «выросли ли» и «когда» названий не содержат вовсе — маскировать нечего.
-    out["overview"] = nar.section(
-        "обзор", P.overview(bm, cm, t, causes, causes_e),
-        N.fb_overview(bm, cm, t, causes, causes_e))
-    out["net"] = nar.section(
-        "рост", P.net(bm, cm, t, causes, gains), N.fb_net(bm, cm, t, causes))
-    out["when"] = nar.section(
+    out["overview"] = _vocab(nar, "обзор", P.overview(bm, cm, t, causes, causes_e),
+                             N.fb_overview(bm, cm, t, causes, causes_e))
+    out["net"] = _vocab(nar, "рост", P.net(bm, cm, t, causes_e, gains_e),
+                        N.fb_net(bm, cm, t, causes_e))
+    out["multi"] = _vocab(nar, "совместители", P.multi(bm, cm, multi or {}),
+                          N.fb_multi(multi or {}))
+    out["when"] = _vocab(nar, 
         "когда", P.when(cm, tr, st, measured, cmp_months, surv, seas, codes_m),
         N.fb_when(tr, st, measured, cmp_months, surv, seas, codes_m))
 
@@ -395,9 +434,12 @@ def _narrate(t, causes, gains, causes_e, tr, st, measured, cmp_months, surv,
 
     al2 = N.Aliases()
     cuts_m, forbidden2 = {}, []
-    kinds = {"holding_name": "Холдинг", "region_name": "Регион",
+    kinds = {"holding_name": "Холдинг", "gosb_name": "ГОСБ",
              "tb_short_name": "ТБ"}
     for dim, df in cuts.items():
+        # В модель — только верх по «перестали» и по изменению, а не все группы.
+        df = pd.concat([A.top_cut(df, A.LOSS, 8), A.top_cut(df, A.DELTA, 8)]) \
+            .drop_duplicates(dim)
         if dim in kinds:
             forbidden2 += [str(v) for v in df[dim]]
             cuts_m[dim] = N.mask_frame(df, dim, kinds[dim], al2)
@@ -432,4 +474,20 @@ def _guarded(nar, label: str, prompt: str, fallback: str,
         progress.warn(f"обезличивание: в промпт «{label}» попали настоящие "
                       f"названия ({', '.join(leaks[:5])}) — раздел уходит в фолбэк")
         return fallback, True
-    return nar.section(label, prompt, fallback, al)
+    return _vocab(nar, label, prompt, fallback, al)
+
+
+def _vocab(nar, label: str, prompt: str, fallback: str, al=None) -> tuple[str, bool]:
+    """Раздел модели с проверкой словаря.
+
+    Модель пересказывает по привычке «реальную потерю» и «приход», даже когда в
+    промпте их нет и они прямо запрещены. Такие слова заказчик не понимает, и
+    абзац с ними рядом с таблицами на новом языке читается как другой отчёт.
+    """
+    text, fb = nar.section(label, prompt, fallback, al)
+    bad = N.old_terms(text) if not fb else []
+    if bad:
+        progress.warn(f"вывод «{label}»: модель употребила устаревшие термины "
+                      f"({', '.join(bad[:3])}) — раздел уходит в фолбэк")
+        return fallback, True
+    return text, fb

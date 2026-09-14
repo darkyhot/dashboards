@@ -379,25 +379,181 @@ def check_additive() -> None:
     if bad:
         raise CheckFailed(f"не сошлось: {bad}")
 
-    if abs((t["d_by_people"] + t["d_by_multi"]) - t["d_triples"]) > 1e-6:
-        raise CheckFailed("вклады людей и совместительства не дают падения")
+    if "d_by_people" in t or "d_by_multi" in t:
+        raise CheckFailed("в итогах снова второе разложение (d_by_people/d_by_multi)")
 
-    # Реальное движение обязано считаться ПО ОБЕИМ сторонам: приход по настоящим
-    # причинам минус уход по настоящим. Если бы вычиталось из ПОЛНОГО прихода,
-    # число было бы завышено ровно на методологию — ошибка первого этапа.
-    # Реальная потеря — всё, кроме переходов внутри сегмента: 200 + 90 + 40.
+    # Перестали получать — всё, кроме строк, где ФЛ продолжает получать в РГС:
+    # 200 + 90 + 40.
     if abs(t["real_lost"] - 330.0) > 1e-6:
-        raise CheckFailed(f"реальная потеря посчитана как {t['real_lost']}, "
-                          f"ждали 330 (200 + 90 + 40; 60 — переход внутри)")
-    if abs(t["net_real"] - (50.0 - 330.0)) > 1e-6:
-        raise CheckFailed(f"чистое реальное изменение посчитано как "
-                          f"{t['net_real']}, ждали -280")
-    # Переходы внутри сегмента считаются отдельно и в потерю не входят.
-    if abs(t["inside_lost"] - 60.0) > 1e-6:
-        raise CheckFailed(f"переходы внутри сегмента посчитаны как "
-                          f"{t['inside_lost']}, ждали 60")
-    _ok("раскладка: обе лестницы сходятся, реальные потери и приход считаются "
-        "по обеим сторонам")
+        raise CheckFailed(f"«перестали получать» посчитано как {t['real_lost']}, "
+                          f"ждали 330 (200 + 90 + 40; 60 — продолжают в РГС)")
+    if abs(t["net_inside"] - (40.0 - 60.0)) > 1e-6:
+        raise CheckFailed(f"слагаемое совместителей {t['net_inside']}, ждали -20")
+
+    # Единственное разложение: строки складываются в итог по получателям и ФЛ.
+    rows = {r["key"]: r for r in A.decomposition(t)}
+    for col, cur in (("triples", t["triples_cur"]), ("epk", t["epk_cur"])):
+        total = sum(rows[k][col] for k in ("base", "lost", "gained", "inside"))
+        if abs(total - cur) > 1e-6:
+            raise CheckFailed(f"разложение по «{col}» даёт {total}, а стало {cur}")
+        if abs(rows["delta"][col] - (cur - rows["base"][col])) > 1e-6:
+            raise CheckFailed(f"строка «Изменение» по «{col}» не равна стало − было")
+    if rows["inside"]["epk"] != 0:
+        raise CheckFailed("у ФЛ третье слагаемое обязано быть нулём")
+    _ok("разложение: было − перестали + начали ± совместители = стало, "
+        "по получателям и по ФЛ")
+
+
+def check_one_decomposition() -> None:
+    """Шапка HTML, таблица «Кто перестал и кто начал» и документ показывают ОДНИ
+    числа — те, что в `A.decomposition`, а не пересчитанные на месте.
+
+    Именно пересчёт на месте дал в шапке −4 709, а в таблице под ней −5 278.
+    """
+    from . import report_text as RT
+    from . import view as V
+    mt, lost, gained, lost_e, gained_e = _fake_totals()
+    t = A.totals(mt, lost, gained, lost_e, gained_e,
+                 pd.Timestamp("2025-08-31"), pd.Timestamp("2026-08-31"))
+    head = V.head_kpi(t)
+    md = RT._decomp_md(t)
+    for r in A.decomposition(t):
+        for col in ("triples", "epk"):
+            v = r[col]
+            signed = r["key"] in ("lost", "gained", "inside", "delta")
+            h = V._signed(v) if signed else V._n(v)
+            if h not in head:
+                raise CheckFailed(f"в шапке нет числа {h} строки «{r['title']}»")
+            m = (("+" if v > 0 else "") + RT._n(v)) if signed else RT._n(v)
+            if m not in md:
+                raise CheckFailed(f"в документе нет числа {m} строки «{r['title']}»")
+    if "чистое изменение" in head.lower():
+        raise CheckFailed("в шапке снова карточка «чистое изменение»")
+    _ok("разложение: шапка и документ показывают одни и те же ключи итогов")
+
+
+def check_cut_delta_and_multi() -> None:
+    """Разрез со второй стороной и раздел про совместителей сходятся с шапкой.
+
+    По каждой группе: изменение = начали − перестали ± переходы; по всем
+    группам: сумма изменения = изменению получателей, сумма переходов = третьей
+    строке шапки. Верх по изменению — отдельный набор групп, а не пересортировка
+    верха по переставшим.
+    """
+    lost = pd.DataFrame({
+        "inn": [1, 1, 2, 3], "agency": ["А", "А", "Б", "В"],
+        "cause": ["left_bank", "stayed_in_segment", "left_bank", "left_bank"],
+        "n_triples": [10.0, 4.0, 3.0, 8.0]})
+    gained = pd.DataFrame({
+        "inn": [1, 2, 3, 4], "agency": ["А", "Б", "В", "Г"],
+        "cause": ["new_to_bank", "stayed_in_segment", "new_to_bank", "new_to_bank"],
+        "n_triples": [14.0, 1.0, 8.0, 2.0]})
+    # А: перестали 10, начали 14, переходы −4 → 0. Б: 3, 0, +1 → −2 — худшая.
+    cut = A.by_dim(lost, "agency", None, None, gained)
+    if not np.allclose(cut[A.DELTA],
+                       cut[A.GAINED] - cut[A.LOSS] + cut[A.MOVES]):
+        raise CheckFailed("разрез: изменение ≠ начали − перестали ± переходы")
+    d_all = gained["n_triples"].sum() - lost["n_triples"].sum()
+    if abs(cut[A.DELTA].sum() - d_all) > 1e-9:
+        raise CheckFailed("разрез: сумма изменения по группам ≠ общему изменению")
+    if "Г" not in set(cut["agency"]):
+        raise CheckFailed("разрез: группа, где только начали получать, потеряна")
+    if A.top_cut(cut, A.DELTA, 1).iloc[0]["agency"] != "Б":
+        raise CheckFailed("разрез: верх по изменению отобран неверно")
+    if A.top_cut(cut, A.LOSS, 1).iloc[0]["agency"] != "А":
+        raise CheckFailed("разрез: верх по переставшим отобран неверно")
+
+    mt, lost_t, gained_t, lost_e, gained_e = _fake_totals()
+    t = A.totals(mt, lost_t, gained_t, lost_e, gained_e,
+                 pd.Timestamp("2025-08-31"), pd.Timestamp("2026-08-31"))
+    causes = A.ladder(lost_t, A.CAUSES, "n_triples")
+    ce = A.ladder(lost_e, A.EPK_CAUSES, "n_epk")
+    m = A.multi_split(t, causes, ce, pd.DataFrame(), pd.DataFrame())
+    if abs(m["lost"] + m["gained"] + m["inside"] - m["d_multi"]) > 1e-9:
+        raise CheckFailed("совместители: три части не дают изменения совместительства")
+    rows = A.multi_rows(pd.DataFrame({
+        "side": ["lost", "lost", "gained"], "situation": ["same_org", "no_pay", "same_org"],
+        "n_triples": [5.0, 2.0, 4.0], "n_epk": [5, 2, 4]}))
+    if abs(rows["net"].sum() - (4.0 - 7.0)) > 1e-9 or list(rows["situation"]) != list(A.MULTI_SITUATIONS):
+        raise CheckFailed("совместители: ситуации не складываются или идут не по порядку")
+    for name in ("MULTI_STRUCTURE", "MULTI_ROWS", "MULTI_ORGS"):
+        if "uzp_data_payroll_m" in getattr(LQ, name):
+            raise CheckFailed(f"{name}: новый скан витрины ведомостей")
+    _ok("разрез: начали, переходы и изменение сходятся с шапкой; совместители "
+        "складываются, новых сканов витрины нет")
+
+
+def check_org_lists_hidden() -> None:
+    """Каждый список организаций в HTML свёрнут под «+».
+
+    Ищется по тексту модуля: у каждой таблицы, первая колонка которой
+    «Организация» или «Откуда», вызов обёрнут в `_disclosure` (или в
+    `details class="orgs"`) не дальше пары строк выше.
+    """
+    import inspect
+    import re as _re
+
+    from . import view as V
+    src = inspect.getsource(V)
+    bad = []
+    for m in _re.finditer(r'\[\s*"(Организация|Откуда)"', src):
+        before = src[max(0, m.start() - 250):m.start()]
+        if "_disclosure(" not in before and 'class="orgs"' not in before:
+            bad.append(src[:m.start()].count("\n") + 1)
+    if bad:
+        raise CheckFailed(f"списки организаций не свёрнуты под «+»: строки {bad}")
+    _ok("списки организаций: все свёрнуты под «+»")
+
+
+def check_old_terms_absent() -> None:
+    """Устаревших терминов нет ни в одном выводимом тексте.
+
+    Проверяется собранное из справочников и шаблонов: подписи веток, заголовки
+    разрезов, шапка, раздел «кто перестал и кто начал» и документ целиком (без
+    приложения с SQL — комментарии запросов пишутся для разработчика).
+    """
+    import re as _re
+
+    from . import narrative as N
+    from . import report_text as RT
+    from . import view as V
+    mt, lost, gained, lost_e, gained_e = _fake_totals()
+    t = A.totals(mt, lost, gained, lost_e, gained_e,
+                 pd.Timestamp("2025-08-31"), pd.Timestamp("2026-08-31"))
+    causes = A.ladder(lost, A.CAUSES, "n_triples")
+    gains = A.ladder(gained, A.GAINS, "n_triples")
+    ce = A.ladder(lost_e, A.EPK_CAUSES, "n_epk")
+    ge = A.ladder(gained_e, A.EPK_GAINS, "n_epk")
+    both = A.side_by_side(causes, lost_e)
+    cut = pd.DataFrame({"gosb_name": ["ГОСБ № 1"], "loss": [1.0], "share": [1.0],
+                        "left_bank": [1.0], "inside": [2.0], "n_triples": [3.0],
+                        "n_inn": [1]})
+    texts = [V.head_kpi(t), V.metric_block(t, pd.DataFrame(), {}),
+             V.net_block(t, causes, gains, ce, ge, {}),
+             V.where_block({"gosb_name": cut}, pd.DataFrame(), {}, {}),
+             N.fb_overview("08.2025", "08.2026", t, causes, ce),
+             N.fb_net("08.2025", "08.2026", t, ce),
+             N.fb_where({"gosb_name": cut})]
+    texts += [h for _, h in A.cut_columns("gosb_name", cut)]
+    texts += [" ".join(v[:2]) for v in list(A.CAUSES.values()) + list(A.GAINS.values())]
+    texts += list(A.KIND_TAG.values())
+    doc, _ = RT.build(t, None, causes, gains, ce, ge, both, pd.DataFrame(),
+                      pd.DataFrame(), "", pd.DataFrame(), pd.DataFrame(),
+                      pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame(),
+                      pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+                      {"gosb_name": cut}, pd.DataFrame(), pd.DataFrame(), [], [],
+                      {}, {}, {}, {})
+    texts.append(doc.split("## Приложение")[0])
+    body = _re.sub(r"<pre>.*?</pre>", "", "\n".join(texts), flags=_re.S)
+    bad = N.old_terms(body)
+    if bad:
+        raise CheckFailed(f"в выводе остались устаревшие термины: {bad}")
+    if "Ушедшие строки" in body or "строка счёта" in body:
+        raise CheckFailed("в выводе снова «строки» вместо получателей")
+    if "Регион" in body:
+        raise CheckFailed("в выводе остался разрез «Регионы»")
+    _ok("словарь: «реальная потеря», «приход», «остался в сегменте», «чистое "
+        "изменение» и «Регионы» из вывода убраны")
 
 
 def check_epk_ladder_shorter() -> None:
@@ -605,13 +761,16 @@ def check_why() -> None:
         raise CheckFailed("«тот же ТБ» перенесён в разрез неверно")
     # Вес 1/n и правило «без холдинга — та же организация» живут в SQL: без них
     # совместитель посчитался бы в двух ТБ сразу.
-    for name in ("STAYED_DEST", "STAYED_DEST_REGION"):
+    for name in ("STAYED_DEST",):
         body = getattr(LQ, name)
         if "1.0 / d.n_dest" not in body or "GROUP BY s.inn" not in body:
             raise CheckFailed(f"{name}: нет веса 1/n или свёртки до организации")
         if "d.inn = s.inn" not in body:
             raise CheckFailed(f"{name}: у организации без холдинга «тот же холдинг» "
                               f"перестал значить «та же организация»")
+        if "d.gosb_id = s.gosb_id" not in body or "n_same_gosb" not in body:
+            raise CheckFailed(f"{name}: «тот же ГОСБ» не считается прямым сравнением "
+                              f"номера ведомостей")
     # У организации без холдинга «тот же холдинг» — это та же организация.
     nh = split["holding_name"].set_index("holding_name")["inside_same"]
     if abs(nh[A.FILL["holding_name"]] - 1.0) > 1e-9:
@@ -716,7 +875,7 @@ def check_join_key_dtypes() -> None:
     tb = pd.DataFrame({"tb_id": [17], "tb_short_name": ["СРБ"]})
     gosb = pd.DataFrame({"old_gosb_id": [38], "new_gosb_id": [38],
                          "tb_id": [17], "tb_short_name": ["СРБ"],
-                         "gosb_name": ["ГОСБ-1"], "region_name": ["Регион-1"]})
+                         "gosb_name": ["ГОСБ-1"]})
 
     marked, meta = A.enrich(lost, attrs, tb, gosb, "old_gosb_id")
     if marked.empty:
@@ -726,9 +885,16 @@ def check_join_key_dtypes() -> None:
                           "ключ строкой слева и числом справа")
     if float(meta.get("tb_known", 0)) <= 0:
         raise CheckFailed("ТБ не определился — соединение по tb_id не состоялось")
-    if float(meta.get("region_known", 0)) <= 0:
-        raise CheckFailed("регион не определился — map по gosb_id дал NaN молча, "
-                          "и разрез схлопнулся бы в заглушку")
+    if float(meta.get("gosb_named", 0)) <= 0 or (marked["gosb_name"] != "ГОСБ-1").any():
+        raise CheckFailed("название ГОСБ не определилось — map по gosb_id дал NaN "
+                          "молча")
+    # Справочник не опознан — разрез всё равно строится, строки подписаны номером.
+    m2, _ = A.enrich(lost, attrs, tb, gosb, None)
+    if set(m2["gosb_name"]) != {"ГОСБ № 38"}:
+        raise CheckFailed(f"без справочника ГОСБ подписан не номером: "
+                          f"{set(m2['gosb_name'])}")
+    if A.by_dim(m2, "gosb_name", 5).empty:
+        raise CheckFailed("без справочника разрез по ГОСБ не построился")
 
     # Тот же разнобой в топе организаций и в миграции.
     gained = pd.DataFrame({"inn": [7701.0], "n_triples": [40.0], "n_real": [40.0]})
@@ -817,7 +983,7 @@ def check_top_orgs_net() -> None:
         "n_triples": [1000.0, 300.0],
         "company_name": ["Большая", "Малая"], "agency": ["А", "Б"],
         "level": ["Ф", "М"], "tb_short_name": ["Т", "Т"],
-        "holding_name": ["Х", "Х"], "region_name": ["Р", "Р"]})
+        "holding_name": ["Х", "Х"], "gosb_name": ["Г", "Г"]})
     gained = pd.DataFrame({"inn": [1, 2], "n_triples": [990.0, 0.0],
                            "n_real": [990.0, 0.0]})
     out = A.top_orgs(marked, gained, top_n=2)
@@ -1007,10 +1173,11 @@ def check_llm_fallback() -> None:
     mt, lost, gained, lost_e, gained_e = _fake_totals()
     t = A.totals(mt, lost, gained, lost_e, gained_e,
                  pd.Timestamp("2025-08-31"), pd.Timestamp("2026-08-31"))
-    txt = N.fb_net("08.2025", "08.2026", t, A.ladder(lost, A.CAUSES, "n_triples"))
+    txt = N.fb_net("08.2025", "08.2026", t, A.ladder(lost_e, A.EPK_CAUSES, "n_epk"))
     if not txt or "сократил" not in txt:
         raise CheckFailed(f"фолбэк главного вывода не дал ответа: {txt}")
-    for word in ("реально потеряно", "реально пришло"):
+    for word in ("Перестали получать зарплату в РГС 330",
+                 "начали получать зарплату в РГС 50", "ещё 20 получателей меньше"):
         if word not in txt:
             raise CheckFailed(f"в главном выводе нет «{word}» — читатель не "
                               f"поймёт, что за число перед ним")
@@ -1154,6 +1321,26 @@ def check_against_synth(res: dict, expect_path: str | None = None) -> None:
                 f"отсева непригодных номеров, поэтому его число обязано быть "
                 f"чуть МЕНЬШЕ, но не вдвое.")
 
+    # Раздел про совместителей: заложенные ситуации обязаны найтись.
+    multi = res.get("multi") or {}
+    mr = multi.get("rows")
+    if mr is None or mr.empty:
+        raise CheckFailed("раздел «почему стало меньше совместителей» не построился")
+    found = set(mr[mr["lost"] > 0]["situation"])
+    for sit in ("same_org", "org_stopped", "no_pay", "below"):
+        if sit not in found:
+            raise CheckFailed(f"ситуация совместителей «{sit}» заложена, но не найдена")
+    st = multi.get("structure")
+    if int(exp.get("split_pay_pairs", 0)) and st is not None and not st.empty:
+        g = st.set_index("key")
+        if float(g.at["extra_gosb", "base"]) <= float(g.at["extra_gosb", "cur"]):
+            raise CheckFailed("сведение выплат в один ГОСБ заложено, но «лишние "
+                              "получатели из-за одной организации через несколько "
+                              "ГОСБ» не уменьшились")
+    if abs(float(multi["lost"] + multi["gained"] + multi["inside"])
+           - float(multi["d_multi"])) > 0.5:
+        raise CheckFailed("три части совместительства не дают его изменения")
+
     mig = res.get("migration")
     n_mig = 0 if mig is None or mig.empty else len(mig)
     _ok(f"синтетика: найдены заложенные ветки — {len(got)} причин потерь, "
@@ -1166,6 +1353,8 @@ ALL = [
     check_inn_cast_guarded, check_codes_binding, check_triple_grain,
     check_probe_placeholders, check_workset_order, check_prelude_minimal,
     check_causes_exhaustive, check_ladder_priority, check_additive,
+    check_one_decomposition, check_old_terms_absent, check_org_lists_hidden,
+    check_cut_delta_and_multi,
     check_epk_ladder_shorter, check_ladder_table,
     check_steps_seasonal, check_steps_short_series,
     check_seasonality_definition, check_month_compare,
