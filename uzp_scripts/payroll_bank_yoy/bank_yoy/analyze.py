@@ -699,3 +699,72 @@ def check(name: str, value: float, tol: float = 0.5, detail: str = "") -> dict:
     ok = bool(pd.notna(value) and abs(value) <= tol)
     return {"check": name, "ok": ok, "residual": float(value) if pd.notna(value) else None,
             "detail": detail}
+
+
+
+# --------------------------------------------------------------------------- #
+# Август: потеря или перенос в следующий месяц
+# --------------------------------------------------------------------------- #
+def bridge(mb: pd.DataFrame, m) -> pd.DataFrame:
+    """Мост m−1 → m → m+1 для этого года и года назад: уровни, месяц к месяцу,
+    год к году, разница переходов. Строки — показатели, столбцы — месяцы."""
+    t = mb.set_index("report_dt")["n_triples"]
+    cols = {"prev": M.shift(m, -1), "cur": M.parse(m), "next": M.shift(m, 1)}
+    need = [M.iso(d) for d in cols.values()] + [M.iso(M.shift(d, -12)) for d in cols.values()]
+    if any(d not in t.index for d in need):
+        return pd.DataFrame()
+    rows = []
+    v26 = {k: float(t[M.iso(d)]) for k, d in cols.items()}
+    v25 = {k: float(t[M.iso(M.shift(d, -12))]) for k, d in cols.items()}
+    rows.append({"key": "lvl_cur", **v26})
+    rows.append({"key": "lvl_prev", **v25})
+    rows.append({"key": "yoy", **{k: v26[k] - v25[k] for k in cols}})
+    mom26 = {"prev": np.nan, "cur": v26["cur"] - v26["prev"], "next": v26["next"] - v26["cur"]}
+    mom25 = {"prev": np.nan, "cur": v25["cur"] - v25["prev"], "next": v25["next"] - v25["cur"]}
+    rows.append({"key": "mom_cur", **mom26})
+    rows.append({"key": "mom_prev", **mom25})
+    rows.append({"key": "did", **{k: mom26[k] - mom25[k] for k in cols}})
+    out = pd.DataFrame(rows)
+    out.attrs["months"] = {k: M.iso(d) for k, d in cols.items()}
+    out.attrs["two"] = {"cur": v26["next"] - v26["prev"], "prev": v25["next"] - v25["prev"]}
+    return out
+
+
+def temp_perm(dc: dict, dp: dict) -> pd.DataFrame:
+    """Переставшие в отчётном месяце: вернулись в следующем (временно) или нет."""
+    rows = []
+    for key, title, fc, fp in (
+            ("temp", "вернулись в следующем месяце (временно)",
+             dc.get("lost_back_tr"), dp.get("lost_back_tr")),
+            ("perm", "не вернулись",
+             dc["lost_tr"] - dc.get("lost_back_tr", 0), dp["lost_tr"] - dp.get("lost_back_tr", 0)),
+            ("all", T_LOST, dc["lost_tr"], dp["lost_tr"])):
+        rows.append({"key": key, "title": title, "cur": -float(fc), "prev": -float(fp)})
+    out = pd.DataFrame(rows)
+    out["diff"] = out["cur"] - out["prev"]
+    return out
+
+
+def august_verdict(br: pd.DataFrame, tp: pd.DataFrame) -> str:
+    """Одна фраза по правилу: вернулся ли минус отчётного месяца к следующему."""
+    if br.empty:
+        return ""
+    b = br.set_index("key")
+    did_cur, did_next = b.loc["did", "cur"], b.loc["did", "next"]
+    two = br.attrs["two"]["cur"] - br.attrs["two"]["prev"]
+    if did_cur < 0 and did_next >= -did_cur:
+        return (f"минус {M.gen(br.attrs['months']['cur'])} к {M.prep(br.attrs['months']['next'])} вернулся с "
+                f"избытком: за два месяца этот год лучше прошлого на {two:,.0f}. Это сдвиг во времени, а не "
+                f"потеря людей.").replace(",", "\u00a0")
+    if did_cur < 0 and did_next > 0:
+        return (f"к {M.prep(br.attrs['months']['next'])} вернулась часть минуса: "
+                f"{did_next:,.0f} из {-did_cur:,.0f}.").replace(",", "\u00a0")
+    if did_cur < 0:
+        return "в следующем месяце минус не вернулся — это потеря, а не сдвиг."
+    return ""
+
+
+def hole_summary(df: pd.DataFrame) -> dict:
+    if df is None or df.empty:
+        return {"n_orgs": 0, "sum_hole": 0.0}
+    return {"n_orgs": int(df["n_orgs"].iloc[0]), "sum_hole": float(df["sum_hole"].iloc[0])}

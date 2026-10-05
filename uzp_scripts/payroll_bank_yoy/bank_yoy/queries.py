@@ -49,8 +49,14 @@ WHERE table_schema = :schema AND table_name = :table
 """
 
 # Какие месяцы есть в витрине. Только по границам периода — партиции отсекаются.
+# Тот же скан даёт и полноту загрузки: отдельный скан партиции ради трёх
+# счётчиков стоил бы на проме ещё 25 проходов по всему банку.
 PROBE_MONTHS = """
-SELECT p.report_dt, count(*) AS n_rows
+SELECT p.report_dt,
+       count(*)                                   AS n_rows,
+       count(*) FILTER (WHERE """ + INN_OK + """) AS n_inn_ok,
+       count(*) FILTER (WHERE p.epk_id IS NULL)   AS n_no_epk,
+       sum(p.amt)                                 AS amt
 FROM {schema}.uzp_data_payroll_m p
 WHERE p.report_dt >= CAST(:d_from AS date)
   AND p.report_dt <= CAST(:d_to AS date)
@@ -245,19 +251,6 @@ SELECT '__ALL__',
        count(*) FILTER (WHERE amt_inn > 5000),
        count(*) FILTER (WHERE amt_inn > 10000)
 FROM y
-"""
-
-# Полнота загрузки и пригодность ИНН — по всему банку, без фильтров. Месяц, где
-# строк вдвое меньше обычного, — недогруженная партиция, и любой вывод по нему
-# будет выводом про загрузку. Рост доли непригодных ИНН — «падение», случившееся
-# в сопоставлении, а не в жизни.
-MONTH_LOAD = """
-SELECT count(*)                                  AS n_rows,
-       count(*) FILTER (WHERE """ + INN_OK + """) AS n_inn_ok,
-       count(*) FILTER (WHERE p.epk_id IS NULL)  AS n_no_epk,
-       sum(p.amt)                                AS amt
-FROM {schema}.uzp_data_payroll_m p
-WHERE p.report_dt = CAST(:m AS date)
 """
 
 # Зарплатные коды месяца по сегментам: КАКОЙ вид выплаты просел (отпускные,
@@ -727,6 +720,67 @@ ORDER BY s.n_mv DESC, s.inn_from
 LIMIT :max_rows
 """
 
+
+# --------------------------------------------------------------------------- #
+# Август: потеря или перенос в следующий месяц
+# --------------------------------------------------------------------------- #
+
+# Организации, пропустившие месяц: в :m_prev у ИНН не меньше :hole_min_base
+# получателей, в :m — не больше половины, в :m_next — снова не меньше 80% от
+# :m_prev. Признак переноса даты выплаты организацией, а не ухода людей.
+# Итоги — по всем ИНН окнами, в ядро едет только верх списка.
+ORG_HOLE = """
+WITH x AS (
+  SELECT inn,
+         count(*) FILTER (WHERE report_dt = CAST(:m_prev AS date)) AS n_prev,
+         count(*) FILTER (WHERE report_dt = CAST(:m AS date))      AS n_cur,
+         count(*) FILTER (WHERE report_dt = CAST(:m_next AS date)) AS n_next
+  FROM t_pairs
+  WHERE report_dt IN (CAST(:m_prev AS date), CAST(:m AS date), CAST(:m_next AS date))
+  GROUP BY inn
+),
+h AS (
+  SELECT x.*, x.n_prev - x.n_cur AS hole
+  FROM x
+  WHERE x.n_prev >= :hole_min_base
+    AND x.n_cur <= 0.5 * x.n_prev
+    AND x.n_next >= 0.8 * x.n_prev
+)
+SELECT h.inn, h.n_prev, h.n_cur, h.n_next, h.hole,
+       COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg, o.company_name,
+       count(*) OVER ()    AS n_orgs,
+       sum(h.hole) OVER () AS sum_hole
+FROM h LEFT JOIN t_org o ON o.inn = h.inn
+ORDER BY h.hole DESC, h.inn
+LIMIT :max_rows
+"""
+
+# Подпись переноса выплаты: у ФЛ, пропавших в :m и вернувшихся в :m_next, —
+# отношение зарплатной суммы :m_next / :m_prev. ≈2 — выплату за пропущенный месяц
+# перенесли; ≈1 — человек просто не получал месяц. Рядом — получавшие все три.
+RETURN_PAY = """
+WITH g AS (
+  SELECT p.epk_id,
+         CASE WHEN c.epk_id IS NULL THEN 'gap' ELSE 'steady' END AS grp
+  FROM t_epk p
+  JOIN t_epk n ON n.epk_id = p.epk_id AND n.report_dt = CAST(:m_next AS date)
+  LEFT JOIN t_epk c ON c.epk_id = p.epk_id AND c.report_dt = CAST(:m AS date)
+  WHERE p.report_dt = CAST(:m_prev AS date)
+),
+r AS (
+  SELECT g.grp, a.amt_codes AS a_prev, b.amt_codes AS a_next
+  FROM g
+  JOIN t_person a ON a.epk_id = g.epk_id AND a.report_dt = CAST(:m_prev AS date)
+  JOIN t_person b ON b.epk_id = g.epk_id AND b.report_dt = CAST(:m_next AS date)
+  WHERE a.amt_codes > 0
+)
+SELECT grp,
+       count(*)                                                     AS n_epk,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY a_next / a_prev) AS median_ratio,
+       avg(CASE WHEN a_next / a_prev >= 1.6 THEN 1.0 ELSE 0 END)    AS share_double,
+       avg(CASE WHEN a_next / a_prev BETWEEN 0.7 AND 1.4 THEN 1.0 ELSE 0 END) AS share_single
+FROM r GROUP BY grp
+"""
 
 SHOW_DEFS["t_tflow"] = T_TFLOW
 SHOW_DEFS["t_oflow"] = T_OFLOW

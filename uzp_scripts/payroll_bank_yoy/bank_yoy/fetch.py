@@ -181,7 +181,8 @@ def month_cached(ws: Workspace, kind: str, sql: str, m: str, fp: dict,
 
 
 def series(ws: Workspace, hist: list, fp: dict, use_cache: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Численность по сегментам и полнота загрузки за каждый месяц ряда."""
+    """Численность по сегментам за каждый месяц ряда. Полнота загрузки — из
+    разведки (тот же скан, что считает строки партиций), второй элемент пуст."""
     progress.step(f"Ряд за {len(hist)} мес. (кэш: {config.CACHE_DIR.name}/)")
     rows, loads = [], []
     for m in hist:
@@ -190,9 +191,6 @@ def series(ws: Workspace, hist: list, fp: dict, use_cache: bool = True) -> tuple
             s = month_cached(ws, "series", Q.MONTH_SERIES, m, fp, use_cache)
             s["report_dt"] = m
             rows.append(s)
-            ld = month_cached(ws, "load", Q.MONTH_LOAD, m, fp, use_cache)
-            ld["report_dt"] = m
-            loads.append(ld)
         except Exception as ex:                                # noqa: BLE001
             progress.warn(f"ряд · {M.label(m)} не читается ({type(ex).__name__}: "
                           f"{str(ex)[:160]}) — месяц пропущен")
@@ -285,3 +283,15 @@ def orgs(ws: Workspace, b, c, o: dict, tag: str) -> dict[str, pd.DataFrame]:
     return {"list": ws.opt(f"org_list_{tag}", Q.ORG_LIST, p),
             "summary": ws.opt(f"org_summary_{tag}", Q.ORG_SUMMARY, p),
             "reorg": ws.opt(f"org_reorg_{tag}", Q.ORG_REORG, p)}
+
+
+def august(ws: Workspace, m, hole_min_base: int, max_rows: int) -> dict:
+    """Перенос или потеря в месяце m: организации с провалом и подпись переноса,
+    для этого года и года назад."""
+    out = {}
+    for tag, mm in (("cur", M.parse(m)), ("prev", M.shift(m, -12))):
+        p = {"m_prev": M.iso(M.shift(mm, -1)), "m": M.iso(mm), "m_next": M.iso(M.shift(mm, 1)),
+             "hole_min_base": int(hole_min_base), "max_rows": int(max_rows)}
+        out[f"hole_{tag}"] = ws.opt(f"org_hole_{M.iso(mm)}", Q.ORG_HOLE, p)
+        out[f"pay_{tag}"] = ws.opt(f"return_pay_{M.iso(mm)}", Q.RETURN_PAY, p)
+    return out

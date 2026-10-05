@@ -44,6 +44,7 @@ def run(conn: str | None = None, schema: str | None = None,
     config.ensure_dirs()
     org_opts = {"min_base": 20, "min_real": 10, "min_share": 0.05,
                 "reorg_min_share": 0.30, "reorg_min_movers": 5, "max_rows": 3000,
+                "hole_min_base": 20,
                 **(org_opts or {})}
     engine = db.get_engine(config.db_url(conn), int(sql_timeout_min))
     db.ping(engine)
@@ -80,7 +81,9 @@ def run(conn: str | None = None, schema: str | None = None,
             fp["rows"] = pr["months"]
             series_raw, load_raw = fetch.series(
                 ws, [m for m in hist if M.iso(m) in pr["months"]], fp, use_cache)
-            res["series_raw"], res["load_raw"] = series_raw, load_raw
+            res["series_raw"] = series_raw
+            hist_iso = {M.iso(m) for m in hist}
+            res["load_raw"] = pd.DataFrame([r for r in pr["load"] if r["report_dt"] in hist_iso])
 
             progress.step("Итоги месяцев набора")
             res["multi_bank_raw"] = ws.sql("multi_bank", Q.MULTI_BANK)
@@ -120,6 +123,10 @@ def run(conn: str | None = None, schema: str | None = None,
                 res["orgs_raw"][M.iso(m)] = fetch.orgs(ws, M.shift(m, -12), m, org_opts, M.iso(m))
                 n = len(res["orgs_raw"][M.iso(m)]["list"])
                 progress.done(f"{M.label(m)}: в списке {n:,} организаций")
+            if res["has_next"]:
+                progress.step(f"{M.label(last)}: потеря или перенос в {M.label(M.shift(last, 1))}")
+                res["aug_raw"] = fetch.august(ws, last, org_opts["hole_min_base"], 300)
+                progress.done("организации с провалом и подпись переноса")
             res["shown"] = dict(ws.shown)
             res["timing"] = dict(ws.timing)
         finally:
@@ -265,6 +272,19 @@ def compute(res: dict) -> None:
                                   detail="Σ ФЛ по ИНН = Σ пар ФЛ×ИНН набора"))
         res["orgs"][mi] = {"list": lst, "summary": smr, "summary_seg": raw["summary"],
                            "reorg": raw["reorg"]}
+    if res.get("aug_raw"):
+        last = report[-1]
+        res["bridge"] = A.bridge(mb, last)
+        tp = A.temp_perm(comp[("cur", M.iso(last))]["d"], comp[("prev", M.iso(last))]["d"])
+        res["temp_perm"] = tp
+        checks.append(A.check(f"временное + постоянное = перестали ({M.label(last)})",
+                              float(tp["diff"].iloc[:2].sum() - tp["diff"].iloc[2])))
+        if not res["bridge"].empty:
+            br = res["bridge"].set_index("key")
+            nxt = M.iso(M.shift(last, 1))
+            checks.append(A.check("мост: разница переходов в следующем месяце = ΔYoY(след.) − ΔYoY(отч.)",
+                                  float(br.loc["did", "next"]
+                                        - (br.loc["yoy", "next"] - br.loc["yoy", "cur"]))))
     res["checks"] = checks
     bad = [c for c in checks if not c["ok"]]
     if bad:

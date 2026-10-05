@@ -42,6 +42,7 @@ def run(conn, d_from, d_to) -> dict:
     mon = db.read_sql(conn, Q.PROBE_MONTHS, {"d_from": M.iso(d_from), "d_to": M.iso(d_to)})
     mon["report_dt"] = mon["report_dt"].astype(str)
     out["months"] = {r.report_dt: int(r.n_rows) for r in mon.itertuples()}
+    out["load"] = mon.to_dict("records")
     not_end = [d for d in out["months"] if M.iso(d) != d]
     if not_end:
         raise ProbeError(f"report_dt не конец месяца: {not_end[:3]} — разбор рассчитан "

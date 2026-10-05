@@ -140,6 +140,10 @@ def verdict(res: dict) -> str:
     parts = []
     s = ", ".join(f"{M.name(m)} {fnum(yoy[m], True)}" for m in rep)
     parts.append(f"<p><b>Год к году по получателям:</b> {esc(s)}. Картина: <b>{esc(res['pattern'])}</b>.</p>")
+    br = res.get("bridge")
+    if br is not None and not br.empty:
+        parts.append(f"<p><b>Следующий месяц:</b> {esc(A.august_verdict(br, res['temp_perm']))} "
+                     f"Подробно — раздел «{esc(M.name(br.attrs['months']['cur']).capitalize())}: потеря или перенос».</p>")
     for i, m in enumerate(rep):
         prev = M.iso(M.shift(m, -1))
         if prev not in yoy:
@@ -626,6 +630,72 @@ def s_checks(res: dict) -> str:
                    table(["", "Проверка", "Невязка", ""], rows, num={2}) + "</details>" + lim + tmh)
 
 
+def s_august(res: dict) -> str:
+    br = res.get("bridge")
+    if br is None or br.empty:
+        return ""
+    ms = br.attrs["months"]
+    nm = {k: M.name(v) for k, v in ms.items()}
+    y1 = M.parse(ms["cur"]).year
+    y0 = y1 - 1
+    b = br.set_index("key")
+    titles = [("lvl_cur", f"Получателей, {y1}"), ("lvl_prev", f"Получателей, {y0}"),
+              ("yoy", "Год к году"), ("mom_cur", f"К предыдущему месяцу, {y1}"),
+              ("mom_prev", f"К предыдущему месяцу, {y0}"), ("did", "Разница переходов")]
+    rows = [[t] + [fnum(b.loc[k, c], k not in ("lvl_cur", "lvl_prev")) for c in ("prev", "cur", "next")]
+            for k, t in titles]
+    two = br.attrs["two"]
+    body = table(["", nm["prev"], nm["cur"], nm["next"]], rows, strong_rows={2, 5})
+    body += (f"<p>За два месяца {esc(nm['prev'])}→{esc(nm['next'])}: {y1} — {esc(fnum(two['cur'], True))}, "
+             f"{y0} — {esc(fnum(two['prev'], True))}, разница {esc(fnum(two['cur'] - two['prev'], True))}. "
+             f"<b>Вывод:</b> {esc(A.august_verdict(br, res['temp_perm']))}</p>")
+    tp = res["temp_perm"]
+    body += (f"<h3>Переставшие в {esc(M.prep(ms['cur']))}: вернулись ли в {esc(M.prep(ms['next']))}</h3>" +
+             table(["", f"{nm['prev']}→{nm['cur']} {y1}", f"{nm['prev']}→{nm['cur']} {y0}", "Разница"],
+                   [[r.title, fnum(r.cur, True), fnum(r.prev, True), fnum(r.diff, True)] for r in tp.itertuples()],
+                   strong_rows={2}) +
+             "<p class='muted'>Получатели. «Временно» — ФЛ снова получатель в следующем месяце: это не потеря.</p>")
+    aug = res["aug_raw"]
+    hc, hp = A.hole_summary(aug["hole_cur"]), A.hole_summary(aug["hole_prev"])
+    body += (f"<h3>Организации, пропустившие {esc(nm['cur'])}</h3>"
+             f"<p class='muted'>В {esc(M.prep(ms['prev']))} ≥ {res['org_opts']['hole_min_base']} получателей, "
+             f"в {esc(M.prep(ms['cur']))} — не больше половины, в {esc(M.prep(ms['next']))} — снова ≥ 80%. "
+             f"Похоже на перенос даты выплаты организацией, а не на уход людей.</p>" +
+             table(["", "Организаций", f"«Дыра» в {M.prep(ms['cur'])}, получателей"],
+                   [[str(y1), fnum(hc["n_orgs"]), fnum(hc["sum_hole"])],
+                    [str(y0), fnum(hp["n_orgs"]), fnum(hp["sum_hole"])],
+                    ["Разница", fnum(hc["n_orgs"] - hp["n_orgs"], True), fnum(hc["sum_hole"] - hp["sum_hole"], True)]],
+                   strong_rows={2}))
+    hl = aug["hole_cur"]
+    if hl is not None and not hl.empty:
+        rows = [[r.company_name or "Организация не в справочнике", int(r.inn), r.seg, fnum(r.n_prev),
+                 fnum(r.n_cur), fnum(r.n_next), fnum(r.hole)] for r in hl.head(30).itertuples()]
+        body += (f"<details><summary>Крупнейшие организации с провалом, {y1} (30 из {fnum(hc['n_orgs'])})</summary>" +
+                 table(["Организация", "Номер", "Сегмент", nm["prev"], nm["cur"], nm["next"], "Дыра"], rows,
+                       num={1, 3, 4, 5, 6}) + "</details>")
+    pr = []
+    for tag, y in (("cur", y1), ("prev", y0)):
+        d = aug[f"pay_{tag}"]
+        if d is None or d.empty:
+            continue
+        for r in d.itertuples():
+            grp = "пропали и вернулись" if r.grp == "gap" else "получали все три месяца"
+            pr.append([str(y), grp, fnum(r.n_epk), fnum(float(r.median_ratio), digits=2),
+                       fpct(float(r.share_double)), fpct(float(r.share_single))])
+    if pr:
+        body += (f"<h3>Пришла ли в {esc(M.prep(ms['next']))} двойная выплата</h3>" +
+                 table(["Год", "Группа ФЛ", "ФЛ", f"Медиана {nm['next']}/{nm['prev']}", "Доля ≥1,6×",
+                        "Доля 0,7–1,4×"], pr, num={2, 3, 4, 5}) +
+                 "<p class='muted'>Зарплатная сумма ФЛ за месяц. Если у пропавших и вернувшихся медиана около 2 — "
+                 "выплату за пропущенный месяц перенесли (организация, график, выходные); около 1 — человек "
+                 "просто не получал в этом месяце (отпуск без выплаты, перерыв).</p>")
+    keys = [k for k in res.get("shown", {}) if k.startswith(("org_hole_", "return_pay_"))][:2]
+    return section("august", f"{M.name(ms['cur']).capitalize()}: потеря или перенос в {M.name(ms['next'])}",
+                   "Провал месяца, который в следующем месяце вернулся, — сдвиг во времени, а не потеря людей. "
+                   "Здесь — какая часть минуса вернулась, кто это и похоже ли это на перенос выплаты.",
+                   body + sql_box(res, keys))
+
+
 # --------------------------------------------------------------------------- #
 CSS = """
 :root{color-scheme:light;
@@ -760,13 +830,13 @@ def render(res: dict) -> str:
     last = rep[-1]
     title = (f"Получатели ЗП по всему Сберу: {M.name(rep[0])}–{M.name(last)} {M.parse(last).year} "
              f"к {M.parse(last).year - 1}")
-    nav = [("summary", "Итог"), ("series", "Ряд"), ("decomp", "Разложение"), ("did", "Почему хуже"),
+    nav = [("summary", "Итог"), ("august", "Перенос?"), ("series", "Ряд"), ("decomp", "Разложение"), ("did", "Почему хуже"),
            ("cohorts", "Пришедшие"), ("multi", "Совместительство"), ("season", "Сезон"),
            ("flows", "Перетоки"), ("tb", "Территория"), ("threshold", "Порог"),
            ("orgs", "Организации"), ("checks", "Проверки")]
     buttons = "".join(f'<button type="button" data-month="{m}" aria-pressed="{"true" if m == last else "false"}">'
                       f'{esc(M.name(m))}</button>' for m in rep)
-    body = "".join([s_summary(res), s_series(res), s_decomp(res), s_did(res), s_cohorts(res), s_multi(res),
+    body = "".join([s_summary(res), s_august(res), s_series(res), s_decomp(res), s_did(res), s_cohorts(res), s_multi(res),
                     s_season(res), s_flows(res), s_tb(res), s_threshold(res), s_orgs(res), s_checks(res)])
     page = (f"<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
