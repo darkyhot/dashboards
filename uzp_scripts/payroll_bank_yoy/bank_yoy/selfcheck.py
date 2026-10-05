@@ -75,6 +75,15 @@ def check_payroll_once() -> None:
         _fail("одна копия ведомостей", "T_RAW_MONTH — тело, а не оператор")
 
 
+def check_no_distinct() -> None:
+    """Нет count(DISTINCT) по большим таблицам: на объёме банка он снимал прогон."""
+    big = ("t_raw", "t_stage", "t_pairs", "t_tflow", "t_mv", "t_epk ", "t_person")
+    for name, sql in Q.all_sql().items():
+        if "count(DISTINCT" in sql and any(t in sql for t in big):
+            _fail("count(DISTINCT)", f"{name}: уникальный подсчёт по большой таблице — "
+                                     f"считайте двухступенчатой группировкой")
+
+
 def check_inn_cast() -> None:
     """CAST(<алиас>.inn AS bigint) — только в запросе, где стоит маска того же алиаса."""
     for name, sql in Q.all_sql().items():
@@ -148,7 +157,7 @@ def check_org_rules() -> None:
     for k, (got, want) in cases.items():
         if got != want:
             _fail("отбор организаций", k)
-    if "LEAST(c.out_stopped, -c.net_ex_reorg)" not in Q.ORG_LIST:
+    if "LEAST(c.out_stopped, -c.net_ex_reorg)" not in Q.T_ORGSEL:
         _fail("отбор организаций", "формула реального сокращения в SQL разошлась с проверкой")
 
 
@@ -166,7 +175,7 @@ def check_months() -> None:
         _fail("месяцы", "сдвиг или конец месяца посчитан неверно")
 
 
-CHECKS = [check_self_contained, check_payroll_once, check_partition_filter, check_dialect, check_inn_cast,
+CHECKS = [check_self_contained, check_payroll_once, check_no_distinct, check_partition_filter, check_dialect, check_inn_cast,
           check_placeholders, check_decomp_identity, check_did_identity, check_org_rules,
           check_sanitize, check_months]
 

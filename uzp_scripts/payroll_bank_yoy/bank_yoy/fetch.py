@@ -78,10 +78,11 @@ class Workspace:
     def _analyze(self, name: str) -> None:
         db.execute(self.conn, Q.ANALYZE_TMP.format(name=name))
 
-    def build_raw(self, months: list) -> dict[str, int]:
+    def build_raw(self, months: list, full: set) -> dict[str, int]:
         """ЕДИНСТВЕННОЕ чтение ведомостей: узкая копия витрины `t_raw` за все нужные
-        месяцы, оператор на партицию. Возвращает число строк по месяцам: месяц с
-        нулём — месяца нет в витрине."""
+        месяцы, оператор на партицию. Месяцы из `full` (рабочий набор) — все строки,
+        остальные (нужны только ряду) — только зарплатные коды. Возвращает число
+        строк по месяцам: месяц с нулём — месяца нет в витрине."""
         progress.step(f"Копия ведомостей t_raw: {len(months)} мес. "
                       f"({M.label(months[0])}…{M.label(months[-1])})")
         n = self._create("t_org", Q.T_ORG)
@@ -90,11 +91,13 @@ class Workspace:
         rows: dict[str, int] = {}
         for i, m in enumerate(M.iso(x) for x in months):
             t0 = pd.Timestamp.now()
-            n = (self._create("t_raw", Q.T_RAW_MONTH, {"m": m}) if i == 0
-                 else self._insert("t_raw", Q.T_RAW_MONTH, {"m": m}))
+            p = {"m": m, "all_rows": m in full}
+            n = (self._create("t_raw", Q.T_RAW_MONTH, p) if i == 0
+                 else self._insert("t_raw", Q.T_RAW_MONTH, p))
             rows[m] = n
             sec = (pd.Timestamp.now() - t0).total_seconds()
-            progress.done(f"t_raw · {M.label(m)}: {n:,} строк за {sec:.0f} с")
+            kind = "все строки" if m in full else "зарплатные"
+            progress.done(f"t_raw · {M.label(m)} ({kind}): {n:,} строк за {sec:.0f} с")
         self._analyze("t_raw")
         progress.done(f"t_raw: всего {sum(rows.values()):,} строк")
         return rows
@@ -112,11 +115,15 @@ class Workspace:
         progress.done(f"t_stage (зарплатные тройки, все месяцы): {n:,} строк за "
                       f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
         t0 = pd.Timestamp.now()
-        ser = self.sql("series", Q.SERIES_ALL, {"months": all_m})
-        ser["report_dt"] = ser["report_dt"].astype(str)
-        self.series_rows = [ser[ser["report_dt"].isin(set(M.iso(x) for x in hist))]]
-        progress.done(f"ряд: {ser['report_dt'].nunique()} мес. за "
-                      f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
+        # Ряд и полнота — необязательные: если не прочитались, отчёт строится без
+        # них (с предупреждением), а не падает целиком.
+        ser = self.opt("series", Q.SERIES_ALL, {"months": all_m})
+        if not ser.empty:
+            ser["report_dt"] = ser["report_dt"].astype(str)
+            self.series_rows = [ser[ser["report_dt"].isin(set(M.iso(x) for x in hist))]]
+            progress.done(f"ряд: {ser['report_dt'].nunique()} мес. за "
+                          f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
+        self.load = self.opt("load", Q.LOAD_FROM_STAGE)      # полнота — из t_stage
         t0 = pd.Timestamp.now()
         n = self._create("t_pairs", Q.PAIRS_FROM_STAGE, {"months": self.months})
         self._drop_one("t_stage")
@@ -132,9 +139,10 @@ class Workspace:
         n = self._create("t_person", Q.T_PERSON, {"months": self.months})
         self._analyze("t_person")
         progress.done(f"t_person: {n:,} строк за {(pd.Timestamp.now() - t0).total_seconds():.0f} с")
-        self.load = self.sql("load", Q.LOAD_FROM_RAW)
+        t0 = pd.Timestamp.now()
         self.codes = self.opt("code_months", Q.CODE_MONTH,
                               {"code_months": [M.iso(x) for x in code_months]})
+        progress.done(f"зарплатные коды: {(pd.Timestamp.now() - t0).total_seconds():.0f} с")
         progress.done("рабочий набор готов")
 
     def _drop_one(self, name: str) -> None:
@@ -249,7 +257,10 @@ def orgs(ws: Workspace, b, c, o: dict, tag: str) -> dict[str, pd.DataFrame]:
     fp = flow_params(ws, b, c)
     p = {**org_params(b, c, o), "cn1": fp["cn1"], "has_cn1": fp["has_cn1"]}
     try:
-        _step_table(ws, "t_oflow", Q.T_OFLOW, p)
+        # Тяжёлая цепочка — один раз, тремя таблицами шага; запросы ниже лёгкие.
+        for name, body in (("t_oflow", Q.T_OFLOW), ("t_mv", Q.T_MV),
+                           ("t_succ", Q.T_SUCC), ("t_orgsel", Q.T_ORGSEL)):
+            _step_table(ws, name, body, p)
     except Exception as ex:                                    # noqa: BLE001
         progress.warn(f"набор ушедших/пришедших по организациям не построен "
                       f"({type(ex).__name__}: {str(ex)[:160]}) — список пропущен")

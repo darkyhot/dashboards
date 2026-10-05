@@ -65,7 +65,12 @@ def run(conn: str | None = None, schema: str | None = None,
         raw_months = M.span(raw_from, M.shift(last, 1))
         ws = fetch.Workspace(cx, [], {"codes": list(codes), "amt_min": int(amt_min)})
         try:
-            rows = ws.build_raw(raw_months)
+            # Все строки — только месяцам рабочего набора (кандидатам: какие из них
+            # загружены, станет известно по копии); остальным — зарплатные коды.
+            full = {M.iso(m) for off in (0, -12)
+                    for m in M.span(M.shift(first, -LOOKBACK + off), M.shift(last, 1 + off))}
+            rows = ws.build_raw(raw_months, full)
+            ws.params["all_rows"] = True       # для показанного SQL: копия рабочего набора
             avail = {m for m, n in rows.items() if n > 0}
             pr["months"] = rows
             if not avail:
@@ -91,7 +96,8 @@ def run(conn: str | None = None, schema: str | None = None,
 
             ws.months = res["work"]
             ws.build(hist, code_ms)
-            res["series_raw"] = pd.concat(ws.series_rows, ignore_index=True)
+            res["series_raw"] = (pd.concat(ws.series_rows, ignore_index=True)
+                                 if ws.series_rows else pd.DataFrame())
             res["load_raw"] = ws.load
             res["codes_raw"] = ws.codes
 

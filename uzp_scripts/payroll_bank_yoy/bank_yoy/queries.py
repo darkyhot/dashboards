@@ -37,6 +37,8 @@ THRESHOLDS = (0, 1000, 5000, 10000)     # плюс AMT_MIN — чувствит�
 
 INN_OK = "p.inn ~ '^[0-9]{1,12}$'"
 INN_OK_R = "r.inn ~ '^[0-9]{1,12}$'"
+_INN_R = "CASE WHEN " + INN_OK_R + " THEN CAST(r.inn AS bigint) END"
+VALID = "epk_id IS NOT NULL AND inn IS NOT NULL"     # пригодная тройка t_stage
 
 
 # --------------------------------------------------------------------------- #
@@ -73,6 +75,11 @@ DROP_PROBE_TEMP = "DROP TABLE IF EXISTS t_probe_tmp"
 # Всё остальное — полнота, ряд, коды, тройки, присутствие ФЛ — считается из неё.
 # Название кода берётся только у зарплатных кодов: длинный текст по каждой
 # строке всего банка таблица не тащит.
+#
+# Незарплатные строки (пенсии, пособия) нужны только месяцам рабочего набора — по
+# ним отличается «нет зачислений в банке» от «только незарплатные выплаты».
+# Месяцам, которые нужны лишь ряду, достаточно зарплатных кодов: `:all_rows` =
+# false, и копия этих месяцев в разы меньше, как и каждый проход по ней.
 T_RAW_MONTH = """
 SELECT p.report_dt,
        p.epk_id,
@@ -85,19 +92,7 @@ SELECT p.report_dt,
        p.amt
 FROM {schema}.uzp_data_payroll_m p
 WHERE p.report_dt = CAST(:m AS date)
-"""
-
-# Полнота загрузки и пригодность номеров организаций — по копии, все месяцы сразу.
-# Месяц без строк в копии — месяца нет в витрине.
-LOAD_FROM_RAW = """
-SELECT r.report_dt,
-       count(*)                                     AS n_rows,
-       count(*) FILTER (WHERE """ + INN_OK_R + """) AS n_inn_ok,
-       count(*) FILTER (WHERE r.epk_id IS NULL)     AS n_no_epk,
-       sum(r.amt)                                   AS amt
-FROM t_raw r
-GROUP BY r.report_dt
-ORDER BY r.report_dt
+  AND (CAST(:all_rows AS boolean) OR p.{code_col} = ANY(:codes))
 """
 
 # Организации справочника ЕПК, свёрнутые до ИНН. Свёртка обязательна: у одного ИНН
@@ -122,6 +117,11 @@ GROUP BY e.inn
 # проходом по t_raw. Из неё — и ряд по сегментам при всех порогах (`SERIES_ALL`),
 # и тройки-получатели месяцев набора (`t_pairs`).
 #
+# Строки с пустым ФЛ или непригодным номером организации (inn = NULL) в t_stage
+# ОСТАЮТСЯ — со счётчиком строк `n_rows`: из них считается полнота загрузки, и
+# отдельного прохода по копии ради неё не нужно. Получатели и ряд берут только
+# пригодные тройки (`VALID`).
+#
 # Именно ОДНИМ запросом, а не циклом по месяцам: у временной таблицы нет партиций,
 # и фильтр `report_dt = :m` по t_raw читает её ЦЕЛИКОМ — цикл по 26 месяцам был
 # 26 полными проходами по копии всего банка, и копия ничего не ускоряла.
@@ -129,22 +129,20 @@ GROUP BY e.inn
 # справочника НЕ отбрасывается: банк — это все получатели, такие ИНН идут
 # строкой «Не в справочнике».
 T_STAGE = """
-SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.tb_id, x.amt, x.amt_inn,
+SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.tb_id, x.amt, x.amt_inn, x.n_rows,
        COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg
 FROM (
   SELECT r.report_dt,
          r.epk_id,
-         CAST(r.inn AS bigint)              AS inn,
+         """ + _INN_R + """                 AS inn,
          COALESCE(r.sys_gosb_id, -1)        AS gosb_id,
          min(r.sys_tb_id)                   AS tb_id,
          sum(r.amt)                         AS amt,
-         sum(sum(r.amt)) OVER (PARTITION BY r.report_dt, r.epk_id,
-                                            CAST(r.inn AS bigint)) AS amt_inn
+         count(*)                           AS n_rows,
+         sum(sum(r.amt)) OVER (PARTITION BY r.report_dt, r.epk_id, """ + _INN_R + """) AS amt_inn
   FROM t_raw r
   WHERE r.code = ANY(:codes)
-    AND r.epk_id IS NOT NULL
-    AND """ + INN_OK_R + """
-  GROUP BY r.report_dt, r.epk_id, CAST(r.inn AS bigint), COALESCE(r.sys_gosb_id, -1)
+  GROUP BY r.report_dt, r.epk_id, """ + _INN_R + """, COALESCE(r.sys_gosb_id, -1)
 ) x
 LEFT JOIN t_org o ON o.inn = x.inn
 """
@@ -154,23 +152,30 @@ PAIRS_FROM_STAGE = """
 SELECT report_dt, epk_id, inn, gosb_id, tb_id, amt, amt_inn, seg
 FROM t_stage
 WHERE amt_inn > :amt_min
+  AND """ + VALID + """
   AND report_dt = ANY(CAST(:months AS date[]))
 """
 
 # То же одним запросом по копии — для ПОКАЗА читателю (определение одно).
 T_PAIRS = ("SELECT s.* FROM (" + T_STAGE + ") s\n"
-           "WHERE s.amt_inn > :amt_min AND s.report_dt = ANY(CAST(:months AS date[]))\n")
+           "WHERE s.amt_inn > :amt_min AND s.epk_id IS NOT NULL AND s.inn IS NOT NULL\n"
+           "  AND s.report_dt = ANY(CAST(:months AS date[]))\n")
 
 # ФЛ-месяц поверх троек: сколько ИНН и троек у человека и его ОСНОВНОЙ сегмент —
 # сегмент ИНН с наибольшей суммой. Основной сегмент один на человека, поэтому
 # численность ФЛ по сегментам складывается в банк, а матрица перетоков замкнута.
-# count(DISTINCT) в оконной функции на 9.4 нет — отсюда два подзапроса.
+# count(DISTINCT) здесь нет нигде: на Greenplum уникальный подсчёт по таблице
+# всего банка — самая дорогая операция, она уже снимала прогон по таймауту.
+# Уникальные считаются двухступенчатой группировкой: сначала до нужного ключа,
+# потом count(*).
 T_EPK = """
 SELECT a.report_dt, a.epk_id, a.n_inn, a.n_triples,
        m.seg AS main_seg, m.tb_id AS main_tb
 FROM (
-  SELECT report_dt, epk_id, count(DISTINCT inn) AS n_inn, count(*) AS n_triples
-  FROM t_pairs GROUP BY report_dt, epk_id
+  SELECT report_dt, epk_id, count(*) AS n_inn, sum(n_tr) AS n_triples
+  FROM (SELECT report_dt, epk_id, inn, count(*) AS n_tr
+        FROM t_pairs GROUP BY report_dt, epk_id, inn) i
+  GROUP BY report_dt, epk_id
 ) a
 JOIN (
   SELECT report_dt, epk_id, seg, tb_id,
@@ -222,10 +227,11 @@ DROP_TMP = "DROP TABLE IF EXISTS {name}"
 WORKSET_ORDER = ["t_org", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_keys", "t_person"]
 # Порядок для ПОКАЗА: плюс временные таблицы отдельных шагов (t_tflow).
 SHOW_ORDER = ["t_org", "t_raw", "t_stage", "t_pairs", "t_epk", "t_epk_seg", "t_keys",
-              "t_person", "t_tflow", "t_oflow"]
+              "t_person", "t_tflow", "t_oflow", "t_mv", "t_succ", "t_orgsel"]
 DIST = {"t_org": "inn", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id",
         "t_epk_seg": "epk_id", "t_keys": "epk_id", "t_person": "epk_id",
-        "t_tflow": "epk_id", "t_oflow": "epk_id", "t_stage": "epk_id"}
+        "t_tflow": "epk_id", "t_oflow": "epk_id", "t_stage": "epk_id",
+        "t_mv": "epk_id", "t_succ": "inn_from", "t_orgsel": "inn"}
 
 # Определения для ПОКАЗА читателю: запрос у блока должен выполняться как есть, а
 # `FROM t_pairs` выполнить негде — таблица жила в чужой сессии. Поэтому к
@@ -249,45 +255,69 @@ SHOW_DEFS = {
 
 # Численность месяца по сегментам и при нескольких порогах. Строка '__ALL__' —
 # банк целиком: ФЛ с работой в двух сегментах в сумме по сегментам посчитался бы
-# дважды. Все месяцы ряда — ОДНИМ запросом по t_stage.
+# дважды. Все месяцы ряда — ОДНИМ запросом по t_stage. ФЛ — двухступенчатой
+# группировкой (до ФЛ, потом счёт), без count(DISTINCT): он на объёме банка
+# не уложился в таймаут. Число организаций в ряду не считается — не используется.
 SERIES_ALL = """
+WITH e AS (
+  SELECT report_dt, seg, epk_id,
+         count(*) FILTER (WHERE amt_inn > :amt_min) AS n_tr,
+         count(*) FILTER (WHERE amt_inn > 0)        AS t0,
+         count(*) FILTER (WHERE amt_inn > 1000)     AS t1000,
+         count(*) FILTER (WHERE amt_inn > 5000)     AS t5000,
+         count(*) FILTER (WHERE amt_inn > 10000)    AS t10000
+  FROM t_stage WHERE """ + VALID + """
+  GROUP BY report_dt, seg, epk_id
+)
 SELECT report_dt, seg,
-       count(*) FILTER (WHERE amt_inn > :amt_min)                AS n_triples,
-       count(DISTINCT epk_id) FILTER (WHERE amt_inn > :amt_min)  AS n_epk,
-       count(DISTINCT inn) FILTER (WHERE amt_inn > :amt_min)     AS n_inn,
-       count(*) FILTER (WHERE amt_inn > 0)                       AS t0,
-       count(*) FILTER (WHERE amt_inn > 1000)                    AS t1000,
-       count(*) FILTER (WHERE amt_inn > 5000)                    AS t5000,
-       count(*) FILTER (WHERE amt_inn > 10000)                   AS t10000
-FROM t_stage GROUP BY report_dt, seg
+       sum(n_tr)                              AS n_triples,
+       count(*) FILTER (WHERE n_tr > 0)       AS n_epk,
+       CAST(NULL AS bigint)                   AS n_inn,
+       sum(t0) AS t0, sum(t1000) AS t1000, sum(t5000) AS t5000, sum(t10000) AS t10000
+FROM e GROUP BY report_dt, seg
 UNION ALL
 SELECT report_dt, '__ALL__',
-       count(*) FILTER (WHERE amt_inn > :amt_min),
-       count(DISTINCT epk_id) FILTER (WHERE amt_inn > :amt_min),
-       count(DISTINCT inn) FILTER (WHERE amt_inn > :amt_min),
-       count(*) FILTER (WHERE amt_inn > 0),
-       count(*) FILTER (WHERE amt_inn > 1000),
-       count(*) FILTER (WHERE amt_inn > 5000),
-       count(*) FILTER (WHERE amt_inn > 10000)
-FROM t_stage GROUP BY report_dt
+       sum(n_tr), count(*) FILTER (WHERE n_tr > 0), CAST(NULL AS bigint),
+       sum(t0), sum(t1000), sum(t5000), sum(t10000)
+FROM (SELECT report_dt, epk_id, sum(n_tr) AS n_tr, sum(t0) AS t0, sum(t1000) AS t1000,
+             sum(t5000) AS t5000, sum(t10000) AS t10000
+      FROM e GROUP BY report_dt, epk_id) a
+GROUP BY report_dt
 """
 
-# Зарплатные коды месяца по сегментам: КАКОЙ вид выплаты просел (отпускные,
-# премия, аванс). Только коды метрики — коды вне списка на неё не влияют, а в
-# таблице заняли бы верх массовыми соцвыплатами (это уже сбивало вывод).
+# Полнота загрузки — по t_stage (зарплатные строки, в т.ч. непригодные): сколько
+# строк, сколько с пригодным номером организации, сколько без ФЛ. Месяцы ряда в
+# копии только зарплатные — полнота везде считается по одним и тем же строкам.
+LOAD_FROM_STAGE = """
+SELECT report_dt,
+       sum(n_rows)                                     AS n_rows,
+       sum(n_rows) FILTER (WHERE inn IS NOT NULL)      AS n_inn_ok,
+       sum(n_rows) FILTER (WHERE epk_id IS NULL)       AS n_no_epk
+FROM t_stage
+GROUP BY report_dt
+"""
+
+# Зарплатные коды по месяцам и сегментам: КАКОЙ вид выплаты просел (отпускные,
+# премия, аванс). Только коды метрики и только месяцы сравнения — проход по
+# копии с фильтром, без справочника для остальных месяцев.
 CODE_MONTH = """
+SELECT report_dt, code, min(code_name) AS code_name, seg,
+       count(*) AS n_epk, sum(amt) AS amt
+FROM (
 SELECT r.report_dt,
        r.code                                AS code,
+       r.epk_id,
        min(r.code_name)                      AS code_name,
-       COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg,
-       count(DISTINCT r.epk_id)              AS n_epk,
+       COALESCE(o.seg, '""" + S.NO_DIM + """')       AS seg,
        sum(r.amt)                            AS amt
 FROM t_raw r
-LEFT JOIN t_org o ON o.inn = CASE WHEN """ + INN_OK_R + """ THEN CAST(r.inn AS bigint) END
+LEFT JOIN t_org o ON o.inn = """ + _INN_R + """
 WHERE r.report_dt = ANY(CAST(:code_months AS date[]))
   AND r.code = ANY(:codes)
   AND r.epk_id IS NOT NULL
-GROUP BY r.report_dt, r.code, COALESCE(o.seg, '""" + S.NO_DIM + """')
+GROUP BY r.report_dt, r.code, r.epk_id, COALESCE(o.seg, '""" + S.NO_DIM + """')
+) x
+GROUP BY report_dt, code, seg
 """
 
 
@@ -405,6 +435,9 @@ WHERE b.epk_id IS NULL
 # «Другой месяц» для исчезнувших — c, для появившихся — b. Сумма по сегментам =
 # банк; на уровне банка inside + other_seg = совместительство.
 TRIPLE_FLOW = """
+SELECT side, seg, cause, tenure, in_cn1,
+       sum(n) AS n_triples, count(*) AS n_epk
+FROM (
 SELECT f.side, f.seg,
        CASE WHEN os.epk_id IS NOT NULL THEN 'inside'
             WHEN oe.epk_id IS NOT NULL THEN 'other_seg'
@@ -412,7 +445,7 @@ SELECT f.side, f.seg,
             ELSE """ + _come_case("ps") + """ END AS cause,
        CASE WHEN f.side = 'lost' THEN """ + _tenure("e1", "e2") + """ END AS tenure,
        """ + _flag("n1", "has_cn1") + """ AS in_cn1,
-       count(*) AS n_triples, count(DISTINCT f.epk_id) AS n_epk
+       f.epk_id, count(*) AS n
 FROM t_tflow f
 LEFT JOIN t_epk_seg os ON os.epk_id = f.epk_id AND os.seg = f.seg
      AND os.report_dt = CASE WHEN f.side = 'lost' THEN CAST(:c AS date) ELSE CAST(:b AS date) END
@@ -423,7 +456,9 @@ LEFT JOIN t_person ps ON ps.epk_id = f.epk_id
 LEFT JOIN t_epk e1 ON e1.report_dt = CAST(:bp1 AS date) AND e1.epk_id = f.epk_id
 LEFT JOIN t_epk e2 ON e2.report_dt = CAST(:bp2 AS date) AND e2.epk_id = f.epk_id
 LEFT JOIN t_epk n1 ON n1.report_dt = CAST(:cn1 AS date) AND n1.epk_id = f.epk_id
-GROUP BY 1, 2, 3, 4, 5
+GROUP BY 1, 2, 3, 4, 5, 6
+) x
+GROUP BY side, seg, cause, tenure, in_cn1
 """
 
 
@@ -442,8 +477,10 @@ SELECT report_dt, seg,
        sum(n_inn - 1)         AS extra_inn,
        sum(n_tr - n_inn)      AS extra_gosb
 FROM (
-  SELECT report_dt, seg, epk_id, count(DISTINCT inn) AS n_inn, count(*) AS n_tr
-  FROM t_pairs GROUP BY report_dt, seg, epk_id
+  SELECT report_dt, seg, epk_id, count(*) AS n_inn, sum(n_tr) AS n_tr
+  FROM (SELECT report_dt, seg, epk_id, inn, count(*) AS n_tr
+        FROM t_pairs GROUP BY report_dt, seg, epk_id, inn) i
+  GROUP BY report_dt, seg, epk_id
 ) x
 GROUP BY report_dt, seg
 """
@@ -571,33 +608,49 @@ LEFT JOIN (SELECT DISTINCT epk_id, inn FROM t_pairs WHERE report_dt = CAST(:b AS
 WHERE b.epk_id IS NULL
 """
 
-_ORG_HEAD = """
+# Тяжёлая цепочка (ушедшие → куда ушли → приёмники → ситуации → итог по ИНН)
+# считается ОДИН раз на сравнение — тремя временными таблицами шага, — а список,
+# сводка и реорганизации читают готовое. Раньше каждый из трёх запросов
+# пересчитывал всю цепочку заново.
+
+# Ушедшие, получающие в c в другой организации: откуда → куда, по ФЛ. Строка
+# уникальна по (откуда, куда, ФЛ): lv и cp — различные пары, поэтому дальше
+# count(*), а не count(DISTINCT).
+T_MV = """
+SELECT lv.inn AS inn_from, cp.inn AS inn_to, lv.epk_id
+FROM (SELECT epk_id, inn FROM t_oflow WHERE side = 'lv') lv
+JOIN (SELECT DISTINCT epk_id, inn FROM t_pairs WHERE report_dt = CAST(:c AS date)) cp
+  ON cp.epk_id = lv.epk_id
+"""
+
+# Приёмники реорганизации: в одну организацию ушло ≥ :reorg_min_movers ФЛ и ≥
+# :reorg_min_share ушедших.
+T_SUCC = """
+WITH lvn AS (SELECT inn, count(*) AS n_lv FROM t_oflow WHERE side = 'lv' GROUP BY inn),
+pairs_mv AS (
+  SELECT inn_from, inn_to, count(*) AS n_mv FROM t_mv GROUP BY inn_from, inn_to
+)
+SELECT m.inn_from, m.inn_to, m.n_mv, l.n_lv
+FROM pairs_mv m JOIN lvn l ON l.inn = m.inn_from
+WHERE m.n_mv >= :reorg_min_movers AND m.n_mv >= :reorg_min_share * l.n_lv
+"""
+
+# Итог по каждой организации базы: было, стало, ситуации ушедших и пришедших,
+# нетто без реорганизации и пропуска месяца, реальное сокращение.
+T_ORGSEL = """
 WITH bp AS (SELECT DISTINCT epk_id, inn FROM t_pairs WHERE report_dt = CAST(:b AS date)),
 cp AS (SELECT DISTINCT epk_id, inn FROM t_pairs WHERE report_dt = CAST(:c AS date)),
 lv AS (SELECT epk_id, inn FROM t_oflow WHERE side = 'lv'),
 jn AS (SELECT epk_id, inn FROM t_oflow WHERE side = 'jn'),
-mv AS (
-  SELECT lv.inn AS inn_from, cp.inn AS inn_to, lv.epk_id
-  FROM lv JOIN cp ON cp.epk_id = lv.epk_id
-),
-lvn AS (SELECT inn, count(*) AS n_lv FROM lv GROUP BY inn),
-pairs_mv AS (
-  SELECT inn_from, inn_to, count(DISTINCT epk_id) AS n_mv FROM mv GROUP BY inn_from, inn_to
-),
-succ AS (
-  SELECT m.inn_from, m.inn_to, m.n_mv, l.n_lv
-  FROM pairs_mv m JOIN lvn l ON l.inn = m.inn_from
-  WHERE m.n_mv >= :reorg_min_movers AND m.n_mv >= :reorg_min_share * l.n_lv
-),
 reorg_out AS (
   SELECT DISTINCT mv.inn_from AS inn, mv.epk_id
-  FROM mv JOIN succ s ON s.inn_from = mv.inn_from AND s.inn_to = mv.inn_to
+  FROM t_mv mv JOIN t_succ s ON s.inn_from = mv.inn_from AND s.inn_to = mv.inn_to
 ),
 reorg_in AS (
   SELECT DISTINCT mv.inn_to AS inn, mv.epk_id
-  FROM mv JOIN succ s ON s.inn_from = mv.inn_from AND s.inn_to = mv.inn_to
+  FROM t_mv mv JOIN t_succ s ON s.inn_from = mv.inn_from AND s.inn_to = mv.inn_to
 ),
-moved_out AS (SELECT DISTINCT inn_from AS inn, epk_id FROM mv),
+moved_out AS (SELECT DISTINCT inn_from AS inn, epk_id FROM t_mv),
 lv_cls AS (
   SELECT lv.inn,
          CASE WHEN r.epk_id IS NOT NULL THEN 'reorg'
@@ -669,13 +722,15 @@ sel AS (
          CASE WHEN c.net_ex_reorg < 0
               THEN LEAST(c.out_stopped, -c.net_ex_reorg) ELSE 0 END AS real_cut
   FROM calc c
-)"""
+)
+SELECT * FROM sel
+"""
 
 # Список организаций с реальным сокращением + итоги по ВСЕМ отобранным (окнами,
 # до LIMIT): «показано N из M» и сумма по всем считаются в SQL, а не по показанным.
-ORG_LIST = _ORG_HEAD + """,
-picked AS (
-  SELECT s.* FROM sel s
+ORG_LIST = """
+WITH picked AS (
+  SELECT s.* FROM t_orgsel s
   WHERE s.base_fl >= :min_base
     AND s.net_ex_reorg < 0
     AND s.real_cut >= :min_real
@@ -689,9 +744,10 @@ tbm AS (
 ),
 dest AS (
   SELECT inn_from AS inn, inn_to, n_mv FROM (
-    SELECT inn_from, inn_to, n_mv,
-           row_number() OVER (PARTITION BY inn_from ORDER BY n_mv DESC, inn_to) AS rn
-    FROM pairs_mv
+    SELECT inn_from, inn_to, count(*) AS n_mv,
+           row_number() OVER (PARTITION BY inn_from
+                              ORDER BY count(*) DESC, inn_to) AS rn
+    FROM t_mv GROUP BY inn_from, inn_to
   ) d WHERE rn = 1
 )
 SELECT p.*,
@@ -713,7 +769,7 @@ LIMIT :max_rows
 
 # Сводка по ВСЕМ организациям базы: сколько и каких — чтобы список не висел в
 # воздухе («показано 300 из 12 000 сократившихся; 4 000 — нетто ноль»).
-ORG_SUMMARY = _ORG_HEAD + """
+ORG_SUMMARY = """
 SELECT CASE WHEN s.base_fl < :min_base                     THEN 'small'
             WHEN s.net_ex_reorg < 0
              AND s.real_cut >= :min_real
@@ -734,17 +790,17 @@ SELECT CASE WHEN s.base_fl < :min_base                     THEN 'small'
        sum(s.in_new)           AS in_new,
        sum(s.in_moved)         AS in_moved,
        sum(s.real_cut)         AS real_cut
-FROM sel s LEFT JOIN t_org o ON o.inn = s.inn
+FROM t_orgsel s LEFT JOIN t_org o ON o.inn = s.inn
 GROUP BY 1, 2
 """
 
 # Реорганизации, исключённые из списка: откуда → куда, сколько и какая доля.
-ORG_REORG = _ORG_HEAD + """
+ORG_REORG = """
 SELECT s.inn_from, s.inn_to, s.n_mv, s.n_lv,
        COALESCE(f.seg, '""" + S.NO_DIM + """') AS seg_from,
        f.company_name AS name_from, t.company_name AS name_to,
        COALESCE(f.is_liquidated, false) AS from_liquidated
-FROM succ s
+FROM t_succ s
 LEFT JOIN t_org f ON f.inn = s.inn_from
 LEFT JOIN t_org t ON t.inn = s.inn_to
 ORDER BY s.n_mv DESC, s.inn_from
@@ -815,6 +871,9 @@ FROM r GROUP BY grp
 
 SHOW_DEFS["t_tflow"] = T_TFLOW
 SHOW_DEFS["t_oflow"] = T_OFLOW
+SHOW_DEFS["t_mv"] = T_MV
+SHOW_DEFS["t_succ"] = T_SUCC
+SHOW_DEFS["t_orgsel"] = T_ORGSEL
 
 
 # Все запросы файла — для самопроверок (партиция, диалект, маска ИНН).

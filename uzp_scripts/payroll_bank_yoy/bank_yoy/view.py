@@ -254,7 +254,8 @@ def s_series(res: dict) -> str:
         warn = (f'<p class="warn">Недогруженные месяцы: {", ".join(M.label(d) for d in bad["report_dt"])}.</p>'
                 if not bad.empty else "")
         load_tbl = (f'<details><summary>Полнота загрузки и пригодность номеров организаций</summary>{warn}'
-                    + table(["Месяц", "Строк ведомостей", "Доля непригодных номеров", ""], rows) + "</details>")
+                    + table(["Месяц", "Строк зарплатных зачислений", "Доля непригодных номеров", ""], rows)
+                    + "</details>")
     prof = res["mom_profile"]
     prof_html = ""
     if not prof.empty:
