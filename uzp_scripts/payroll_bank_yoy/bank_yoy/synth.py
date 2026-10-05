@@ -20,6 +20,8 @@
   ГОСБ — уровень, а не август);
 * переходы ФЛ между сегментами;
 * реорганизация: все люди ИНН переезжают в ИНН-приёмник;
+* перенос выплаты: организации не платят в августе 2026 и платят вдвойне в
+  сентябре — провал, который не потеря;
 * организации с реальным сокращением (люди уходят из Сбера), «5 ушли — 5 пришли»
   и «перетока» (люди уходят в другие организации) — для списка организаций;
 * непригодные ИНН в ведомостях.
@@ -215,6 +217,9 @@ class Gen:
         self.ev_five = self._orgs_for(10, {"КСБ", "РГС", "ММБ", "СКМ"}, 30, taken)
         self.ev_peretok = self._orgs_for(8, {"КСБ", "РГС", "ММБ"}, 30, taken)
         self.ev_reorg = self._orgs_for(4, {"КСБ", "РГС"}, 20, taken)
+        # Перенос выплаты: в августе 2026 организация не платит никому, в сентябре —
+        # двойная сумма. Люди не уходят — отчёт обязан это различить.
+        self.ev_shift = set(self._orgs_for(15, {"КСБ", "ММБ", "РГС", "СКМ"}, 30, taken))
         self.protected = taken
 
     def simulate(self) -> None:
@@ -308,6 +313,7 @@ class Gen:
                               for t, v in self.ev_real.items()},
             "seasonal_persons": len(self.seasonal),
             "split_gosb_end": M.iso(M.shift(START, T_SPLIT_END)),
+            "pay_shift_inns": [int(self.orgs[o]["inn"]) for o in sorted(self.ev_shift)],
         })
 
     # -- строки витрин ----------------------------------------------------- #
@@ -328,7 +334,11 @@ class Gen:
             for t in range(j["start"], j["end"]):
                 if (j["epk"], t) in season_off:
                     continue
+                if j["org"] in self.ev_shift and t == T_AUG26:
+                    continue                              # август не выплачен
                 amt = j["amt"] * float(r.lognormal(0, 0.05))
+                if j["org"] in self.ev_shift and t == T_AUG26 + 1 and j["start"] < T_AUG26:
+                    amt *= 2                              # в сентябре — за два месяца
                 merged = o["seg"] == "КСБ" and o["id"] % 3 == 0 and t >= T_SPLIT_END
                 g2 = o["gosb2"] if (o["gosb2"] and not merged) else o["gosb"]
                 rows.append((t, j["epk"], j["org"], o["gosb"], 1, 0.6 * amt))

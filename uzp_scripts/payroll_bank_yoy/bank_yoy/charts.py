@@ -76,7 +76,7 @@ def lines(xlabels: list[str], series: list[dict], height: int = 260,
     """series: [{name, values (None — пропуск), color, emphasis}]. Перекрестие —
     колонками-мишенями по X: подсказка перечисляет все серии в этой точке."""
     W, H = 720, height
-    L, R, T, B = 64, 80, 14, 30
+    L, R, T, B = 64, 130, 14, 30            # справа — место под имя серии у конца линии
     vals = [v for s in series for v in s["values"] if v is not None]
     if not vals:
         return ""

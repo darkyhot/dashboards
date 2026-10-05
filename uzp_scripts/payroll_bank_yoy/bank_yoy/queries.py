@@ -36,7 +36,7 @@ AMT_MIN = 2500
 THRESHOLDS = (0, 1000, 5000, 10000)     # плюс AMT_MIN — чувствительность к порогу
 
 INN_OK = "p.inn ~ '^[0-9]{1,12}$'"
-INN_BIG = f"CASE WHEN {INN_OK} THEN CAST(p.inn AS bigint) END"
+INN_OK_R = "r.inn ~ '^[0-9]{1,12}$'"
 
 
 # --------------------------------------------------------------------------- #
@@ -46,22 +46,6 @@ PROBE_COLUMNS = """
 SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_schema = :schema AND table_name = :table
-"""
-
-# Какие месяцы есть в витрине. Только по границам периода — партиции отсекаются.
-# Тот же скан даёт и полноту загрузки: отдельный скан партиции ради трёх
-# счётчиков стоил бы на проме ещё 25 проходов по всему банку.
-PROBE_MONTHS = """
-SELECT p.report_dt,
-       count(*)                                   AS n_rows,
-       count(*) FILTER (WHERE """ + INN_OK + """) AS n_inn_ok,
-       count(*) FILTER (WHERE p.epk_id IS NULL)   AS n_no_epk,
-       sum(p.amt)                                 AS amt
-FROM {schema}.uzp_data_payroll_m p
-WHERE p.report_dt >= CAST(:d_from AS date)
-  AND p.report_dt <= CAST(:d_to AS date)
-GROUP BY p.report_dt
-ORDER BY p.report_dt
 """
 
 PROBE_EPK = """
@@ -83,6 +67,39 @@ DROP_PROBE_TEMP = "DROP TABLE IF EXISTS t_probe_tmp"
 # statement_timeout даже на объёме всего банка.
 # --------------------------------------------------------------------------- #
 
+# ЕДИНСТВЕННОЕ обращение к ведомостям во всём отчёте. Узкая копия витрины за все
+# нужные месяцы (ряд, месяцы набора, месяц после отчётного) — одна временная
+# таблица, заполняется оператором на партицию (каждый — в statement_timeout).
+# Всё остальное — полнота, ряд, коды, тройки, присутствие ФЛ — считается из неё.
+# Название кода берётся только у зарплатных кодов: длинный текст по каждой
+# строке всего банка таблица не тащит.
+T_RAW_MONTH = """
+SELECT p.report_dt,
+       p.epk_id,
+       p.inn,
+       p.sys_gosb_id,
+       p.sys_tb_id,
+       p.{code_col}                                    AS code,
+       CASE WHEN p.{code_col} = ANY(:codes)
+            THEN p.enrollment_transcription END        AS code_name,
+       p.amt
+FROM {schema}.uzp_data_payroll_m p
+WHERE p.report_dt = CAST(:m AS date)
+"""
+
+# Полнота загрузки и пригодность номеров организаций — по копии, все месяцы сразу.
+# Месяц без строк в копии — месяца нет в витрине.
+LOAD_FROM_RAW = """
+SELECT r.report_dt,
+       count(*)                                     AS n_rows,
+       count(*) FILTER (WHERE """ + INN_OK_R + """) AS n_inn_ok,
+       count(*) FILTER (WHERE r.epk_id IS NULL)     AS n_no_epk,
+       sum(r.amt)                                   AS amt
+FROM t_raw r
+GROUP BY r.report_dt
+ORDER BY r.report_dt
+"""
+
 # Организации справочника ЕПК, свёрнутые до ИНН. Свёртка обязательна: у одного ИНН
 # бывает несколько ЕПК, и соединение строкой справочника задвоило бы ВЕДОМОСТИ.
 # Ликвидация — «нет НИ ОДНОЙ активной записи», одна мёртвая строка при живой
@@ -101,32 +118,43 @@ WHERE e.inn IS NOT NULL
 GROUP BY e.inn
 """
 
-# Тройки выше порога за ОДИН месяц. Сегмент денормализуется сразу: дальше он
-# нужен в каждом запросе, и соединять по сто миллионов строк каждый раз незачем.
-# ИНН вне справочника НЕ отбрасывается: банк — это все получатели, такие ИНН идут
+# ВСЕ зарплатные тройки ОДНОГО месяца с суммой по ИНН — без порога, из копии
+# витрины. Из неё — и тройки-получатели (`t_pairs`, порог), и строка ряда по
+# сегментам при всех порогах (`SERIES_FROM_STAGE`).
+# Сегмент денормализуется сразу: дальше он нужен в каждом запросе. ИНН вне
+# справочника НЕ отбрасывается: банк — это все получатели, такие ИНН идут
 # строкой «Не в справочнике».
-T_PAIRS_MONTH = """
+T_STAGE_MONTH = """
 SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.tb_id, x.amt, x.amt_inn,
        COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg
 FROM (
-  SELECT p.report_dt,
-         p.epk_id,
-         CAST(p.inn AS bigint)              AS inn,
-         COALESCE(p.sys_gosb_id, -1)        AS gosb_id,
-         min(p.sys_tb_id)                   AS tb_id,
-         sum(p.amt)                         AS amt,
-         sum(sum(p.amt)) OVER (PARTITION BY p.report_dt, p.epk_id,
-                                            CAST(p.inn AS bigint)) AS amt_inn
-  FROM {schema}.uzp_data_payroll_m p
-  WHERE p.report_dt = CAST(:m AS date)
-    AND p.{code_col} = ANY(:codes)
-    AND p.epk_id IS NOT NULL
-    AND """ + INN_OK + """
-  GROUP BY p.report_dt, p.epk_id, CAST(p.inn AS bigint), COALESCE(p.sys_gosb_id, -1)
+  SELECT r.report_dt,
+         r.epk_id,
+         CAST(r.inn AS bigint)              AS inn,
+         COALESCE(r.sys_gosb_id, -1)        AS gosb_id,
+         min(r.sys_tb_id)                   AS tb_id,
+         sum(r.amt)                         AS amt,
+         sum(sum(r.amt)) OVER (PARTITION BY r.report_dt, r.epk_id,
+                                            CAST(r.inn AS bigint)) AS amt_inn
+  FROM t_raw r
+  WHERE r.report_dt = CAST(:m AS date)
+    AND r.code = ANY(:codes)
+    AND r.epk_id IS NOT NULL
+    AND """ + INN_OK_R + """
+  GROUP BY r.report_dt, r.epk_id, CAST(r.inn AS bigint), COALESCE(r.sys_gosb_id, -1)
 ) x
 LEFT JOIN t_org o ON o.inn = x.inn
-WHERE x.amt_inn > :amt_min
 """
+
+# Получатели: тройки месяца выше порога по ИНН.
+PAIRS_FROM_STAGE = """
+SELECT report_dt, epk_id, inn, gosb_id, tb_id, amt, amt_inn, seg
+FROM t_stage
+WHERE amt_inn > :amt_min
+"""
+
+# То же одним запросом по копии — для ПОКАЗА читателю (определение одно).
+T_PAIRS_MONTH = "SELECT s.* FROM (" + T_STAGE_MONTH + ") s\nWHERE s.amt_inn > :amt_min\n"
 
 # ФЛ-месяц поверх троек: сколько ИНН и троек у человека и его ОСНОВНОЙ сегмент —
 # сегмент ИНН с наибольшей суммой. Основной сегмент один на человека, поэтому
@@ -165,16 +193,16 @@ SELECT DISTINCT epk_id FROM t_epk
 # Зарплатная сумма берётся только по пригодным ИНН: зарплата на ИНН, который не
 # сопоставить, получателя не делает (это видно в полноте загрузки).
 T_PERSON_MONTH = """
-SELECT p.report_dt,
-       p.epk_id,
-       sum(p.amt) AS amt_all,
-       sum(CASE WHEN p.{code_col} = ANY(:codes) AND """ + INN_OK + """
-                THEN p.amt ELSE 0 END) AS amt_codes
-FROM {schema}.uzp_data_payroll_m p
-JOIN t_keys k ON k.epk_id = p.epk_id
-WHERE p.report_dt = CAST(:m AS date)
-  AND p.epk_id IS NOT NULL
-GROUP BY p.report_dt, p.epk_id
+SELECT r.report_dt,
+       r.epk_id,
+       sum(r.amt) AS amt_all,
+       sum(CASE WHEN r.code = ANY(:codes) AND """ + INN_OK_R + """
+                THEN r.amt ELSE 0 END) AS amt_codes
+FROM t_raw r
+JOIN t_keys k ON k.epk_id = r.epk_id
+WHERE r.report_dt = CAST(:m AS date)
+  AND r.epk_id IS NOT NULL
+GROUP BY r.report_dt, r.epk_id
 """
 
 CREATE_TMP = "CREATE TEMP TABLE {name} AS\n{body}\nDISTRIBUTED BY ({dist})"
@@ -185,53 +213,38 @@ ANALYZE_TMP = "ANALYZE {name}"
 DROP_TMP = "DROP TABLE IF EXISTS {name}"
 
 # Порядок значим: каждая следующая таблица читает предыдущие.
-WORKSET_ORDER = ["t_org", "t_pairs", "t_epk", "t_epk_seg", "t_keys", "t_person"]
+WORKSET_ORDER = ["t_org", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_keys", "t_person"]
 # Порядок для ПОКАЗА: плюс временные таблицы отдельных шагов (t_tflow).
-SHOW_ORDER = WORKSET_ORDER + ["t_tflow", "t_oflow"]
-DIST = {"t_org": "inn", "t_pairs": "epk_id", "t_epk": "epk_id",
+SHOW_ORDER = ["t_org", "t_raw", "t_stage", "t_pairs", "t_epk", "t_epk_seg", "t_keys",
+              "t_person", "t_tflow", "t_oflow"]
+DIST = {"t_org": "inn", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id",
         "t_epk_seg": "epk_id", "t_keys": "epk_id", "t_person": "epk_id",
-        "t_tflow": "epk_id", "t_oflow": "epk_id"}
+        "t_tflow": "epk_id", "t_oflow": "epk_id", "t_stage": "epk_id"}
 
 # Определения для ПОКАЗА читателю: запрос у блока должен выполняться как есть, а
 # `FROM t_pairs` выполнить негде — таблица жила в чужой сессии. Поэтому к
 # показанному запросу приклеиваются эти определения как CTE (по всем месяцам).
+_ALL = "report_dt = ANY(CAST(:months AS date[]))"
 SHOW_DEFS = {
     "t_org": T_ORG,
-    "t_pairs": T_PAIRS_MONTH.replace("p.report_dt = CAST(:m AS date)",
-                                     "p.report_dt = ANY(CAST(:months AS date[]))"),
+    "t_raw": T_RAW_MONTH.replace("p.report_dt = CAST(:m AS date)", "p." + _ALL),
+    "t_stage": T_STAGE_MONTH,
+    "t_pairs": T_PAIRS_MONTH.replace("r.report_dt = CAST(:m AS date)", "r." + _ALL),
     "t_epk": T_EPK,
     "t_epk_seg": T_EPK_SEG,
     "t_keys": T_KEYS,
-    "t_person": T_PERSON_MONTH.replace("p.report_dt = CAST(:m AS date)",
-                                       "p.report_dt = ANY(CAST(:months AS date[]))"),
+    "t_person": T_PERSON_MONTH.replace("r.report_dt = CAST(:m AS date)", "r." + _ALL),
 }
 
 
 # --------------------------------------------------------------------------- #
-# Ряд и полнота загрузки — по ОДНОМУ месяцу, с кэшем на диске
+# Ряд и зарплатные коды — по копии витрины
 # --------------------------------------------------------------------------- #
 
-# Численность месяца по сегментам и при нескольких порогах. Считается прямо по
-# витрине (а не по рабочему набору): ряду нужны месяцы вне набора и пороги ниже
-# рабочего. Строка '__ALL__' — банк целиком: ФЛ с работой в двух сегментах в
-# сумме по сегментам посчитался бы дважды.
-MONTH_SERIES = """
-WITH x AS (
-  SELECT p.epk_id,
-         CAST(p.inn AS bigint)            AS inn,
-         COALESCE(p.sys_gosb_id, -1)      AS gosb_id,
-         sum(sum(p.amt)) OVER (PARTITION BY p.epk_id, CAST(p.inn AS bigint)) AS amt_inn
-  FROM {schema}.uzp_data_payroll_m p
-  WHERE p.report_dt = CAST(:m AS date)
-    AND p.{code_col} = ANY(:codes)
-    AND p.epk_id IS NOT NULL
-    AND """ + INN_OK + """
-  GROUP BY p.epk_id, CAST(p.inn AS bigint), COALESCE(p.sys_gosb_id, -1)
-),
-y AS (
-  SELECT x.*, COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg
-  FROM x LEFT JOIN t_org o ON o.inn = x.inn
-)
+# Численность месяца по сегментам и при нескольких порогах. Строка '__ALL__' —
+# банк целиком: ФЛ с работой в двух сегментах в сумме по сегментам посчитался бы
+# дважды. Считается по `t_stage` каждого месяца ряда — то есть по копии витрины.
+_SERIES_AGG = """
 SELECT seg,
        count(*) FILTER (WHERE amt_inn > :amt_min)                AS n_triples,
        count(DISTINCT epk_id) FILTER (WHERE amt_inn > :amt_min)  AS n_epk,
@@ -240,7 +253,7 @@ SELECT seg,
        count(*) FILTER (WHERE amt_inn > 1000)                    AS t1000,
        count(*) FILTER (WHERE amt_inn > 5000)                    AS t5000,
        count(*) FILTER (WHERE amt_inn > 10000)                   AS t10000
-FROM y GROUP BY seg
+FROM __SRC__ GROUP BY seg
 UNION ALL
 SELECT '__ALL__',
        count(*) FILTER (WHERE amt_inn > :amt_min),
@@ -250,24 +263,26 @@ SELECT '__ALL__',
        count(*) FILTER (WHERE amt_inn > 1000),
        count(*) FILTER (WHERE amt_inn > 5000),
        count(*) FILTER (WHERE amt_inn > 10000)
-FROM y
+FROM __SRC__
 """
+SERIES_FROM_STAGE = _SERIES_AGG.replace("__SRC__", "t_stage")
 
 # Зарплатные коды месяца по сегментам: КАКОЙ вид выплаты просел (отпускные,
 # премия, аванс). Только коды метрики — коды вне списка на неё не влияют, а в
 # таблице заняли бы верх массовыми соцвыплатами (это уже сбивало вывод).
 CODE_MONTH = """
-SELECT p.{code_col}                          AS code,
-       min(p.enrollment_transcription)       AS code_name,
+SELECT r.report_dt,
+       r.code                                AS code,
+       min(r.code_name)                      AS code_name,
        COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg,
-       count(DISTINCT p.epk_id)              AS n_epk,
-       sum(p.amt)                            AS amt
-FROM {schema}.uzp_data_payroll_m p
-LEFT JOIN t_org o ON o.inn = """ + INN_BIG + """
-WHERE p.report_dt = CAST(:m AS date)
-  AND p.{code_col} = ANY(:codes)
-  AND p.epk_id IS NOT NULL
-GROUP BY p.{code_col}, COALESCE(o.seg, '""" + S.NO_DIM + """')
+       count(DISTINCT r.epk_id)              AS n_epk,
+       sum(r.amt)                            AS amt
+FROM t_raw r
+LEFT JOIN t_org o ON o.inn = CASE WHEN """ + INN_OK_R + """ THEN CAST(r.inn AS bigint) END
+WHERE r.report_dt = ANY(CAST(:code_months AS date[]))
+  AND r.code = ANY(:codes)
+  AND r.epk_id IS NOT NULL
+GROUP BY r.report_dt, r.code, COALESCE(o.seg, '""" + S.NO_DIM + """')
 """
 
 
@@ -518,14 +533,18 @@ GROUP BY bp.main_seg
 #                а не сокращение — исключается;
 #   moved      — получает ЗП в банке в другой организации: ПЕРЕТОК. Часть снижения
 #                организации, но не потеря для Сбера — отдельная колонка;
+#   back       — в c не получатель нигде, но снова получатель в c+1 (если загружен):
+#                пропуск месяца (перенос выплаты, отпуск), а не уход — отдельная
+#                колонка, в сокращение не идёт. Иначе организация, заплатившая за
+#                август в сентябре, выглядела бы «ушедшей из Сбера целиком»;
 #   left_bank / below_threshold / other_codes — ПЕРЕСТАЛ получать ЗП в Сбере.
 #                Это и есть основная метрика.
 # Пришедшие (нет в b, есть в c): reorg (из ИНН-предшественника), moved (был
 # получателем в банке), new (не был).
 #
 # Отбор (в SQL, в ядро едет только список):
-#   нетто без реорганизации < 0      — численность действительно упала: «5 ушли,
-#                                      5 пришли» сюда не попадает;
+#   нетто без реорганизации и пропуска месяца < 0 — численность действительно
+#                                      упала: «5 ушли, 5 пришли» сюда не попадает;
 #   реальное = min(перестали в Сбере, −нетто без реорганизации) — какая часть
 #                                      падения объяснена уходом из Сбера;
 #   база ≥ :min_base, реальное ≥ :min_real и ≥ :min_share · база.
@@ -578,10 +597,12 @@ lv_cls AS (
   SELECT lv.inn,
          CASE WHEN r.epk_id IS NOT NULL THEN 'reorg'
               WHEN m.epk_id IS NOT NULL THEN 'moved'
+              WHEN CAST(:has_cn1 AS boolean) AND nx.epk_id IS NOT NULL THEN 'back'
               ELSE """ + _gone_case("ps") + """ END AS cls
   FROM lv
   LEFT JOIN reorg_out r ON r.inn = lv.inn AND r.epk_id = lv.epk_id
   LEFT JOIN moved_out m ON m.inn = lv.inn AND m.epk_id = lv.epk_id
+  LEFT JOIN t_epk nx ON nx.report_dt = CAST(:cn1 AS date) AND nx.epk_id = lv.epk_id
   LEFT JOIN t_person ps ON ps.report_dt = CAST(:c AS date) AND ps.epk_id = lv.epk_id
 ),
 jn_cls AS (
@@ -601,7 +622,8 @@ lo AS (
          count(*) FILTER (WHERE cls = 'below_threshold') AS out_below,
          count(*) FILTER (WHERE cls = 'other_codes')     AS out_other_codes,
          count(*) FILTER (WHERE cls = 'moved')           AS out_moved,
-         count(*) FILTER (WHERE cls = 'reorg')           AS out_reorg
+         count(*) FILTER (WHERE cls = 'reorg')           AS out_reorg,
+         count(*) FILTER (WHERE cls = 'back')            AS out_back
   FROM lv_cls GROUP BY inn
 ),
 ji AS (
@@ -619,6 +641,7 @@ org AS (
          COALESCE(lo.out_other_codes, 0)      AS out_other_codes,
          COALESCE(lo.out_moved, 0)            AS out_moved,
          COALESCE(lo.out_reorg, 0)            AS out_reorg,
+         COALESCE(lo.out_back, 0)             AS out_back,
          COALESCE(ji.in_new, 0)               AS in_new,
          COALESCE(ji.in_moved, 0)             AS in_moved,
          COALESCE(ji.in_reorg, 0)             AS in_reorg
@@ -631,7 +654,9 @@ calc AS (
   SELECT o.*,
          o.out_left_bank + o.out_below + o.out_other_codes          AS out_stopped,
          o.cur_fl - o.base_fl                                        AS net,
-         o.cur_fl - o.base_fl + o.out_reorg - o.in_reorg             AS net_ex_reorg
+         -- Вернувшиеся в следующем месяце считаются присутствующими: пропуск
+         -- месяца не падение численности.
+         o.cur_fl - o.base_fl + o.out_reorg - o.in_reorg + o.out_back AS net_ex_reorg
   FROM org o
 ),
 sel AS (
@@ -700,6 +725,7 @@ SELECT CASE WHEN s.base_fl < :min_base                     THEN 'small'
        sum(s.out_stopped)      AS out_stopped,
        sum(s.out_moved)        AS out_moved,
        sum(s.out_reorg)        AS out_reorg,
+       sum(s.out_back)         AS out_back,
        sum(s.in_new)           AS in_new,
        sum(s.in_moved)         AS in_moved,
        sum(s.real_cut)         AS real_cut

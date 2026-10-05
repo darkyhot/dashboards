@@ -19,11 +19,10 @@ SCHEMA = PROM_SCHEMA
 
 # Всё, что пишет отчёт, лежит ВНУТРИ его папки: отчёт переносится одной папкой.
 OUTPUT_DIR = REPORT_DIR / "output"
-CACHE_DIR = OUTPUT_DIR / "cache"
 
 # Правило платформы 13: сервер сам снимает запрос, висящий дольше лимита.
-# Рабочий набор строится ПОМЕСЯЧНО именно затем, чтобы каждый оператор в лимит
-# укладывался даже на объёме всего банка.
+# Копия ведомостей t_raw заполняется ПОМЕСЯЧНО именно затем, чтобы каждый
+# оператор в лимит укладывался даже на объёме всего банка.
 SQL_TIMEOUT_MIN = 10
 
 
@@ -67,4 +66,3 @@ def db_url(override: str | None = None) -> str:
 
 def ensure_dirs() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)

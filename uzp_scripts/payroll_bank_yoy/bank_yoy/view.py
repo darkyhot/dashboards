@@ -209,7 +209,9 @@ def s_series(res: dict) -> str:
     bs = res["bank_series"]
     if bs.empty:
         return section("series", "Ряд", "Ряд не построен — см. предупреждения прогона.", "")
-    last = M.parse(res["report_month"])
+    # Ось кончается последним месяцем ряда: если загружен месяц после отчётного,
+    # отскок после провала виден на том же графике.
+    last = M.parse(bs["report_dt"].max())
     cal = [M.shift(last, -11 + i) for i in range(12)]
     b = bs.set_index("report_dt")
 
@@ -219,9 +221,9 @@ def s_series(res: dict) -> str:
 
     labels = [M.RU[d.month - 1] for d in cal]
     y1, y0 = last.year, last.year - 1
-    # Короткие имена серий: 12 месяцев, кончающихся отчётным, и те же год назад.
-    span_cur = f"{cal[0].year}–{cal[-1].year % 100:02d}"
-    span_prev = f"{cal[0].year - 1}–{(cal[-1].year - 1) % 100:02d}"
+    # Имена серий — явные периоды: «2025–26» читалось как финансовый год.
+    span_cur = f"{M.label(cal[0])} … {M.label(cal[-1])}"
+    span_prev = f"{M.label(M.shift(cal[0], -12))} … {M.label(M.shift(cal[-1], -12))}"
     lines = C.lines(labels, [
         {"name": span_prev, "values": [val(M.shift(d, -12)) for d in cal], "color": "var(--neutral)"},
         {"name": span_cur, "values": [val(d) for d in cal], "color": "var(--series-1)", "emphasis": True}])
@@ -266,15 +268,16 @@ def s_series(res: dict) -> str:
                                [M.RU[c - 1] for c in order],
                                lambda r, c: _get(p, {v: k for k, v in rows_h.items()}[r], order[[M.RU[x - 1] for x in order].index(c)]),
                                lambda v: fnum(v, True), row_head="12 месяцев"))
-    body = (f"<h3>Получатели по календарному месяцу: этот год против прошлого</h3>"
-            f"<p class='muted'>{esc(span_cur)} — {esc(M.label(cal[0]))}…{esc(M.label(cal[-1]))}; "
-            f"{esc(span_prev)} — те же месяцы годом раньше.</p>{lines}"
+    body = (f"<h3>Каждый месяц последних 12 месяцев против того же месяца годом раньше</h3>"
+            f"<p class='muted'>Синяя линия — получатели за {esc(span_cur)}, серая — за {esc(span_prev)}. "
+            f"Расстояние между линиями над месяцем — изменение год к году (столбики ниже). "
+            f"Провал, который есть на ОБЕИХ линиях, — сезон; отличие формы — то, что надо объяснять.</p>{lines}"
             f"<h3>Изменение год к году</h3>{cols}<p class='muted'>{st}</p>"
             f"<h3>Сегмент × месяц: изменение год к году, %</h3>{hm}{prof_html}{load_tbl}"
             + sql_box(res, [k for k in res.get("shown", {}) if k.startswith(("series_", "load_"))][:2]))
     return section("series", "Ряд и сезон",
-                   "Когда началось изменение и повторяется ли оно каждый год. Ряд считается прямо по "
-                   "витрине (с кэшем по месяцам) и сверяется с рабочим набором в общих месяцах.", body)
+                   "Когда началось изменение и повторяется ли оно каждый год. Ряд считается по копии "
+                   "ведомостей t_raw — той же, из которой строится весь разбор.", body)
 
 
 def _get(df: pd.DataFrame, r, c):
@@ -551,9 +554,11 @@ def s_orgs(res: dict) -> str:
         sm = ""
         if not smr.empty:
             rows = [[r.title, fnum(r.n_orgs), fnum(r.base_fl), fnum(r.cur_fl), fnum(r.out_stopped),
-                     fnum(r.out_moved), fnum(r.out_reorg), fnum(r.in_new), fnum(r.real_cut)] for r in smr.itertuples()]
+                     fnum(r.out_moved), fnum(r.out_reorg), fnum(r.out_back), fnum(r.in_new), fnum(r.real_cut)]
+                    for r in smr.itertuples()]
             sm = table(["Класс организаций", "Организаций", "ФЛ было", "ФЛ стало", "Перестали в Сбере",
-                        "Ушли в другие орг.", "Реорганизация", "Новые в Сбере", "Реальное сокращение"], rows)
+                        "Ушли в другие орг.", "Реорганизация", "Пропустили месяц", "Новые в Сбере",
+                        "Реальное сокращение"], rows)
         if lst.empty:
             return sm + "<p>Организаций с реальным сокращением по заданным порогам нет.</p>"
         n_all = int(lst["n_picked"].iloc[0])
@@ -567,7 +572,8 @@ def s_orgs(res: dict) -> str:
                '<span class="cnt"></span></div>')
         head = ["Организация", "Номер", "Сегмент", "ТБ", "Было ФЛ", "Стало", "Нетто", "Реальное сокращение",
                 "% базы", "Перестали в Сбере", "из них: нет зачислений", "ниже порога", "только незарплатные",
-                "Переток в др. орг.", "Реорг.", "Пришли новые", "Пришли из др. орг."]
+                "Переток в др. орг.", "Реорг.", "Пропустили месяц, вернулись", "Пришли новые",
+                "Пришли из др. орг."]
         rows = []
         for r in lst.itertuples():
             name = esc(r.company_name) + (' <span class="tag">ликвидирована</span>' if r.is_liquidated else "")
@@ -577,7 +583,8 @@ def s_orgs(res: dict) -> str:
                         + "".join(f'<td class="n">{x}</td>' for x in (
                             fnum(r.base_fl), fnum(r.cur_fl), fnum(r.net, True), f"<b>{fnum(r.real_cut)}</b>",
                             fpct(r.real_share), fnum(r.out_stopped), fnum(r.out_left_bank), fnum(r.out_below),
-                            fnum(r.out_other_codes), fnum(r.out_moved), fnum(r.out_reorg), fnum(r.in_new),
+                            fnum(r.out_other_codes), fnum(r.out_moved), fnum(r.out_reorg), fnum(r.out_back),
+                            fnum(r.in_new),
                             fnum(r.in_moved))) + "</tr>")
         tbl = (f'<div class="scroll tall"><table class="data orgs" id="org-{m}"><thead><tr>' +
                "".join(f'<th class="{"" if i < 4 else "n"}">{esc(h)}</th>' for i, h in enumerate(head)) +
@@ -598,7 +605,8 @@ def s_orgs(res: dict) -> str:
             f"<b>Реальное сокращение</b> = min(перестали получать ЗП в Сбере; падение численности без учёта "
             f"реорганизации). В список — только где численность действительно упала: «5 ушли, 5 пришли» "
             f"не попадает. Переток в другие организации — часть снижения, но не потеря для Сбера: отдельная "
-            f"колонка. Реорганизация — ушло ≥ {fpct(oo['reorg_min_share'], digits=0)} ушедших и ≥ "
+            f"колонка. Кто не получал в месяце сравнения, но снова получает в следующем, — пропуск месяца "
+            f"(перенос выплаты, отпуск), а не уход: отдельная колонка, в сокращение не идёт. Реорганизация — ушло ≥ {fpct(oo['reorg_min_share'], digits=0)} ушедших и ≥ "
             f"{oo['reorg_min_movers']} ФЛ в одну организацию-приёмник; исключается. Пороги: база ≥ "
             f"{oo['min_base']} ФЛ, сокращение ≥ {oo['min_real']} ФЛ и ≥ {fpct(oo['min_share'], digits=0)} базы.")
     return section("orgs", "Организации с реальным сокращением", lead, per_month(res, build))
@@ -670,7 +678,8 @@ def s_august(res: dict) -> str:
     if hl is not None and not hl.empty:
         rows = [[r.company_name or "Организация не в справочнике", int(r.inn), r.seg, fnum(r.n_prev),
                  fnum(r.n_cur), fnum(r.n_next), fnum(r.hole)] for r in hl.head(30).itertuples()]
-        body += (f"<details><summary>Крупнейшие организации с провалом, {y1} (30 из {fnum(hc['n_orgs'])})</summary>" +
+        body += (f"<details><summary>Крупнейшие организации с провалом, {y1} "
+                 f"({fnum(min(30, hc['n_orgs']))} из {fnum(hc['n_orgs'])})</summary>" +
                  table(["Организация", "Номер", "Сегмент", nm["prev"], nm["cur"], nm["next"], "Дыра"], rows,
                        num={1, 3, 4, 5, 6}) + "</details>")
     pr = []

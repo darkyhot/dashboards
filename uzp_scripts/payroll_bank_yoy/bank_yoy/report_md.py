@@ -97,6 +97,46 @@ def render(res: dict) -> tuple[str, list[str]]:
     L.append(_md_table(["Месяц", "Получателей год назад", "Сейчас", "Изменение", "%", "Изменение ФЛ"], rows))
     L.append(_plain(V.verdict(res)) + "\n")
 
+    br = res.get("bridge")
+    if br is not None and not br.empty:
+        ms = br.attrs["months"]
+        y1 = M.parse(ms["cur"]).year
+        L.append(f"## {M.name(ms['cur']).capitalize()}: потеря или перенос в {M.name(ms['next'])}\n")
+        b = br.set_index("key")
+        titles = [("lvl_cur", f"Получателей, {y1}"), ("lvl_prev", f"Получателей, {y1 - 1}"),
+                  ("yoy", "Год к году"), ("mom_cur", f"К предыдущему месяцу, {y1}"),
+                  ("mom_prev", f"К предыдущему месяцу, {y1 - 1}"), ("did", "Разница переходов")]
+        L.append(_md_table(["", M.name(ms["prev"]), M.name(ms["cur"]), M.name(ms["next"])],
+                           [[t] + [fnum(b.loc[k, c], k not in ("lvl_cur", "lvl_prev"))
+                                   for c in ("prev", "cur", "next")] for k, t in titles]))
+        L.append(f"Вывод: {A.august_verdict(br, res['temp_perm'])}\n")
+        tp = res["temp_perm"]
+        L.append(_md_table(["Переставшие", str(y1), str(y1 - 1), "Разница"],
+                           [[r.title, fnum(r.cur, True), fnum(r.prev, True), fnum(r.diff, True)]
+                            for r in tp.itertuples()]))
+        aug = res["aug_raw"]
+        hc, hp = A.hole_summary(aug["hole_cur"]), A.hole_summary(aug["hole_prev"])
+        L.append(f"Организации, пропустившие {M.name(ms['cur'])} (были в {M.prep(ms['prev'])}, "
+                 f"вернулись в {M.prep(ms['next'])}): {y1} — {fnum(hc['n_orgs'])} организаций, "
+                 f"{fnum(hc['sum_hole'])} получателей; {y1 - 1} — {fnum(hp['n_orgs'])}, "
+                 f"{fnum(hp['sum_hole'])}.\n")
+        hl = aug["hole_cur"]
+        if hl is not None and not hl.empty:
+            L.append(_md_table(["Организация", "Сегмент", M.name(ms["prev"]), M.name(ms["cur"]),
+                                M.name(ms["next"]), "Дыра"],
+                               [[al("Орг", r.company_name), r.seg, fnum(r.n_prev), fnum(r.n_cur),
+                                 fnum(r.n_next), fnum(r.hole)] for r in hl.head(15).itertuples()]))
+        pr = []
+        for tag, y in (("cur", y1), ("prev", y1 - 1)):
+            d = aug[f"pay_{tag}"]
+            for r in (d.itertuples() if d is not None and not d.empty else []):
+                grp = "пропали и вернулись" if r.grp == "gap" else "получали все три месяца"
+                pr.append([y, grp, fnum(r.n_epk), fnum(float(r.median_ratio), digits=2),
+                           fpct(float(r.share_double)), fpct(float(r.share_single))])
+        if pr:
+            L.append(_md_table(["Год", "Группа ФЛ", "ФЛ", f"Медиана {M.name(ms['next'])}/{M.name(ms['prev'])}",
+                                "Доля ≥1,6×", "Доля 0,7–1,4×"], pr))
+
     for m in rep:
         cp = res["comp"][("yoy", m)]
         L.append(f"## Разложение: {M.long(cp['b'])} → {M.long(cp['c'])}\n")

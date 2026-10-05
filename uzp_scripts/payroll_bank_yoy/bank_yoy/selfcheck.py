@@ -66,11 +66,21 @@ def check_dialect() -> None:
                 _fail("диалект", f"{name}: {why}")
 
 
+def check_payroll_once() -> None:
+    """Ведомости читает ТОЛЬКО копия t_raw — всё остальное считается из неё."""
+    readers = [n for n, sql in Q.all_sql().items() if "uzp_data_payroll_m" in sql]
+    if readers != ["T_RAW_MONTH"]:
+        _fail("одна копия ведомостей", f"к витрине обращаются: {readers}")
+    if "CREATE_TMP" in Q.T_RAW_MONTH or "INSERT" in Q.T_RAW_MONTH:
+        _fail("одна копия ведомостей", "T_RAW_MONTH — тело, а не оператор")
+
+
 def check_inn_cast() -> None:
-    """CAST(p.inn AS bigint) — только в запросе, где стоит маска."""
+    """CAST(<алиас>.inn AS bigint) — только в запросе, где стоит маска того же алиаса."""
     for name, sql in Q.all_sql().items():
-        if "CAST(p.inn AS bigint)" in sql and Q.INN_OK not in sql:
-            _fail("маска ИНН", f"{name}: приведение номера без маски")
+        for alias in set(re.findall(r"CAST\((\w+)\.inn AS bigint\)", sql)):
+            if f"{alias}.inn ~ '^[0-9]{{1,12}}$'" not in sql:
+                _fail("маска ИНН", f"{name}: приведение {alias}.inn без маски")
         if re.search(r"IN\s*:codes", sql):
             _fail("коды", f"{name}: IN :codes вместо = ANY(:codes)")
 
@@ -156,7 +166,7 @@ def check_months() -> None:
         _fail("месяцы", "сдвиг или конец месяца посчитан неверно")
 
 
-CHECKS = [check_self_contained, check_partition_filter, check_dialect, check_inn_cast,
+CHECKS = [check_self_contained, check_payroll_once, check_partition_filter, check_dialect, check_inn_cast,
           check_placeholders, check_decomp_identity, check_did_identity, check_org_rules,
           check_sanitize, check_months]
 
@@ -210,7 +220,12 @@ def check_against_synth(res: dict) -> None:
         if k <= last:
             miss = [i for i in v if i not in inns]
             need(not miss, f"реальное сокращение ({k}) в списке: не найдены {miss}")
-    need(not (inns & set(exp["five_five_inns"])), "«5 ушли — 5 пришли» в список не попали")
+    # «5 ушли — 5 пришли»: заложенный обмен взаимно гасится. В список организация
+    # может попасть только за счёт ОБЫЧНОЙ текучести на фоне — тогда пришедшие
+    # обязаны уменьшить реальное сокращение относительно ушедших.
+    ff = lst[lst["inn"].isin(exp["five_five_inns"])] if not lst.empty else lst
+    need(ff.empty or bool((ff["real_cut"] < ff["out_stopped"]).all()),
+         f"«5 ушли — 5 пришли»: пришедшие гасят ушедших ({len(ff)} в списке за счёт фона)")
     need(not (inns & {a for a, _ in exp["reorg_pairs"]}), "реорганизации в список не попали")
     # Переток не засчитывается в реальное сокращение. Сама организация в список
     # попасть может — если у неё ещё и обычная текучесть из Сбера выше порога.
@@ -221,6 +236,20 @@ def check_against_synth(res: dict) -> None:
     found = {(int(a), int(b)) for a, b in zip(rg["inn_from"], rg["inn_to"])} if not rg.empty else set()
     # Реорганизация была до базового месяца или внутри года — ищем там, где она внутри окна.
     need(all((a, b) in found for a, b in exp["reorg_pairs"]), "реорганизации опознаны")
+    # Перенос выплаты: организации найдены, двойная выплата видна, в сокращение не попали.
+    shift = set(exp.get("pay_shift_inns", []))
+    if shift and res.get("aug_raw"):
+        hole = res["aug_raw"]["hole_cur"]
+        found = set(hole["inn"].astype("int64")) if not hole.empty else set()
+        need(shift <= found, f"перенос выплаты: найдено {len(shift & found)} из {len(shift)} организаций")
+        pc, pp = res["aug_raw"]["pay_cur"], res["aug_raw"]["pay_prev"]
+        dc = float(pc.loc[pc["grp"] == "gap", "share_double"].iloc[0])
+        dp = float(pp.loc[pp["grp"] == "gap", "share_double"].iloc[0])
+        need(dc - dp > 0.2, f"двойная выплата у вернувшихся: {dc:.0%} против {dp:.0%} год назад")
+        sh = lst[lst["inn"].isin(shift)] if not lst.empty else lst
+        need(sh.empty or bool(((sh["out_back"] >= 0.5 * sh["base_fl"])
+                               & (sh["real_cut"] <= sh["out_stopped"])).all()),
+             f"перенос выплаты не засчитан в сокращение ({len(sh)} в списке за счёт фона)")
     for w in ok:
         print(f"  ✓ {w}", flush=True)
     for w in errs:

@@ -645,7 +645,7 @@ def org_list(df: pd.DataFrame, tbd: pd.DataFrame) -> pd.DataFrame:
     names = dict(zip(tbd["tb_id"], tbd["tb_short_name"])) if not tbd.empty else {}
     x["tb"] = [names.get(t, f"ТБ № {int(t)}" if pd.notna(t) else "—") for t in x["tb_id"]]
     for c in ("base_fl", "cur_fl", "net", "net_ex_reorg", "out_stopped", "out_left_bank",
-              "out_below", "out_other_codes", "out_moved", "out_reorg", "in_new", "in_moved",
+              "out_below", "out_other_codes", "out_moved", "out_reorg", "out_back", "in_new", "in_moved",
               "in_reorg", "real_cut"):
         x[c] = _num(x, c)
     x["real_share"] = x["real_cut"] / x["base_fl"]
@@ -753,11 +753,11 @@ def august_verdict(br: pd.DataFrame, tp: pd.DataFrame) -> str:
     did_cur, did_next = b.loc["did", "cur"], b.loc["did", "next"]
     two = br.attrs["two"]["cur"] - br.attrs["two"]["prev"]
     if did_cur < 0 and did_next >= -did_cur:
-        return (f"минус {M.gen(br.attrs['months']['cur'])} к {M.prep(br.attrs['months']['next'])} вернулся с "
+        return (f"минус {M.gen(br.attrs['months']['cur'])} в {M.prep(br.attrs['months']['next'])} вернулся с "
                 f"избытком: за два месяца этот год лучше прошлого на {two:,.0f}. Это сдвиг во времени, а не "
                 f"потеря людей.").replace(",", "\u00a0")
     if did_cur < 0 and did_next > 0:
-        return (f"к {M.prep(br.attrs['months']['next'])} вернулась часть минуса: "
+        return (f"в {M.prep(br.attrs['months']['next'])} вернулась часть минуса: "
                 f"{did_next:,.0f} из {-did_cur:,.0f}.").replace(",", "\u00a0")
     if did_cur < 0:
         return "в следующем месяце минус не вернулся — это потеря, а не сдвиг."

@@ -35,7 +35,7 @@ def _months_plan(report_month, n_months: int, avail: set[str]) -> dict:
 def run(conn: str | None = None, schema: str | None = None,
         report_month: str = "2026-08", n_months: int = 3,
         history_months: int = 25, amt_min: int = Q.AMT_MIN, codes=Q.CODES,
-        org_opts: dict | None = None, use_cache: bool = True,
+        org_opts: dict | None = None,
         sql_timeout_min: int = config.SQL_TIMEOUT_MIN,
         verbose: bool = True, show_sql: bool = False) -> dict:
     t_start = time.time()
@@ -57,33 +57,43 @@ def run(conn: str | None = None, schema: str | None = None,
                  "generated": datetime.now().strftime("%Y-%m-%d %H:%M")}
 
     with db.session(engine) as cx:
-        pr = probe.run(cx, min(hist[0], M.shift(last, -15)), M.shift(last, 1))
+        pr = probe.run(cx)
         res["probe"] = pr
-        plan = _months_plan(last, n_months, set(pr["months"]))
-        if plan["missing"]:
-            raise probe.ProbeError(f"в витрине нет месяцев, нужных разбору: {plan['missing']}")
-        report = plan["report"]
-        res["report"] = [M.iso(m) for m in report]
-        res["work"] = [M.iso(m) for m in plan["work"]]
-        nxt = M.iso(M.shift(last, 1))
-        res["has_next"] = nxt in pr["months"]
-        if not res["has_next"]:
-            progress.warn(f"{M.label(nxt)} не загружен — проверка «вернулись в следующем "
-                          f"месяце» для {M.label(last)} не строится")
-
-        ws = fetch.Workspace(cx, plan["work"], {"codes": list(codes), "amt_min": int(amt_min)})
+        # Месяцы копии: ряд, рабочий набор обоих лет и месяц после отчётного.
+        first = M.shift(last, -(n_months - 1))
+        raw_from = min(hist[0], M.shift(first, -LOOKBACK - 12))
+        raw_months = M.span(raw_from, M.shift(last, 1))
+        ws = fetch.Workspace(cx, [], {"codes": list(codes), "amt_min": int(amt_min)})
         try:
-            ws.build()
-            fp = {"schema": config.SCHEMA, "amt_min": amt_min, "codes": list(codes),
-                  "code_col": db.CODE_COL, "epk": pr["epk"]}
-            # Число строк партиции — в ключе кэша СВОЕГО месяца (см. month_cached):
-            # перезагрузка месяца меняет его ключ и только его.
-            fp["rows"] = pr["months"]
-            series_raw, load_raw = fetch.series(
-                ws, [m for m in hist if M.iso(m) in pr["months"]], fp, use_cache)
-            res["series_raw"] = series_raw
-            hist_iso = {M.iso(m) for m in hist}
-            res["load_raw"] = pd.DataFrame([r for r in pr["load"] if r["report_dt"] in hist_iso])
+            rows = ws.build_raw(raw_months)
+            avail = {m for m, n in rows.items() if n > 0}
+            pr["months"] = rows
+            if not avail:
+                raise probe.ProbeError(
+                    "в витрине нет ни одной строки за нужные месяцы — проверьте схему и что "
+                    "report_dt в ведомостях — последний день месяца")
+            plan = _months_plan(last, n_months, avail)
+            if plan["missing"]:
+                raise probe.ProbeError(f"в витрине нет месяцев, нужных разбору: {plan['missing']}")
+            report = plan["report"]
+            res["report"] = [M.iso(m) for m in report]
+            res["work"] = [M.iso(m) for m in plan["work"]]
+            nxt = M.iso(M.shift(last, 1))
+            res["has_next"] = nxt in avail
+            if res["has_next"]:
+                # Ряд — до месяца после отчётного: отскок после провала виден на графике.
+                hist = hist + [M.parse(nxt)]
+            else:
+                progress.warn(f"{M.label(nxt)} не загружен — проверка «вернулись в следующем "
+                              f"месяце» для {M.label(last)} не строится")
+            hist = [m for m in hist if M.iso(m) in avail]
+            code_ms = sorted({M.shift(m, k) for m in report for k in (0, -1, -12, -13)})
+
+            ws.months = res["work"]
+            ws.build(hist, code_ms)
+            res["series_raw"] = pd.concat(ws.series_rows, ignore_index=True)
+            res["load_raw"] = ws.load
+            res["codes_raw"] = ws.codes
 
             progress.step("Итоги месяцев набора")
             res["multi_bank_raw"] = ws.sql("multi_bank", Q.MULTI_BANK)
@@ -104,7 +114,7 @@ def run(conn: str | None = None, schema: str | None = None,
                 progress.done(f"{M.label(m)}: год к году и два месячных перехода")
             res["fl_raw"], res["tr_raw"] = fl, tr
 
-            progress.step("Когорты пришедших, сезонность, зарплатные коды")
+            progress.step("Когорты пришедших, сезонность")
             coh = {}
             for off in (0, -12):
                 for k in M.span(M.shift(report[0], -1 + off), M.shift(report[-1], off)):
@@ -113,9 +123,7 @@ def run(conn: str | None = None, schema: str | None = None,
                 coh[("yoy", k)] = fetch.cohort(ws, k, M.shift(k, -12), f"yoy_{M.iso(k)}")
             res["cohort_raw"] = coh
             res["seasonal_raw"] = {M.iso(m): fetch.seasonal(ws, m) for m in report}
-            code_ms = sorted({M.shift(m, k) for m in report for k in (0, -1, -12, -13)})
-            res["codes_raw"] = fetch.code_months(ws, code_ms, fp, use_cache)
-            progress.done("когорты, сезонность, коды")
+            progress.done("когорты и сезонность")
 
             progress.step("Организации: где численность реально сократилась")
             res["orgs_raw"] = {}
@@ -170,7 +178,7 @@ def compute(res: dict) -> None:
     if not res["bank_series"].empty:
         bs = res["bank_series"].set_index("report_dt")["n_triples"]
         common = [d for d in tot.index if d in bs.index]
-        checks.append(A.check("ряд по витрине = рабочий набор (получатели)",
+        checks.append(A.check("ряд (t_stage) = рабочий набор (t_pairs), получатели",
                               float(sum(abs(bs[d] - tot[d]) for d in common)),
                               detail=f"месяцев сверено: {len(common)}"))
 

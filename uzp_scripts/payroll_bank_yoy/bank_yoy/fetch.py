@@ -1,9 +1,10 @@
 """Выгрузка. Тяжёлое считается в БД, в pandas едут только свёртки.
 
-Главное решение модуля — РАБОЧИЙ НАБОР временных таблиц в ОДНОЙ сессии. Двадцать
-запросов разбора смотрят на одни и те же месяцы ведомостей; сканировать витрину
-всего банка двадцать раз незачем. Набор строится ПОМЕСЯЧНО — оператор на партицию,
-— чтобы каждый укладывался в statement_timeout.
+Главное решение модуля — ведомости читаются РОВНО ОДИН РАЗ: узкая копия витрины
+`t_raw` за все нужные месяцы (ряд, набор, месяц после отчётного), одна временная
+таблица в одной сессии, заполняется оператором на партицию — каждый укладывается
+в statement_timeout. Всё остальное (полнота, ряд, коды, тройки, присутствие ФЛ)
+считается из неё; к витрине больше никто не обращается.
 
 Запасного пути через CTE здесь НЕТ, в отличие от разбора одного сегмента: на
 объёме всего банка каждый запрос пересчитывал бы тройки за все месяцы, а это часы.
@@ -11,12 +12,9 @@
 """
 from __future__ import annotations
 
-import hashlib
-import json
-
 import pandas as pd
 
-from . import config, db, progress
+from . import db, progress
 from . import months as M
 from . import queries as Q
 
@@ -47,6 +45,9 @@ class Workspace:
         # Показанные читателю запросы: имя → (самодостаточный текст, параметры).
         self.shown: dict[str, tuple[str, dict]] = {}
         self.timing: dict[str, float] = {}
+        self.series_rows: list[pd.DataFrame] = []
+        self.load = pd.DataFrame()
+        self.codes = pd.DataFrame()
 
     # -- построение -------------------------------------------------------- #
     def _create(self, name: str, body: str, params: dict | None = None) -> int:
@@ -90,20 +91,68 @@ class Workspace:
         self._analyze(name)
         progress.done(f"{name}: всего {total:,} строк")
 
-    def build(self) -> None:
-        progress.step(f"Рабочий набор: {len(self.months)} мес. "
-                      f"({', '.join(M.label(m) for m in self.months)})")
+    def build_raw(self, months: list) -> dict[str, int]:
+        """ЕДИНСТВЕННОЕ чтение ведомостей: узкая копия витрины `t_raw` за все нужные
+        месяцы, оператор на партицию. Возвращает число строк по месяцам: месяц с
+        нулём — месяца нет в витрине."""
+        progress.step(f"Копия ведомостей t_raw: {len(months)} мес. "
+                      f"({M.label(months[0])}…{M.label(months[-1])})")
         n = self._create("t_org", Q.T_ORG)
         self._analyze("t_org")
         progress.done(f"t_org: {n:,} организаций справочника")
-        self._monthly("t_pairs", Q.T_PAIRS_MONTH)
+        rows: dict[str, int] = {}
+        for i, m in enumerate(M.iso(x) for x in months):
+            t0 = pd.Timestamp.now()
+            n = (self._create("t_raw", Q.T_RAW_MONTH, {"m": m}) if i == 0
+                 else self._insert("t_raw", Q.T_RAW_MONTH, {"m": m}))
+            rows[m] = n
+            sec = (pd.Timestamp.now() - t0).total_seconds()
+            progress.done(f"t_raw · {M.label(m)}: {n:,} строк за {sec:.0f} с")
+        self._analyze("t_raw")
+        progress.done(f"t_raw: всего {sum(rows.values()):,} строк")
+        return rows
+
+    def build(self, hist: list, code_months: list) -> None:
+        """Всё остальное — из t_raw: ряд по каждому месяцу ряда, тройки месяцев
+        набора, ФЛ-месяц, присутствие ФЛ, зарплатные коды, полнота."""
+        progress.step(f"Рабочий набор из t_raw: {len(self.months)} мес. "
+                      f"({', '.join(M.label(m) for m in self.months)}), ряд {len(hist)} мес.")
+        self.series_rows = []
+        n_pairs, first = 0, True
+        for m in sorted({M.iso(x) for x in hist} | set(self.months)):
+            t0 = pd.Timestamp.now()
+            self._drop_one("t_stage")
+            self._create("t_stage", Q.T_STAGE_MONTH, {"m": m})
+            ser = self.sql(f"series_{m}", Q.SERIES_FROM_STAGE, {"m": m, "months": [m]})
+            ser["report_dt"] = m
+            self.series_rows.append(ser)
+            note = "ряд"
+            if m in self.months:
+                n = (self._create("t_pairs", Q.PAIRS_FROM_STAGE) if first
+                     else self._insert("t_pairs", Q.PAIRS_FROM_STAGE, {}))
+                first = False
+                n_pairs += n
+                note = f"ряд + {n:,} получателей"
+            sec = (pd.Timestamp.now() - t0).total_seconds()
+            progress.done(f"{M.label(m)}: {note} за {sec:.0f} с")
+        self._drop_one("t_stage")
+        self._analyze("t_pairs")
+        progress.done(f"t_pairs: всего {n_pairs:,} строк")
         for name, body in (("t_epk", Q.T_EPK), ("t_epk_seg", Q.T_EPK_SEG),
                            ("t_keys", Q.T_KEYS)):
             n = self._create(name, body)
             self._analyze(name)
             progress.done(f"{name}: {n:,} строк")
         self._monthly("t_person", Q.T_PERSON_MONTH)
+        self.load = self.sql("load", Q.LOAD_FROM_RAW)
+        self.codes = self.opt("code_months", Q.CODE_MONTH,
+                              {"code_months": [M.iso(x) for x in code_months]})
         progress.done("рабочий набор готов")
+
+    def _drop_one(self, name: str) -> None:
+        db.execute(self.conn, Q.DROP_TMP.format(name=name))
+        if name in self.built:
+            self.built.remove(name)
 
     def drop(self) -> None:
         for name in reversed(self.built):
@@ -151,69 +200,6 @@ class Workspace:
                           f"раздел будет пропущен")
             db.rollback(self.conn)
             return pd.DataFrame()
-
-
-# --------------------------------------------------------------------------- #
-# Ряд по месяцам — прямо по витрине, с кэшем на диске
-# --------------------------------------------------------------------------- #
-def _cache_key(kind: str, m: str, fp: dict) -> str:
-    raw = json.dumps({"kind": kind, "m": m, **fp}, sort_keys=True, default=str)
-    return f"{kind}_{m}_{hashlib.md5(raw.encode()).hexdigest()[:10]}.csv"
-
-
-def month_cached(ws: Workspace, kind: str, sql: str, m: str, fp: dict,
-                 use_cache: bool = True) -> pd.DataFrame:
-    """Один месяц ряда. Кэш ключуется всем, от чего зависит число: схема, месяц,
-    число строк партиции, порог, коды, имя колонки кода, срез справочника ЕПК.
-    Закрытый месяц не меняется, и повторный прогон его не пересчитывает; перезагрузка
-    партиции меняет число строк — и ключ."""
-    config.ensure_dirs()
-    key = {k: v for k, v in fp.items() if k != "rows"}
-    key["n_rows"] = (fp.get("rows") or {}).get(m)
-    path = config.CACHE_DIR / _cache_key(kind, m, key)
-    if use_cache and path.exists():
-        return pd.read_csv(path)
-    t0 = pd.Timestamp.now()
-    df = ws.sql(f"{kind}_{m}", sql, {"m": m})
-    df.to_csv(path, index=False)
-    progress.done(f"{kind} · {M.label(m)}: {(pd.Timestamp.now() - t0).total_seconds():.0f} с")
-    return df
-
-
-def series(ws: Workspace, hist: list, fp: dict, use_cache: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Численность по сегментам за каждый месяц ряда. Полнота загрузки — из
-    разведки (тот же скан, что считает строки партиций), второй элемент пуст."""
-    progress.step(f"Ряд за {len(hist)} мес. (кэш: {config.CACHE_DIR.name}/)")
-    rows, loads = [], []
-    for m in hist:
-        m = M.iso(m)
-        try:
-            s = month_cached(ws, "series", Q.MONTH_SERIES, m, fp, use_cache)
-            s["report_dt"] = m
-            rows.append(s)
-        except Exception as ex:                                # noqa: BLE001
-            progress.warn(f"ряд · {M.label(m)} не читается ({type(ex).__name__}: "
-                          f"{str(ex)[:160]}) — месяц пропущен")
-            db.rollback(ws.conn)
-    cat = (lambda xs: pd.concat(xs, ignore_index=True) if xs else pd.DataFrame())
-    progress.done(f"ряд: {len(rows)} из {len(hist)} мес.")
-    return cat(rows), cat(loads)
-
-
-def code_months(ws: Workspace, ms: list, fp: dict, use_cache: bool = True) -> pd.DataFrame:
-    """Зарплатные коды по месяцам — тоже скан партиции, тоже в кэш."""
-    out = []
-    for m in ms:
-        m = M.iso(m)
-        try:
-            df = month_cached(ws, "code_month", Q.CODE_MONTH, m, fp, use_cache)
-        except Exception as ex:                                # noqa: BLE001
-            progress.warn(f"коды · {M.label(m)} не читаются ({type(ex).__name__}: {str(ex)[:160]})")
-            db.rollback(ws.conn)
-            continue
-        df["report_dt"] = m
-        out.append(df)
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
 
 # --------------------------------------------------------------------------- #
@@ -272,7 +258,8 @@ def org_params(b, c, o: dict) -> dict:
 
 
 def orgs(ws: Workspace, b, c, o: dict, tag: str) -> dict[str, pd.DataFrame]:
-    p = org_params(b, c, o)
+    fp = flow_params(ws, b, c)
+    p = {**org_params(b, c, o), "cn1": fp["cn1"], "has_cn1": fp["has_cn1"]}
     try:
         _step_table(ws, "t_oflow", Q.T_OFLOW, p)
     except Exception as ex:                                    # noqa: BLE001
