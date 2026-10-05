@@ -100,12 +100,14 @@ WHERE p.report_dt = CAST(:m AS date)
 # Ликвидация — «нет НИ ОДНОЙ активной записи», одна мёртвая строка при живой
 # соседней ничего не значит. Сегмент при нескольких записях — min() по короткому
 # имени: детерминированно, и расхождение печатается разведкой.
+#
+# НАЗВАНИЯ организаций и холдингов из справочника НЕ берутся вовсе: у ИП в
+# названии — фамилия, имя и отчество человека. Организация везде показывается
+# только номером; названия не покидают БД.
 T_ORG = """
 SELECT e.inn,
        min(""" + S.seg_case("e.segment_name") + """)            AS seg,
        count(DISTINCT """ + S.seg_case("e.segment_name") + """) AS n_seg,
-       min(e.company_name)                                       AS company_name,
-       min(e.holding_name)                                       AS holding_name,
        min(e.industry_name)                                      AS industry_name,
        NOT bool_or(COALESCE(e.status_name, '') = 'Активна')      AS is_liquidated
 FROM {schema}.uzp_data_epk_consolidation e
@@ -752,7 +754,7 @@ dest AS (
 )
 SELECT p.*,
        COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg,
-       o.company_name, o.holding_name, o.industry_name,
+       o.industry_name,
        COALESCE(o.is_liquidated, false)        AS is_liquidated,
        t.tb_id,
        d.inn_to AS top_dest_inn, d.n_mv AS top_dest_n,
@@ -798,7 +800,6 @@ GROUP BY 1, 2
 ORG_REORG = """
 SELECT s.inn_from, s.inn_to, s.n_mv, s.n_lv,
        COALESCE(f.seg, '""" + S.NO_DIM + """') AS seg_from,
-       f.company_name AS name_from, t.company_name AS name_to,
        COALESCE(f.is_liquidated, false) AS from_liquidated
 FROM t_succ s
 LEFT JOIN t_org f ON f.inn = s.inn_from
@@ -834,7 +835,7 @@ h AS (
     AND x.n_next >= 0.8 * x.n_prev
 )
 SELECT h.inn, h.n_prev, h.n_cur, h.n_next, h.hole,
-       COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg, o.company_name,
+       COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg,
        count(*) OVER ()    AS n_orgs,
        sum(h.hole) OVER () AS sum_hole
 FROM h LEFT JOIN t_org o ON o.inn = h.inn

@@ -649,7 +649,6 @@ def org_list(df: pd.DataFrame, tbd: pd.DataFrame) -> pd.DataFrame:
               "in_reorg", "real_cut"):
         x[c] = _num(x, c)
     x["real_share"] = x["real_cut"] / x["base_fl"]
-    x["company_name"] = x["company_name"].fillna("Организация не в справочнике")
     return x
 
 

@@ -55,16 +55,19 @@ def _plain(h: str) -> str:
 
 
 def _names(res: dict) -> set[str]:
-    """Все настоящие названия из данных — для проверки утечки."""
+    """Всё, чего в документе быть не должно: номера организаций (названий отчёт
+    не берёт вовсе — у ИП в названии ФИО) и названия ТБ."""
     out: set[str] = set()
-    for o in res.get("orgs", {}).values():
-        for df, cols in ((o["list"], ("company_name", "holding_name")),
-                         (o["reorg"], ("name_from", "name_to"))):
-            if df is None or df.empty:
-                continue
-            for c in cols:
-                if c in df:
-                    out |= {str(x).strip() for x in df[c].dropna()}
+    frames = [o[k] for o in res.get("orgs", {}).values() for k in ("list", "reorg")]
+    if res.get("aug_raw"):
+        frames += [res["aug_raw"].get("hole_cur"), res["aug_raw"].get("hole_prev")]
+    for df in frames:
+        if df is None or df.empty:
+            continue
+        for c in ("inn", "inn_from", "inn_to", "top_dest_inn"):
+            if c in df:
+                # Только длинные номера: короткое число совпало бы с численностью.
+                out |= {str(int(x)) for x in df[c].dropna() if len(str(int(x))) >= 5}
     tbd = res.get("tb_dim")
     if tbd is not None and not tbd.empty:
         out |= {str(x).strip() for x in tbd["tb_short_name"].dropna()}
@@ -124,7 +127,7 @@ def render(res: dict) -> tuple[str, list[str]]:
         if hl is not None and not hl.empty:
             L.append(_md_table(["Организация", "Сегмент", M.name(ms["prev"]), M.name(ms["cur"]),
                                 M.name(ms["next"]), "Дыра"],
-                               [[al("Орг", r.company_name), r.seg, fnum(r.n_prev), fnum(r.n_cur),
+                               [[al("Орг", int(r.inn)), r.seg, fnum(r.n_prev), fnum(r.n_cur),
                                  fnum(r.n_next), fnum(r.hole)] for r in hl.head(15).itertuples()]))
         pr = []
         for tag, y in (("cur", y1), ("prev", y1 - 1)):
@@ -223,7 +226,7 @@ def render(res: dict) -> tuple[str, list[str]]:
             L.append(f"Крупнейшие 30 из {fnum(int(lst['n_picked'].iloc[0]))}:\n")
             L.append(_md_table(["Организация", "Сегмент", "ТБ", "Было", "Стало", "Реальное сокращение",
                                 "Перестали в Сбере", "Переток", "Пришли новые"],
-                               [[al("Орг", r.company_name), r.seg, al("ТБ", r.tb), fnum(r.base_fl),
+                               [[al("Орг", int(r.inn)), r.seg, al("ТБ", r.tb), fnum(r.base_fl),
                                  fnum(r.cur_fl), fnum(r.real_cut), fnum(r.out_stopped), fnum(r.out_moved),
                                  fnum(r.in_new)] for r in top.itertuples()]))
 

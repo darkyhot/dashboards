@@ -569,18 +569,18 @@ def s_orgs(res: dict) -> str:
                + "".join(f'<option>{esc(s)}</option>' for s in segs) +
                '</select></label><label>ТБ <select data-k="tb"><option value="">все</option>'
                + "".join(f'<option>{esc(t)}</option>' for t in tbs) +
-               '</select></label><label>Поиск <input data-k="q" type="search" placeholder="название или номер"></label>'
+               '</select></label><label>Поиск <input data-k="q" type="search" placeholder="номер организации"></label>'
                '<span class="cnt"></span></div>')
-        head = ["Организация", "Номер", "Сегмент", "ТБ", "Было ФЛ", "Стало", "Нетто", "Реальное сокращение",
+        head = ["Номер организации", "Сегмент", "ТБ", "Было ФЛ", "Стало", "Нетто", "Реальное сокращение",
                 "% базы", "Перестали в Сбере", "из них: нет зачислений", "ниже порога", "только незарплатные",
                 "Переток в др. орг.", "Реорг.", "Пропустили месяц, вернулись", "Пришли новые",
                 "Пришли из др. орг."]
         rows = []
         for r in lst.itertuples():
-            name = esc(r.company_name) + (' <span class="tag">ликвидирована</span>' if r.is_liquidated else "")
-            rows.append(f'<tr data-seg="{esc(r.seg)}" data-tb="{esc(r.tb)}" '
-                        f'data-q="{esc(str(r.company_name).lower())} {int(r.inn)}">'
-                        f'<td>{name}</td><td class="n">{int(r.inn)}</td><td>{esc(r.seg)}</td><td>{esc(r.tb)}</td>'
+            # Только номер: в названии ИП — ФИО человека, названия не показываются.
+            name = f"{int(r.inn)}" + (' <span class="tag">ликвидирована</span>' if r.is_liquidated else "")
+            rows.append(f'<tr data-seg="{esc(r.seg)}" data-tb="{esc(r.tb)}" data-q="{int(r.inn)}">'
+                        f'<td>{name}</td><td>{esc(r.seg)}</td><td>{esc(r.tb)}</td>'
                         + "".join(f'<td class="n">{x}</td>' for x in (
                             fnum(r.base_fl), fnum(r.cur_fl), fnum(r.net, True), f"<b>{fnum(r.real_cut)}</b>",
                             fpct(r.real_share), fnum(r.out_stopped), fnum(r.out_left_bank), fnum(r.out_below),
@@ -588,7 +588,7 @@ def s_orgs(res: dict) -> str:
                             fnum(r.in_new),
                             fnum(r.in_moved))) + "</tr>")
         tbl = (f'<div class="scroll tall"><table class="data orgs" id="org-{m}"><thead><tr>' +
-               "".join(f'<th class="{"" if i < 4 else "n"}">{esc(h)}</th>' for i, h in enumerate(head)) +
+               "".join(f'<th class="{"" if i < 3 else "n"}">{esc(h)}</th>' for i, h in enumerate(head)) +
                "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
         shown = (f"Показано {fnum(len(lst))} из {fnum(n_all)} организаций с реальным сокращением; "
                  f"их сокращение — {fnum(lst['sum_real_picked'].iloc[0])} ФЛ.")
@@ -596,9 +596,9 @@ def s_orgs(res: dict) -> str:
         rgh = ""
         if rg is not None and not rg.empty:
             rgh = ("<details><summary>Реорганизации — исключены из списка</summary>" +
-                   table(["Откуда", "Номер", "Куда", "Номер приёмника", "Переехало ФЛ", "Ушло всего"],
-                         [[r.name_from or "—", int(r.inn_from), r.name_to or "—", int(r.inn_to), fnum(r.n_mv),
-                           fnum(r.n_lv)] for r in rg.itertuples()], num={1, 3, 4, 5}) + "</details>")
+                   table(["Откуда (номер)", "Куда (номер приёмника)", "Переехало ФЛ", "Ушло всего"],
+                         [[int(r.inn_from), int(r.inn_to), fnum(r.n_mv), fnum(r.n_lv)]
+                          for r in rg.itertuples()], num={2, 3}) + "</details>")
         return (f"<h3>{esc(M.long(b))} → {esc(M.long(m))}</h3>{sm}"
                 f"<details open><summary>Список: {esc(shown)}</summary>{flt}{tbl}</details>{rgh}"
                 + sql_box(res, [f"org_list_{m}", f"org_summary_{m}"]))
@@ -677,12 +677,12 @@ def s_august(res: dict) -> str:
                    strong_rows={2}))
     hl = aug["hole_cur"]
     if hl is not None and not hl.empty:
-        rows = [[r.company_name or "Организация не в справочнике", int(r.inn), r.seg, fnum(r.n_prev),
-                 fnum(r.n_cur), fnum(r.n_next), fnum(r.hole)] for r in hl.head(30).itertuples()]
+        rows = [[int(r.inn), r.seg, fnum(r.n_prev), fnum(r.n_cur), fnum(r.n_next), fnum(r.hole)]
+                for r in hl.head(30).itertuples()]
         body += (f"<details><summary>Крупнейшие организации с провалом, {y1} "
                  f"({fnum(min(30, hc['n_orgs']))} из {fnum(hc['n_orgs'])})</summary>" +
-                 table(["Организация", "Номер", "Сегмент", nm["prev"], nm["cur"], nm["next"], "Дыра"], rows,
-                       num={1, 3, 4, 5, 6}) + "</details>")
+                 table(["Номер организации", "Сегмент", nm["prev"], nm["cur"], nm["next"], "Дыра"], rows,
+                       num={2, 3, 4, 5}) + "</details>")
     pr = []
     for tag, y in (("cur", y1), ("prev", y0)):
         d = aug[f"pay_{tag}"]

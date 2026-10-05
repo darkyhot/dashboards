@@ -84,6 +84,14 @@ def check_no_distinct() -> None:
                                      f"считайте двухступенчатой группировкой")
 
 
+def check_no_org_names() -> None:
+    """Названия организаций и холдингов отчёт не берёт: у ИП в названии ФИО."""
+    for name, sql in Q.all_sql().items():
+        for col in ("company_name", "holding_name", "head_holding_name"):
+            if col in sql:
+                _fail("названия организаций", f"{name}: выбирается {col}")
+
+
 def check_inn_cast() -> None:
     """CAST(<алиас>.inn AS bigint) — только в запросе, где стоит маска того же алиаса."""
     for name, sql in Q.all_sql().items():
@@ -175,7 +183,7 @@ def check_months() -> None:
         _fail("месяцы", "сдвиг или конец месяца посчитан неверно")
 
 
-CHECKS = [check_self_contained, check_payroll_once, check_no_distinct, check_partition_filter, check_dialect, check_inn_cast,
+CHECKS = [check_self_contained, check_payroll_once, check_no_distinct, check_no_org_names, check_partition_filter, check_dialect, check_inn_cast,
           check_placeholders, check_decomp_identity, check_did_identity, check_org_rules,
           check_sanitize, check_months]
 
