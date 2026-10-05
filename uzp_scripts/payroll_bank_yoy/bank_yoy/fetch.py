@@ -78,19 +78,6 @@ class Workspace:
     def _analyze(self, name: str) -> None:
         db.execute(self.conn, Q.ANALYZE_TMP.format(name=name))
 
-    def _monthly(self, name: str, body: str) -> None:
-        """CREATE по первому месяцу, INSERT по остальным — оператор на партицию."""
-        total = 0
-        for i, m in enumerate(self.months):
-            t0 = pd.Timestamp.now()
-            n = (self._create(name, body, {"m": m}) if i == 0
-                 else self._insert(name, body, {"m": m}))
-            total += n
-            sec = (pd.Timestamp.now() - t0).total_seconds()
-            progress.done(f"{name} · {M.label(m)}: {n:,} строк за {sec:.0f} с")
-        self._analyze(name)
-        progress.done(f"{name}: всего {total:,} строк")
-
     def build_raw(self, months: list) -> dict[str, int]:
         """ЕДИНСТВЕННОЕ чтение ведомостей: узкая копия витрины `t_raw` за все нужные
         месяцы, оператор на партицию. Возвращает число строк по месяцам: месяц с
@@ -117,33 +104,34 @@ class Workspace:
         набора, ФЛ-месяц, присутствие ФЛ, зарплатные коды, полнота."""
         progress.step(f"Рабочий набор из t_raw: {len(self.months)} мес. "
                       f"({', '.join(M.label(m) for m in self.months)}), ряд {len(hist)} мес.")
-        self.series_rows = []
-        n_pairs, first = 0, True
-        for m in sorted({M.iso(x) for x in hist} | set(self.months)):
-            t0 = pd.Timestamp.now()
-            self._drop_one("t_stage")
-            self._create("t_stage", Q.T_STAGE_MONTH, {"m": m})
-            ser = self.sql(f"series_{m}", Q.SERIES_FROM_STAGE, {"m": m, "months": [m]})
-            ser["report_dt"] = m
-            self.series_rows.append(ser)
-            note = "ряд"
-            if m in self.months:
-                n = (self._create("t_pairs", Q.PAIRS_FROM_STAGE) if first
-                     else self._insert("t_pairs", Q.PAIRS_FROM_STAGE, {}))
-                first = False
-                n_pairs += n
-                note = f"ряд + {n:,} получателей"
-            sec = (pd.Timestamp.now() - t0).total_seconds()
-            progress.done(f"{M.label(m)}: {note} за {sec:.0f} с")
+        # Каждый шаг — ОДИН проход по копии за все месяцы, без циклов по месяцам:
+        # у временной таблицы нет партиций, и фильтр по месяцу читал бы её целиком.
+        all_m = sorted({M.iso(x) for x in hist} | set(self.months))
+        t0 = pd.Timestamp.now()
+        n = self._create("t_stage", Q.T_STAGE)
+        progress.done(f"t_stage (зарплатные тройки, все месяцы): {n:,} строк за "
+                      f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
+        t0 = pd.Timestamp.now()
+        ser = self.sql("series", Q.SERIES_ALL, {"months": all_m})
+        ser["report_dt"] = ser["report_dt"].astype(str)
+        self.series_rows = [ser[ser["report_dt"].isin(set(M.iso(x) for x in hist))]]
+        progress.done(f"ряд: {ser['report_dt'].nunique()} мес. за "
+                      f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
+        t0 = pd.Timestamp.now()
+        n = self._create("t_pairs", Q.PAIRS_FROM_STAGE, {"months": self.months})
         self._drop_one("t_stage")
         self._analyze("t_pairs")
-        progress.done(f"t_pairs: всего {n_pairs:,} строк")
+        progress.done(f"t_pairs (получатели набора): {n:,} строк за "
+                      f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
         for name, body in (("t_epk", Q.T_EPK), ("t_epk_seg", Q.T_EPK_SEG),
                            ("t_keys", Q.T_KEYS)):
             n = self._create(name, body)
             self._analyze(name)
             progress.done(f"{name}: {n:,} строк")
-        self._monthly("t_person", Q.T_PERSON_MONTH)
+        t0 = pd.Timestamp.now()
+        n = self._create("t_person", Q.T_PERSON, {"months": self.months})
+        self._analyze("t_person")
+        progress.done(f"t_person: {n:,} строк за {(pd.Timestamp.now() - t0).total_seconds():.0f} с")
         self.load = self.sql("load", Q.LOAD_FROM_RAW)
         self.codes = self.opt("code_months", Q.CODE_MONTH,
                               {"code_months": [M.iso(x) for x in code_months]})

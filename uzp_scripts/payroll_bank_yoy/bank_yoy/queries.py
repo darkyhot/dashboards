@@ -118,13 +118,17 @@ WHERE e.inn IS NOT NULL
 GROUP BY e.inn
 """
 
-# ВСЕ зарплатные тройки ОДНОГО месяца с суммой по ИНН — без порога, из копии
-# витрины. Из неё — и тройки-получатели (`t_pairs`, порог), и строка ряда по
-# сегментам при всех порогах (`SERIES_FROM_STAGE`).
+# ВСЕ зарплатные тройки ВСЕХ месяцев копии с суммой по ИНН — без порога, ОДНИМ
+# проходом по t_raw. Из неё — и ряд по сегментам при всех порогах (`SERIES_ALL`),
+# и тройки-получатели месяцев набора (`t_pairs`).
+#
+# Именно ОДНИМ запросом, а не циклом по месяцам: у временной таблицы нет партиций,
+# и фильтр `report_dt = :m` по t_raw читает её ЦЕЛИКОМ — цикл по 26 месяцам был
+# 26 полными проходами по копии всего банка, и копия ничего не ускоряла.
 # Сегмент денормализуется сразу: дальше он нужен в каждом запросе. ИНН вне
 # справочника НЕ отбрасывается: банк — это все получатели, такие ИНН идут
 # строкой «Не в справочнике».
-T_STAGE_MONTH = """
+T_STAGE = """
 SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.tb_id, x.amt, x.amt_inn,
        COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg
 FROM (
@@ -137,8 +141,7 @@ FROM (
          sum(sum(r.amt)) OVER (PARTITION BY r.report_dt, r.epk_id,
                                             CAST(r.inn AS bigint)) AS amt_inn
   FROM t_raw r
-  WHERE r.report_dt = CAST(:m AS date)
-    AND r.code = ANY(:codes)
+  WHERE r.code = ANY(:codes)
     AND r.epk_id IS NOT NULL
     AND """ + INN_OK_R + """
   GROUP BY r.report_dt, r.epk_id, CAST(r.inn AS bigint), COALESCE(r.sys_gosb_id, -1)
@@ -146,15 +149,17 @@ FROM (
 LEFT JOIN t_org o ON o.inn = x.inn
 """
 
-# Получатели: тройки месяца выше порога по ИНН.
+# Получатели: тройки месяцев набора выше порога по ИНН — одним запросом.
 PAIRS_FROM_STAGE = """
 SELECT report_dt, epk_id, inn, gosb_id, tb_id, amt, amt_inn, seg
 FROM t_stage
 WHERE amt_inn > :amt_min
+  AND report_dt = ANY(CAST(:months AS date[]))
 """
 
 # То же одним запросом по копии — для ПОКАЗА читателю (определение одно).
-T_PAIRS_MONTH = "SELECT s.* FROM (" + T_STAGE_MONTH + ") s\nWHERE s.amt_inn > :amt_min\n"
+T_PAIRS = ("SELECT s.* FROM (" + T_STAGE + ") s\n"
+           "WHERE s.amt_inn > :amt_min AND s.report_dt = ANY(CAST(:months AS date[]))\n")
 
 # ФЛ-месяц поверх троек: сколько ИНН и троек у человека и его ОСНОВНОЙ сегмент —
 # сегмент ИНН с наибольшей суммой. Основной сегмент один на человека, поэтому
@@ -187,12 +192,13 @@ T_KEYS = """
 SELECT DISTINCT epk_id FROM t_epk
 """
 
-# Присутствие ФЛ в ведомостях БЕЗ фильтра кода и порога — за ОДИН месяц. Без него
+# Присутствие ФЛ в ведомостях БЕЗ фильтра кода и порога — все месяцы набора ОДНИМ
+# запросом (тот же довод, что у t_stage: цикл по месяцам = полный проход на месяц). Без него
 # не отличить «нет зачислений в банке» от «зарплата ниже порога» и «только
 # незарплатные выплаты» — три разных диагноза.
 # Зарплатная сумма берётся только по пригодным ИНН: зарплата на ИНН, который не
 # сопоставить, получателя не делает (это видно в полноте загрузки).
-T_PERSON_MONTH = """
+T_PERSON = """
 SELECT r.report_dt,
        r.epk_id,
        sum(r.amt) AS amt_all,
@@ -200,7 +206,7 @@ SELECT r.report_dt,
                 THEN r.amt ELSE 0 END) AS amt_codes
 FROM t_raw r
 JOIN t_keys k ON k.epk_id = r.epk_id
-WHERE r.report_dt = CAST(:m AS date)
+WHERE r.report_dt = ANY(CAST(:months AS date[]))
   AND r.epk_id IS NOT NULL
 GROUP BY r.report_dt, r.epk_id
 """
@@ -228,12 +234,12 @@ _ALL = "report_dt = ANY(CAST(:months AS date[]))"
 SHOW_DEFS = {
     "t_org": T_ORG,
     "t_raw": T_RAW_MONTH.replace("p.report_dt = CAST(:m AS date)", "p." + _ALL),
-    "t_stage": T_STAGE_MONTH,
-    "t_pairs": T_PAIRS_MONTH.replace("r.report_dt = CAST(:m AS date)", "r." + _ALL),
+    "t_stage": T_STAGE,
+    "t_pairs": T_PAIRS,
     "t_epk": T_EPK,
     "t_epk_seg": T_EPK_SEG,
     "t_keys": T_KEYS,
-    "t_person": T_PERSON_MONTH.replace("r.report_dt = CAST(:m AS date)", "r." + _ALL),
+    "t_person": T_PERSON,
 }
 
 
@@ -243,9 +249,9 @@ SHOW_DEFS = {
 
 # Численность месяца по сегментам и при нескольких порогах. Строка '__ALL__' —
 # банк целиком: ФЛ с работой в двух сегментах в сумме по сегментам посчитался бы
-# дважды. Считается по `t_stage` каждого месяца ряда — то есть по копии витрины.
-_SERIES_AGG = """
-SELECT seg,
+# дважды. Все месяцы ряда — ОДНИМ запросом по t_stage.
+SERIES_ALL = """
+SELECT report_dt, seg,
        count(*) FILTER (WHERE amt_inn > :amt_min)                AS n_triples,
        count(DISTINCT epk_id) FILTER (WHERE amt_inn > :amt_min)  AS n_epk,
        count(DISTINCT inn) FILTER (WHERE amt_inn > :amt_min)     AS n_inn,
@@ -253,9 +259,9 @@ SELECT seg,
        count(*) FILTER (WHERE amt_inn > 1000)                    AS t1000,
        count(*) FILTER (WHERE amt_inn > 5000)                    AS t5000,
        count(*) FILTER (WHERE amt_inn > 10000)                   AS t10000
-FROM __SRC__ GROUP BY seg
+FROM t_stage GROUP BY report_dt, seg
 UNION ALL
-SELECT '__ALL__',
+SELECT report_dt, '__ALL__',
        count(*) FILTER (WHERE amt_inn > :amt_min),
        count(DISTINCT epk_id) FILTER (WHERE amt_inn > :amt_min),
        count(DISTINCT inn) FILTER (WHERE amt_inn > :amt_min),
@@ -263,9 +269,8 @@ SELECT '__ALL__',
        count(*) FILTER (WHERE amt_inn > 1000),
        count(*) FILTER (WHERE amt_inn > 5000),
        count(*) FILTER (WHERE amt_inn > 10000)
-FROM __SRC__
+FROM t_stage GROUP BY report_dt
 """
-SERIES_FROM_STAGE = _SERIES_AGG.replace("__SRC__", "t_stage")
 
 # Зарплатные коды месяца по сегментам: КАКОЙ вид выплаты просел (отпускные,
 # премия, аванс). Только коды метрики — коды вне списка на неё не влияют, а в
