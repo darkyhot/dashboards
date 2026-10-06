@@ -39,7 +39,9 @@ class Workspace:
     def __init__(self, conn, months: list, params: dict) -> None:
         self.conn = conn
         self.months = [M.iso(m) for m in sorted({M.parse(x) for x in months})]
-        self.params = dict(params)               # codes, amt_min
+        # codes, amt_min; all_rows — для показанного SQL (копия рабочего набора), при
+        # заполнении t_raw каждый месяц передаёт свой.
+        self.params = {"all_rows": True, **params}
         self.built: list[str] = []
         self.plain_ddl = False
         # Показанные читателю запросы: имя → (самодостаточный текст, параметры).
@@ -137,6 +139,7 @@ class Workspace:
         # Виды выплат (аванс / зарплата) — из t_stage, пока она жива.
         pt = sorted(({M.iso(x) for x in self.pt_months}
                      | {M.iso(M.shift(x, -1)) for x in self.pt_months}) & set(self.months))
+        self.pt_used = pt
         if pt:
             t0 = pd.Timestamp.now()
             try:
@@ -169,7 +172,7 @@ class Workspace:
         if "t_ptype" in self.built:
             pb = [M.iso(M.shift(x, -1)) for x in self.pt_months
                   if M.iso(M.shift(x, -1)) in set(self.months)]
-            self.paytype = self.opt("paytype", Q.PAYTYPE, {"pt_b": pb})
+            self.paytype = self.opt("paytype", Q.PAYTYPE, {"pt_b": pb, "pt_months": self.pt_used})
             self._drop_one("t_ptype")
         progress.done("рабочий набор готов")
 

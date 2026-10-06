@@ -90,7 +90,7 @@ def _params_comment(args: dict) -> str:
     lines = []
     for k, v in sorted(args.items()):
         if isinstance(v, (list, tuple)):
-            if k == "months":
+            if v and all(isinstance(x, str) for x in v):        # месяцы
                 v = "ARRAY[" + ", ".join(f"'{x}'" for x in v) + "]::date[]"
             else:
                 v = "ARRAY[" + ", ".join(str(x) for x in v) + "]"
