@@ -15,16 +15,19 @@
   августе («растворились пришедшие»);
 * сезонные ямы января и августа у ОДНИХ И ТЕХ ЖЕ людей в оба года, с возвратом в
   следующем месяце (повтор год к году);
-* уход совместителей РГС со второй работы в августе 2026 (схлопывание по ИНН);
+* уход совместителей РГС со второй работы в августе 2026 (схлопывание по id орг);
 * сведение аванса из второго ГОСБ в основной у трети КСБ с апреля 2026 (схлопывание по
   ГОСБ — уровень, а не август);
 * переходы ФЛ между сегментами;
-* реорганизация: все люди ИНН переезжают в ИНН-приёмник;
+* реорганизация: все люди id орг переезжают в организацию-приёмник;
 * перенос выплаты: организации не платят в августе 2026 и платят вдвойне в
   сентябре — провал, который не потеря;
 * организации с реальным сокращением (люди уходят из Сбера), «5 ушли — 5 пришли»
   и «перетока» (люди уходят в другие организации) — для списка организаций;
-* непригодные ИНН в ведомостях.
+* непригодные номера организаций в ведомостях;
+* ИП с ФИО в названии (название не должно попасть в отчёт) и холдинг с ФИО;
+* выделенный холдинг «МИНОБОРОНЫ»: часть его людей уходит из Сбера в августе 2026;
+* пропажа аванса: организации в августе 2026 платят только зарплату.
 """
 from __future__ import annotations
 
@@ -41,6 +44,7 @@ from . import config
 from . import months as M
 
 START = date(2024, 8, 31)       # idx 0
+HOLDING_FIO = "ГК Петров Пётр Петрович"
 N_MONTHS = 26                   # авг-24 … сен-26: сентябрь нужен для проверки возврата
 SEED = 20261005
 
@@ -66,13 +70,13 @@ SEG_BIG = {          # большое имя → (доля организаци�
     "Клиенты машиностроения": (0.05, 2.0),
     "Фин.институты": (0.04, 1.2),
     "SBI": (0.03, 0.8),
-    None: (0.06, 0.6),                    # ИНН нет в справочнике ЕПК
+    None: (0.06, 0.6),                    # id орг нет в справочнике ЕПК
 }
 SHORT = {"Микро": "ММБ", "Малые": "ММБ", "Средние": "КСБ", "Крупные": "КСБ",
          "Крупнейшие": "КСБ", "Рег. госсектор": "РГС", "Клиенты машиностроения": "СКМ",
          "Фин.институты": "КФИ", "SBI": "БМО", None: "Не в справочнике"}
 TB = [(38, "Северный"), (40, "Южный"), (42, "Западный"), (44, "Восточный"), (52, "Центральный")]
-CODE_NAMES = {1: "Заработная плата", 16: "Аванс", 26: "Отпускные", 28: "Премия",
+CODE_NAMES = {1: "Заработная плата", 16: "Аванс по заработной плате", 26: "Отпускные", 28: "Премия",
               7: "Пособие", 3: "Пенсия НПФ"}
 
 # Базовая текучесть (в месяц) и куда уходит человек.
@@ -88,6 +92,11 @@ INFLUX = {T_JUN26: 700, T_JUL26: 500}
 INFLUX_LEAVE_AUG26 = 0.75
 SPLIT_GOSB_SHARE = 0.12
 JUNK_INN_SHARE = 0.004
+FOCUS_HOLDING = "МИНОБОРОНЫ"
+FOCUS_LEAVE_AUG26 = 0.15
+SURNAMES = ["Иванов", "Петров", "Сидоров", "Кузнецов", "Смирнов", "Попов", "Волков", "Зайцев"]
+FIRST = ["Иван", "Пётр", "Сергей", "Андрей", "Олег", "Николай"]
+PATR = ["Иванович", "Петрович", "Сергеевич", "Андреевич", "Олегович", "Николаевич"]
 
 
 class Gen:
@@ -114,9 +123,13 @@ class Gen:
         split = bool(r.random() < SPLIT_GOSB_SHARE) if split is None else split
         gosb2 = tb * 100 + (gosb % 100) % 4 + 1 if split else None
         self.next_inn += int(r.integers(1, 50))
-        o = {"id": len(self.orgs), "inn": self.next_inn, "big": big, "seg": SHORT[big],
+        k = len(self.orgs)
+        # Каждая четвёртая микро — ИП: в названии ФИО, показывать нельзя.
+        name = (f"ИП {SURNAMES[k % 8]}{k} {FIRST[k % 6]} {PATR[k % 6]}"
+                if big == "Микро" and k % 4 == 0 else f"ООО «Синтетика {k:04d}»")
+        o = {"id": k, "inn": self.next_inn, "big": big, "seg": SHORT[big],
              "tb": tb, "gosb": gosb, "gosb2": gosb2, "size": size,
-             "name": f"ООО «Синтетика {len(self.orgs):04d}»", "liquidated": False,
+             "name": name, "liquidated": False,
              "amt": {"Рег. госсектор": 32000}.get(big, 52000)}
         self.orgs.append(o)
         return o
@@ -214,12 +227,24 @@ class Gen:
         taken: set[int] = set()
         self.ev_real = {T_JUL26: self._orgs_for(6, {"КСБ", "РГС", "ММБ"}, 40, taken),
                         T_AUG26: self._orgs_for(6, {"КСБ", "РГС", "ММБ"}, 40, taken)}
+        # Одна сокращающаяся организация — ИП, у другой холдинг с ФИО: в списке обязаны
+        # стоять id орг и «название скрыто», а не ФИО.
+        self.orgs[self.ev_real[T_AUG26][0]]["name"] = "ИП Зайцев Олег Николаевич"
+        self.fio_holding_orgs = {self.ev_real[T_AUG26][1]}
         self.ev_five = self._orgs_for(10, {"КСБ", "РГС", "ММБ", "СКМ"}, 30, taken)
         self.ev_peretok = self._orgs_for(8, {"КСБ", "РГС", "ММБ"}, 30, taken)
         self.ev_reorg = self._orgs_for(4, {"КСБ", "РГС"}, 20, taken)
         # Перенос выплаты: в августе 2026 организация не платит никому, в сентябре —
         # двойная сумма. Люди не уходят — отчёт обязан это различить.
         self.ev_shift = set(self._orgs_for(15, {"КСБ", "ММБ", "РГС", "СКМ"}, 30, taken))
+        # Выделенный холдинг — организации РГС.
+        self.ev_focus = set(self._orgs_for(20, {"РГС"}, 20, taken))
+        # Пропажа аванса: только организации без второго ГОСБ (иначе пропадёт и тройка
+        # второго ГОСБ, а это другое событие — сведение ГОСБ).
+        cand = [o["id"] for o in self.orgs if o["seg"] in ("КСБ", "ММБ") and o["size"] >= 20
+                and o["gosb2"] is None and o["id"] not in taken]
+        self.ev_adv = set(int(x) for x in self.rng.choice(cand, size=min(20, len(cand)), replace=False))
+        taken.update(self.ev_adv)
         self.protected = taken
 
     def simulate(self) -> None:
@@ -241,7 +266,7 @@ class Gen:
             # Новые люди в банке.
             for _ in range(r.poisson(n_active * JOIN_RATE)):
                 self._job(self._new_epk(), self._pick_org(), t)
-            # Реорганизация: все люди переезжают в новый ИНН того же сегмента.
+            # Реорганизация: все люди переезжают в новый id орг того же сегмента.
             if t == T_REORG:
                 for oid in self.ev_reorg:
                     src = self.orgs[oid]
@@ -303,6 +328,14 @@ class Gen:
                         j["end"] = t
                         cut += 1
                 self.expect["second_job_cut_aug26"] = cut
+                # Выделенный холдинг: часть людей уходит из Сбера.
+                fl = 0
+                for oid in self.ev_focus:
+                    for j in self._active(t, org=oid):
+                        if r.random() < FOCUS_LEAVE_AUG26:
+                            self._exit(j, t, "left")
+                            fl += 1
+                self.expect["focus_left_aug26"] = fl
 
         self.expect.update({
             "influx": {M.iso(M.shift(START, t)): len(v) for t, v in influx_epk.items()},
@@ -314,6 +347,12 @@ class Gen:
             "seasonal_persons": len(self.seasonal),
             "split_gosb_end": M.iso(M.shift(START, T_SPLIT_END)),
             "pay_shift_inns": [int(self.orgs[o]["inn"]) for o in sorted(self.ev_shift)],
+            "focus_holding": FOCUS_HOLDING,
+            "focus_inns": [int(self.orgs[o]["inn"]) for o in sorted(self.ev_focus)],
+            "adv_drop_pairs": sum(1 for j in self.jobs if j["org"] in self.ev_adv and not j["second"]
+                                  and j["start"] <= T_JUL26 < T_AUG26 < j["end"]),
+            "fio_names": [o["name"] for o in self.orgs if o["name"].startswith("ИП ")]
+                         + [HOLDING_FIO],
         })
 
     # -- строки витрин ----------------------------------------------------- #
@@ -336,13 +375,15 @@ class Gen:
                     continue
                 if j["org"] in self.ev_shift and t == T_AUG26:
                     continue                              # август не выплачен
+                no_adv = j["org"] in self.ev_adv and t == T_AUG26     # аванса нет
                 amt = j["amt"] * float(r.lognormal(0, 0.05))
                 if j["org"] in self.ev_shift and t == T_AUG26 + 1 and j["start"] < T_AUG26:
                     amt *= 2                              # в сентябре — за два месяца
                 merged = o["seg"] == "КСБ" and o["id"] % 3 == 0 and t >= T_SPLIT_END
                 g2 = o["gosb2"] if (o["gosb2"] and not merged) else o["gosb"]
                 rows.append((t, j["epk"], j["org"], o["gosb"], 1, 0.6 * amt))
-                rows.append((t, j["epk"], j["org"], g2, 16, 0.4 * amt))
+                if not no_adv:
+                    rows.append((t, j["epk"], j["org"], g2, 16, 0.4 * amt))
                 if t in AUGS and r.random() < 0.4:
                     rows.append((t, j["epk"], j["org"], o["gosb"], 26, 0.5 * amt))
                 if t in DECS and r.random() < 0.3:
@@ -356,7 +397,7 @@ class Gen:
         df["report_dt"] = [M.shift(START, int(t)) for t in df["t"]]
         df["inn"] = df["org"].map(org_inn)
         junk = r.random(len(df)) < JUNK_INN_SHARE
-        df.loc[junk, "inn"] = "ИНН" + df.loc[junk, "inn"].str[-6:]
+        df.loc[junk, "inn"] = "ID" + df.loc[junk, "inn"].str[-6:]
         df["sys_tb_id"] = (df["sys_gosb_id"] // 100).astype("int16")
         df["gosb_id"] = df["sys_gosb_id"] + 900000          # «старый» номер — не сходится
         df["tb_id"] = None
@@ -374,7 +415,7 @@ class Gen:
                 continue
             rows.append({"epk_id": 9_000_000 + o["id"], "inn": o["inn"],
                          "segment_name": o["big"], "company_name": o["name"],
-                         "holding_name": f"Холдинг синтетики {o['id'] % 40:02d}" if o["id"] % 3 == 0 else None,
+                         "holding_name": self._holding(o),
                          "industry_name": "Образование" if o["seg"] == "РГС" else "Торговля",
                          "status_name": "Ликвидирована" if o["liquidated"] else "Активна",
                          "tb_id": o["tb"]})
@@ -385,6 +426,16 @@ class Gen:
             dup["status_name"] = "Ликвидирована"
             rows.append(dup)
         return pd.DataFrame(rows)
+
+    def _holding(self, o: dict):
+        if o["id"] in self.ev_focus:
+            return FOCUS_HOLDING
+        if o["id"] in self.fio_holding_orgs:
+            return HOLDING_FIO
+        if o["id"] % 3:
+            return None
+        k = o["id"] % 40
+        return HOLDING_FIO if k == 13 else f"Холдинг синтетики {k:02d}"
 
     def gosb(self) -> pd.DataFrame:
         rows = []

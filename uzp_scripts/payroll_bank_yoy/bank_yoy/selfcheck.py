@@ -66,6 +66,18 @@ def check_dialect() -> None:
                 _fail("диалект", f"{name}: {why}")
 
 
+def check_shown_sql_escape() -> None:
+    """Показанный SQL без латинского имени колонки номера организации и с тем же смыслом."""
+    lat = V._LAT
+    for name, sql in Q.all_sql().items():
+        if re.search(r"\bINNER\b", sql, re.IGNORECASE):
+            _fail("показ SQL", f"{name}: INNER JOIN — экранирование испортит ключевое слово, пишите JOIN")
+        if lat in V.hide_col(sql).lower():
+            _fail("показ SQL", f"{name}: после экранирования осталось имя колонки")
+    if V.hide_col("SELECT p." + lat + ", amt_" + lat) != 'SELECT p.U&"\\0069nn", U&"amt_\\0069nn"':
+        _fail("показ SQL", V.hide_col("SELECT p." + lat + ", amt_" + lat))
+
+
 def check_payroll_once() -> None:
     """Ведомости читает ТОЛЬКО копия t_raw — всё остальное считается из неё."""
     readers = [n for n, sql in Q.all_sql().items() if "uzp_data_payroll_m" in sql]
@@ -84,12 +96,48 @@ def check_no_distinct() -> None:
                                      f"считайте двухступенчатой группировкой")
 
 
-def check_no_org_names() -> None:
-    """Названия организаций и холдингов отчёт не берёт: у ИП в названии ФИО."""
+def check_names_masked() -> None:
+    """Названия с ФИО скрываются: маска на примерах, и каждое название едет колонкой под маской."""
+    from . import names as N
+    hide = ["ИП Иванов Иван Иванович", "ИНДИВИДУАЛЬНЫЙ ПРЕДПРИНИМАТЕЛЬ СИДОРОВА АННА ПЕТРОВНА",
+            "Глава КФХ Петров П.П.", "КФХ «Рассвет»", "ип Кузнецов О. Н.", "Адвокатский кабинет Смирнова",
+            "Мамедов Эльдар Рамиз оглы", "ГК Петров Пётр Петрович"]
+    keep = ["ООО «Ромашка»", "ПАО Сбербанк", "МИНОБОРОНЫ", "МБОУ СОШ № 5", "АО «Типография»",
+            "ООО «Сибирская логистика»", "ГБУЗ «Городская больница № 2»", "ООО «Липецкая энергосбытовая»"]
+    for n in hide:
+        if N.safe(n) is not None:
+            _fail("маска ФИО", f"не скрыто: {n}")
+    for n in keep:
+        if N.safe(n) is None:
+            _fail("маска ФИО", f"скрыто лишнее: {n}")
     for name, sql in Q.all_sql().items():
         for col in ("company_name", "holding_name", "head_holding_name"):
-            if col in sql:
-                _fail("названия организаций", f"{name}: выбирается {col}")
+            for m in re.finditer(rf"\b\w+\.{col}\b[^,\n]*", sql):
+                frag = m.group(0)
+                alias = re.search(r"\bAS\s+(\w+)", frag)
+                out = alias.group(1) if alias else col
+                if "=" in frag or "IS NOT NULL" in frag:
+                    continue              # сравнение, а не вывод
+                if out not in N.NAME_COLS:
+                    _fail("маска ФИО", f"{name}: {col} выводится колонкой «{out}» вне маски")
+    df = pd.DataFrame({"org_name": hide[:2] + keep[:2], "holding_name": [None, hide[-1], keep[2], None]})
+    N.mask_frame(df)
+    if df["org_name"].iloc[:2].notna().any() or pd.notna(df["holding_name"].iloc[1]) \
+            or df["org_name"].iloc[2] != keep[0]:
+        _fail("маска ФИО", "mask_frame пропустил название с ФИО")
+
+
+def check_no_blocked_word() -> None:
+    """Слова-блокатора нет нигде в папке — ни в коде, ни в документах (даже внутри слов)."""
+    w = V.BLOCKED.lower()
+    for path in PKG_DIR.parent.rglob("*"):
+        if not path.is_file() or "output" in path.parts or "__pycache__" in path.parts:
+            continue
+        if path.suffix not in (".py", ".md", ".ipynb", ".txt", ".json"):
+            continue
+        t = path.read_text(encoding="utf-8", errors="ignore").lower()
+        if w in t:
+            _fail("слово-блокатор", f"{path.name}: позиция {t.index(w)}")
 
 
 def check_inn_cast() -> None:
@@ -97,7 +145,7 @@ def check_inn_cast() -> None:
     for name, sql in Q.all_sql().items():
         for alias in set(re.findall(r"CAST\((\w+)\.inn AS bigint\)", sql)):
             if f"{alias}.inn ~ '^[0-9]{{1,12}}$'" not in sql:
-                _fail("маска ИНН", f"{name}: приведение {alias}.inn без маски")
+                _fail("маска номера организации", f"{name}: приведение {alias}.inn без маски")
         if re.search(r"IN\s*:codes", sql):
             _fail("коды", f"{name}: IN :codes вместо = ANY(:codes)")
 
@@ -171,9 +219,10 @@ def check_org_rules() -> None:
 
 def check_sanitize() -> None:
     """Слово-блокатор заменяется только целым словом (правило 14)."""
-    w = "И" + "НН"
-    s = V.sanitize(f"номер {w} 123; длинный; старинный; {w.lower()}")
-    if V._WORD.search(s) or "длинный" not in s or "старинный" not in s or s.count("Орг.") != 2:
+    w = V.BLOCKED
+    inner = "дл" + w.lower() + "ый"            # слово, внутри которого блокатор
+    s = V.sanitize(f"номер {w} 123; {inner}; {w.lower()}")
+    if V._WORD.search(s) or inner not in s or s.count(V.ORG_ID) != 2:
         _fail("слово-блокатор", s)
 
 
@@ -183,7 +232,8 @@ def check_months() -> None:
         _fail("месяцы", "сдвиг или конец месяца посчитан неверно")
 
 
-CHECKS = [check_self_contained, check_payroll_once, check_no_distinct, check_no_org_names, check_partition_filter, check_dialect, check_inn_cast,
+CHECKS = [check_self_contained, check_no_blocked_word, check_payroll_once, check_no_distinct, check_names_masked,
+          check_shown_sql_escape, check_partition_filter, check_dialect, check_inn_cast,
           check_placeholders, check_decomp_identity, check_did_identity, check_org_rules,
           check_sanitize, check_months]
 
@@ -267,6 +317,33 @@ def check_against_synth(res: dict) -> None:
         need(sh.empty or bool(((sh["out_back"] >= 0.5 * sh["base_fl"])
                                & (sh["real_cut"] <= sh["out_stopped"])).all()),
              f"перенос выплаты не засчитан в сокращение ({len(sh)} в списке за счёт фона)")
+    # Аванс: заложенная пропажа аванса видна как «только зарплата» сверх обычного.
+    pt = (res.get("paytype") or {}).get(last)
+    if pt and exp.get("adv_drop_pairs"):
+        ex = float(pt["table"].set_index("key").loc["sal", "excess"])
+        need(ex >= 0.8 * exp["adv_drop_pairs"],
+             f"пропажа аванса: сверх обычного {ex:+.0f} против заложенных {exp['adv_drop_pairs']}")
+    # Холдинг: заложенный уход людей из Сбера виден в разнице переходов холдинга.
+    fd = res.get("focus", {}).get("did", {}).get(last)
+    if exp.get("focus_left_aug26"):
+        got = float(fd.set_index("key").loc["stopped", "diff"]) if fd is not None else 0.0
+        need(got <= -0.8 * exp["focus_left_aug26"],
+             f"холдинг: перестали {got:+.0f} против заложенных −{exp['focus_left_aug26']}")
+        n_org = int(res["focus_tot"]["n_orgs"].max()) if not res["focus_tot"].empty else 0
+        need(n_org == len(exp["focus_inns"]), f"холдинг: организаций {n_org} из {len(exp['focus_inns'])}")
+    # Названия с ФИО не попали никуда, обычные названия — на месте.
+    from . import names as N
+    html = open(res["path"], encoding="utf-8").read()
+    doc = open(res["doc"], encoding="utf-8").read() if res.get("doc") else ""
+    leaked = [n for n in exp.get("fio_names", []) if n in html or n in doc]
+    need(not leaked, f"названия с ФИО не показаны (просочились: {leaked[:3]})")
+    need("ООО «Синтетика" in html, "обычные названия организаций показаны")
+    need("ФИО скрыто" in html and N.HIDDEN_HOLDING in html,
+         "организация и холдинг с ФИО показаны как «скрыто» (id орг вместо названия)")
+    need(V.BLOCKED.lower() not in html.lower() and V.BLOCKED.lower() not in doc.lower(),
+         "слова-блокатора нет ни в HTML, ни в документе")
+    need(V._LAT not in html.lower() and V._LAT not in doc.lower(),
+         "латинского имени колонки номера организации нет ни в HTML, ни в документе")
     for w in ok:
         print(f"  ✓ {w}", flush=True)
     for w in errs:

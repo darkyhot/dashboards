@@ -8,9 +8,10 @@
 * текст — по правилам из чисел (LLM в отчёте нет);
 * светлая и тёмная темы — роли цветов в CSS-переменных.
 
-Слово-идентификатор организации из трёх букв в видимом тексте не используется
-(правило платформы 14: файл не пройдёт по почте); последним шагом `sanitize`
-заменяет его на «Орг.», если оно всё же пришло из данных.
+Слово-идентификатор организации из трёх букв не используется нигде — ни в тексте,
+ни в коде (правило платформы 14: файл не пройдёт по почте); вместо него «id орг».
+Последним шагом `sanitize` заменяет его, если оно всё же пришло из данных.
+Названия организаций с ФИО (ИП, КФХ) сюда не доходят: их отсекает маска выборки.
 """
 from __future__ import annotations
 
@@ -22,14 +23,39 @@ import pandas as pd
 from . import analyze as A
 from . import charts as C
 from . import months as M
+from . import names as N
 from . import segments as S
 from .charts import esc, fnum, fpct
 
-_WORD = re.compile("(?<![А-Яа-яЁёA-Za-z])" + "И" + "НН" + "(?![А-Яа-яЁёA-Za-z])", re.IGNORECASE)
+# Само слово в коде не пишется — собирается из кодов букв.
+BLOCKED = "".join(map(chr, (1048, 1053, 1053)))
+_WORD = re.compile("(?<![А-Яа-яЁёA-Za-z])" + BLOCKED + "(?![А-Яа-яЁёA-Za-z])", re.IGNORECASE)
+ORG_ID = "id орг"
 
 
 def sanitize(text: str) -> str:
-    return _WORD.sub("Орг.", text or "")
+    return _WORD.sub(ORG_ID, text or "")
+
+
+# Латинское имя колонки номера организации (и производные: amt_..., ..._from) в
+# показанном SQL тоже не пишется: идентификатор записывается кодами символов,
+# U&"\0069nn" — для Postgres/Greenplum это ТО ЖЕ имя, запрос выполняется как есть
+# (нужно standard_conforming_strings = on, по умолчанию так).
+_LAT = "".join(map(chr, (105, 110, 110)))
+_IDENT = re.compile(r"(?<![\w&\"\\])[A-Za-z_][A-Za-z0-9_]*")
+
+
+def hide_col(sql: str) -> str:
+    def f(m):
+        tok = m.group(0)
+        if _LAT not in tok.lower():
+            return tok
+        return 'U&"' + tok.lower().replace(_LAT, "\\0069" + _LAT[1:]) + '"'
+    return _IDENT.sub(f, sql)
+
+
+SQL_NOTE = ('Имена колонок, где есть три латинские буквы номера организации, записаны кодами '
+            'символов — U&"\\0069…": для Postgres и Greenplum это то же имя, запрос выполняется как есть.')
 
 
 # --------------------------------------------------------------------------- #
@@ -84,8 +110,9 @@ def sql_box(res: dict, names: list[str], title: str = "Как посчитано
     body = []
     for n, (sql, args) in items:
         used = {k: v for k, v in args.items() if f":{k}" in sql}
-        body.append(f'<p class="muted">Запрос «{esc(n)}»</p><pre>{esc(_params_comment(used) + sql)}</pre>')
-    return f'<details class="sql"><summary>{esc(title)}</summary>{"".join(body)}</details>'
+        body.append(f'<p class="muted">Запрос «{esc(n)}»</p><pre>{esc(_params_comment(used) + hide_col(sql))}</pre>')
+    return (f'<details class="sql"><summary>{esc(title)}</summary><p class="muted">{esc(SQL_NOTE)}</p>'
+            f'{"".join(body)}</details>')
 
 
 def per_month(res: dict, build) -> str:
@@ -176,11 +203,120 @@ def verdict(res: dict) -> str:
         else:
             txt += (f"<li><b>Сезонность:</b> {esc(M.long(M.shift(m, 1)))} не загружен — возврат "
                     f"не проверить; см. повтор год к году в разделе «Сезонность».</li>")
+        st = res.get("stop", {}).get(m)
+        if st is not None:
+            g = st["did"].set_index("key")
+            txt += (f"<li><b>Перестали получать ЗП в Сбере</b> — отток B2C (1–2 ФЛ из организации) "
+                    f"{esc(fnum(g.loc['b2c', 'diff'], True))}, B2B (3 ФЛ и больше) "
+                    f"{esc(fnum(g.loc['b2b', 'diff'], True))} к тому же переходу год назад.</li>")
         rest = float(did["expect"]) - h["newcomers"] - h["collapse"]
         txt += (f"<li>Остальное ({esc(fnum(rest, True))}) — старожилы и приход новых "
                 f"получателей; разбивка — в разделе «Почему месяц хуже предыдущего».</li></ul>")
         parts.append(txt)
     return "".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Общие блоки новых разрезов
+# --------------------------------------------------------------------------- #
+STOP_LEAD = ("Переставшие получать ЗП в Сбере — по организации, из которой ушли. Сколько ФЛ "
+             "перестали получать из ОДНОЙ организации за переход: 1–2 — <b>отток B2C</b> (люди "
+             "уходят поодиночке: сменили банк, уволились), 3 и больше — <b>отток B2B</b> (уходит "
+             "организация или её часть). Счёт — по получателям, совместитель считается в каждой "
+             "организации; B2C + B2B = «перестали получать» разложения.")
+
+
+def stop_yoy_table(b: pd.DataFrame | None) -> str:
+    """Год к году: сколько переставших — поодиночке и группами."""
+    if b is None or b.empty or not b["n_tr"].sum():
+        return ""
+    rows = []
+    for key, title, idx in (("b2c", A.T_B2C, list(A.B2C)),
+                            ("b2b", A.T_B2B, [k for k in A.BUCKETS if k not in A.B2C])):
+        rows.append([title, fnum(b.loc[idx, "n_orgs"].sum()), fnum(b.loc[idx, "n_fl"].sum()),
+                     fnum(b.loc[idx, "n_tr"].sum()), fpct(b.loc[idx, "n_tr"].sum() / b["n_tr"].sum())])
+    return ("<h4>Перестали получать: отток B2C и B2B</h4>" +
+            table(["", "Организаций", "ФЛ × организация", "Получатели", "Доля"], rows))
+
+
+def stop_block(st: dict, mp, m, y1, y0) -> str:
+    """Разница переходов: B2C и B2B этого года против года назад, плюс сегменты."""
+    t = st["did"]
+    rows = [[("  " if r.sub else "") + r.title, fnum(r.n_orgs_cur), fnum(r.tr_cur, True),
+             fnum(r.n_orgs_prev), fnum(r.tr_prev, True), fnum(r.diff, True)] for r in t.itertuples()]
+    tot = t[~t["sub"]]
+    rows.append(["Итого перестали", fnum(tot["n_orgs_cur"].sum()), fnum(tot["tr_cur"].sum(), True),
+                 fnum(tot["n_orgs_prev"].sum()), fnum(tot["tr_prev"].sum(), True), fnum(tot["diff"].sum(), True)])
+    sub = {i for i, r in enumerate(t.itertuples()) if r.sub}
+    strong = {i for i, r in enumerate(t.itertuples()) if not r.sub} | {len(rows) - 1}
+    tb = table(["", f"Организаций, {y1}", f"Получатели, {y1}", f"Организаций, {y0}", f"Получатели, {y0}",
+                "Разница"], rows, strong_rows=strong, sub_rows=sub)
+    hm = ""
+    sd = st.get("seg")
+    if sd is not None and not sd.empty:
+        cols = ["B2C", "B2B", "Итого"]
+        keys = {"B2C": "b2c", "B2B": "b2b", "Итого": "total"}
+        hm = C.heatmap(list(sd.index), cols, lambda r, c: float(sd.loc[r, keys[c]]), lambda v: fnum(v, True),
+                       row_head="Сегмент", total_col="Итого",
+                       tipf=lambda r, c, v: f"{r} · {c}|{y1} минус {y0}: {fnum(v, True)} получателей")
+    return (f"<h4>Перестали получать ЗП в Сбере: отток B2C и B2B, {esc(M.name(mp))}→{esc(M.name(m))}</h4>"
+            f"<p class='muted'>{STOP_LEAD}</p>{tb}{hm}")
+
+
+def dim_table(t: pd.DataFrame, dim: str, cols: list[tuple], top: int | None = None,
+              keep=None) -> str:
+    """Таблица разреза: первая колонка — подпись (холдинг уже под маской ФИО)."""
+    if t is None or t.empty:
+        return ""
+    x = t
+    if top is not None:
+        mask = pd.Series(False, index=x.index)
+        mask.iloc[:top] = True
+        if keep is not None:
+            mask |= keep(x)
+        x = x[mask]
+    rows = [[r["label"]] + [f(r) for _, f in cols] for _, r in x.iterrows()]
+    return table([A.DIM_T.get(dim, dim)] + [h for h, _ in cols], rows)
+
+
+def _focus_keep(x: pd.DataFrame):
+    return x["focus"].astype(bool) if "focus" in x else pd.Series(False, index=x.index)
+
+
+def cohort_where(res: dict) -> str:
+    cd = res.get("cohort_dims") or {}
+    if not cd:
+        return ""
+    last = res["report"][-1]
+    rep = res["report"]
+    k0, k1 = M.shift(rep[0], -1), M.shift(rep[-1], -1)
+    y1, y0 = M.parse(last).year, M.parse(last).year - 1
+    cz = cd["causes"]
+    st_t = {"alive": f"получают в {M.prep(last)}", **{k: A.T[k] for k in A.COHORT_ST}}
+    ctb = table(["Где пришедшие сейчас", f"ФЛ, {y1}", "Доля", f"ФЛ, {y0}", "Доля", "Сверх обычного"],
+                [[st_t.get(r.st, r.st), fnum(r.cur), fpct(r.share_cur), fnum(r.prev), fpct(r.share_prev),
+                  fnum(-r.excess, True) if not _isnan(r.excess) else ""]
+                 for r in cz.itertuples()])
+    cols = [(f"Пришли, {y1}", lambda r: fnum(r["size_cur"])), ("Дожили", lambda r: fpct(r["surv_cur"])),
+            (f"Пришли, {y0}", lambda r: fnum(r["size_prev"])), ("Дожили", lambda r: fpct(r["surv_prev"])),
+            ("Лишняя убыль, ФЛ", lambda r: fnum(-r["excess"], True) if not _isnan(r["excess"]) else "")]
+    hold = cd.get("holding", pd.DataFrame())
+    ind = cd.get("industry", pd.DataFrame())
+    out = (f"<h3>Где вымываются: пришедшие с {esc(M.gen(k0))} по {esc(M.long(k1))} — кто из них "
+           f"получает ЗП в {esc(M.prep(last))}</h3>"
+           "<p class='muted'>Пришедший относится к организации с наибольшей зарплатой в месяце прихода. "
+           "Лишняя убыль = пришли в этом году × (доживаемость год назад − в этом году): сколько ФЛ "
+           "потеряно сверх обычного для такой когорты. Минус — вымывается быстрее, чем год назад.</p>"
+           f"<h4>Почему не дожили</h4>{ctb}"
+           f"<h4>По сегментам</h4>{dim_table(cd.get('seg'), 'seg', cols)}")
+    if not hold.empty:
+        h = hold[hold["excess"] > 0]
+        out += (f"<h4>Холдинги: где лишняя убыль больше всего (верх 15)</h4>"
+                f"{dim_table(h, 'holding', cols, top=15)}")
+    if not ind.empty:
+        out += (f"<h4>Отрасли (верх 15)</h4>"
+                f"{dim_table(ind[ind['excess'] > 0], 'industry', cols, top=15)}")
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -319,7 +455,8 @@ def s_decomp(res: dict) -> str:
         base_tbl = table(["Сегмент", "Было", "Стало", "Изменение", "%"],
                          [[r.seg, fnum(r.base), fnum(r.cur), fnum(r.delta, True),
                            fpct(r.delta / r.base if r.base else None, True)] for r in sd.itertuples()])
-        return (f"<h3>{esc(M.long(cp['b']))} → {esc(M.long(cp['c']))}</h3>{dec}{causes}"
+        stp = stop_yoy_table(res.get("stop", {}).get(m, {}).get("yoy"))
+        return (f"<h3>{esc(M.long(cp['b']))} → {esc(M.long(cp['c']))}</h3>{dec}{causes}{stp}"
                 f"<h3>По сегментам: из чего сложилось изменение получателей</h3>{hm}"
                 f"<details><summary>Численность сегментов</summary>{base_tbl}</details>"
                 + sql_box(res, [f"fl_flow_yoy_{m}", f"triple_flow_yoy_{m}"]))
@@ -372,14 +509,17 @@ def s_did(res: dict) -> str:
                   C.heatmap(list(sdi.index), cols, lambda r, c: float(sdi.loc[r, keys[cols.index(c)]]),
                             lambda v: fnum(v, True), row_head="Сегмент", total_col="Итого",
                             tipf=lambda r, c, v: f"{r} · {c}|{y1} минус {y0}: {fnum(v, True)}"))
+        st = res.get("stop", {}).get(m)
+        stb = stop_block(st, mp, m, y1, y0) if st else ""
         return (f"<h3>{esc(M.name(m).capitalize())} к {esc(M.gen(mp))}: ΔYoY изменилась на "
                 f"{esc(fnum(did['expect'], True))}</h3>"
                 f"<p class='muted'>Синий — слагаемое в этом году лучше, чем год назад; красный — хуже. "
                 f"Подстроки «перестали» делятся по тому, когда ФЛ пришёл: в {esc(M.prep(mp))}, "
                 f"в {esc(M.prep(M.shift(mp, -1)))} или раньше.</p>{chart}{tb}{bk}"
-                f"<h4>По причинам</h4>{ctb}{hm}"
+                f"<h4>По причинам</h4>{ctb}{stb}{hm}"
                 + sql_box(res, [f"fl_flow_mom_{m}", f"fl_flow_mom_{M.iso(M.shift(m, -12))}",
-                                f"triple_flow_mom_{m}", f"triple_flow_mom_{M.iso(M.shift(m, -12))}"]))
+                                f"triple_flow_mom_{m}", f"triple_flow_mom_{M.iso(M.shift(m, -12))}",
+                                f"stop_size_mom_{m}"]))
     return section("did", "Почему месяц хуже предыдущего",
                    "ΔYoY(m) − ΔYoY(m−1) = переход (m−1→m) этого года − тот же переход год назад. "
                    "Поэтому вопрос «почему август хуже июля» — это вопрос «чем переход июль→август "
@@ -419,7 +559,9 @@ def s_cohorts(res: dict) -> str:
         rows = [[M.long(r.k), fnum(r.size), fpct(r.surv1), fpct(r.surv2), fpct(r.surv3)] for r in yy.itertuples()]
         body += ("<h3>Новые год к году: получатели месяца, которых не было год назад</h3>" +
                  table(["Месяц", "ФЛ", "Через 1 мес.", "Через 2 мес.", "Через 3 мес."], rows))
+    body += cohort_where(res)
     keys = [k for k in res.get("shown", {}) if k.startswith("cohort_")][:1]
+    keys += [k for k in res.get("shown", {}) if k.startswith("cohort_dim_")][:1]
     return section("cohorts", "Растворились ли пришедшие",
                    "Когорта — ФЛ, ставшие получателями в месяце (не получали в предыдущем). Сравнивается "
                    "доживаемость когорт этого года с теми же месяцами год назад.", body + sql_box(res, keys))
@@ -479,6 +621,60 @@ def s_season(res: dict) -> str:
     keys = [k for k in res.get("shown", {}) if k.startswith(("seasonal_", "code_month_"))][:2]
     return section("season", "Сезонность", "Повтор год к году и возврат в следующем месяце.",
                    body + per_month(res, build) + sql_box(res, keys))
+
+
+def paytype_tables(t: pd.DataFrame, y1, y0, mp, m) -> str:
+    if t is None or t.empty:
+        return "<p class='muted'>Нет данных.</p>"
+    rows = [[("  " if r.sub else "") + r.title, fnum(r.cur), fpct(r.share_cur), fnum(r.prev), fpct(r.share_prev),
+             "" if _isnan(r.excess) else fnum(r.excess, True)] for r in t.itertuples()]
+    return table(["", f"Пар, {M.name(mp)}→{M.name(m)} {y1}", "Доля", f"Пар, {y0}", "Доля", "Сверх обычного"],
+                 rows, strong_rows={0}, sub_rows={i for i, r in enumerate(t.itertuples()) if r.sub})
+
+
+def s_paytype(res: dict) -> str:
+    pc = res.get("pay_codes") or {}
+    pt = res.get("paytype") or {}
+    nm = pc.get("names", {})
+    def codes(lst):
+        return ", ".join(f"{c} «{nm.get(c, '')}»" for c in lst) or "не найдены"
+    lead = ("Пара ФЛ × организация — получатель в предыдущем месяце, у которой были ОБА вида выплат: "
+            "аванс и зарплата. Что с ней стало: оба вида остались, пропал один, пропали оба (ФЛ ушёл "
+            "из организации). Сравнение с тем же переходом год назад; «сверх обычного» = было × "
+            "(доля в этом году − доля год назад). Если пропажа одного вида выросла — часть людей не "
+            "ушла, а получила одну выплату вместо двух (аванс перенесли, сменили график).<br>"
+            f"Аванс — коды {esc(codes(pc.get('adv', [])))}; зарплата — {esc(codes(pc.get('sal', [])))}. "
+            "Виды определены по названию кода зачисления.")
+    if not pt:
+        return section("paytype", "Аванс и зарплата", lead,
+                       "<p class='muted'>Не посчитано: коды аванса или зарплаты не найдены, или выборка "
+                       "не прочиталась — см. предупреждения прогона.</p>")
+
+    def build(m):
+        d = pt.get(m)
+        if not d:
+            return ""
+        y1, y0 = M.parse(m).year, M.parse(m).year - 1
+        mp = M.shift(m, -1)
+        mix = d["mix"]
+        mx = ""
+        if not mix.empty:
+            mx = (f"<h4>Состав получателей {esc(M.gen(mp))} по видам выплат</h4>" +
+                  table(["Виды выплат у пары", f"Пар, {y1}", "Доля", f"Пар, {y0}", "Доля"],
+                        [[r.title, fnum(r.cur), fpct(r.share_cur), fnum(r.prev), fpct(r.share_prev)]
+                         for r in mix.itertuples()]))
+        sg = d["seg"]
+        sgh = ""
+        if not sg.empty:
+            sgh = ("<h4>По сегментам: доля пар, потерявших один вид выплаты</h4>" +
+                   table(["Сегмент", f"Было оба вида, {y1}", f"Потеряли один, {y1}", "Доля",
+                          f"Было оба вида, {y0}", "Доля", "Сверх обычного"],
+                         [[r.seg, fnum(r.base_cur), fnum(r.lost_cur), fpct(r.share_cur), fnum(r.base_prev),
+                           fpct(r.share_prev), fnum(r.excess, True)] for r in sg.itertuples()]))
+        return (f"<h3>{esc(M.name(mp))} → {esc(M.name(m))}: было аванс и зарплата — что стало</h3>"
+                + paytype_tables(d["table"], y1, y0, mp, m) + mx + sgh)
+    return section("paytype", "Аванс и зарплата: не пропал ли один вид выплаты", lead,
+                   per_month(res, build) + sql_box(res, ["paytype", "code_names"]))
 
 
 def s_flows(res: dict) -> str:
@@ -545,6 +741,67 @@ def s_threshold(res: dict) -> str:
                    table(["Порог по организации"] + [f"Год к году, {M.name(m)}" for m in pv.columns], rows))
 
 
+ORG_HEAD = ["Организация", ORG_ID, "Холдинг", "Отрасль", "Сегмент", "ТБ", "Было ФЛ", "Стало", "Нетто",
+            "Реальное сокращение", "% базы", "Перестали в Сбере", "из них: нет зачислений", "ниже порога",
+            "только незарплатные", "Переток в др. орг.", "Реорг.", "Пропустили месяц, вернулись",
+            "Пришли новые", "Пришли из др. орг."]
+N_TEXT = 6
+
+
+def org_rows(lst: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """Строки списка организаций. Название с ФИО уже снято маской — тогда в первой
+    колонке id орг."""
+    rows = []
+    for r in lst.itertuples():
+        hidden = bool(getattr(r, "org_name_hidden", False))
+        name = esc(r.org) + (' <span class="tag">ФИО скрыто</span>' if hidden else "") + \
+            (' <span class="tag">ликвидирована</span>' if r.is_liquidated else "") + \
+            (' <span class="tag">реальное сокращение</span>' if getattr(r, "picked", 0) == 1 else "")
+        q = f"{r.org} {int(r.inn)} {r.holding} {r.industry}".lower()
+        rows.append(f'<tr data-seg="{esc(r.seg)}" data-tb="{esc(r.tb)}" data-q="{esc(q)}">'
+                    f'<td>{name}</td><td>{int(r.inn)}</td><td>{esc(r.holding)}</td><td>{esc(r.industry)}</td>'
+                    f'<td>{esc(r.seg)}</td><td>{esc(r.tb)}</td>'
+                    + "".join(f'<td class="n">{x}</td>' for x in (
+                        fnum(r.base_fl), fnum(r.cur_fl), fnum(r.net, True), f"<b>{fnum(r.real_cut)}</b>",
+                        fpct(r.real_share), fnum(r.out_stopped), fnum(r.out_left_bank), fnum(r.out_below),
+                        fnum(r.out_other_codes), fnum(r.out_moved), fnum(r.out_reorg), fnum(r.out_back),
+                        fnum(r.in_new), fnum(r.in_moved))) + "</tr>")
+    return rows, ORG_HEAD
+
+
+def org_table(tid: str, head: list[str], rows: list[str]) -> str:
+    return (f'<div class="scroll tall"><table class="data orgs" id="{tid}"><thead><tr>' +
+            "".join(f'<th class="{"" if i < N_TEXT else "n"}">{esc(h)}</th>' for i, h in enumerate(head)) +
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
+
+
+def org_break_html(brk: dict) -> str:
+    """Разрезы реального сокращения: по ВСЕМ отобранным организациям."""
+    if not brk:
+        return ""
+    cols = [("Организаций в списке", lambda r: fnum(r["n_orgs"])),
+            ("Реальное сокращение", lambda r: fnum(r["real_cut"])),
+            ("Перестали в Сбере (у них)", lambda r: fnum(r["out_stopped"])),
+            ("Переток (у них)", lambda r: fnum(r["out_moved"])),
+            ("ФЛ разреза год назад", lambda r: fnum(r["base_all"])),
+            ("Доля сокращения", lambda r: fpct(r["share"])),
+            ("Перестали в Сбере, весь разрез", lambda r: fnum(r["out_stopped_all"]))]
+    seg = dim_table(brk.get("seg"), "seg", cols)
+    hold = brk.get("holding", pd.DataFrame())
+    hold = hold[hold["real_cut"] > 0] if not hold.empty else hold
+    ind = brk.get("industry", pd.DataFrame())
+    ind = ind[ind["real_cut"] > 0] if not ind.empty else ind
+    return ("<h4>Где реальное сокращение: сегменты, холдинги, отрасли</h4>"
+            "<p class='muted'>По всем организациям списка, а не по показанным. «ФЛ разреза» — все организации "
+            "сегмента / холдинга / отрасли в базе; доля — какая часть их численности пришлась на реальное "
+            "сокращение. «Перестали в Сбере, весь разрез» — включая организации вне списка (мелкие, "
+            "«5 ушли — 5 пришли»).</p>" + seg +
+            ("<details open><summary>Холдинги (верх 30 по реальному сокращению)</summary>"
+             + dim_table(hold, "holding", cols, top=30, keep=_focus_keep) + "</details>" if not hold.empty else "") +
+            ("<details><summary>Отрасли (верх 30)</summary>"
+             + dim_table(ind, "industry", cols, top=30) + "</details>" if not ind.empty else ""))
+
+
 def s_orgs(res: dict) -> str:
     oo = res["org_opts"]
 
@@ -569,39 +826,25 @@ def s_orgs(res: dict) -> str:
                + "".join(f'<option>{esc(s)}</option>' for s in segs) +
                '</select></label><label>ТБ <select data-k="tb"><option value="">все</option>'
                + "".join(f'<option>{esc(t)}</option>' for t in tbs) +
-               '</select></label><label>Поиск <input data-k="q" type="search" placeholder="номер организации"></label>'
+               '</select></label><label>Поиск <input data-k="q" type="search" '
+               'placeholder="название, id орг, холдинг, отрасль"></label>'
                '<span class="cnt"></span></div>')
-        head = ["Номер организации", "Сегмент", "ТБ", "Было ФЛ", "Стало", "Нетто", "Реальное сокращение",
-                "% базы", "Перестали в Сбере", "из них: нет зачислений", "ниже порога", "только незарплатные",
-                "Переток в др. орг.", "Реорг.", "Пропустили месяц, вернулись", "Пришли новые",
-                "Пришли из др. орг."]
-        rows = []
-        for r in lst.itertuples():
-            # Только номер: в названии ИП — ФИО человека, названия не показываются.
-            name = f"{int(r.inn)}" + (' <span class="tag">ликвидирована</span>' if r.is_liquidated else "")
-            rows.append(f'<tr data-seg="{esc(r.seg)}" data-tb="{esc(r.tb)}" data-q="{int(r.inn)}">'
-                        f'<td>{name}</td><td>{esc(r.seg)}</td><td>{esc(r.tb)}</td>'
-                        + "".join(f'<td class="n">{x}</td>' for x in (
-                            fnum(r.base_fl), fnum(r.cur_fl), fnum(r.net, True), f"<b>{fnum(r.real_cut)}</b>",
-                            fpct(r.real_share), fnum(r.out_stopped), fnum(r.out_left_bank), fnum(r.out_below),
-                            fnum(r.out_other_codes), fnum(r.out_moved), fnum(r.out_reorg), fnum(r.out_back),
-                            fnum(r.in_new),
-                            fnum(r.in_moved))) + "</tr>")
-        tbl = (f'<div class="scroll tall"><table class="data orgs" id="org-{m}"><thead><tr>' +
-               "".join(f'<th class="{"" if i < 3 else "n"}">{esc(h)}</th>' for i, h in enumerate(head)) +
-               "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
+        rows, head = org_rows(lst)
+        tbl = org_table(f"org-{m}", head, rows)
         shown = (f"Показано {fnum(len(lst))} из {fnum(n_all)} организаций с реальным сокращением; "
                  f"их сокращение — {fnum(lst['sum_real_picked'].iloc[0])} ФЛ.")
         rg = o["reorg"]
         rgh = ""
         if rg is not None and not rg.empty:
             rgh = ("<details><summary>Реорганизации — исключены из списка</summary>" +
-                   table(["Откуда (номер)", "Куда (номер приёмника)", "Переехало ФЛ", "Ушло всего"],
-                         [[int(r.inn_from), int(r.inn_to), fnum(r.n_mv), fnum(r.n_lv)]
+                   table(["Откуда", "Куда (приёмник)", "Переехало ФЛ", "Ушло всего"],
+                         [[N.org_label(getattr(r, "org_name", None), r.inn_from),
+                           N.org_label(getattr(r, "org_name_to", None), r.inn_to), fnum(r.n_mv), fnum(r.n_lv)]
                           for r in rg.itertuples()], num={2, 3}) + "</details>")
-        return (f"<h3>{esc(M.long(b))} → {esc(M.long(m))}</h3>{sm}"
+        brk = org_break_html(o.get("break") or {})
+        return (f"<h3>{esc(M.long(b))} → {esc(M.long(m))}</h3>{sm}{brk}"
                 f"<details open><summary>Список: {esc(shown)}</summary>{flt}{tbl}</details>{rgh}"
-                + sql_box(res, [f"org_list_{m}", f"org_summary_{m}"]))
+                + sql_box(res, [f"org_list_{m}", f"org_summary_{m}", f"org_break_{m}"]))
     lead = (f"Грейн — ФЛ внутри организации, поэтому переводы между ГОСБ одной организации сюда не попадают. "
             f"<b>Реальное сокращение</b> = min(перестали получать ЗП в Сбере; падение численности без учёта "
             f"реорганизации). В список — только где численность действительно упала: «5 ушли, 5 пришли» "
@@ -637,6 +880,29 @@ def s_checks(res: dict) -> str:
                    "Части обязаны складываться в итог; расхождение — ошибка расчёта, а не свойство данных.",
                    head + "<details><summary>Все проверки</summary>" +
                    table(["", "Проверка", "Невязка", ""], rows, num={2}) + "</details>" + lim + tmh)
+
+
+def hole_dims_html(hd: dict, nm: dict, y1, y0) -> str:
+    if not hd:
+        return ""
+    cols = [("Организаций (база ≥ порога)", lambda r: fnum(r["n_orgs_base_cur"])),
+            (f"Пропустили, {y1}", lambda r: fnum(r["n_orgs_cur"])), ("доля", lambda r: fpct(r["share_cur"])),
+            ("Дыра, получателей", lambda r: fnum(r["hole_cur"])),
+            (f"Пропустили, {y0}", lambda r: fnum(r["n_orgs_prev"])), ("доля", lambda r: fpct(r["share_prev"])),
+            (f"Дыра, {y0}", lambda r: fnum(r["hole_prev"]))]
+    hold = hd.get("holding", pd.DataFrame())
+    ind = hd.get("industry", pd.DataFrame())
+    hold_hit = hold[(hold["n_orgs_cur"] > 0) | hold["focus"].astype(bool)] if not hold.empty else hold
+    ind_hit = ind[ind["n_orgs_cur"] > 0] if not ind.empty else ind
+    return (f"<h4>Где пропустили {esc(nm['cur'])}: сегменты, холдинги, отрасли</h4>"
+            "<p class='muted'>Знаменатель — все организации разреза с базой не меньше порога в предыдущем "
+            "месяце: «пропустили 12 из 40» — закономерность, «пропустили 12» — нет.</p>"
+            + dim_table(hd.get("seg"), "seg", cols) +
+            ("<details open><summary>Холдинги (верх 30 по «дыре»)</summary>"
+             + dim_table(hold_hit, "holding", cols, top=30, keep=_focus_keep) + "</details>"
+             if not hold_hit.empty else "") +
+            ("<details><summary>Отрасли</summary>" + dim_table(ind_hit, "industry", cols, top=30) + "</details>"
+             if not ind_hit.empty else ""))
 
 
 def s_august(res: dict) -> str:
@@ -675,14 +941,15 @@ def s_august(res: dict) -> str:
                     [str(y0), fnum(hp["n_orgs"]), fnum(hp["sum_hole"])],
                     ["Разница", fnum(hc["n_orgs"] - hp["n_orgs"], True), fnum(hc["sum_hole"] - hp["sum_hole"], True)]],
                    strong_rows={2}))
+    body += hole_dims_html(res.get("hole_dims") or {}, nm, y1, y0)
     hl = aug["hole_cur"]
     if hl is not None and not hl.empty:
-        rows = [[int(r.inn), r.seg, fnum(r.n_prev), fnum(r.n_cur), fnum(r.n_next), fnum(r.hole)]
-                for r in hl.head(30).itertuples()]
+        rows = [[r.org, int(r.inn), r.holding, r.seg, fnum(r.n_prev), fnum(r.n_cur), fnum(r.n_next),
+                 fnum(r.hole)] for r in hl.head(50).itertuples()]
         body += (f"<details><summary>Крупнейшие организации с провалом, {y1} "
-                 f"({fnum(min(30, hc['n_orgs']))} из {fnum(hc['n_orgs'])})</summary>" +
-                 table(["Номер организации", "Сегмент", nm["prev"], nm["cur"], nm["next"], "Дыра"], rows,
-                       num={2, 3, 4, 5}) + "</details>")
+                 f"({fnum(min(50, hc['n_orgs']))} из {fnum(hc['n_orgs'])})</summary>" +
+                 table(["Организация", ORG_ID, "Холдинг", "Сегмент", nm["prev"], nm["cur"], nm["next"], "Дыра"],
+                       rows, num={4, 5, 6, 7}) + "</details>")
     pr = []
     for tag, y in (("cur", y1), ("prev", y0)):
         d = aug[f"pay_{tag}"]
@@ -699,11 +966,187 @@ def s_august(res: dict) -> str:
                  "<p class='muted'>Зарплатная сумма ФЛ за месяц. Если у пропавших и вернувшихся медиана около 2 — "
                  "выплату за пропущенный месяц перенесли (организация, график, выходные); около 1 — человек "
                  "просто не получал в этом месяце (отпуск без выплаты, перерыв).</p>")
-    keys = [k for k in res.get("shown", {}) if k.startswith(("org_hole_", "return_pay_"))][:2]
+    keys = [k for k in res.get("shown", {}) if k.startswith(("org_hole_", "return_pay_"))][:3]
     return section("august", f"{M.name(ms['cur']).capitalize()}: потеря или перенос в {M.name(ms['next'])}",
                    "Провал месяца, который в следующем месяце вернулся, — сдвиг во времени, а не потеря людей. "
                    "Здесь — какая часть минуса вернулась, кто это и похоже ли это на перенос выплаты.",
                    body + sql_box(res, keys))
+
+
+# --------------------------------------------------------------------------- #
+# Вкладка выделенного холдинга
+# --------------------------------------------------------------------------- #
+FOCUS_SHORT = {"stopped": "Перестали в Сбере", "started": "Начали в Сбере",
+               "other_org": "Переток вне холдинга", "inside": "Внутри холдинга"}
+
+
+def s_focus(res: dict) -> str:
+    fh = res.get("focus_holding", "")
+    ft = res.get("focus_tot", pd.DataFrame())
+    rep = res["report"]
+    if ft is None or ft.empty:
+        return section("f-summary", f"Холдинг «{fh}»",
+                       f"Организации, у которых в справочнике ЕПК holding_name = «{esc(fh)}».",
+                       "<p class='warn'>Таких организаций с получателями ЗП в рабочем наборе нет — проверьте "
+                       "написание холдинга в параметре FOCUS_HOLDING.</p>")
+    fc, fd, fs = res["focus"]["comp"], res["focus"]["did"], res["focus"]["stop"]
+    tiles = []
+    for m in rep:
+        p = M.iso(M.shift(m, -12))
+        if m not in ft.index or p not in ft.index:
+            continue
+        a, b = ft.loc[m], ft.loc[p]
+        d = a["n_triples"] - b["n_triples"]
+        tiles.append(tile(f"{M.long(m)} к {M.long(p)}", fnum(d, True),
+                          f"{fpct(d / b['n_triples'] if b['n_triples'] else None, True)} · получателей "
+                          f"{fnum(a['n_triples'])}",
+                          f"ФЛ {fnum(a['n_epk'] - b['n_epk'], True)} · организаций {fnum(a['n_orgs'])}", _tone(d)))
+    lines_ = []
+    for m in rep:
+        c = fc.get(("yoy", m))
+        if not c:
+            continue
+        d = c["d"]
+        lines_.append(f"<li><b>{esc(M.long(m))}</b>: {esc(fnum(d['delta'], True))} = перестали получать ЗП в "
+                      f"Сбере {esc(fnum(-d['stopped'], True))}, начали {esc(fnum(d['started'], True))}, "
+                      f"переток вне холдинга {esc(fnum(d['other_org'], True))}, внутри холдинга "
+                      f"{esc(fnum(d['inside'], True))}.</li>")
+    for m in rep:
+        t = fd.get(m)
+        if t is None:
+            continue
+        tot = float(t["diff"].sum())
+        if tot >= 0:
+            continue
+        top = t.reindex(t["diff"].abs().sort_values(ascending=False).index).iloc[0]
+        mp = M.shift(m, -1)
+        lines_.append(f"<li><b>{esc(M.name(m).capitalize())} хуже {esc(M.gen(mp))} на {esc(fnum(-tot))}</b>: "
+                      f"больше всего — «{esc(top['title'])}» ({esc(fnum(top['diff'], True))} к тому же переходу "
+                      f"год назад).</li>")
+    body = (f'<div class="tiles">{"".join(tiles)}</div><div class="verdict"><ul>{"".join(lines_)}</ul></div>'
+            + sql_box(res, ["focus_tot"]))
+    out = section("f-summary", f"Холдинг «{fh}»",
+                  f"Организации, у которых в справочнике ЕПК holding_name = «{esc(fh)}». Получатель — тот же, что "
+                  "во всём отчёте (тройка ФЛ × организация × ГОСБ). «Переток» — ФЛ продолжает получать ЗП в "
+                  "Сбере, но в организации вне холдинга; «внутри холдинга» — сменил организацию холдинга, ГОСБ "
+                  "или число мест работы в нём.", body)
+
+    sr = res.get("focus_series", pd.DataFrame())
+    if sr is not None and not sr.empty:
+        last = M.parse(sr.index.max())
+        cal = [M.shift(last, -11 + i) for i in range(12)]
+        val = lambda d: float(sr.loc[M.iso(d), "n_triples"]) if M.iso(d) in sr.index else None
+        span_cur = f"{M.label(cal[0])} … {M.label(cal[-1])}"
+        span_prev = f"{M.label(M.shift(cal[0], -12))} … {M.label(M.shift(cal[-1], -12))}"
+        ln = C.lines([M.RU[d.month - 1] for d in cal], [
+            {"name": span_prev, "values": [val(M.shift(d, -12)) for d in cal], "color": "var(--neutral)"},
+            {"name": span_cur, "values": [val(d) for d in cal], "color": "var(--series-1)", "emphasis": True}])
+        yo = [(val(d) - val(M.shift(d, -12))) if val(d) is not None and val(M.shift(d, -12)) is not None
+              else None for d in cal]
+        cols = C.columns([M.label(d) for d in cal], yo, highlight={i for i, d in enumerate(cal)
+                                                                     if M.iso(d) in rep})
+        out += section("f-series", "Ряд холдинга", "Получатели в организациях холдинга по месяцам, два года.",
+                       ln + "<h3>Изменение год к году</h3>" + cols + sql_box(res, ["series_focus"]))
+
+    def build(m):
+        c = fc.get(("yoy", m))
+        if not c:
+            return ""
+        rows = [[r["title"], fnum(r["v"], r["key"] not in ("base", "cur"))] for r in c["rows"]]
+        strong = {i for i, r in enumerate(c["rows"]) if r["key"] in ("base", "cur", "delta")}
+        subs = {i for i, r in enumerate(c["rows"]) if r.get("sub")}
+        d = c["d"]
+        cz = table(["Перестали получать: ситуация", "Получатели"],
+                   [[A.T[k], fnum(d[f"lost_{k}"])] for k in A.GONE] +
+                   [["  из них вернулись в следующем месяце", "" if _isnan(d["stopped_back"]) else fnum(d["stopped_back"])]])
+        st = fs.get(m, {})
+        out_ = (f"<h3>{esc(M.long(c['b']))} → {esc(M.long(c['c']))}</h3>"
+                + table(["", "Получатели"], rows, strong_rows=strong, sub_rows=subs, cls="decomp")
+                + cz + stop_yoy_table(st.get("yoy")))
+        t = fd.get(m)
+        if t is not None:
+            mp = M.shift(m, -1)
+            y1, y0 = M.parse(m).year, M.parse(m).year - 1
+            out_ += (f"<h3>Почему {esc(M.name(m))} к {esc(M.gen(mp))}: переход {esc(M.name(mp))}→{esc(M.name(m))} "
+                     f"{y1} против {y0}</h3>"
+                     + C.hbars([FOCUS_SHORT.get(k, k) for k in t["key"]], list(t["diff"]),
+                               tips=[f"{r.title}|{y1}: {fnum(r.cur, True)} · {y0}: {fnum(r.prev, True)}"
+                                     for r in t.itertuples()])
+                     + table(["Слагаемое", str(y1), str(y0), "Разница"],
+                             [[r.title, fnum(r.cur, True), fnum(r.prev, True), fnum(r.diff, True)]
+                              for r in t.itertuples()]
+                             + [["Итого", fnum(t["cur"].sum(), True), fnum(t["prev"].sum(), True),
+                                 fnum(t["diff"].sum(), True)]], strong_rows={len(t)}))
+            if st.get("did") is not None:
+                out_ += stop_block({"did": st["did"]}, mp, m, y1, y0)
+        return out_ + sql_box(res, [f"focus_flow_yoy_{m}", f"focus_flow_mom_{m}", f"stop_size_mom_{m}"])
+    out += section("f-decomp", "Разложение и почему месяц хуже",
+                   "Было − перестали получать ЗП в Сбере + начали ± переток вне холдинга ± внутри холдинга = стало. "
+                   "Разница месячных переходов этого года и прошлого — тем же разложением.", per_month(res, build))
+
+    def orgs(m):
+        o = res["orgs"].get(m, {}).get("focus")
+        if o is None or o.empty:
+            return "<p class='muted'>Нет организаций холдинга в базе сравнения.</p>"
+        rows, head = org_rows(o)
+        segs = o.groupby("seg")[["base_fl", "cur_fl", "real_cut", "out_stopped", "out_moved"]].sum()
+        segs = segs.reindex(S.ordered(segs.index))
+        sg = table(["Сегмент", "Было ФЛ", "Стало", "Реальное сокращение", "Перестали в Сбере", "Переток"],
+                   [[k, fnum(r.base_fl), fnum(r.cur_fl), fnum(r.real_cut), fnum(r.out_stopped), fnum(r.out_moved)]
+                    for k, r in segs.iterrows()])
+        return (f"<h3>{esc(M.long(M.shift(m, -12)))} → {esc(M.long(m))}: {fnum(len(o))} организаций</h3>{sg}"
+                + org_table(f"forg-{m}", head, rows) + sql_box(res, [f"org_focus_{m}"]))
+    out += section("f-orgs", "Организации холдинга",
+                   "Все организации холдинга в базе сравнения (год назад), без порогов списка. Метка «реальное "
+                   "сокращение» — организация прошла пороги общего списка. Колонки — как в общем списке.",
+                   per_month(res, orgs))
+
+    extra = ""
+    aug = res.get("aug_raw") or {}
+    hd = (res.get("hole_dims") or {}).get("holding", pd.DataFrame())
+    br = res.get("bridge")
+    if aug and br is not None and not br.empty:
+        ms = br.attrs["months"]
+        nm = {k: M.name(v) for k, v in ms.items()}
+        y1 = M.parse(ms["cur"]).year
+        fr = hd[hd["focus"].astype(bool)] if not hd.empty else hd
+        hl = aug.get("hole_cur")
+        hl = hl[hl["focus"].astype(bool)] if hl is not None and not hl.empty else pd.DataFrame()
+        extra += (f"<h3>Пропустили {esc(nm['cur'])} (были в {esc(M.prep(ms['prev']))}, вернулись в "
+                  f"{esc(M.prep(ms['next']))})</h3>")
+        if not fr.empty:
+            r = fr.iloc[0]
+            extra += (f"<p>{y1}: {fnum(r['n_orgs_cur'])} из {fnum(r['n_orgs_base_cur'])} организаций, «дыра» "
+                      f"{fnum(r['hole_cur'])} получателей; {y1 - 1}: {fnum(r['n_orgs_prev'])} из "
+                      f"{fnum(r['n_orgs_base_prev'])}, {fnum(r['hole_prev'])}.</p>")
+        if not hl.empty:
+            extra += table(["Организация", ORG_ID, "Сегмент", nm["prev"], nm["cur"], nm["next"], "Дыра"],
+                           [[r.org, int(r.inn), r.seg, fnum(r.n_prev), fnum(r.n_cur), fnum(r.n_next), fnum(r.hole)]
+                            for r in hl.itertuples()], num={3, 4, 5, 6})
+        else:
+            extra += "<p class='muted'>Организаций холдинга с провалом нет.</p>"
+    cf = (res.get("cohort_dims") or {}).get("focus")
+    if cf is not None and not cf.empty:
+        r = cf.iloc[0]
+        last = res["report"][-1]
+        extra += (f"<h3>Пришедшие в холдинг: кто получает ЗП в {esc(M.prep(last))}</h3>"
+                  + table(["", "Пришли", "Дожили", "Доля"],
+                          [[str(M.parse(last).year), fnum(r["size_cur"]), fnum(r["alive_cur"]), fpct(r["surv_cur"])],
+                           [str(M.parse(last).year - 1), fnum(r["size_prev"]), fnum(r["alive_prev"]),
+                            fpct(r["surv_prev"])]]))
+    pt = res.get("paytype") or {}
+
+    def pay(m):
+        d = pt.get(m)
+        if not d:
+            return ""
+        mp = M.shift(m, -1)
+        return (f"<h3>Аванс и зарплата: {esc(M.name(mp))} → {esc(M.name(m))}</h3>"
+                + paytype_tables(d["focus"], M.parse(m).year, M.parse(m).year - 1, mp, m))
+    out += section("f-more", "Пропуск месяца, пришедшие, виды выплат",
+                   "Те же проверки, что во всём банке, — только по организациям холдинга.",
+                   extra + per_month(res, pay))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -728,6 +1171,7 @@ CSS = """
  --series-5:#d55181;--series-6:#008300;--neutral:#6e6c66;
  --div-pos:#3987e5;--div-neg:#e66767;--div-mid:#383835;--pos:#3987e5;--neg:#e66767;--warn:#fab219;--good:#0ca30c}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{margin:0;background:var(--page);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 header{padding:24px max(16px,4vw) 8px}
 h1{font-size:22px;margin:0 0 4px}
@@ -740,7 +1184,11 @@ nav.bar{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:6px 14px
  padding:8px max(16px,4vw);background:var(--page);border-bottom:1px solid var(--grid)}
 nav.bar a{color:var(--ink2);text-decoration:none;font-size:13px}
 nav.bar a:hover{color:var(--ink)}
-.months{display:flex;gap:4px;margin-right:10px}
+.months,.tabs{display:flex;gap:4px;margin-right:10px}
+.tabs button{font:inherit;font-size:13px;font-weight:600;padding:3px 12px;border-radius:6px;border:1px solid var(--grid);
+ background:var(--surface);color:var(--ink);cursor:pointer}
+.tabs button[aria-pressed="true"]{background:var(--series-1);color:var(--on-strong);border-color:var(--series-1)}
+.anchors{display:flex;flex-wrap:wrap;gap:6px 14px}
 .months button{font:inherit;font-size:13px;padding:3px 10px;border-radius:6px;border:1px solid var(--grid);
  background:var(--surface);color:var(--ink);cursor:pointer}
 .months button[aria-pressed="true"]{background:var(--ink);color:var(--surface);border-color:var(--ink)}
@@ -814,7 +1262,7 @@ function show(el,x,y){var t=el.getAttribute('data-tip');if(!t)return;var p=t.spl
  if(p.length>1){var h=document.createElement('div');h.textContent=p[0];tip.insertBefore(h,b);
   for(var i=2;i<p.length;i++){var d=document.createElement('div');d.textContent=p[i];tip.appendChild(d);}}
  tip.hidden=false;var w=tip.offsetWidth,hh=tip.offsetHeight;
- tip.style.left=Math.min(x+14,window.innerWidth-w-8)+'px';tip.style.top=Math.max(8,y-hh-10)+'px';}
+ tip.style.left=Math.min(x+14,document.documentElement.clientWidth-w-8)+'px';tip.style.top=Math.max(8,y-hh-10)+'px';}
 document.addEventListener('pointermove',function(e){var el=e.target.closest&&e.target.closest('[data-tip]');
  if(el)show(el,e.clientX,e.clientY);else tip.hidden=true;});
 document.addEventListener('focusin',function(e){var el=e.target.closest&&e.target.closest('[data-tip]');
@@ -824,6 +1272,10 @@ var btns=document.querySelectorAll('.months button');
 function pick(m){btns.forEach(function(b){b.setAttribute('aria-pressed',b.dataset.month===m?'true':'false');});
  document.querySelectorAll('.pm').forEach(function(d){d.hidden=d.dataset.month!==m;});}
 btns.forEach(function(b){b.addEventListener('click',function(){pick(b.dataset.month);});});
+var tabs=document.querySelectorAll('.tabs button');
+function tab(t){tabs.forEach(function(b){b.setAttribute('aria-pressed',b.dataset.tab===t?'true':'false');});
+ document.querySelectorAll('[data-pane]').forEach(function(d){d.hidden=d.dataset.pane!==t;});}
+tabs.forEach(function(b){b.addEventListener('click',function(){tab(b.dataset.tab);window.scrollTo(0,0);});});
 document.querySelectorAll('.flt').forEach(function(f){var tb=document.getElementById(f.dataset.for);
  if(!tb)return;var rows=tb.querySelectorAll('tbody tr'),cnt=f.querySelector('.cnt');
  function apply(){var s=f.querySelector('[data-k=seg]').value,t=f.querySelector('[data-k=tb]').value,
@@ -841,20 +1293,32 @@ def render(res: dict) -> str:
     title = (f"Получатели ЗП по всему Сберу: {M.name(rep[0])}–{M.name(last)} {M.parse(last).year} "
              f"к {M.parse(last).year - 1}")
     nav = [("summary", "Итог"), ("august", "Перенос?"), ("series", "Ряд"), ("decomp", "Разложение"), ("did", "Почему хуже"),
-           ("cohorts", "Пришедшие"), ("multi", "Совместительство"), ("season", "Сезон"),
+           ("cohorts", "Пришедшие"), ("multi", "Совместительство"), ("season", "Сезон"), ("paytype", "Аванс/ЗП"),
            ("flows", "Перетоки"), ("tb", "Территория"), ("threshold", "Порог"),
            ("orgs", "Организации"), ("checks", "Проверки")]
+    fnav = [("f-summary", "Итог"), ("f-series", "Ряд"), ("f-decomp", "Разложение"), ("f-orgs", "Организации"),
+            ("f-more", "Пропуск, пришедшие, аванс")]
+    fh = res.get("focus_holding") or "Холдинг"
     buttons = "".join(f'<button type="button" data-month="{m}" aria-pressed="{"true" if m == last else "false"}">'
                       f'{esc(M.name(m))}</button>' for m in rep)
-    body = "".join([s_summary(res), s_august(res), s_series(res), s_decomp(res), s_did(res), s_cohorts(res), s_multi(res),
-                    s_season(res), s_flows(res), s_tb(res), s_threshold(res), s_orgs(res), s_checks(res)])
+    bank = "".join([s_summary(res), s_august(res), s_series(res), s_decomp(res), s_did(res), s_cohorts(res),
+                    s_multi(res), s_season(res), s_paytype(res), s_flows(res), s_tb(res), s_threshold(res),
+                    s_orgs(res), s_checks(res)])
+    body = (f"<div data-pane='bank'>{bank}</div>"
+            f"<div data-pane='focus' hidden>{s_focus(res)}</div>")
+    tabs = (f"<span class='tabs' role='group' aria-label='Вкладка'>"
+            f"<button type='button' data-tab='bank' aria-pressed='true'>Весь банк</button>"
+            f"<button type='button' data-tab='focus' aria-pressed='false'>{esc(fh)}</button></span>")
     page = (f"<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
             f"<title>{esc(title)}</title><style>{CSS}</style></head><body>"
             f"<header><h1>{esc(title)}</h1><div class='meta'>Сформирован {esc(res['generated'])} · "
             f"схема {esc(res['schema'])} · порог {fnum(res['amt_min'])} ₽ · кодов {len(res['codes'])}</div></header>"
-            f"<nav class='bar'><span class='months' role='group' aria-label='Месяц сравнения'>"
+            f"<nav class='bar'>{tabs}<span class='months' role='group' aria-label='Месяц сравнения'>"
             f"<span class='muted' style='font-size:13px;margin-right:4px'>Месяц:</span>{buttons}</span>"
+            f"<span class='anchors' data-pane='bank'>"
             + "".join(f"<a href='#{a}'>{esc(t)}</a>" for a, t in nav) +
-            f"</nav><main>{body}</main><div id='tip' hidden></div><script>{JS}</script></body></html>")
+            f"</span><span class='anchors' data-pane='focus' hidden>"
+            + "".join(f"<a href='#{a}'>{esc(t)}</a>" for a, t in fnav) +
+            f"</span></nav><main>{body}</main><div id='tip' hidden></div><script>{JS}</script></body></html>")
     return sanitize(page)

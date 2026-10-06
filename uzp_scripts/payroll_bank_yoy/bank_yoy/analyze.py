@@ -12,7 +12,7 @@
 Одно разложение на весь отчёт (по получателям, в скобках — по ФЛ):
 
     было − перестали получать ЗП в Сбере + начали получать ЗП в Сбере
-         ± совместительство (у продолжающих стало меньше/больше ИНН или ГОСБ) = стало
+         ± совместительство (у продолжающих стало меньше/больше организаций или ГОСБ) = стало
 
 По ФЛ третье слагаемое всегда ноль. Других разложений в отчёте нет.
 """
@@ -464,7 +464,7 @@ def multi_seg(ms: pd.DataFrame) -> pd.DataFrame:
 
 
 def multi_yoy(mb: pd.DataFrame, ms: pd.DataFrame, report: list) -> pd.DataFrame:
-    """Изменение «лишних» получателей год к году: банк и сегменты, ИНН и ГОСБ."""
+    """Изменение «лишних» получателей год к году: банк и сегменты, организации и ГОСБ."""
     rows = []
     for m in report:
         m, p = M.iso(m), M.iso(M.shift(m, -12))
@@ -649,6 +649,23 @@ def org_list(df: pd.DataFrame, tbd: pd.DataFrame) -> pd.DataFrame:
               "in_reorg", "real_cut"):
         x[c] = _num(x, c)
     x["real_share"] = x["real_cut"] / x["base_fl"]
+    return with_labels(x)
+
+
+def with_labels(x: pd.DataFrame) -> pd.DataFrame:
+    """Подписи организации и холдинга: название либо id орг (название с ФИО скрыто)."""
+    from . import names as N
+    if x is None or x.empty:
+        return x
+    if "inn" in x:
+        x["org"] = [N.org_label(n, i) for n, i in
+                    zip(x.get("org_name", pd.Series(index=x.index)), x["inn"])]
+    if "holding_name" in x or "holding_name_hidden" in x:
+        hid = x["holding_name_hidden"] if "holding_name_hidden" in x else pd.Series(False, index=x.index)
+        x["holding"] = [N.holding_label(n, bool(h)) for n, h in
+                        zip(x.get("holding_name", pd.Series(index=x.index)), hid)]
+    if "industry_name" in x:
+        x["industry"] = [v if isinstance(v, str) and v.strip() else NO_INDUSTRY for v in x["industry_name"]]
     return x
 
 
@@ -767,3 +784,392 @@ def hole_summary(df: pd.DataFrame) -> dict:
     if df is None or df.empty:
         return {"n_orgs": 0, "sum_hole": 0.0}
     return {"n_orgs": int(df["n_orgs"].iloc[0]), "sum_hole": float(df["sum_hole"].iloc[0])}
+
+
+# --------------------------------------------------------------------------- #
+# Отток B2C / B2B: сколько ФЛ перестали получать ЗП в Сбере из ОДНОЙ организации
+# --------------------------------------------------------------------------- #
+BUCKETS = ["1", "2", "3-9", "10-49", "50+"]
+B2C = ("1", "2")
+BUCKET_T = {"1": "1 ФЛ из организации", "2": "2 ФЛ", "3-9": "3–9 ФЛ", "10-49": "10–49 ФЛ",
+            "50+": "50 ФЛ и больше"}
+T_B2C = "Отток B2C: 1–2 ФЛ из организации"
+T_B2B = "Отток B2B: 3 ФЛ и больше из организации"
+
+
+def _stop_frame(df: pd.DataFrame, focus_only: bool = False) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    for c in ("n_orgs", "n_fl", "n_tr"):
+        x[c] = _num(x, c)
+    if focus_only:
+        x = x[x["focus"].astype(bool)]
+    return x
+
+
+def stop_buckets(df: pd.DataFrame, focus_only: bool = False) -> pd.DataFrame:
+    """Ступени по числу переставших из организации: организации, ФЛ, получатели."""
+    x = _stop_frame(df, focus_only)
+    if x.empty:
+        return pd.DataFrame(0.0, index=BUCKETS, columns=["n_orgs", "n_fl", "n_tr"])
+    return x.groupby("bucket")[["n_orgs", "n_fl", "n_tr"]].sum().reindex(BUCKETS, fill_value=0)
+
+
+def stop_did(cur: pd.DataFrame, prev: pd.DataFrame, focus_only: bool = False) -> pd.DataFrame:
+    """B2C и B2B (и ступени) — этот год против года назад. Знак получателей —
+    вклад в изменение (перестали — минус)."""
+    a, b = stop_buckets(cur, focus_only), stop_buckets(prev, focus_only)
+    rows = []
+    for key, title, idx in (("b2c", T_B2C, list(B2C)),
+                            ("b2b", T_B2B, [k for k in BUCKETS if k not in B2C])):
+        rows.append({"key": key, "title": title, "sub": False,
+                     **{f"{c}_{y}": float(d.loc[idx, c].sum()) for y, d in (("cur", a), ("prev", b))
+                        for c in ("n_orgs", "n_fl", "n_tr")}})
+        for k in idx:
+            rows.append({"key": k, "title": BUCKET_T[k], "sub": True,
+                         **{f"{c}_{y}": float(d.loc[k, c]) for y, d in (("cur", a), ("prev", b))
+                            for c in ("n_orgs", "n_fl", "n_tr")}})
+    out = pd.DataFrame(rows)
+    for y in ("cur", "prev"):
+        out[f"tr_{y}"] = -out[f"n_tr_{y}"]
+    out["diff"] = out["tr_cur"] - out["tr_prev"]
+    return out
+
+
+def stop_seg(cur: pd.DataFrame, prev: pd.DataFrame) -> pd.DataFrame:
+    """Сегмент × (B2C, B2B): разница вкладов этого года и года назад, получатели."""
+    out = {}
+    for y, df in (("cur", cur), ("prev", prev)):
+        x = _stop_frame(df)
+        if x.empty:
+            continue
+        x["cls"] = np.where(x["bucket"].isin(B2C), "b2c", "b2b")
+        out[y] = x.groupby(["seg", "cls"])["n_tr"].sum().unstack(fill_value=0)
+    if len(out) < 2:
+        return pd.DataFrame()
+    idx = S.ordered(set(out["cur"].index) | set(out["prev"].index))
+    cols = ["b2c", "b2b"]
+    a = out["cur"].reindex(index=idx, columns=cols, fill_value=0)
+    b = out["prev"].reindex(index=idx, columns=cols, fill_value=0)
+    d = -(a - b)
+    d["total"] = d.sum(axis=1)
+    return d
+
+
+# --------------------------------------------------------------------------- #
+# Выделенный холдинг: разложение получателей по t_tflow
+# --------------------------------------------------------------------------- #
+FOCUS_COLS = [("stopped", "Перестали получать ЗП в Сбере"), ("started", "Начали получать ЗП в Сбере"),
+              ("other_org", "Переток: в/из организаций вне холдинга"),
+              ("inside", "Внутри холдинга: сменили организацию или ГОСБ, число мест")]
+
+
+def focus_tot(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    x["report_dt"] = x["report_dt"].astype(str)
+    for c in ("n_triples", "n_pairs", "n_epk", "n_orgs"):
+        x[c] = _num(x, c)
+    return x.set_index("report_dt").sort_index()
+
+
+def focus_decomp(ff: pd.DataFrame, base: float, cur: float) -> dict:
+    """Было − перестали + начали ± переток вне холдинга ± внутри = стало."""
+    if ff is None:
+        ff = pd.DataFrame()
+    x = ff.copy()
+    if x.empty:
+        x = pd.DataFrame(columns=["side", "cause", "tenure", "in_cn1", "n_triples", "n_epk"])
+    x["n_triples"] = _num(x, "n_triples")
+    lo, ga = x[x["side"] == "lost"], x[x["side"] == "gained"]
+    d = {"base": float(base), "cur": float(cur),
+         "stopped": float(lo.loc[lo["cause"].isin(GONE), "n_triples"].sum()),
+         "started": float(ga.loc[ga["cause"].isin(COME), "n_triples"].sum()),
+         "other_out": float(lo.loc[lo["cause"] == "other_org", "n_triples"].sum()),
+         "other_in": float(ga.loc[ga["cause"] == "other_org", "n_triples"].sum()),
+         "inside_out": float(lo.loc[lo["cause"] == "inside", "n_triples"].sum()),
+         "inside_in": float(ga.loc[ga["cause"] == "inside", "n_triples"].sum())}
+    d["other_org"] = d["other_in"] - d["other_out"]
+    d["inside"] = d["inside_in"] - d["inside_out"]
+    d["delta"] = d["cur"] - d["base"]
+    d["residual"] = d["base"] - d["stopped"] + d["started"] + d["other_org"] + d["inside"] - d["cur"]
+    for c in GONE:
+        d[f"lost_{c}"] = float(lo.loc[lo["cause"] == c, "n_triples"].sum())
+    for c in COME:
+        d[f"gained_{c}"] = float(ga.loc[ga["cause"] == c, "n_triples"].sum())
+    st = lo[lo["cause"].isin(GONE)]
+    back = _flag(st["in_cn1"]) if "in_cn1" in st else pd.Series(dtype=float)
+    d["stopped_back"] = float(st.loc[back == 1, "n_triples"].sum()) if back.notna().any() else np.nan
+    ten = st["tenure"].fillna("unknown") if "tenure" in st else pd.Series(dtype=str)
+    for k in ("new1", "new2", "old", "unknown"):
+        d[f"stopped_{k}"] = float(st.loc[ten == k, "n_triples"].sum())
+    return d
+
+
+def focus_rows(d: dict, b, c) -> list[dict]:
+    if not d:
+        return []
+    return [
+        {"key": "base", "title": f"Получателей в {M.prep(b)} {M.parse(b).year}", "v": d["base"]},
+        {"key": "stopped", "title": T_LOST, "v": -d["stopped"]},
+        {"key": "started", "title": T_GAINED, "v": d["started"]},
+        {"key": "other_org", "title": FOCUS_COLS[2][1], "v": d["other_org"]},
+        {"key": "other_out", "title": "  ушли в организации вне холдинга", "v": -d["other_out"], "sub": True},
+        {"key": "other_in", "title": "  пришли из организаций вне холдинга", "v": d["other_in"], "sub": True},
+        {"key": "inside", "title": FOCUS_COLS[3][1], "v": d["inside"]},
+        {"key": "cur", "title": f"Получателей в {M.prep(c)} {M.parse(c).year}", "v": d["cur"]},
+        {"key": "delta", "title": "Изменение", "v": d["delta"]},
+    ]
+
+
+def focus_did(dc: dict, dp: dict) -> pd.DataFrame:
+    rows = [("stopped", T_LOST, -1), ("started", T_GAINED, 1), ("other_org", FOCUS_COLS[2][1], 1),
+            ("inside", FOCUS_COLS[3][1], 1)]
+    out = pd.DataFrame([{"key": k, "title": t, "cur": s * dc.get(k, 0), "prev": s * dp.get(k, 0)}
+                        for k, t, s in rows])
+    out["diff"] = out["cur"] - out["prev"]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Разрезы: подписи сегмента, холдинга, отрасли
+# --------------------------------------------------------------------------- #
+DIM_T = {"seg": "Сегмент", "holding": "Холдинг", "industry": "Отрасль"}
+NO_INDUSTRY = "Отрасль не указана"
+
+
+def dim_label(df: pd.DataFrame) -> pd.Series:
+    """Подпись строки разреза. Холдинг — уже под маской названий (с ФИО → скрыт)."""
+    from . import names as N
+    hid = df["holding_name_hidden"] if "holding_name_hidden" in df else pd.Series(False, index=df.index)
+    out = []
+    for dim, key, hn, h in zip(df["dim"], df.get("key", pd.Series(index=df.index)),
+                               df.get("holding_name", pd.Series(index=df.index)), hid):
+        if dim == "holding":
+            out.append(N.holding_label(hn, bool(h)))
+        elif dim == "industry":
+            out.append(key if isinstance(key, str) and key.strip() else NO_INDUSTRY)
+        else:
+            out.append(str(key))
+    return pd.Series(out, index=df.index)
+
+
+# --------------------------------------------------------------------------- #
+# Растворились пришедшие — где
+# --------------------------------------------------------------------------- #
+COHORT_ST = ["left_bank", "below_threshold", "other_codes"]
+
+
+def cohort_dims(cur: list, prev: list, min_size: int = 10) -> dict:
+    """Когорты этого года (сумма по месяцам прихода) против тех же месяцев год назад.
+    На разрез: пришли, дожили, доживаемость; «лишняя убыль» = пришли × (доживаемость
+    год назад − в этом году). Плюс — почему не дожили (по всем пришедшим)."""
+    def collect(frames):
+        x = pd.concat([f for f in frames if f is not None and not f.empty], ignore_index=True) \
+            if any(f is not None and not f.empty for f in frames) else pd.DataFrame()
+        if x.empty:
+            return x
+        x["n"] = _num(x, "n")
+        x["label"] = dim_label(x)
+        return x
+    a, b = collect(cur), collect(prev)
+    if a.empty or b.empty:
+        return {}
+    out = {}
+    for dim in ("seg", "holding", "industry", "focus"):
+        rows = {}
+        for y, x in (("cur", a), ("prev", b)):
+            z = x[x["dim"] == dim]
+            size = z.groupby("label")["n"].sum()
+            alive = z[z["st"] == "alive"].groupby("label")["n"].sum()
+            rows[f"size_{y}"], rows[f"alive_{y}"] = size, alive
+        t = pd.DataFrame(rows).fillna(0)
+        if t.empty:
+            out[dim] = t
+            continue
+        for y in ("cur", "prev"):
+            t[f"surv_{y}"] = t[f"alive_{y}"] / t[f"size_{y}"].where(t[f"size_{y}"] > 0)
+        ok = (t["size_prev"] >= min_size) & (t["size_cur"] >= min_size)
+        t["excess"] = np.where(ok, t["size_cur"] * (t["surv_prev"] - t["surv_cur"]), np.nan)
+        t = t.reset_index().rename(columns={"index": "label"})
+        if dim == "seg":
+            t = t.set_index("label").reindex(S.ordered(t["label"])).reset_index()
+        else:
+            t = t.sort_values("excess", ascending=False, na_position="last").reset_index(drop=True)
+        out[dim] = t
+    # Почему не дожили: распределение по ситуациям в отчётном месяце.
+    st = {}
+    for y, x in (("cur", a), ("prev", b)):
+        z = x[x["dim"] == "seg"]
+        st[y] = z.groupby("st")["n"].sum()
+    c = pd.DataFrame(st).reindex(["alive"] + COHORT_ST).fillna(0)
+    for y in ("cur", "prev"):
+        c[f"share_{y}"] = c[y] / c[y].sum() if c[y].sum() else np.nan
+    c["excess"] = c["cur"].sum() * (c["share_prev"] - c["share_cur"])
+    out["causes"] = c.reset_index().rename(columns={"index": "st"})
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Аванс и зарплата
+# --------------------------------------------------------------------------- #
+ADV_RE = r"аванс"
+SAL_RE = r"^\s*(заработн|зарплат)"
+
+
+def classify_codes(cn: pd.DataFrame, adv_re: str = ADV_RE, sal_re: str = SAL_RE) -> dict:
+    """Какие коды — аванс, какие — заработная плата: по названию кода."""
+    import re
+    adv, sal = [], []
+    names_ = {}
+    if cn is not None and not cn.empty:
+        for code, name in zip(cn["code"], cn["code_name"]):
+            s = "" if name is None or (isinstance(name, float) and pd.isna(name)) else str(name)
+            names_[int(code)] = s
+            if re.search(adv_re, s, re.IGNORECASE):
+                adv.append(int(code))
+            elif re.search(sal_re, s, re.IGNORECASE):
+                sal.append(int(code))
+    return {"adv": sorted(adv), "sal": sorted(sal), "names": names_}
+
+
+KIND_T = {"both": "аванс и зарплата", "sal": "только зарплата", "adv": "только аванс",
+          "other": "только другие зарплатные коды", "none": "нет зарплатных выплат от организации"}
+
+
+def _pt(df: pd.DataFrame, b) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    x["b_dt"] = x["b_dt"].astype(str)
+    x["n_pairs"] = _num(x, "n_pairs")
+    x["rec_c"] = _num(x, "rec_c")
+    return x[x["b_dt"] == M.iso(b)]
+
+
+def paytype_table(df: pd.DataFrame, m, focus_only: bool = False, seg: str | None = None) -> pd.DataFrame:
+    """Пары-получатели в m−1 с авансом И зарплатой: что стало в m. Этот год и год
+    назад; «сверх обычного» = было × (доля в этом году − доля год назад)."""
+    rows = []
+    res = {}
+    for y, c in (("cur", M.parse(m)), ("prev", M.shift(m, -12))):
+        x = _pt(df, M.shift(c, -1))
+        if x.empty:
+            return pd.DataFrame()
+        if focus_only:
+            x = x[x["focus"].astype(bool)]
+        if seg is not None:
+            x = x[x["seg"] == seg]
+        res[y] = x
+    for kb in ("both",):
+        base = {y: float(res[y].loc[res[y]["kind_b"] == kb, "n_pairs"].sum()) for y in res}
+        rows.append({"key": "base", "title": f"Было: {KIND_T[kb]}", "sub": False,
+                     "cur": base["cur"], "prev": base["prev"]})
+        for kc in ("both", "sal", "adv", "other", "none"):
+            v = {y: res[y][(res[y]["kind_b"] == kb) & (res[y]["kind_c"] == kc)] for y in res}
+            rows.append({"key": kc, "title": f"→ {KIND_T[kc]}", "sub": False,
+                         "cur": float(v["cur"]["n_pairs"].sum()), "prev": float(v["prev"]["n_pairs"].sum())})
+            if kc in ("sal", "adv"):
+                rows.append({"key": f"{kc}_below", "title": "из них стали ниже порога", "sub": True,
+                             "cur": float(v["cur"].loc[v["cur"]["rec_c"] == 0, "n_pairs"].sum()),
+                             "prev": float(v["prev"].loc[v["prev"]["rec_c"] == 0, "n_pairs"].sum())})
+    out = pd.DataFrame(rows)
+    bc, bp = out.loc[0, "cur"], out.loc[0, "prev"]
+    out["share_cur"] = out["cur"] / bc if bc else np.nan
+    out["share_prev"] = out["prev"] / bp if bp else np.nan
+    out["excess"] = bc * (out["share_cur"] - out["share_prev"])
+    out.loc[0, ["share_cur", "share_prev", "excess"]] = [1.0, 1.0, np.nan]
+    return out
+
+
+def paytype_mix(df: pd.DataFrame, m) -> pd.DataFrame:
+    """Состав пар-получателей месяца m−1 по видам выплат — этот год и год назад."""
+    rows = {}
+    for y, c in (("cur", M.parse(m)), ("prev", M.shift(m, -12))):
+        x = _pt(df, M.shift(c, -1))
+        if x.empty:
+            return pd.DataFrame()
+        rows[y] = x.groupby("kind_b")["n_pairs"].sum()
+    t = pd.DataFrame(rows).reindex(["both", "sal", "adv", "other"]).fillna(0)
+    for y in ("cur", "prev"):
+        t[f"share_{y}"] = t[y] / t[y].sum() if t[y].sum() else np.nan
+    t["title"] = [KIND_T[k] for k in t.index]
+    return t.reset_index().rename(columns={"index": "kind"})
+
+
+def paytype_seg(df: pd.DataFrame, m) -> pd.DataFrame:
+    """По сегментам: доля пар, потерявших один вид выплаты, этот год и год назад."""
+    out = []
+    x = _pt(df, M.shift(m, -1))
+    if x.empty:
+        return pd.DataFrame()
+    for s in S.ordered(set(x["seg"])):
+        t = paytype_table(df, m, seg=s)
+        if t.empty:
+            continue
+        g = t.set_index("key")
+        lost = g.loc[["sal", "adv"], ["cur", "prev"]].sum()
+        out.append({"seg": s, "base_cur": g.loc["base", "cur"], "base_prev": g.loc["base", "prev"],
+                    "lost_cur": lost["cur"], "lost_prev": lost["prev"]})
+    t = pd.DataFrame(out)
+    if t.empty:
+        return t
+    t["share_cur"] = t["lost_cur"] / t["base_cur"].where(t["base_cur"] > 0)
+    t["share_prev"] = t["lost_prev"] / t["base_prev"].where(t["base_prev"] > 0)
+    t["excess"] = t["base_cur"] * (t["share_cur"] - t["share_prev"])
+    return t
+
+
+# --------------------------------------------------------------------------- #
+# Организации: разрезы реального сокращения и пропустивших месяц
+# --------------------------------------------------------------------------- #
+def org_break(df: pd.DataFrame) -> dict:
+    if df is None or df.empty:
+        return {}
+    x = df.copy()
+    for c in ("n_orgs_all", "base_all", "cur_all", "n_orgs", "base_fl", "real_cut", "out_stopped",
+              "out_moved", "out_back", "in_new", "out_stopped_all"):
+        x[c] = _num(x, c)
+    x["label"] = dim_label(x)
+    x["share"] = x["real_cut"] / x["base_all"].where(x["base_all"] > 0)
+    out = {}
+    for dim in ("seg", "holding", "industry"):
+        z = x[x["dim"] == dim].copy()
+        if dim == "seg":
+            z = z.set_index("label").reindex(S.ordered(z["label"])).reset_index()
+        else:
+            z = z.sort_values("real_cut", ascending=False).reset_index(drop=True)
+        out[dim] = z
+    return out
+
+
+def hole_dims(cur: pd.DataFrame, prev: pd.DataFrame) -> dict:
+    if cur is None or cur.empty:
+        return {}
+    def prep(df):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["dim", "label", "n_orgs_base", "n_orgs", "hole"])
+        x = df.copy()
+        for c in ("n_orgs_base", "n_prev_all", "n_orgs", "hole"):
+            x[c] = _num(x, c)
+        x["label"] = dim_label(x)
+        return x
+    a, b = prep(cur), prep(prev)
+    out = {}
+    for dim in ("seg", "holding", "industry"):
+        za = a[a["dim"] == dim].groupby("label")[["n_orgs_base", "n_orgs", "hole"]].sum()
+        zb = b[b["dim"] == dim].groupby("label")[["n_orgs_base", "n_orgs", "hole"]].sum()
+        focus = set(a.loc[(a["dim"] == dim) & a["focus"].astype(bool), "label"]) if "focus" in a else set()
+        t = za.join(zb, lsuffix="_cur", rsuffix="_prev", how="left").fillna(0)
+        for y in ("cur", "prev"):
+            t[f"share_{y}"] = t[f"n_orgs_{y}"] / t[f"n_orgs_base_{y}"].where(t[f"n_orgs_base_{y}"] > 0)
+        t["focus"] = [lbl in focus for lbl in t.index]
+        t = t.reset_index()
+        if dim == "seg":
+            t = t.set_index("label").reindex(S.ordered(t["label"])).reset_index()
+        else:
+            t = t.sort_values("hole_cur", ascending=False).reset_index(drop=True)
+        out[dim] = t
+    return out

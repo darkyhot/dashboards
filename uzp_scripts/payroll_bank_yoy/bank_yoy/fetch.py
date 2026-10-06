@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from . import db, progress
+from . import db, names, progress
 from . import months as M
 from . import queries as Q
 
@@ -48,6 +48,9 @@ class Workspace:
         self.series_rows: list[pd.DataFrame] = []
         self.load = pd.DataFrame()
         self.codes = pd.DataFrame()
+        self.code_names = pd.DataFrame()
+        self.series_focus = pd.DataFrame()
+        self.paytype = pd.DataFrame()
 
     # -- построение -------------------------------------------------------- #
     def _create(self, name: str, body: str, params: dict | None = None) -> int:
@@ -95,12 +98,17 @@ class Workspace:
             n = (self._create("t_raw", Q.T_RAW_MONTH, p) if i == 0
                  else self._insert("t_raw", Q.T_RAW_MONTH, p))
             rows[m] = n
+            if self.code_names.empty and n > 0:
+                # Названия кодов — пока в копии один месяц: проход дешёвый.
+                self.code_names = self.opt("code_names", Q.CODE_NAMES)
             sec = (pd.Timestamp.now() - t0).total_seconds()
             kind = "все строки" if m in full else "зарплатные"
             progress.done(f"t_raw · {M.label(m)} ({kind}): {n:,} строк за {sec:.0f} с")
         self._analyze("t_raw")
         progress.done(f"t_raw: всего {sum(rows.values()):,} строк")
         return rows
+
+    pt_months: list = []          # месяцы c переходов «виды выплат» (b = c − 1)
 
     def build(self, hist: list, code_months: list) -> None:
         """Всё остальное — из t_raw: ряд по каждому месяцу ряда, тройки месяцев
@@ -125,13 +133,28 @@ class Workspace:
                           f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
         self.load = self.opt("load", Q.LOAD_FROM_STAGE)      # полнота — из t_stage
         t0 = pd.Timestamp.now()
+        self.series_focus = self.opt("series_focus", Q.SERIES_FOCUS)
+        # Виды выплат (аванс / зарплата) — из t_stage, пока она жива.
+        pt = sorted(({M.iso(x) for x in self.pt_months}
+                     | {M.iso(M.shift(x, -1)) for x in self.pt_months}) & set(self.months))
+        if pt:
+            t0 = pd.Timestamp.now()
+            try:
+                n = self._create("t_ptype", Q.T_PTYPE, {"pt_months": pt})
+                self._analyze("t_ptype")
+                progress.done(f"t_ptype (виды выплат): {n:,} строк за "
+                              f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
+            except Exception as ex:                            # noqa: BLE001
+                progress.warn(f"t_ptype не построена ({type(ex).__name__}: {str(ex)[:160]}) — "
+                              f"раздел «аванс и зарплата» будет пропущен")
+                db.rollback(self.conn)
         n = self._create("t_pairs", Q.PAIRS_FROM_STAGE, {"months": self.months})
         self._drop_one("t_stage")
         self._analyze("t_pairs")
         progress.done(f"t_pairs (получатели набора): {n:,} строк за "
                       f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
         for name, body in (("t_epk", Q.T_EPK), ("t_epk_seg", Q.T_EPK_SEG),
-                           ("t_keys", Q.T_KEYS)):
+                           ("t_epk_foc", Q.T_EPK_FOC), ("t_keys", Q.T_KEYS)):
             n = self._create(name, body)
             self._analyze(name)
             progress.done(f"{name}: {n:,} строк")
@@ -143,6 +166,11 @@ class Workspace:
         self.codes = self.opt("code_months", Q.CODE_MONTH,
                               {"code_months": [M.iso(x) for x in code_months]})
         progress.done(f"зарплатные коды: {(pd.Timestamp.now() - t0).total_seconds():.0f} с")
+        if "t_ptype" in self.built:
+            pb = [M.iso(M.shift(x, -1)) for x in self.pt_months
+                  if M.iso(M.shift(x, -1)) in set(self.months)]
+            self.paytype = self.opt("paytype", Q.PAYTYPE, {"pt_b": pb})
+            self._drop_one("t_ptype")
         progress.done("рабочий набор готов")
 
     def _drop_one(self, name: str) -> None:
@@ -184,7 +212,8 @@ class Workspace:
         t0 = pd.Timestamp.now()
         df = db.read_sql(self.conn, sql, args)
         self.timing[name] = self.timing.get(name, 0) + (pd.Timestamp.now() - t0).total_seconds()
-        return guard_rows(df, name, limit)
+        # Названия с ФИО отсекаются здесь — у КАЖДОЙ выборки, до любых расчётов.
+        return names.mask_frame(guard_rows(df, name, limit))
 
     def opt(self, name: str, sql: str, params: dict | None = None) -> pd.DataFrame:
         """Необязательная выборка: не читается — раздел отключается, прогон идёт.
@@ -234,6 +263,21 @@ def triple_flow(ws: Workspace, b, c, tag: str) -> pd.DataFrame:
     return ws.sql(f"triple_flow_{tag}", Q.TRIPLE_FLOW, p)
 
 
+def stop_size(ws: Workspace, b, c, tag: str) -> pd.DataFrame:
+    """Отток B2C/B2B — по t_tflow, построенной `triple_flow` того же перехода."""
+    return ws.opt(f"stop_size_{tag}", Q.STOP_SIZE, flow_params(ws, b, c))
+
+
+def focus_flow(ws: Workspace, b, c, tag: str) -> pd.DataFrame:
+    """Разложение выделенного холдинга — по той же t_tflow."""
+    return ws.opt(f"focus_flow_{tag}", Q.FOCUS_FLOW, flow_params(ws, b, c))
+
+
+def cohort_dim(ws: Workspace, k, kp, t, tag: str) -> pd.DataFrame:
+    return ws.opt(f"cohort_dim_{tag}", Q.COHORT_DIM,
+                  {"k": M.iso(k), "kp": M.iso(kp), "t": M.iso(t)})
+
+
 def cohort(ws: Workspace, k, kp, tag: str) -> pd.DataFrame:
     return ws.opt(f"cohort_{tag}", Q.COHORT, {"k": M.iso(k), "kp": M.iso(kp)})
 
@@ -250,7 +294,8 @@ def org_params(b, c, o: dict) -> dict:
             "reorg_min_movers": int(o["reorg_min_movers"]),
             "reorg_min_share": float(o["reorg_min_share"]),
             "min_base": int(o["min_base"]), "min_real": int(o["min_real"]),
-            "min_share": float(o["min_share"]), "max_rows": int(o["max_rows"])}
+            "min_share": float(o["min_share"]), "max_rows": int(o["max_rows"]),
+            "break_max": int(o.get("break_max", 40))}
 
 
 def orgs(ws: Workspace, b, c, o: dict, tag: str) -> dict[str, pd.DataFrame]:
@@ -265,19 +310,23 @@ def orgs(ws: Workspace, b, c, o: dict, tag: str) -> dict[str, pd.DataFrame]:
         progress.warn(f"набор ушедших/пришедших по организациям не построен "
                       f"({type(ex).__name__}: {str(ex)[:160]}) — список пропущен")
         db.rollback(ws.conn)
-        return {"list": pd.DataFrame(), "summary": pd.DataFrame(), "reorg": pd.DataFrame()}
+        return {k: pd.DataFrame() for k in ("list", "summary", "reorg", "break", "focus")}
     return {"list": ws.opt(f"org_list_{tag}", Q.ORG_LIST, p),
             "summary": ws.opt(f"org_summary_{tag}", Q.ORG_SUMMARY, p),
-            "reorg": ws.opt(f"org_reorg_{tag}", Q.ORG_REORG, p)}
+            "reorg": ws.opt(f"org_reorg_{tag}", Q.ORG_REORG, p),
+            "break": ws.opt(f"org_break_{tag}", Q.ORG_BREAK, p),
+            "focus": ws.opt(f"org_focus_{tag}", Q.ORG_FOCUS, p)}
 
 
-def august(ws: Workspace, m, hole_min_base: int, max_rows: int) -> dict:
+def august(ws: Workspace, m, hole_min_base: int, max_rows: int, break_max: int = 40) -> dict:
     """Перенос или потеря в месяце m: организации с провалом и подпись переноса,
     для этого года и года назад."""
     out = {}
     for tag, mm in (("cur", M.parse(m)), ("prev", M.shift(m, -12))):
         p = {"m_prev": M.iso(M.shift(mm, -1)), "m": M.iso(mm), "m_next": M.iso(M.shift(mm, 1)),
-             "hole_min_base": int(hole_min_base), "max_rows": int(max_rows)}
+             "hole_min_base": int(hole_min_base), "max_rows": int(max_rows),
+             "break_max": int(break_max)}
         out[f"hole_{tag}"] = ws.opt(f"org_hole_{M.iso(mm)}", Q.ORG_HOLE, p)
+        out[f"hole_dim_{tag}"] = ws.opt(f"org_hole_dim_{M.iso(mm)}", Q.ORG_HOLE_DIM, p)
         out[f"pay_{tag}"] = ws.opt(f"return_pay_{M.iso(mm)}", Q.RETURN_PAY, p)
     return out

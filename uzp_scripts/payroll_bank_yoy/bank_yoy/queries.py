@@ -10,8 +10,8 @@
    `report_dt` в WHERE читает всю историю всего банка — на проме это «никогда».
    Каждое обращение к витрине ниже ограничено ОДНИМ месяцем (`= CAST(:m AS date)`),
    и это проверяет самопроверка `check_partition_filter`.
-2. **Тип ИНН.** В ведомостях `inn` — text длиной 1–12, в справочнике ЕПК — bigint.
-   `CAST` на значении «ИНН123» роняет ВЕСЬ запрос, поэтому приведение — только под
+2. **Тип номера организации.** В ведомостях `inn` — text длиной 1–12, в справочнике ЕПК — bigint.
+   `CAST` на значении «ID123» роняет ВЕСЬ запрос, поэтому приведение — только под
    маской `INN_OK`, а в условии соединения — внутри `CASE`.
 3. **Диалект 9.4.** Никаких `make_interval(months => n)`, `ON CONFLICT`, `GROUPING
    SETS`. Предыдущий месяц передаётся параметром, а не вычисляется в SQL.
@@ -22,9 +22,9 @@
 
 Грейн и порог
 -------------
-Получатель — ТРОЙКА (epk_id, ИНН, ГОСБ). Засчитывается, если сумма по зарплатным
-кодам за месяц В ИНН (не в тройке!) больше порога. Порог и ключ счёта живут на
-разных грейнах, поэтому сумма по ИНН — оконная функция поверх группировки по
+Получатель — ТРОЙКА (epk_id, inn, ГОСБ). Засчитывается, если сумма по зарплатным
+кодам за месяц В id орг (не в тройке!) больше порога. Порог и ключ счёта живут на
+разных грейнах, поэтому сумма по id орг — оконная функция поверх группировки по
 тройке: HAVING умеет фильтровать только свою группу.
 """
 from __future__ import annotations
@@ -73,7 +73,7 @@ DROP_PROBE_TEMP = "DROP TABLE IF EXISTS t_probe_tmp"
 # нужные месяцы (ряд, месяцы набора, месяц после отчётного) — одна временная
 # таблица, заполняется оператором на партицию (каждый — в statement_timeout).
 # Всё остальное — полнота, ряд, коды, тройки, присутствие ФЛ — считается из неё.
-# Название кода берётся только у зарплатных кодов: длинный текст по каждой
+# Название кода берётся только у зарплатных кодов: объёмный текст по каждой
 # строке всего банка таблица не тащит.
 #
 # Незарплатные строки (пенсии, пособия) нужны только месяцам рабочего набора — по
@@ -95,27 +95,32 @@ WHERE p.report_dt = CAST(:m AS date)
   AND (CAST(:all_rows AS boolean) OR p.{code_col} = ANY(:codes))
 """
 
-# Организации справочника ЕПК, свёрнутые до ИНН. Свёртка обязательна: у одного ИНН
+# Организации справочника ЕПК, свёрнутые до id орг. Свёртка обязательна: у одного id орг
 # бывает несколько ЕПК, и соединение строкой справочника задвоило бы ВЕДОМОСТИ.
 # Ликвидация — «нет НИ ОДНОЙ активной записи», одна мёртвая строка при живой
 # соседней ничего не значит. Сегмент при нескольких записях — min() по короткому
 # имени: детерминированно, и расхождение печатается разведкой.
 #
-# НАЗВАНИЯ организаций и холдингов из справочника НЕ берутся вовсе: у ИП в
-# названии — фамилия, имя и отчество человека. Организация везде показывается
-# только номером; названия не покидают БД.
+# Названия организаций и холдингов берутся, но колонки называются ТОЛЬКО
+# `org_name` / `holding_name`: каждая выборка проходит маску `names.mask_frame`,
+# и название с ФИО (у ИП, главы КФХ — фамилия, имя и отчество человека) дальше
+# выборки не уходит — вместо него показывается id орг.
+# `focus` — организация выделенного холдинга (отдельная вкладка отчёта).
 T_ORG = """
 SELECT e.inn,
        min(""" + S.seg_case("e.segment_name") + """)            AS seg,
        count(DISTINCT """ + S.seg_case("e.segment_name") + """) AS n_seg,
+       min(e.company_name)                                       AS org_name,
+       min(NULLIF(btrim(e.holding_name), ''))                    AS holding_name,
        min(e.industry_name)                                      AS industry_name,
+       bool_or(COALESCE(btrim(e.holding_name), '') = :focus_holding) AS focus,
        NOT bool_or(COALESCE(e.status_name, '') = 'Активна')      AS is_liquidated
 FROM {schema}.uzp_data_epk_consolidation e
 WHERE e.inn IS NOT NULL
 GROUP BY e.inn
 """
 
-# ВСЕ зарплатные тройки ВСЕХ месяцев копии с суммой по ИНН — без порога, ОДНИМ
+# ВСЕ зарплатные тройки ВСЕХ месяцев копии с суммой по id орг — без порога, ОДНИМ
 # проходом по t_raw. Из неё — и ряд по сегментам при всех порогах (`SERIES_ALL`),
 # и тройки-получатели месяцев набора (`t_pairs`).
 #
@@ -127,12 +132,18 @@ GROUP BY e.inn
 # Именно ОДНИМ запросом, а не циклом по месяцам: у временной таблицы нет партиций,
 # и фильтр `report_dt = :m` по t_raw читает её ЦЕЛИКОМ — цикл по 26 месяцам был
 # 26 полными проходами по копии всего банка, и копия ничего не ускоряла.
-# Сегмент денормализуется сразу: дальше он нужен в каждом запросе. ИНН вне
-# справочника НЕ отбрасывается: банк — это все получатели, такие ИНН идут
+# Сегмент денормализуется сразу: дальше он нужен в каждом запросе. id орг вне
+# справочника НЕ отбрасывается: банк — это все получатели, такие id орг идут
 # строкой «Не в справочнике».
+#
+# Виды выплат (`has_adv` — аванс, `has_sal` — заработная плата) — по номерам
+# кодов, которые классифицированы по названиям ОДИН раз (`CODE_NAMES`): сравнение
+# чисел дешевле регулярки по каждой строке банка.
 T_STAGE = """
 SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.tb_id, x.amt, x.amt_inn, x.n_rows,
-       COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg
+       x.has_adv, x.has_sal,
+       COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg,
+       COALESCE(o.focus, false)           AS focus
 FROM (
   SELECT r.report_dt,
          r.epk_id,
@@ -141,6 +152,8 @@ FROM (
          min(r.sys_tb_id)                   AS tb_id,
          sum(r.amt)                         AS amt,
          count(*)                           AS n_rows,
+         bool_or(r.code = ANY(:adv_codes))  AS has_adv,
+         bool_or(r.code = ANY(:sal_codes))  AS has_sal,
          sum(sum(r.amt)) OVER (PARTITION BY r.report_dt, r.epk_id, """ + _INN_R + """) AS amt_inn
   FROM t_raw r
   WHERE r.code = ANY(:codes)
@@ -149,9 +162,9 @@ FROM (
 LEFT JOIN t_org o ON o.inn = x.inn
 """
 
-# Получатели: тройки месяцев набора выше порога по ИНН — одним запросом.
+# Получатели: тройки месяцев набора выше порога по id орг — одним запросом.
 PAIRS_FROM_STAGE = """
-SELECT report_dt, epk_id, inn, gosb_id, tb_id, amt, amt_inn, seg
+SELECT report_dt, epk_id, inn, gosb_id, tb_id, amt, amt_inn, seg, focus, has_adv, has_sal
 FROM t_stage
 WHERE amt_inn > :amt_min
   AND """ + VALID + """
@@ -163,8 +176,8 @@ T_PAIRS = ("SELECT s.* FROM (" + T_STAGE + ") s\n"
            "WHERE s.amt_inn > :amt_min AND s.epk_id IS NOT NULL AND s.inn IS NOT NULL\n"
            "  AND s.report_dt = ANY(CAST(:months AS date[]))\n")
 
-# ФЛ-месяц поверх троек: сколько ИНН и троек у человека и его ОСНОВНОЙ сегмент —
-# сегмент ИНН с наибольшей суммой. Основной сегмент один на человека, поэтому
+# ФЛ-месяц поверх троек: сколько id орг и троек у человека и его ОСНОВНОЙ сегмент —
+# сегмент id орг с наибольшей суммой. Основной сегмент один на человека, поэтому
 # численность ФЛ по сегментам складывается в банк, а матрица перетоков замкнута.
 # count(DISTINCT) здесь нет нигде: на Greenplum уникальный подсчёт по таблице
 # всего банка — самая дорогая операция, она уже снимала прогон по таймауту.
@@ -172,7 +185,7 @@ T_PAIRS = ("SELECT s.* FROM (" + T_STAGE + ") s\n"
 # потом count(*).
 T_EPK = """
 SELECT a.report_dt, a.epk_id, a.n_inn, a.n_triples,
-       m.seg AS main_seg, m.tb_id AS main_tb
+       m.seg AS main_seg, m.tb_id AS main_tb, m.inn AS main_inn
 FROM (
   SELECT report_dt, epk_id, count(*) AS n_inn, sum(n_tr) AS n_triples
   FROM (SELECT report_dt, epk_id, inn, count(*) AS n_tr
@@ -180,7 +193,7 @@ FROM (
   GROUP BY report_dt, epk_id
 ) a
 JOIN (
-  SELECT report_dt, epk_id, seg, tb_id,
+  SELECT report_dt, epk_id, seg, tb_id, inn,
          row_number() OVER (PARTITION BY report_dt, epk_id
                             ORDER BY amt_inn DESC, inn, gosb_id) AS rn
   FROM t_pairs
@@ -193,6 +206,11 @@ T_EPK_SEG = """
 SELECT DISTINCT report_dt, epk_id, seg FROM t_pairs
 """
 
+# ФЛ-месяц выделенного холдинга: получает ли ФЛ в его организациях. Маленькая.
+T_EPK_FOC = """
+SELECT DISTINCT report_dt, epk_id FROM t_pairs WHERE focus
+"""
+
 # Все ФЛ, бывшие получателями хоть в одном месяце набора. Только про них разбор
 # и спрашивает; витрина за месяц — это клиенты всего банка, включая пенсионеров.
 T_KEYS = """
@@ -203,7 +221,7 @@ SELECT DISTINCT epk_id FROM t_epk
 # запросом (тот же довод, что у t_stage: цикл по месяцам = полный проход на месяц). Без него
 # не отличить «нет зачислений в банке» от «зарплата ниже порога» и «только
 # незарплатные выплаты» — три разных диагноза.
-# Зарплатная сумма берётся только по пригодным ИНН: зарплата на ИНН, который не
+# Зарплатная сумма берётся только по пригодным id орг: зарплата на id орг, который не
 # сопоставить, получателя не делает (это видно в полноте загрузки).
 T_PERSON = """
 SELECT r.report_dt,
@@ -226,14 +244,15 @@ ANALYZE_TMP = "ANALYZE {name}"
 DROP_TMP = "DROP TABLE IF EXISTS {name}"
 
 # Порядок значим: каждая следующая таблица читает предыдущие.
-WORKSET_ORDER = ["t_org", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_keys", "t_person"]
+WORKSET_ORDER = ["t_org", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc", "t_keys", "t_person"]
 # Порядок для ПОКАЗА: плюс временные таблицы отдельных шагов (t_tflow).
-SHOW_ORDER = ["t_org", "t_raw", "t_stage", "t_pairs", "t_epk", "t_epk_seg", "t_keys",
-              "t_person", "t_tflow", "t_oflow", "t_mv", "t_succ", "t_orgsel"]
+SHOW_ORDER = ["t_org", "t_raw", "t_stage", "t_ptype", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc",
+              "t_keys", "t_person", "t_tflow", "t_oflow", "t_mv", "t_succ", "t_orgsel"]
 DIST = {"t_org": "inn", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id",
         "t_epk_seg": "epk_id", "t_keys": "epk_id", "t_person": "epk_id",
         "t_tflow": "epk_id", "t_oflow": "epk_id", "t_stage": "epk_id",
-        "t_mv": "epk_id", "t_succ": "inn_from", "t_orgsel": "inn"}
+        "t_mv": "epk_id", "t_succ": "inn_from", "t_orgsel": "inn",
+        "t_epk_foc": "epk_id", "t_ptype": "epk_id"}
 
 # Определения для ПОКАЗА читателю: запрос у блока должен выполняться как есть, а
 # `FROM t_pairs` выполнить негде — таблица жила в чужой сессии. Поэтому к
@@ -246,6 +265,7 @@ SHOW_DEFS = {
     "t_pairs": T_PAIRS,
     "t_epk": T_EPK,
     "t_epk_seg": T_EPK_SEG,
+    "t_epk_foc": T_EPK_FOC,
     "t_keys": T_KEYS,
     "t_person": T_PERSON,
 }
@@ -297,6 +317,57 @@ SELECT report_dt,
        sum(n_rows) FILTER (WHERE epk_id IS NULL)       AS n_no_epk
 FROM t_stage
 GROUP BY report_dt
+"""
+
+# Ряд выделенного холдинга — отдельным оператором (свой таймаут), из t_stage.
+SERIES_FOCUS = """
+SELECT report_dt, sum(n_tr) AS n_triples, count(*) FILTER (WHERE n_tr > 0) AS n_epk
+FROM (SELECT report_dt, epk_id, count(*) FILTER (WHERE amt_inn > :amt_min) AS n_tr
+      FROM t_stage WHERE """ + VALID + """ AND focus
+      GROUP BY report_dt, epk_id) e
+GROUP BY report_dt
+"""
+
+# Названия зарплатных кодов — по ПЕРВОМУ скопированному месяцу (одна партиция
+# в копии, проход дешёвый). Из них в Python — какие коды аванс, какие зарплата.
+CODE_NAMES = """
+SELECT code, min(code_name) AS code_name, count(*) AS n_rows
+FROM t_raw
+WHERE code = ANY(:codes)
+GROUP BY code
+"""
+
+# Виды выплат пары ФЛ × организация в месяцах переходов: был ли аванс, была ли
+# зарплата. Временной таблицей из t_stage (в t_pairs нет тех, кто ниже порога, а
+# «потерял аванс и упал ниже порога» — ровно тот случай, который ищем).
+T_PTYPE = """
+SELECT report_dt, epk_id, inn, min(seg) AS seg, bool_or(focus) AS focus,
+       bool_or(has_adv) AS has_adv, bool_or(has_sal) AS has_sal, max(amt_inn) AS amt_inn,
+       CAST(date_trunc('month', report_dt) + interval '2 month' - interval '1 day' AS date) AS dt_next
+FROM t_stage
+WHERE """ + VALID + """ AND report_dt = ANY(CAST(:pt_months AS date[]))
+GROUP BY report_dt, epk_id, inn
+"""
+
+
+def _kind(a: str) -> str:
+    return (f"CASE WHEN {a}.has_adv AND {a}.has_sal THEN 'both' WHEN {a}.has_sal THEN 'sal' "
+            f"WHEN {a}.has_adv THEN 'adv' ELSE 'other' END")
+
+
+# Пара — получатель в месяце b: какие виды выплат были в b и что стало в
+# следующем месяце (оба / только один / нет выплат от этой организации) и
+# осталась ли пара получателем.
+PAYTYPE = """
+SELECT b.report_dt AS b_dt, b.seg, b.focus,
+       """ + _kind("b") + """ AS kind_b,
+       CASE WHEN c.epk_id IS NULL THEN 'none' ELSE """ + _kind("c") + """ END AS kind_c,
+       CASE WHEN c.amt_inn > :amt_min THEN 1 ELSE 0 END AS rec_c,
+       count(*) AS n_pairs
+FROM t_ptype b
+LEFT JOIN t_ptype c ON c.epk_id = b.epk_id AND c.inn = b.inn AND c.report_dt = b.dt_next
+WHERE b.amt_inn > :amt_min AND b.report_dt = ANY(CAST(:pt_b AS date[]))
+GROUP BY 1, 2, 3, 4, 5, 6
 """
 
 # Зарплатные коды по месяцам и сегментам: КАКОЙ вид выплаты просел (отпускные,
@@ -370,7 +441,7 @@ def _flag(alias: str, has: str) -> str:
 #   * матрица перетоков между сегментами (замкнута: сумма строк = было, столбцов = стало);
 #   * разложение по ФЛ: перестали / начали / продолжают;
 #   * совместительство: Σ(троек в c − троек в b) у продолжающих = третья строка
-#     разложения по получателям, а та же разность по ИНН и ГОСБ делит его на
+#     разложения по получателям, а та же разность по организациям и ГОСБ делит его на
 #     «меньше организаций» и «меньше ГОСБ в одной организации».
 FL_FLOW = """
 WITH b AS (SELECT * FROM t_epk WHERE report_dt = CAST(:b AS date)),
@@ -415,13 +486,13 @@ GROUP BY 1, 2, 3, 4, 5, 6
 # соединениям. На синтетике это 370 секунд вместо одной; на объёме банка — никогда.
 # С материализованным набором и ANALYZE оценка честная.
 T_TFLOW = """
-SELECT 'lost' AS side, b.seg, b.epk_id
+SELECT 'lost' AS side, b.seg, b.epk_id, b.inn, b.focus
 FROM (SELECT * FROM t_pairs WHERE report_dt = CAST(:b AS date)) b
 LEFT JOIN (SELECT * FROM t_pairs WHERE report_dt = CAST(:c AS date)) c
        ON c.epk_id = b.epk_id AND c.inn = b.inn AND c.gosb_id = b.gosb_id
 WHERE c.epk_id IS NULL
 UNION ALL
-SELECT 'gained', c.seg, c.epk_id
+SELECT 'gained', c.seg, c.epk_id, c.inn, c.focus
 FROM (SELECT * FROM t_pairs WHERE report_dt = CAST(:c AS date)) c
 LEFT JOIN (SELECT * FROM t_pairs WHERE report_dt = CAST(:b AS date)) b
        ON b.epk_id = c.epk_id AND b.inn = c.inn AND b.gosb_id = c.gosb_id
@@ -429,7 +500,7 @@ WHERE b.epk_id IS NULL
 """
 
 # Шаг 2 — ситуация каждой тройки, ровно одна:
-#   inside      — ФЛ в другом месяце получает в ЭТОМ ЖЕ сегменте (сменил ИНН/ГОСБ
+#   inside      — ФЛ в другом месяце получает в ЭТОМ ЖЕ сегменте (сменил организацию/ГОСБ
 #                 или стал получать в меньшем/большем числе мест);
 #   other_seg   — ФЛ получает в банке, но только в ДРУГИХ сегментах;
 #   left_bank / below_threshold / other_codes (и зеркальные для появившихся) —
@@ -463,13 +534,85 @@ GROUP BY 1, 2, 3, 4, 5, 6
 GROUP BY side, seg, cause, tenure, in_cn1
 """
 
+# Отток B2C и B2B: переставшие получать ЗП в Сбере, по организации, из которой
+# ушли. Сколько ФЛ перестали получать из ОДНОЙ организации за переход: 1–2 —
+# отток B2C (люди уходят поодиночке), 3 и больше — B2B (уходит организация или
+# её часть). Ступени внутри B2B — для формы распределения.
+# Грейн — ФЛ × организация: совместитель, переставший получать в двух
+# организациях, считается в обеих. Получатели (тройки) складываются точно в
+# «перестали получать» разложения — это проверяется.
+STOP_SIZE = """
+WITH s AS (
+  SELECT f.inn, f.epk_id, min(f.seg) AS seg, bool_or(f.focus) AS focus, count(*) AS n_tr
+  FROM t_tflow f
+  LEFT JOIN t_epk oe ON oe.epk_id = f.epk_id AND oe.report_dt = CAST(:c AS date)
+  WHERE f.side = 'lost' AND oe.epk_id IS NULL
+  GROUP BY f.inn, f.epk_id
+),
+o AS (
+  SELECT inn, min(seg) AS seg, bool_or(focus) AS focus, count(*) AS n_fl, sum(n_tr) AS n_tr
+  FROM s GROUP BY inn
+)
+SELECT seg, focus,
+       CASE WHEN n_fl = 1 THEN '1' WHEN n_fl = 2 THEN '2' WHEN n_fl < 10 THEN '3-9'
+            WHEN n_fl < 50 THEN '10-49' ELSE '50+' END AS bucket,
+       count(*) AS n_orgs, sum(n_fl) AS n_fl, sum(n_tr) AS n_tr
+FROM o
+GROUP BY 1, 2, 3
+"""
+
+# Выделенный холдинг: то же разложение по получателям, где «свой сегмент» —
+# организации холдинга. Ситуация исчезнувшей/появившейся тройки холдинга:
+#   inside    — ФЛ в другом месяце получает в организациях холдинга;
+#   other_org — получает в банке, но вне холдинга (переток);
+#   left_bank / below_threshold / other_codes (и зеркальные) — нигде не получатель.
+FOCUS_FLOW = """
+SELECT side, cause, tenure, in_cn1, sum(n) AS n_triples, count(*) AS n_epk
+FROM (
+SELECT f.side,
+       CASE WHEN fo.epk_id IS NOT NULL THEN 'inside'
+            WHEN oe.epk_id IS NOT NULL THEN 'other_org'
+            WHEN f.side = 'lost' THEN """ + _gone_case("ps") + """
+            ELSE """ + _come_case("ps") + """ END AS cause,
+       CASE WHEN f.side = 'lost' THEN """ + _tenure("e1", "e2") + """ END AS tenure,
+       """ + _flag("n1", "has_cn1") + """ AS in_cn1,
+       f.epk_id, count(*) AS n
+FROM t_tflow f
+LEFT JOIN t_epk_foc fo ON fo.epk_id = f.epk_id
+     AND fo.report_dt = CASE WHEN f.side = 'lost' THEN CAST(:c AS date) ELSE CAST(:b AS date) END
+LEFT JOIN t_epk oe ON oe.epk_id = f.epk_id
+     AND oe.report_dt = CASE WHEN f.side = 'lost' THEN CAST(:c AS date) ELSE CAST(:b AS date) END
+LEFT JOIN t_person ps ON ps.epk_id = f.epk_id
+     AND ps.report_dt = CASE WHEN f.side = 'lost' THEN CAST(:c AS date) ELSE CAST(:b AS date) END
+LEFT JOIN t_epk e1 ON e1.report_dt = CAST(:bp1 AS date) AND e1.epk_id = f.epk_id
+LEFT JOIN t_epk e2 ON e2.report_dt = CAST(:bp2 AS date) AND e2.epk_id = f.epk_id
+LEFT JOIN t_epk n1 ON n1.report_dt = CAST(:cn1 AS date) AND n1.epk_id = f.epk_id
+WHERE f.focus
+GROUP BY 1, 2, 3, 4, 5
+) x
+GROUP BY side, cause, tenure, in_cn1
+"""
+
+# Итоги холдинга по месяцам набора: получатели, пары ФЛ × организация, ФЛ, организации.
+FOCUS_TOT = """
+WITH x AS (
+  SELECT report_dt, epk_id, inn, count(*) AS n FROM t_pairs WHERE focus GROUP BY 1, 2, 3
+)
+SELECT p.report_dt, p.n_triples, p.n_pairs, e.n_epk, o.n_orgs
+FROM (SELECT report_dt, sum(n) AS n_triples, count(*) AS n_pairs FROM x GROUP BY 1) p
+JOIN (SELECT report_dt, count(*) AS n_epk
+      FROM (SELECT report_dt, epk_id FROM x GROUP BY 1, 2) y GROUP BY 1) e ON e.report_dt = p.report_dt
+JOIN (SELECT report_dt, count(*) AS n_orgs
+      FROM (SELECT report_dt, inn FROM x GROUP BY 1, 2) y GROUP BY 1) o ON o.report_dt = p.report_dt
+"""
+
 
 # --------------------------------------------------------------------------- #
 # Итоги месяцев набора: банк, сегменты, совместительство, территория
 # --------------------------------------------------------------------------- #
 
 # Совместительство по сегментам: «лишние» получатели = тройки − ФЛ. Делятся на
-# несколько ИНН у ФЛ (Σ(n_inn − 1)) и одну организацию через несколько ГОСБ
+# несколько организаций у ФЛ (Σ(n_inn − 1)) и одну организацию через несколько ГОСБ
 # (Σ(n_triples − n_inn)). Второе — чистый эффект счёта: человек ничего не менял.
 MULTI_SEG = """
 SELECT report_dt, seg,
@@ -536,6 +679,42 @@ FROM k JOIN t_epk j ON j.epk_id = k.epk_id AND j.report_dt >= CAST(:k AS date)
 GROUP BY k.seg, j.report_dt
 """
 
+# Растворились пришедшие — ГДЕ: когорта прихода :k (не было в :kp) по основной
+# организации в месяце прихода, и что с каждым в :t — получает (alive) или почему
+# нет. Разрезы — сегмент, холдинг, отрасль, выделенный холдинг. Холдинг едет
+# колонкой `holding_name` — под маску названий.
+COHORT_DIM = """
+WITH k AS (
+  SELECT c.epk_id, c.main_inn
+  FROM t_epk c
+  LEFT JOIN t_epk p ON p.report_dt = CAST(:kp AS date) AND p.epk_id = c.epk_id
+  WHERE c.report_dt = CAST(:k AS date) AND p.epk_id IS NULL
+),
+a AS (
+  SELECT k.main_inn,
+         CASE WHEN j.epk_id IS NOT NULL THEN 'alive' ELSE """ + _gone_case("ps") + """ END AS st,
+         count(*) AS n
+  FROM k
+  LEFT JOIN t_epk j ON j.epk_id = k.epk_id AND j.report_dt = CAST(:t AS date)
+  LEFT JOIN t_person ps ON ps.epk_id = k.epk_id AND ps.report_dt = CAST(:t AS date)
+  GROUP BY 1, 2
+),
+d AS (
+  SELECT a.st, a.n, COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg, o.holding_name, o.industry_name,
+         COALESCE(o.focus, false) AS focus
+  FROM a LEFT JOIN t_org o ON o.inn = a.main_inn
+)
+SELECT 'seg' AS dim, seg AS key, CAST(NULL AS text) AS holding_name, st, sum(n) AS n
+FROM d GROUP BY seg, st
+UNION ALL
+SELECT 'holding', NULL, holding_name, st, sum(n) FROM d WHERE holding_name IS NOT NULL
+GROUP BY holding_name, st
+UNION ALL
+SELECT 'industry', industry_name, NULL, st, sum(n) FROM d GROUP BY industry_name, st
+UNION ALL
+SELECT 'focus', 'focus', NULL, st, sum(n) FROM d WHERE focus GROUP BY st
+"""
+
 # Сезонность — только при ПОВТОРЕ. «Получал в июле, не получает в августе» ещё не
 # сезон: доказать, что человек вернётся, нечем. Сезонным поведение становится,
 # когда повторяется: получал в предыдущем месяце ОБОИХ лет и не получал в отчётном
@@ -568,12 +747,12 @@ GROUP BY bp.main_seg
 # Организации: где численность СОКРАТИЛАСЬ на самом деле
 # --------------------------------------------------------------------------- #
 #
-# Грейн — ФЛ внутри ИНН (пара epk × ИНН): перевод между ГОСБ одной организации
+# Грейн — ФЛ внутри id орг (пара epk × организация): перевод между ГОСБ одной организации
 # сюда не попадает по построению. Сравнение b → c (год к году).
 #
-# Ушедшие из ИНН (были в b, нет в c) — ровно одна ситуация:
-#   reorg      — ушёл в ИНН-приёмник: туда переехало не меньше :reorg_min_movers
-#                ФЛ и не меньше :reorg_min_share ушедших этого ИНН. Переоформление,
+# Ушедшие из id орг (были в b, нет в c) — ровно одна ситуация:
+#   reorg      — ушёл в организацию-приёмник: туда переехало не меньше :reorg_min_movers
+#                ФЛ и не меньше :reorg_min_share ушедших этого id орг. Переоформление,
 #                а не сокращение — исключается;
 #   moved      — получает ЗП в банке в другой организации: ПЕРЕТОК. Часть снижения
 #                организации, но не потеря для Сбера — отдельная колонка;
@@ -583,7 +762,7 @@ GROUP BY bp.main_seg
 #                август в сентябре, выглядела бы «ушедшей из Сбера целиком»;
 #   left_bank / below_threshold / other_codes — ПЕРЕСТАЛ получать ЗП в Сбере.
 #                Это и есть основная метрика.
-# Пришедшие (нет в b, есть в c): reorg (из ИНН-предшественника), moved (был
+# Пришедшие (нет в b, есть в c): reorg (из организации-предшественника), moved (был
 # получателем в банке), new (не был).
 #
 # Отбор (в SQL, в ядро едет только список):
@@ -610,7 +789,7 @@ LEFT JOIN (SELECT DISTINCT epk_id, inn FROM t_pairs WHERE report_dt = CAST(:b AS
 WHERE b.epk_id IS NULL
 """
 
-# Тяжёлая цепочка (ушедшие → куда ушли → приёмники → ситуации → итог по ИНН)
+# Тяжёлая цепочка (ушедшие → куда ушли → приёмники → ситуации → итог по id орг)
 # считается ОДИН раз на сравнение — тремя временными таблицами шага, — а список,
 # сводка и реорганизации читают готовое. Раньше каждый из трёх запросов
 # пересчитывал всю цепочку заново.
@@ -754,7 +933,10 @@ dest AS (
 )
 SELECT p.*,
        COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg,
+       o.org_name,
+       o.holding_name,
        o.industry_name,
+       COALESCE(o.focus, false)                AS focus,
        COALESCE(o.is_liquidated, false)        AS is_liquidated,
        t.tb_id,
        d.inn_to AS top_dest_inn, d.n_mv AS top_dest_n,
@@ -796,9 +978,63 @@ FROM t_orgsel s LEFT JOIN t_org o ON o.inn = s.inn
 GROUP BY 1, 2
 """
 
+# Разрезы организаций с реальным сокращением (по ВСЕМ отобранным, а не по
+# показанным): сегмент, холдинг, отрасль. Рядом — вся база разреза: какая доля
+# его численности пришлась на реальное сокращение. Холдингов и отраслей — верх
+# по реальному сокращению (:break_max), выделенный холдинг — всегда.
+_ORG_AGG = """count(*) AS n_orgs_all, sum(base_fl) AS base_all, sum(cur_fl) AS cur_all,
+       sum(picked) AS n_orgs, sum(base_fl * picked) AS base_fl, sum(real_cut * picked) AS real_cut,
+       sum(out_stopped * picked) AS out_stopped, sum(out_moved * picked) AS out_moved,
+       sum(out_back * picked) AS out_back, sum(in_new * picked) AS in_new,
+       sum(out_stopped) AS out_stopped_all, bool_or(focus) AS focus"""
+ORG_BREAK = """
+WITH s AS (
+  SELECT s.*, COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg, o.holding_name, o.industry_name,
+         COALESCE(o.focus, false) AS focus,
+         CASE WHEN s.base_fl >= :min_base AND s.net_ex_reorg < 0 AND s.real_cut >= :min_real
+               AND s.real_cut >= :min_share * s.base_fl THEN 1 ELSE 0 END AS picked
+  FROM t_orgsel s LEFT JOIN t_org o ON o.inn = s.inn
+),
+g AS (
+  SELECT 'seg' AS dim, seg AS key, CAST(NULL AS text) AS holding_name, """ + _ORG_AGG + """
+  FROM s GROUP BY seg
+  UNION ALL
+  SELECT 'holding', NULL, holding_name, """ + _ORG_AGG + """
+  FROM s WHERE holding_name IS NOT NULL GROUP BY holding_name
+  UNION ALL
+  SELECT 'industry', industry_name, NULL, """ + _ORG_AGG + """
+  FROM s GROUP BY industry_name
+)
+SELECT * FROM (
+  SELECT g.*, row_number() OVER (PARTITION BY dim ORDER BY real_cut DESC, n_orgs_all DESC) AS rn
+  FROM g
+) x
+WHERE rn <= :break_max OR dim = 'seg' OR focus
+"""
+
+# Все организации выделенного холдинга (без порогов): было, стало, куда ушли.
+ORG_FOCUS = """
+WITH tbm AS (
+  SELECT inn, tb_id FROM (
+    SELECT inn, tb_id, row_number() OVER (PARTITION BY inn ORDER BY count(*) DESC, tb_id) AS rn
+    FROM t_pairs WHERE report_dt = CAST(:b AS date) AND focus GROUP BY inn, tb_id
+  ) t WHERE rn = 1
+)
+SELECT s.*, t.tb_id, COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg, o.org_name, o.holding_name,
+       o.industry_name,
+       COALESCE(o.is_liquidated, false) AS is_liquidated,
+       CASE WHEN s.base_fl >= :min_base AND s.net_ex_reorg < 0 AND s.real_cut >= :min_real
+             AND s.real_cut >= :min_share * s.base_fl THEN 1 ELSE 0 END AS picked
+FROM t_orgsel s JOIN t_org o ON o.inn = s.inn AND o.focus
+LEFT JOIN tbm t ON t.inn = s.inn
+ORDER BY s.net_ex_reorg, s.inn
+LIMIT :max_rows
+"""
+
 # Реорганизации, исключённые из списка: откуда → куда, сколько и какая доля.
 ORG_REORG = """
 SELECT s.inn_from, s.inn_to, s.n_mv, s.n_lv,
+       f.org_name, t.org_name AS org_name_to,
        COALESCE(f.seg, '""" + S.NO_DIM + """') AS seg_from,
        COALESCE(f.is_liquidated, false) AS from_liquidated
 FROM t_succ s
@@ -813,10 +1049,10 @@ LIMIT :max_rows
 # Август: потеря или перенос в следующий месяц
 # --------------------------------------------------------------------------- #
 
-# Организации, пропустившие месяц: в :m_prev у ИНН не меньше :hole_min_base
+# Организации, пропустившие месяц: в :m_prev у id орг не меньше :hole_min_base
 # получателей, в :m — не больше половины, в :m_next — снова не меньше 80% от
 # :m_prev. Признак переноса даты выплаты организацией, а не ухода людей.
-# Итоги — по всем ИНН окнами, в ядро едет только верх списка.
+# Итоги — по всем id орг окнами, в ядро едет только верх списка.
 ORG_HOLE = """
 WITH x AS (
   SELECT inn,
@@ -834,13 +1070,58 @@ h AS (
     AND x.n_cur <= 0.5 * x.n_prev
     AND x.n_next >= 0.8 * x.n_prev
 )
-SELECT h.inn, h.n_prev, h.n_cur, h.n_next, h.hole,
-       COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg,
-       count(*) OVER ()    AS n_orgs,
-       sum(h.hole) OVER () AS sum_hole
-FROM h LEFT JOIN t_org o ON o.inn = h.inn
-ORDER BY h.hole DESC, h.inn
-LIMIT :max_rows
+SELECT * FROM (
+  SELECT h.inn, h.n_prev, h.n_cur, h.n_next, h.hole,
+         COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg,
+         o.org_name, o.holding_name, o.industry_name,
+         COALESCE(o.focus, false) AS focus,
+         count(*) OVER ()    AS n_orgs,
+         sum(h.hole) OVER () AS sum_hole,
+         row_number() OVER (ORDER BY h.hole DESC, h.inn) AS rn
+  FROM h LEFT JOIN t_org o ON o.inn = h.inn
+) z
+WHERE rn <= :max_rows OR focus
+ORDER BY rn
+"""
+
+# Пропустившие месяц — по разрезам: сегмент, холдинг, отрасль. Знаменатель —
+# все организации разреза с базой ≥ :hole_min_base в :m_prev: «пропустили 12 из
+# 40» говорит о закономерности, «пропустили 12» — нет.
+_HOLE_AGG = """count(*) AS n_orgs_base, sum(n_prev) AS n_prev_all, sum(hit) AS n_orgs,
+       sum(hit * (n_prev - n_cur)) AS hole, bool_or(focus) AS focus"""
+ORG_HOLE_DIM = """
+WITH x AS (
+  SELECT inn,
+         count(*) FILTER (WHERE report_dt = CAST(:m_prev AS date)) AS n_prev,
+         count(*) FILTER (WHERE report_dt = CAST(:m AS date))      AS n_cur,
+         count(*) FILTER (WHERE report_dt = CAST(:m_next AS date)) AS n_next
+  FROM t_pairs
+  WHERE report_dt IN (CAST(:m_prev AS date), CAST(:m AS date), CAST(:m_next AS date))
+  GROUP BY inn
+),
+s AS (
+  SELECT x.*,
+         CASE WHEN x.n_cur <= 0.5 * x.n_prev AND x.n_next >= 0.8 * x.n_prev THEN 1 ELSE 0 END AS hit,
+         COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg, o.holding_name, o.industry_name,
+         COALESCE(o.focus, false) AS focus
+  FROM x LEFT JOIN t_org o ON o.inn = x.inn
+  WHERE x.n_prev >= :hole_min_base
+),
+g AS (
+  SELECT 'seg' AS dim, seg AS key, CAST(NULL AS text) AS holding_name, """ + _HOLE_AGG + """
+  FROM s GROUP BY seg
+  UNION ALL
+  SELECT 'holding', NULL, holding_name, """ + _HOLE_AGG + """
+  FROM s WHERE holding_name IS NOT NULL GROUP BY holding_name
+  UNION ALL
+  SELECT 'industry', industry_name, NULL, """ + _HOLE_AGG + """
+  FROM s GROUP BY industry_name
+)
+SELECT * FROM (
+  SELECT g.*, row_number() OVER (PARTITION BY dim ORDER BY hole DESC, n_orgs_base DESC) AS rn
+  FROM g
+) y
+WHERE rn <= :break_max OR dim = 'seg' OR focus
 """
 
 # Подпись переноса выплаты: у ФЛ, пропавших в :m и вернувшихся в :m_next, —
@@ -871,13 +1152,14 @@ FROM r GROUP BY grp
 """
 
 SHOW_DEFS["t_tflow"] = T_TFLOW
+SHOW_DEFS["t_ptype"] = T_PTYPE
 SHOW_DEFS["t_oflow"] = T_OFLOW
 SHOW_DEFS["t_mv"] = T_MV
 SHOW_DEFS["t_succ"] = T_SUCC
 SHOW_DEFS["t_orgsel"] = T_ORGSEL
 
 
-# Все запросы файла — для самопроверок (партиция, диалект, маска ИНН).
+# Все запросы файла — для самопроверок (партиция, диалект, маска номера организации).
 def all_sql() -> dict[str, str]:
     return {k: v for k, v in globals().items()
             if k.isupper() and isinstance(v, str) and ("SELECT" in v or "CREATE" in v)}

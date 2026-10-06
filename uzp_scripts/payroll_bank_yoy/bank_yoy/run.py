@@ -36,6 +36,8 @@ def run(conn: str | None = None, schema: str | None = None,
         report_month: str = "2026-08", n_months: int = 3,
         history_months: int = 25, amt_min: int = Q.AMT_MIN, codes=Q.CODES,
         org_opts: dict | None = None,
+        focus_holding: str = "МИНОБОРОНЫ",
+        adv_pattern: str = A.ADV_RE, sal_pattern: str = A.SAL_RE,
         sql_timeout_min: int = config.SQL_TIMEOUT_MIN,
         verbose: bool = True, show_sql: bool = False) -> dict:
     t_start = time.time()
@@ -44,7 +46,7 @@ def run(conn: str | None = None, schema: str | None = None,
     config.ensure_dirs()
     org_opts = {"min_base": 20, "min_real": 10, "min_share": 0.05,
                 "reorg_min_share": 0.30, "reorg_min_movers": 5, "max_rows": 3000,
-                "hole_min_base": 20,
+                "hole_min_base": 20, "break_max": 40,
                 **(org_opts or {})}
     engine = db.get_engine(config.db_url(conn), int(sql_timeout_min))
     db.ping(engine)
@@ -53,7 +55,7 @@ def run(conn: str | None = None, schema: str | None = None,
     last = M.parse(report_month)
     hist = M.span(M.shift(last, -(history_months - 1)), last)
     res: dict = {"report_month": M.iso(last), "schema": config.SCHEMA, "amt_min": amt_min,
-                 "codes": list(codes), "org_opts": org_opts,
+                 "codes": list(codes), "org_opts": org_opts, "focus_holding": focus_holding,
                  "generated": datetime.now().strftime("%Y-%m-%d %H:%M")}
 
     with db.session(engine) as cx:
@@ -63,7 +65,9 @@ def run(conn: str | None = None, schema: str | None = None,
         first = M.shift(last, -(n_months - 1))
         raw_from = min(hist[0], M.shift(first, -LOOKBACK - 12))
         raw_months = M.span(raw_from, M.shift(last, 1))
-        ws = fetch.Workspace(cx, [], {"codes": list(codes), "amt_min": int(amt_min)})
+        ws = fetch.Workspace(cx, [], {"codes": list(codes), "amt_min": int(amt_min),
+                                      "focus_holding": focus_holding,
+                                      "adv_codes": [-1], "sal_codes": [-1]})
         try:
             # Все строки — только месяцам рабочего набора (кандидатам: какие из них
             # загружены, станет известно по копии); остальным — зарплатные коды.
@@ -71,6 +75,12 @@ def run(conn: str | None = None, schema: str | None = None,
                     for m in M.span(M.shift(first, -LOOKBACK + off), M.shift(last, 1 + off))}
             rows = ws.build_raw(raw_months, full)
             ws.params["all_rows"] = True       # для показанного SQL: копия рабочего набора
+            # Аванс и зарплата — по названиям кодов из первого скопированного месяца.
+            pc = A.classify_codes(ws.code_names, adv_pattern, sal_pattern)
+            res["pay_codes"] = pc
+            ws.params["adv_codes"] = pc["adv"] or [-1]
+            ws.params["sal_codes"] = pc["sal"] or [-1]
+            progress.done(f"коды аванса: {pc['adv'] or 'не найдены'}; зарплаты: {pc['sal'] or 'не найдены'}")
             avail = {m for m, n in rows.items() if n > 0}
             pr["months"] = rows
             if not avail:
@@ -95,7 +105,15 @@ def run(conn: str | None = None, schema: str | None = None,
             code_ms = sorted({M.shift(m, k) for m in report for k in (0, -1, -12, -13)})
 
             ws.months = res["work"]
+            ws.pt_months = [M.shift(m, off) for m in report for off in (0, -12)]
             ws.build(hist, code_ms)
+            res["series_focus_raw"] = ws.series_focus
+            res["paytype_raw"] = ws.paytype
+            res["focus_tot_raw"] = ws.opt("focus_tot", Q.FOCUS_TOT)
+            nf = res["focus_tot_raw"]
+            progress.done(f"холдинг «{focus_holding}»: " + (
+                f"{int(nf['n_orgs'].max()):,} организаций с получателями" if not nf.empty
+                else "организаций с получателями нет"))
             res["series_raw"] = (pd.concat(ws.series_rows, ignore_index=True)
                                  if ws.series_rows else pd.DataFrame())
             res["load_raw"] = ws.load
@@ -109,16 +127,22 @@ def run(conn: str | None = None, schema: str | None = None,
             progress.done("совместительство и территория")
 
             progress.step("Переходы: год к году и месяц к месяцу в обоих годах")
-            fl, tr = {}, {}
+            fl, tr, stp, ff = {}, {}, {}, {}
+
+            def flows(key, b, c, tag):
+                fl[key] = fetch.fl_flow(ws, b, c, tag)
+                tr[key] = fetch.triple_flow(ws, b, c, tag)
+                # По той же t_tflow: отток B2C/B2B и разложение холдинга.
+                stp[key] = fetch.stop_size(ws, b, c, tag)
+                ff[key] = fetch.focus_flow(ws, b, c, tag)
+
             for m in report:
-                fl[("yoy", M.iso(m))] = fetch.fl_flow(ws, M.shift(m, -12), m, f"yoy_{M.iso(m)}")
-                tr[("yoy", M.iso(m))] = fetch.triple_flow(ws, M.shift(m, -12), m, f"yoy_{M.iso(m)}")
+                flows(("yoy", M.iso(m)), M.shift(m, -12), m, f"yoy_{M.iso(m)}")
                 for off, y in ((0, "cur"), (-12, "prev")):
                     c = M.shift(m, off)
-                    fl[(y, M.iso(m))] = fetch.fl_flow(ws, M.shift(c, -1), c, f"mom_{M.iso(c)}")
-                    tr[(y, M.iso(m))] = fetch.triple_flow(ws, M.shift(c, -1), c, f"mom_{M.iso(c)}")
+                    flows((y, M.iso(m)), M.shift(c, -1), c, f"mom_{M.iso(c)}")
                 progress.done(f"{M.label(m)}: год к году и два месячных перехода")
-            res["fl_raw"], res["tr_raw"] = fl, tr
+            res["fl_raw"], res["tr_raw"], res["stop_raw"], res["ff_raw"] = fl, tr, stp, ff
 
             progress.step("Когорты пришедших, сезонность")
             coh = {}
@@ -128,6 +152,14 @@ def run(conn: str | None = None, schema: str | None = None,
             for k in report:
                 coh[("yoy", k)] = fetch.cohort(ws, k, M.shift(k, -12), f"yoy_{M.iso(k)}")
             res["cohort_raw"] = coh
+            # Где растворились: когорты до последнего отчётного месяца, по разрезам.
+            cd = {"cur": [], "prev": []}
+            for k in M.span(M.shift(report[0], -1), M.shift(report[-1], -1)):
+                for y, off in (("cur", 0), ("prev", -12)):
+                    kk = M.shift(k, off)
+                    cd[y].append(fetch.cohort_dim(ws, kk, M.shift(kk, -1), M.shift(last, off),
+                                                  f"{M.iso(kk)}"))
+            res["cohort_dim_raw"] = cd
             res["seasonal_raw"] = {M.iso(m): fetch.seasonal(ws, m) for m in report}
             progress.done("когорты и сезонность")
 
@@ -139,7 +171,8 @@ def run(conn: str | None = None, schema: str | None = None,
                 progress.done(f"{M.label(m)}: в списке {n:,} организаций")
             if res["has_next"]:
                 progress.step(f"{M.label(last)}: потеря или перенос в {M.label(M.shift(last, 1))}")
-                res["aug_raw"] = fetch.august(ws, last, org_opts["hole_min_base"], 300)
+                res["aug_raw"] = fetch.august(ws, last, org_opts["hole_min_base"], 300,
+                                              org_opts["break_max"])
                 progress.done("организации с провалом и подпись переноса")
             res["shown"] = dict(ws.shown)
             res["timing"] = dict(ws.timing)
@@ -254,6 +287,34 @@ def compute(res: dict) -> None:
                    "drivers": A.drivers(tab)}
     res["did"] = did
 
+    # Отток B2C / B2B: ступени обязаны сложиться ровно в «перестали получать».
+    res["stop"] = {}
+    for key, df in res.get("stop_raw", {}).items():
+        if df is None or df.empty or not comp[key]["d"]:
+            continue
+        got = float(A.stop_buckets(df)["n_tr"].sum())
+        checks.append(A.check(f"B2C + B2B = перестали получать ({key[0]} {M.label(key[1])})",
+                              got - float(comp[key]["d"]["lost_tr"])))
+    for m in report:
+        mi = M.iso(m)
+        sr = res.get("stop_raw", {})
+        if sr.get(("cur", mi)) is None or sr[("cur", mi)].empty:
+            continue
+        res["stop"][mi] = {"did": A.stop_did(sr[("cur", mi)], sr.get(("prev", mi))),
+                           "seg": A.stop_seg(sr[("cur", mi)], sr.get(("prev", mi))),
+                           "yoy": A.stop_buckets(sr.get(("yoy", mi)))}
+
+    _focus(res, checks, report)
+    res["cohort_dims"] = A.cohort_dims(res["cohort_dim_raw"]["cur"], res["cohort_dim_raw"]["prev"]) \
+        if res.get("cohort_dim_raw") else {}
+    pt = res.get("paytype_raw")
+    res["paytype"] = {}
+    if pt is not None and not pt.empty:
+        for m in report:
+            res["paytype"][M.iso(m)] = {"table": A.paytype_table(pt, m), "mix": A.paytype_mix(pt, m),
+                                        "seg": A.paytype_seg(pt, m),
+                                        "focus": A.paytype_table(pt, m, focus_only=True)}
+
     res["cohorts"] = A.cohort_table(res["cohort_raw"])
     res["dissolved"] = A.dissolved(res["cohorts"], report)
     res["cohort_seg"] = {M.iso(k): A.cohort_seg(res["cohort_raw"], "mom", k,
@@ -283,11 +344,30 @@ def compute(res: dict) -> None:
             pairs = float(mb.set_index("report_dt").loc[b, "n_pairs"]) if b in set(mb["report_dt"]) else float("nan")
             checks.append(A.check(f"организации покрывают всю базу ({M.label(m)})",
                                   float(smr["base_fl"].sum()) - pairs,
-                                  detail="Σ ФЛ по ИНН = Σ пар ФЛ×ИНН набора"))
+                                  detail="Σ ФЛ по id орг = Σ пар ФЛ×организация набора"))
+        brk = A.org_break(raw.get("break"))
+        if brk and not lst.empty:
+            sg = brk["seg"]
+            checks.append(A.check(f"организации: Σ сегментов разреза = список ({M.label(m)})",
+                                  float(sg["n_orgs"].sum()) - float(lst["n_picked"].iloc[0])))
+            checks.append(A.check(f"организации: реальное сокращение разреза = списка ({M.label(m)})",
+                                  float(sg["real_cut"].sum()) - float(lst["sum_real_picked"].iloc[0])))
+        foc = raw.get("focus")
+        if foc is not None and not foc.empty:
+            foc = A.org_list(foc, res["tb_dim"])
         res["orgs"][mi] = {"list": lst, "summary": smr, "summary_seg": raw["summary"],
-                           "reorg": raw["reorg"]}
+                           "reorg": raw["reorg"], "break": brk,
+                           "focus": foc if foc is not None else pd.DataFrame()}
     if res.get("aug_raw"):
         last = report[-1]
+        aug = res["aug_raw"]
+        for k in ("hole_cur", "hole_prev"):
+            aug[k] = A.with_labels(aug[k])
+        res["hole_dims"] = A.hole_dims(aug.get("hole_dim_cur"), aug.get("hole_dim_prev"))
+        if res["hole_dims"]:
+            checks.append(A.check(f"пропустившие месяц: Σ сегментов = всего ({M.label(last)})",
+                                  float(res["hole_dims"]["seg"]["n_orgs_cur"].sum())
+                                  - A.hole_summary(aug["hole_cur"])["n_orgs"]))
         res["bridge"] = A.bridge(mb, last)
         tp = A.temp_perm(comp[("cur", M.iso(last))]["d"], comp[("prev", M.iso(last))]["d"])
         res["temp_perm"] = tp
@@ -306,6 +386,52 @@ def compute(res: dict) -> None:
             progress.warn(f"НЕ СХОДИТСЯ: {c['check']} — невязка {c['residual']}")
     else:
         progress.done(f"проверки сходимости: все {len(checks)} сошлись")
+
+
+# --------------------------------------------------------------------------- #
+def _focus(res: dict, checks: list, report: list) -> None:
+    """Выделенный холдинг: итоги, разложения переходов, разница разниц, отток B2C/B2B."""
+    ft = A.focus_tot(res.get("focus_tot_raw"))
+    res["focus_tot"] = ft
+    res["focus"] = {"comp": {}, "did": {}, "stop": {}}
+    sf = res.get("series_focus_raw")
+    res["focus_series"] = (sf.assign(report_dt=sf["report_dt"].astype(str)).set_index("report_dt").sort_index()
+                           if sf is not None and not sf.empty else pd.DataFrame())
+    if ft.empty:
+        return
+    if not res["focus_series"].empty:
+        fs = res["focus_series"]["n_triples"].astype(float)
+        common = [d for d in ft.index if d in fs.index]
+        checks.append(A.check("холдинг: ряд (t_stage) = рабочий набор (t_pairs)",
+                              float(sum(abs(fs[d] - ft.loc[d, "n_triples"]) for d in common))))
+    for (kind, m), df in res.get("ff_raw", {}).items():
+        md = M.parse(m)
+        c = md if kind != "prev" else M.shift(md, -12)
+        b = M.shift(c, -12) if kind == "yoy" else M.shift(c, -1)
+        get = lambda d: float(ft.loc[M.iso(d), "n_triples"]) if M.iso(d) in ft.index else 0.0
+        d = A.focus_decomp(df, get(b), get(c))
+        tag = f"{kind} {M.label(b)}→{M.label(c)}"
+        checks.append(A.check(f"холдинг: разложение сходится ({tag})", d["residual"]))
+        sr = res.get("stop_raw", {}).get((kind, m))
+        if sr is not None and not sr.empty:
+            checks.append(A.check(f"холдинг: B2C + B2B = перестали ({tag})",
+                                  float(A.stop_buckets(sr, focus_only=True)["n_tr"].sum()) - d["stopped"]))
+        res["focus"]["comp"][(kind, m)] = {"b": M.iso(b), "c": M.iso(c), "d": d,
+                                           "rows": A.focus_rows(d, b, c)}
+    for m in report:
+        mi = M.iso(m)
+        fc = res["focus"]["comp"]
+        if ("cur", mi) not in fc or ("prev", mi) not in fc:
+            continue
+        dc, dp = fc[("cur", mi)]["d"], fc[("prev", mi)]["d"]
+        t = A.focus_did(dc, dp)
+        checks.append(A.check(f"холдинг: разница разниц = разница изменений ({M.label(m)})",
+                              float(t["diff"].sum()) - (dc["delta"] - dp["delta"])))
+        res["focus"]["did"][mi] = t
+        sr = res.get("stop_raw", {})
+        if sr.get(("cur", mi)) is not None and not sr[("cur", mi)].empty:
+            res["focus"]["stop"][mi] = {"did": A.stop_did(sr[("cur", mi)], sr.get(("prev", mi)), True),
+                                        "yoy": A.stop_buckets(sr.get(("yoy", mi)), True)}
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +463,9 @@ def _write(res: dict) -> None:
         if o["list"].empty:
             continue
         p = config.OUTPUT_DIR / f"orgs_real_cut_{m[:7].replace('-', '')}_{stamp}.csv"
-        o["list"].to_csv(p, index=False, encoding="utf-8-sig", sep=";")
+        # Латинское имя колонки номера организации в выгрузку не идёт — «org_id».
+        out = o["list"].rename(columns=lambda c: c.replace("".join(map(chr, (105, 110, 110))), "org_id"))
+        out.to_csv(p, index=False, encoding="utf-8-sig", sep=";")
         csv_paths.append(str(p))
     res["csv"] = csv_paths
     if csv_paths:

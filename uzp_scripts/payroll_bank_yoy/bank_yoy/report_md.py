@@ -19,6 +19,7 @@ import pandas as pd
 
 from . import analyze as A
 from . import months as M
+from . import names as N
 from . import segments as S
 from . import view as V
 from .charts import fnum, fpct
@@ -54,25 +55,55 @@ def _plain(h: str) -> str:
     return html.unescape(re.sub(r"\n{3,}", "\n\n", h)).strip()
 
 
+_SKIP = {N.HIDDEN_HOLDING, "без холдинга", A.NO_INDUSTRY}
+
+
 def _names(res: dict) -> set[str]:
-    """Всё, чего в документе быть не должно: номера организаций (названий отчёт
-    не берёт вовсе — у ИП в названии ФИО) и названия ТБ."""
+    """Всё, чего в документе быть не должно: номера и названия организаций,
+    названия холдингов и ТБ."""
     out: set[str] = set()
-    frames = [o[k] for o in res.get("orgs", {}).values() for k in ("list", "reorg")]
+    frames = [o.get(k) for o in res.get("orgs", {}).values() for k in ("list", "reorg", "focus")]
     if res.get("aug_raw"):
-        frames += [res["aug_raw"].get("hole_cur"), res["aug_raw"].get("hole_prev")]
+        frames += [res["aug_raw"].get(k) for k in ("hole_cur", "hole_prev", "hole_dim_cur", "hole_dim_prev")]
+    frames += [o.get("break", {}).get("holding") for o in res.get("orgs", {}).values()]
+    frames += [(res.get("cohort_dims") or {}).get("holding")]
     for df in frames:
         if df is None or df.empty:
             continue
         for c in ("inn", "inn_from", "inn_to", "top_dest_inn"):
             if c in df:
-                # Только длинные номера: короткое число совпало бы с численностью.
+                # Только номера от 5 цифр: короткое число совпало бы с численностью.
                 out |= {str(int(x)) for x in df[c].dropna() if len(str(int(x))) >= 5}
+        for c in ("org_name", "org_name_to", "holding_name", "org", "holding"):
+            if c in df:
+                out |= {str(x).strip() for x in df[c].dropna()}
+        if "label" in df and "dim" in df:
+            out |= {str(x).strip() for x in df.loc[df["dim"] == "holding", "label"].dropna()}
+        elif "label" in df and df is (res.get("cohort_dims") or {}).get("holding"):
+            out |= {str(x).strip() for x in df["label"].dropna()}
+    if res.get("focus_holding"):
+        out.add(str(res["focus_holding"]).strip())
+    # Не имена: заглушки, сегменты, отрасли (их документ показывает как есть) и
+    # слишком короткие строки — иначе ложная «утечка» остановила бы запись документа.
+    plain = set(S.PLACEHOLDERS) | set(S.ORDER) | set(S.FULL.values())
+    for o in res.get("orgs", {}).values():
+        for df in (o.get("list"), o.get("focus")):
+            if df is not None and not df.empty and "industry" in df:
+                plain |= set(df["industry"].dropna().astype(str))
+    out = {n for n in out if n not in _SKIP and n not in plain and len(n) >= 4
+           and not n.startswith("id орг") and not n.startswith("Организация не в")}
     tbd = res.get("tb_dim")
     if tbd is not None and not tbd.empty:
         out |= {str(x).strip() for x in tbd["tb_short_name"].dropna()}
     return {n for n in out if len(n) >= 4 and n not in S.PLACEHOLDERS
             and not n.startswith("Организация не в")}
+
+
+def _lbl(al: Aliases, dim: str, label) -> str:
+    """Холдинг — токеном; сегмент и отрасль — как есть (не имена)."""
+    if dim == "holding" and label not in _SKIP:
+        return al("Холд", label)
+    return str(label)
 
 
 def render(res: dict) -> tuple[str, list[str]]:
@@ -83,7 +114,8 @@ def render(res: dict) -> tuple[str, list[str]]:
     L.append(f"# Получатели ЗП по всему Сберу: {M.name(rep[0])}–{M.name(last)} {M.parse(last).year} "
              f"к {M.parse(last).year - 1}\n")
     L.append("**Документ обезличен.** Названия организаций, холдингов и ТБ заменены устойчивыми токенами "
-             "(Орг-01, ТБ-01); номера организаций удалены; численности, доли и даты — как есть. "
+             "(Орг-01, Холд-01, ТБ-01); номера организаций удалены; отрасли, численности, доли и даты — "
+             "как есть. "
              "Запросы, которыми посчитаны цифры, — в приложении.\n")
     L.append("## Определения\n")
     L.append(f"- {A.DEF_REC}\n- {A.DEF_GETS}\n- Сегмент организации — текущий срез справочника ЕПК, "
@@ -123,6 +155,20 @@ def render(res: dict) -> tuple[str, list[str]]:
                  f"вернулись в {M.prep(ms['next'])}): {y1} — {fnum(hc['n_orgs'])} организаций, "
                  f"{fnum(hc['sum_hole'])} получателей; {y1 - 1} — {fnum(hp['n_orgs'])}, "
                  f"{fnum(hp['sum_hole'])}.\n")
+        hd = res.get("hole_dims") or {}
+        for dim in ("seg", "holding", "industry"):
+            t = hd.get(dim)
+            if t is None or t.empty:
+                continue
+            t = t if dim == "seg" else t[t["n_orgs_cur"] > 0].head(15)
+            if t.empty:
+                continue
+            L.append(f"Пропустившие {M.name(ms['cur'])} по разрезу «{A.DIM_T[dim]}»:\n")
+            L.append(_md_table([A.DIM_T[dim], "Организаций (база)", f"Пропустили {y1}", "доля", "Дыра",
+                                f"Пропустили {y1 - 1}", "доля"],
+                               [[_lbl(al, dim, r.label), fnum(r.n_orgs_base_cur), fnum(r.n_orgs_cur),
+                                 fpct(r.share_cur), fnum(r.hole_cur), fnum(r.n_orgs_prev), fpct(r.share_prev)]
+                                for r in t.itertuples()]))
         hl = aug["hole_cur"]
         if hl is not None and not hl.empty:
             L.append(_md_table(["Организация", "Сегмент", M.name(ms["prev"]), M.name(ms["cur"]),
@@ -167,6 +213,22 @@ def render(res: dict) -> tuple[str, list[str]]:
                             "Разница"],
                            [[("— " + r.title) if isinstance(r.sub, str) else f"**{grp_t[r.group]}**",
                              fnum(r.cur, True), fnum(r.prev, True), fnum(r.diff, True)] for r in tab.itertuples()]))
+        st = res.get("stop", {}).get(m)
+        if st is not None:
+            t = st["did"]
+            L.append(f"Перестали получать ЗП в Сбере: отток B2C (1–2 ФЛ из организации) и B2B (3+), "
+                     f"{M.name(mp)}→{M.name(m)}, получатели:\n")
+            L.append(_md_table(["", f"Организаций {y1}", f"{y1}", f"Организаций {y0}", f"{y0}", "Разница"],
+                               [[("— " if r.sub else "") + r.title, fnum(r.n_orgs_cur), fnum(r.tr_cur, True),
+                                 fnum(r.n_orgs_prev), fnum(r.tr_prev, True), fnum(r.diff, True)]
+                                for r in t.itertuples()]))
+        pt = (res.get("paytype") or {}).get(m)
+        if pt and not pt["table"].empty:
+            L.append(f"Аванс и зарплата: пары-получатели {M.gen(mp)} с обоими видами выплат — что стало:\n")
+            L.append(_md_table(["", f"Пар {y1}", "доля", f"Пар {y0}", "доля", "Сверх обычного"],
+                               [[("— " if r.sub else "") + r.title, fnum(r.cur), fpct(r.share_cur), fnum(r.prev),
+                                 fpct(r.share_prev), "" if pd.isna(r.excess) else fnum(r.excess, True)]
+                                for r in pt["table"].itertuples()]))
         if not did["seg"].empty:
             L.append(_md_table(["Сегмент"] + [t for _, t in A.SEG_COLS] + ["Итого"],
                                [[r.seg] + [fnum(getattr(r, k), True) for k, _ in A.SEG_COLS] + [fnum(r.delta, True)]
@@ -180,6 +242,26 @@ def render(res: dict) -> tuple[str, list[str]]:
                            [[M.long(r.k), fnum(r.size_cur), fpct(r.surv_cur), fnum(r.size_prev),
                              fpct(r.surv_prev), fnum(-r.excess_loss if pd.notna(r.excess_loss) else None, True)]
                             for r in ds.itertuples()]))
+
+    cd = res.get("cohort_dims") or {}
+    if cd:
+        L.append("### Где вымываются пришедшие\n")
+        cz = cd["causes"]
+        L.append(_md_table(["Где пришедшие сейчас", "ФЛ этот год", "доля", "ФЛ год назад", "доля", "Сверх обычного"],
+                           [["получают ЗП в отчётном месяце" if r.st == "alive" else A.T.get(r.st, r.st), fnum(r.cur), fpct(r.share_cur),
+                             fnum(r.prev), fpct(r.share_prev), fnum(-r.excess, True)] for r in cz.itertuples()]))
+        for dim in ("seg", "holding", "industry"):
+            t = cd.get(dim)
+            if t is None or t.empty:
+                continue
+            t = t if dim == "seg" else t[t["excess"] > 0].head(15)
+            if t.empty:
+                continue
+            L.append(_md_table([A.DIM_T[dim], "Пришли", "Дожили", "Пришли год назад", "Дожили год назад",
+                                "Лишняя убыль ФЛ"],
+                               [[_lbl(al, dim, r.label), fnum(r.size_cur), fpct(r.surv_cur), fnum(r.size_prev),
+                                 fpct(r.surv_prev), "" if pd.isna(r.excess) else fnum(-r.excess, True)]
+                                for r in t.itertuples()]))
 
     my = res["multi_yoy"]
     if not my.empty:
@@ -221,6 +303,18 @@ def render(res: dict) -> tuple[str, list[str]]:
                                 "Ушли в др. орг.", "Реорг.", "Реальное сокращение"],
                                [[r.title, fnum(r.n_orgs), fnum(r.base_fl), fnum(r.cur_fl), fnum(r.out_stopped),
                                  fnum(r.out_moved), fnum(r.out_reorg), fnum(r.real_cut)] for r in smr.itertuples()]))
+        brk = o.get("break") or {}
+        for dim in ("seg", "holding", "industry"):
+            t = brk.get(dim)
+            if t is None or t.empty:
+                continue
+            t = t if dim == "seg" else t[t["real_cut"] > 0].head(20)
+            if t.empty:
+                continue
+            L.append(_md_table([A.DIM_T[dim], "Организаций в списке", "Реальное сокращение", "Перестали в Сбере",
+                                "Переток", "ФЛ разреза год назад", "Доля"],
+                               [[_lbl(al, dim, r.label), fnum(r.n_orgs), fnum(r.real_cut), fnum(r.out_stopped),
+                                 fnum(r.out_moved), fnum(r.base_all), fpct(r.share)] for r in t.itertuples()]))
         if not lst.empty:
             top = lst.head(30)
             L.append(f"Крупнейшие 30 из {fnum(int(lst['n_picked'].iloc[0]))}:\n")
@@ -230,6 +324,30 @@ def render(res: dict) -> tuple[str, list[str]]:
                                  fnum(r.cur_fl), fnum(r.real_cut), fnum(r.out_stopped), fnum(r.out_moved),
                                  fnum(r.in_new)] for r in top.itertuples()]))
 
+    ft = res.get("focus_tot")
+    if ft is not None and not ft.empty:
+        tok = al("Холд", res.get("focus_holding"))
+        L.append(f"## Выделенный холдинг ({tok})\n")
+        rows = []
+        for m in rep:
+            c = res["focus"]["comp"].get(("yoy", m))
+            if not c:
+                continue
+            d = c["d"]
+            rows.append([M.long(m), fnum(d["base"]), fnum(d["cur"]), fnum(d["delta"], True), fnum(-d["stopped"], True),
+                         fnum(d["started"], True), fnum(d["other_org"], True), fnum(d["inside"], True)])
+        L.append(_md_table(["Месяц", "Год назад", "Сейчас", "Изменение", "Перестали в Сбере", "Начали",
+                            "Переток вне холдинга", "Внутри холдинга"], rows))
+        for m in rep:
+            t = res["focus"]["did"].get(m)
+            if t is None:
+                continue
+            mp = M.shift(m, -1)
+            L.append(f"Почему {M.name(m)} к {M.gen(mp)}: переход этого года против прошлого\n")
+            L.append(_md_table(["Слагаемое", "Этот год", "Год назад", "Разница"],
+                               [[r.title, fnum(r.cur, True), fnum(r.prev, True), fnum(r.diff, True)]
+                                for r in t.itertuples()]))
+
     ch = res["checks"]
     bad = [c for c in ch if not c["ok"]]
     L.append("## Проверки сходимости\n")
@@ -237,6 +355,7 @@ def render(res: dict) -> tuple[str, list[str]]:
              " Не сошлись: " + "; ".join(c["check"] for c in bad)) + "\n")
 
     L.append("## Приложение: запросы\n")
+    L.append(V.SQL_NOTE + "\n")
     shown = res.get("shown", {})
     keys = ["multi_bank", f"fl_flow_yoy_{last}", f"fl_flow_mom_{last}", f"triple_flow_yoy_{last}",
             f"org_list_{last}"]
@@ -244,7 +363,9 @@ def render(res: dict) -> tuple[str, list[str]]:
         if k in shown:
             sql, args = shown[k]
             used = {a: v for a, v in args.items() if f":{a}" in sql}
-            L.append(f"### {k}\n\n```sql\n{V._params_comment(used)}{sql}\n```\n")
+            if "focus_holding" in used:
+                used["focus_holding"] = "<название выделенного холдинга>"     # не имя в документе
+            L.append(f"### {k}\n\n```sql\n{V._params_comment(used)}{V.hide_col(sql)}\n```\n")
 
     doc = V.sanitize("\n".join(L))
     leaks = sorted(n for n in _names(res) if n in doc)

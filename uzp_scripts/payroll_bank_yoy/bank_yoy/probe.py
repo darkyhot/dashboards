@@ -42,7 +42,7 @@ def run(conn) -> dict:
 
     epk = db.read_sql(conn, Q.PROBE_EPK).iloc[0].to_dict()
     out["epk"] = {k: (str(v) if v is not None else None) for k, v in epk.items()}
-    progress.done(f"справочник ЕПК: {int(epk['n_inn']):,} ИНН, "
+    progress.done(f"справочник ЕПК: {int(epk['n_inn']):,} id орг, "
                   f"без сегмента {int(epk['n_no_seg']):,} строк")
 
     try:
