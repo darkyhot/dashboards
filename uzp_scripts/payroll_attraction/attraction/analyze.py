@@ -24,6 +24,7 @@ CLS_GROUP = {"grow": "grow", "new": "grow", "decl": "decl", "closed": "decl", "f
 GROUP_T = {"grow": "Рост (+1 и больше)", "decl": "Снижение (−1 и больше)", "flat": "Без изменений",
            "none": "Ячейки нет в ведомостях"}
 STEPS = ["1", "2-5", "6-20", "21-100", "100+"]
+STEP_T = {"1": "+1", "2-5": "+2…5", "6-20": "+6…20", "21-100": "+21…100", "100+": "больше +100"}
 DIM_T = {"seg": "Сегмент", "holding": "Холдинг", "industry": "Отрасль", "tb": "ТБ"}
 NO_INDUSTRY = "Отрасль не указана"
 
@@ -129,13 +130,25 @@ def cell_tables(cs: pd.DataFrame, ct: pd.DataFrame, cells: list) -> dict:
     grp = x.groupby(["pair", "grp"])[["n_cells", "n_b", "n_c", "d"]].sum()
     steps = x[x["grp"] == "grow"].pivot_table(index="step", columns="pair", values="n_cells",
                                               aggfunc="sum").reindex(STEPS).fillna(0)
+    steps_fl = x[x["grp"] == "grow"].pivot_table(index="step", columns="pair", values="d",
+                                                 aggfunc="sum").reindex(STEPS).fillna(0)
     steps_d = x[x["grp"] == "decl"].pivot_table(index="step", columns="pair", values="n_cells",
                                                 aggfunc="sum").reindex(STEPS).fillna(0)
     t = _num(ct.copy(), ["n_cells", "n_fl"])
     t["report_dt"] = t["report_dt"].astype(str)
     t = t.set_index("report_dt")
-    return {"cls": cls, "grp": grp, "steps": steps, "steps_decl": steps_d, "tot": t,
+    return {"cls": cls, "grp": grp, "steps": steps, "steps_fl": steps_fl, "steps_decl": steps_d, "tot": t,
             "pairs": {"cur": (cells[1], cells[2]), "prev": (cells[0], cells[1])}}
+
+
+def nfl_step_table(ns: pd.DataFrame) -> pd.DataFrame:
+    """(год, ступень роста ячейки) × канал: НФЛ, пришедшие в растущие ячейки."""
+    if ns is None or ns.empty:
+        return pd.DataFrame()
+    x = _num(ns.copy(), ["n"])
+    idx = pd.MultiIndex.from_product([["prev", "cur"], STEPS], names=["yr", "step"])
+    return x.pivot_table(index=["yr", "step"], columns="ch", values="n", aggfunc="sum").reindex(
+        index=idx, columns=CH).fillna(0)
 
 
 def nfl_cell_table(nc: pd.DataFrame) -> pd.DataFrame:
@@ -333,6 +346,14 @@ def compute(res: dict) -> None:
     res["cell_top"] = top
     dm = raw.get("deal_match", pd.DataFrame())
     res["deal_match"] = dm
+    res["nfl_step"] = nfl_step_table(raw.get("nfl_step"))
+    ng = res["nfl_cell"]
+    if not res["nfl_step"].empty and not ng.empty:
+        for y in ("prev", "cur"):
+            got = float(res["nfl_step"].xs(y, level="yr").to_numpy().sum()) if y in res["nfl_step"].index.get_level_values(0) else 0.0
+            want = float(ng.loc[(y, "grow")].sum()) if (y, "grow") in ng.index else 0.0
+            checks.append(check(f"НФЛ по ступеням роста = НФЛ в ячейках роста ({'этот год' if y == 'cur' else 'год назад'})",
+                                got - want))
     res["checks"] = checks
     res["verdict"] = verdict(res)
     res["facts"] = facts(res)

@@ -401,3 +401,41 @@ def channel_strip(rows: list[tuple[str, dict]], order: list[str], names: dict,
         out.append(f'<text class="strip-tot" x="{x + 10:.1f}" y="{y + bar / 2 + 7:.1f}">{esc(fmt(tot))}</text>')
     out.append("</svg>")
     return "".join(out)
+
+
+def stacked_pairs(groups: list[tuple[str, dict]], years: tuple[str, str], order: list[str], names: dict,
+                  colors: dict, fmt=fnum) -> str:
+    """Группы (ступени роста) по два ряда — год назад и этот год; ряд — сегменты
+    каналов. Один масштаб на весь график: длина ряда — сумма каналов."""
+    W, LW, YW, R = 960, 110, 52, 70
+    bar, inner, outer = 24, 4, 18
+    H = len(groups) * (2 * bar + inner + outer) + 6
+    vmax = max((sum(v.get(y, {}).get(c, 0) for c in order) for _, v in groups for y in years), default=1) or 1
+    scale = (W - LW - YW - R) / vmax
+    out = [f'<svg class="chart strip pairs" viewBox="0 0 {W} {H}" role="img">']
+    y = 4
+    for lab, v in groups:
+        out.append(f'<text class="strip-g" x="0" y="{y + bar + inner / 2 + 6:.1f}">{esc(lab)}</text>')
+        for k, yr in enumerate(years):
+            yy = y + k * (bar + inner)
+            out.append(f'<text class="strip-yr" x="{LW}" y="{yy + bar / 2 + 4.5:.1f}">{esc(yr)}</text>')
+            x = LW + YW
+            row = v.get(yr, {})
+            tot = sum(row.get(c, 0) for c in order)
+            for c in order:
+                w = row.get(c, 0) * scale
+                if w <= 0:
+                    continue
+                tip = f"{lab} · {yr} · {names[c]}|{fmt(row.get(c, 0))} НФЛ, {fpct(row.get(c, 0) / tot if tot else 0)}"
+                out.append(f'<g class="hit" tabindex="0" data-tip="{esc(tip)}">'
+                           f'<rect x="{x:.1f}" y="{yy}" width="{max(w - 2, 0.5):.1f}" height="{bar}" rx="3" '
+                           f'fill="{colors[c]}"/>')
+                if w > 46:
+                    out.append(f'<text class="strip-s ch-{c}" x="{x + 6:.1f}" y="{yy + bar / 2 + 4.5:.1f}">'
+                               f'{esc(fmt(row.get(c, 0)))}</text>')
+                out.append("</g>")
+                x += w
+            out.append(f'<text class="strip-st" x="{x + 8:.1f}" y="{yy + bar / 2 + 5:.1f}">{esc(fmt(tot))}</text>')
+        y += 2 * bar + inner + outer
+    out.append("</svg>")
+    return "".join(out)

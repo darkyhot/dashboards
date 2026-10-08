@@ -83,7 +83,7 @@ def run(conn: str | None = None, schema: str | None = None, schema_t: str | None
             for name, sql in (("cell_sum", Q.CELL_SUM), ("cell_tot", Q.CELL_TOT), ("cell_dim", Q.CELL_DIM),
                               ("cell_top", Q.CELL_TOP), ("nfl_month", Q.NFL_MONTH),
                               ("nfl_overlap", Q.NFL_OVERLAP), ("nfl_lag", Q.NFL_LAG),
-                              ("nfl_cell", Q.NFL_CELL), ("nfl_dim", Q.NFL_DIM),
+                              ("nfl_cell", Q.NFL_CELL), ("nfl_step", Q.NFL_STEP), ("nfl_dim", Q.NFL_DIM),
                               ("deal_month", Q.DEAL_MONTH), ("deal_match", Q.DEAL_MATCH),
                               ("staff", Q.STAFF), ("staff_tot", Q.STAFF_TOT), ("tb_dim", Q.TB_DIM), ("nfl_no_epk", Q.NFL_NO_EPK)):
                 raw[name] = ws.opt(name, sql)

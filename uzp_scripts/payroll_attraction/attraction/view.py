@@ -276,10 +276,11 @@ def s_cells(res: dict) -> str:
     tb = table(["Ячейка ГОСБ × организация", f"Ячеек {lab_p}", f"Ячеек {lab_c}", "Изменение", "%",
                 f"ФЛ {lab_p}", f"ФЛ {lab_c}"], rows, strong_rows=strong, sub_rows=sub)
     st = ct["steps"]
-    steps = C.paired([f"+{s}" for s in st.index],
+    steps = C.paired([A.STEP_T[s] for s in st.index],
                      [float(st.loc[s, "cur"]) if "cur" in st else 0 for s in st.index],
                      [float(st.loc[s, "prev"]) if "prev" in st else 0 for s in st.index],
                      (lab_c, lab_p), fmt=fnum, vmax=float(st.max().max() or 1))
+    steps += _steps_people(res, lab_c, lab_p)
     nc = res["nfl_cell"]
     nct = ""
     if not nc.empty:
@@ -318,8 +319,54 @@ def s_cells(res: dict) -> str:
                    "Численность ячейки — ФЛ с зарплатой в портфеле (правила портфеля заказчика) в августе. Рост — "
                    "+1 ФЛ и больше, включая ячейки, которых год назад не было; снижение — −1 и больше, включая "
                    "закрывшиеся. «10 ушли — 10 пришли» — это «без изменений».",
-                   tb + f"<h3>Насколько выросли растущие ячейки</h3>{steps}{nct}{tt}"
-                   + sql_box(res, ["cell_sum", "cell_tot", "nfl_cell", "cell_top"]))
+                   tb + f"<h3>Насколько выросли растущие ячейки: число ячеек (организации)</h3>{steps}{nct}{tt}"
+                   + sql_box(res, ["cell_sum", "cell_tot", "nfl_cell", "nfl_step", "cell_top"]))
+
+
+def _steps_people(res: dict, lab_c: str, lab_p: str) -> str:
+    """То же по людям: сколько ФЛ прибавили растущие ячейки каждой ступени и сколько
+    НФЛ пришло в них по каналам."""
+    ct = res["cell_t"]
+    sf = ct.get("steps_fl")
+    out = ""
+    if sf is not None and not sf.empty:
+        out += ("<h3>Сколько ФЛ прибавили растущие ячейки (люди)</h3>"
+                "<p class='muted'>Прирост численности (стало − было) в ячейках каждой ступени роста.</p>"
+                + C.paired([A.STEP_T[s] for s in sf.index],
+                           [float(sf.loc[s, "cur"]) if "cur" in sf else 0 for s in sf.index],
+                           [float(sf.loc[s, "prev"]) if "prev" in sf else 0 for s in sf.index],
+                           (lab_c, lab_p), fmt=fnum, vmax=float(sf.max().max() or 1)))
+    ns = res.get("nfl_step")
+    if ns is None or ns.empty:
+        return out
+    y0, y1 = str(M.parse(res["m_prev"][-1]).year), str(M.parse(res["m_cur"][-1]).year)
+    groups = []
+    for st in A.STEPS:
+        groups.append((A.STEP_T[st], {y: {c: float(ns.loc[(t, st), c]) for c in A.CH}
+                                  for y, t in ((y0, "prev"), (y1, "cur"))}))
+    chart = C.stacked_pairs(groups, (y0, y1), A.CH, A.CH_T, COLOR)
+    rows, strong = [], set()
+    for st in A.STEPS + ["all"]:
+        row = [A.STEP_T[st] if st != "all" else "Все растущие ячейки"]
+        for c in A.CH + ["all"]:
+            def v(t):
+                z = ns.xs(t, level="yr")
+                z = z if st == "all" else z.loc[[st]]
+                return float(z.to_numpy().sum()) if c == "all" else float(z[c].sum())
+            a, b = v("cur"), v("prev")
+            row += [fnum(b), fnum(a), delta(a - b)]
+        if st == "all":
+            strong.add(len(rows))
+        rows.append(row)
+    head = ["Ступень роста"] + [h for c in A.CH + ["all"]
+                                for h in (f"{A.CH_T.get(c, 'Всего НФЛ')}: {y0}", y1, "Δ")]
+    leg = "".join(f'<li><span class="chip" style="--c:{COLOR[c]}"></span>{esc(A.CH_T[c])}</li>' for c in A.CH)
+    return (out + "<h3>НФЛ в растущих ячейках по каналам (люди)</h3>"
+            "<p class='muted'>НФЛ янв–авг, пришедшие в ячейки, выросшие к августу того же года, — по ступени "
+            f"роста своей ячейки. Верхний ряд каждой ступени — {y0}, нижний — {y1}; масштаб общий.</p>"
+            f'<ul class="legend">{leg}</ul>' + chart
+            + "<details><summary>Таблица: ступень роста × канал</summary>" + table(head, rows, strong_rows=strong,
+                                                                                    cls="wide") + "</details>")
 
 
 def s_mzp(res: dict) -> str:
@@ -565,6 +612,11 @@ svg.strip{max-width:1120px}
 .strip-v{font-size:17px;font-weight:600;fill:var(--strip-ink)}
 .strip-in.ch-other,.strip-v.ch-other{fill:var(--strip-ink-other)}
 .strip-tot{font-size:20px;font-weight:600;fill:var(--ink)}
+.strip-g{font-family:Bahnschrift,"DIN Alternate","Arial Narrow","Segoe UI",sans-serif;font-size:19px;font-weight:600;fill:var(--ink)}
+.strip-yr{font-size:13px;fill:var(--ink2)}
+.strip-s{font-size:12.5px;font-weight:600;fill:var(--strip-ink)}
+.strip-s.ch-other{fill:var(--strip-ink-other)}
+.strip-st{font-size:14px;font-weight:600;fill:var(--ink)}
 .legend{list-style:none;padding:0;margin:4px 0 0;display:flex;flex-wrap:wrap;gap:6px 26px;font-size:14px}
 .chip{display:inline-block;width:11px;height:11px;border-radius:3px;background:var(--c);margin-right:7px;
  vertical-align:-1px}

@@ -417,6 +417,21 @@ NFL_CELL = """
 SELECT yr, COALESCE(cls, 'none') AS cls, ch, count(*) AS n
 FROM t_nflc GROUP BY 1, 2, 3
 """
+# НФЛ в ячейках роста — по ступени роста своей ячейки и каналу: «физлица» к графику
+# ступеней ячеек. Ступени — те же, что в CELL_SUM.
+_STEP = """CASE WHEN c.n_c - c.n_b = 1 THEN '1'
+            WHEN c.n_c - c.n_b <= 5 THEN '2-5'
+            WHEN c.n_c - c.n_b <= 20 THEN '6-20'
+            WHEN c.n_c - c.n_b <= 100 THEN '21-100'
+            ELSE '100+' END"""
+NFL_STEP = """
+SELECT n.yr, """ + _STEP + """ AS step, n.ch, count(*) AS n
+FROM t_nflc n
+JOIN t_cls c ON c.pair = n.yr AND c.gosb_id = n.gosb_id AND c.inn = n.inn
+WHERE c.cls IN ('grow', 'new')
+GROUP BY 1, 2, 3
+"""
+
 # НФЛ по разрезам × канал × год. Холдинг — колонкой под маску.
 NFL_DIM = """
 SELECT 'seg' AS dim, seg AS key, CAST(NULL AS text) AS holding_name, yr, ch, count(*) AS n
