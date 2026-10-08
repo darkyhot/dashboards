@@ -54,14 +54,15 @@ def _isnan(v) -> bool:
 
 def table(head: list[str], rows: list[list], num: set[int] | None = None, cls: str = "",
           strong_rows: set[int] | None = None, sub_rows: set[int] | None = None, tid: str = "",
-          row_attrs: list[str] | None = None) -> str:
+          row_attrs: list[str] | None = None, head_rows: set[int] | None = None) -> str:
     num = num if num is not None else set(range(1, len(head)))
     out = [f'<div class="scroll"><table class="data {cls}"{f" id={chr(34)}{tid}{chr(34)}" if tid else ""}>'
            f'<thead><tr>']
     out += [f'<th class="{"n" if i in num else ""}">{esc(h)}</th>' for i, h in enumerate(head)]
     out.append("</tr></thead><tbody>")
     for k, r in enumerate(rows):
-        rc = (" strong" if strong_rows and k in strong_rows else "") + (" sub" if sub_rows and k in sub_rows else "")
+        rc = ((" strong" if strong_rows and k in strong_rows else "") + (" sub" if sub_rows and k in sub_rows else "")
+              + (" head" if head_rows and k in head_rows else ""))
         attrs = row_attrs[k] if row_attrs else ""
         out.append(f'<tr class="{rc.strip()}"{attrs}>')
         for i, v in enumerate(r):
@@ -149,17 +150,47 @@ def s_hero(res: dict) -> str:
                  ("deals_per_mgr", "Сделок на менеджера")):
         a, b = mz.loc["cur", k], mz.loc["prev", k]
         idx.append((t, A.pct(a, b), a, b))
+    # Длина — изменение в %, подпись — во сколько раз: «×1,50» читается быстрее «+50%».
     bars = C.hbars([t for t, *_ in idx], [100 * (v if not _isnan(v) else 0) for _, v, *_ in idx],
-                   fmt=lambda v, s=True: fnum(v, s, 0) + "%",
+                   fmt=lambda v, s=True: "×" + fnum(1 + v / 100, digits=2),
                    tips=[f"{t}|{fnum(b, digits=1 if 'менеджера' in t else 0)} → "
-                         f"{fnum(a, digits=1 if 'менеджера' in t else 0)}" for t, _, a, b in idx])
+                         f"{fnum(a, digits=1 if 'менеджера' in t else 0)} ({fpct(v, True, 0)})"
+                         for t, v, a, b in idx])
     vd = "".join(f"<li>{esc(x)}</li>" for x in res["verdict"])
+    pl = "".join(f"<li>{esc(x)}</li>" for x in res.get("prop_lines", []))
+    y0, y1 = M.parse(res["m_prev"][-1]).year, M.parse(res["m_cur"][-1]).year
     return (f'<section id="hero" class="hero">'
             f'<p class="kicker">Новые получатели зарплаты в Сбере (НФЛ), {esc(_y(res, "prev"))} и {esc(_y(res, "cur"))}</p>'
             f'{strip}<ul class="legend">{legend}</ul>'
             f'<div class="hero-grid"><div><h3>Что произошло</h3><ul class="verdict">{vd}</ul></div>'
-            f'<div><h3>Штат МЗП и отдача, изменение год к году</h3>{bars}</div></div>'
-            + sql_box(res, ["nfl_month"]) + "</section>")
+            f'<div><h3>Пропорции МЗП: штат и продажи</h3><ul class="verdict">{pl}</ul></div></div>'
+            f'<h3 class="big">Штат МЗП и отдача: во сколько изменилось, {y1} к {y0}</h3>'
+            f'<div class="bars-big">{bars}</div>'
+            f'<h3 id="facts">Факты: {y0} и {y1}</h3>{facts_table(res)}'
+            + sql_box(res, ["nfl_month", "cell_tot", "cell_sum", "staff_tot", "deal_month"]) + "</section>")
+
+
+def facts_table(res: dict) -> str:
+    f = res.get("facts")
+    if f is None or f.empty:
+        return ""
+    y0, y1 = M.parse(res["m_prev"][-1]).year, M.parse(res["m_cur"][-1]).year
+    rows, strong, sub, heads = [], set(), set(), set()
+    for r in f.itertuples():
+        if r.head:
+            heads.add(len(rows))
+            rows.append([Raw(f"<b>{esc(r.title)}</b>"), "", "", "", ""])
+            continue
+        if r.sub:
+            sub.add(len(rows))
+        elif r.key in ("port", "nfl", "nfl_grow", "nfl_per_mgr"):
+            strong.add(len(rows))
+        title = chip(r.key.split("_")[-1]) if r.sub and r.key.split("_")[-1] in A.CH_T else r.title
+        bad = r.key in ("decl", "decl_d")
+        rows.append([title, fnum(r.prev, digits=r.digits), fnum(r.cur, digits=r.digits),
+                     delta(r.delta, r.digits, bad_up=bad), dpct(r.pct, bad)])
+    return table(["", str(y0), str(y1), "Разница", "%"], rows, strong_rows=strong, sub_rows=sub,
+                 cls="facts", head_rows=heads)
 
 
 def s_channels(res: dict) -> str:
@@ -252,16 +283,25 @@ def s_cells(res: dict) -> str:
     nc = res["nfl_cell"]
     nct = ""
     if not nc.empty:
-        r2 = []
-        for grp in ("grow", "flat", "decl", "none"):
-            for y in ("prev", "cur"):
-                if (y, grp) not in nc.index:
-                    continue
-                v = nc.loc[(y, grp)]
-                r2.append([A.GROUP_T[grp], _y(res, y)] + [fnum(v[c]) for c in A.CH] + [fnum(v.sum())])
-        nct = ("<h3>НФЛ по классу своей ячейки</h3><p class='muted'>НФЛ года — к классу ячейки за тот же год "
-               "(август к августу). Сколько НФЛ пришло в растущие ячейки и через какие каналы.</p>"
-               + table(["Ячейка", "Период"] + [A.CH_T[c] for c in A.CH] + ["Всего"], r2, num=set(range(2, 7))))
+        def v(y, grp, c):
+            if (y, grp) not in nc.index:
+                return 0.0
+            return float(nc.loc[(y, grp)].sum()) if c == "all" else float(nc.loc[(y, grp), c])
+        y0, y1 = M.parse(res["m_prev"][-1]).year, M.parse(res["m_cur"][-1]).year
+        groups = [g for g in ("grow", "flat", "decl", "none") if any((y, g) in nc.index for y in ("prev", "cur"))]
+        r2, strong = [], set()
+        for c in A.CH + ["all"]:
+            row = [chip(c) if c != "all" else "Всего НФЛ"]
+            for grp in groups:
+                a, b = v("cur", grp, c), v("prev", grp, c)
+                row += [fnum(b), fnum(a), delta(a - b)]
+            if c == "all":
+                strong.add(len(r2))
+            r2.append(row)
+        head = ["Канал"] + [h for grp in groups for h in (f"{A.GROUP_T[grp]}: {y0}", str(y1), "Разница")]
+        nct = ("<h3>НФЛ по классу своей ячейки, по каналам</h3><p class='muted'>НФЛ года — к классу своей ячейки "
+               "за тот же год (август к августу). Сколько НФЛ пришло в растущие ячейки и через какие каналы.</p>"
+               + table(head, r2, strong_rows=strong, cls="wide"))
     top = res["cell_top"]
     tt = ""
     if top is not None and not top.empty:
@@ -513,6 +553,12 @@ h3{font-size:16.5px;font-weight:600;margin:24px 0 8px}
 svg.chart{width:100%;height:auto;display:block;margin:4px 0}
 svg.chart{max-width:780px}
 svg.strip,.smalls svg.chart{max-width:none}
+.bars-big svg.chart{max-width:1000px}
+.bars-big svg .rlabel{font-size:15px}
+.bars-big svg .vlabel{font-size:14px;font-weight:600;fill:var(--ink)}
+h3.big{font-size:19px;margin-top:30px}
+table.facts td:first-child{min-width:340px}
+table.facts tr.head td{padding-top:16px;border-bottom:1px solid var(--axis)}
 svg.strip{max-width:1120px}
 .strip-y{font-size:22px;font-weight:600;fill:var(--ink)}
 .strip-in{font-size:13px;fill:var(--strip-ink)}

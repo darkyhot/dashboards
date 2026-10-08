@@ -335,3 +335,115 @@ def compute(res: dict) -> None:
     res["deal_match"] = dm
     res["checks"] = checks
     res["verdict"] = verdict(res)
+    res["facts"] = facts(res)
+    res["prop"] = proportions(res)
+    res["prop_lines"] = proportion_lines(res["prop"])
+    f = res["facts"].set_index("key")
+    if "nfl_grow" in f.index:
+        for y in ("prev", "cur"):
+            checks.append(check(f"НФЛ в ячейках роста: Σ каналов = всего ({'этот год' if y == 'cur' else 'год назад'})",
+                                float(sum(f.loc[f"nfl_grow_{c}", y] for c in CH) - f.loc["nfl_grow", y])))
+
+
+# --------------------------------------------------------------------------- #
+# Факты (абсолютные числа двух лет) и пропорции
+# --------------------------------------------------------------------------- #
+def facts(res: dict) -> pd.DataFrame:
+    """Одна таблица в абсолютных числах: 2025, 2026, разница, %.
+    Портфель и ячейки — на август; НФЛ и МЗП — за январь–отчётный месяц."""
+    ct = res["cell_t"]
+    pp, pc = ct["pairs"]["prev"], ct["pairs"]["cur"]
+    tot, grp = ct["tot"], ct["grp"]
+    rows = []
+
+    def add(key, title, prev, cur, sub=False, digits=0, head=False):
+        rows.append({"key": key, "title": title, "prev": prev, "cur": cur, "sub": sub, "digits": digits,
+                     "head": head})
+
+    def g(pair, k, col):
+        try:
+            return float(grp.loc[(pair, k), col])
+        except KeyError:
+            return 0.0
+    tv = lambda d, c: float(tot.loc[M.iso(d), c]) if M.iso(d) in tot.index else np.nan
+    add("h_port", f"Портфель, август", None, None, head=True)
+    add("port", "Получателей ЗП в портфеле, ФЛ", tv(pp[1], "n_fl"), tv(pc[1], "n_fl"))
+    add("cells", "Ячеек ГОСБ × организация", tv(pp[1], "n_cells"), tv(pc[1], "n_cells"))
+    add("grow", "Ячеек роста (+1 ФЛ и больше) к августу прошлого года", g("prev", "grow", "n_cells"),
+        g("cur", "grow", "n_cells"))
+    add("grow_d", "ФЛ прибавили в ячейках роста", g("prev", "grow", "d"), g("cur", "grow", "d"), sub=True)
+    add("decl", "Ячеек снижения (−1 ФЛ и больше)", g("prev", "decl", "n_cells"), g("cur", "decl", "n_cells"))
+    add("decl_d", "ФЛ потеряли в ячейках снижения", -g("prev", "decl", "d"), -g("cur", "decl", "d"), sub=True)
+    add("flat", "Ячеек без изменений", g("prev", "flat", "n_cells"), g("cur", "flat", "n_cells"))
+
+    nt = res["nfl"]["tot"]
+    add("h_nfl", f"Новые получатели (НФЛ), {res['period']}", None, None, head=True)
+    add("nfl", "НФЛ всего", float(nt.loc["prev", "all"]), float(nt.loc["cur", "all"]))
+    for c in CH:
+        add(f"nfl_{c}", CH_T[c], float(nt.loc["prev", c]), float(nt.loc["cur", c]), sub=True)
+    nc = res.get("nfl_cell")
+    if nc is not None and not nc.empty:
+        def ncv(y, c):
+            return float(nc.loc[(y, "grow"), c]) if (y, "grow") in nc.index else 0.0
+        add("nfl_grow", "НФЛ в ячейках роста", sum(ncv("prev", c) for c in CH), sum(ncv("cur", c) for c in CH))
+        for c in CH:
+            add(f"nfl_grow_{c}", CH_T[c], ncv("prev", c), ncv("cur", c), sub=True)
+
+    mz = res["mzp"]["year"]
+    add("h_mzp", "МЗП", None, None, head=True)
+    for k, t, dg in (("staff", "Менеджеров МЗП", 0), ("deals", f"Сделок МЗП, {res['period']}", 0),
+                     ("fact", "Факт по сделкам, ФЛ", 0), ("nfl_mzp", "НФЛ через МЗП", 0),
+                     ("nfl_per_mgr", "НФЛ МЗП на менеджера", 1), ("deals_per_mgr", "Сделок на менеджера", 1),
+                     ("fact_per_mgr", "Факт по сделкам на менеджера, ФЛ", 1)):
+        add(k, t, float(mz.loc["prev", k]), float(mz.loc["cur", k]), digits=dg)
+    out = pd.DataFrame(rows)
+    out["delta"] = out["cur"] - out["prev"]
+    out["pct"] = [pct(c, p) if pd.notna(p) and p else np.nan for c, p in zip(out["cur"], out["prev"])]
+    return out
+
+
+def proportions(res: dict) -> dict:
+    """Пропорции МЗП: во сколько раз вырос штат и во сколько — продажи. Плюс сколько
+    НФЛ дал бы новый штат при прошлогодней производительности."""
+    mz = res["mzp"]["year"]
+    k = {}
+    for key in ("staff", "deals", "plan", "fact", "nfl_mzp", "nfl_per_mgr", "deals_per_mgr", "fact_per_mgr",
+                "nfl_per_deal", "fact_per_deal"):
+        a, b = float(mz.loc["cur", key]), float(mz.loc["prev", key])
+        k[key] = a / b if b else np.nan
+    expected = float(mz.loc["prev", "nfl_per_mgr"]) * float(mz.loc["cur", "staff"])
+    yoy = res["nfl"]["yoy"].set_index("ch")
+    return {"k": k, "expected_nfl": expected, "actual_nfl": float(mz.loc["cur", "nfl_mzp"]),
+            "gap": float(mz.loc["cur", "nfl_mzp"]) - expected,
+            "share_prev": float(yoy.loc["mzp", "share_prev"]), "share_cur": float(yoy.loc["mzp", "share_cur"]),
+            "staff_prev": float(mz.loc["prev", "staff"]), "staff_cur": float(mz.loc["cur", "staff"]),
+            "nfl_prev": float(mz.loc["prev", "nfl_mzp"]),
+            "year_prev": int(mz.loc["prev", "year"]), "year_cur": int(mz.loc["cur", "year"])}
+
+
+def proportion_lines(pr: dict) -> list[str]:
+    from .charts import fnum, fpct
+    k = pr["k"]
+
+    def times(x):
+        return "—" if pd.isna(x) else f"в {fnum(x, digits=2)} раза"
+
+    def ch(x):
+        return "" if pd.isna(x) else f" ({fpct(x - 1, True, 0)})"
+    y0, y1 = pr["year_prev"], pr["year_cur"]
+    out = [
+        f"Штат МЗП вырос {times(k['staff'])}: {fnum(pr['staff_prev'])} → {fnum(pr['staff_cur'])} менеджеров.",
+        f"НФЛ через МЗП изменились {times(k['nfl_mzp'])}{ch(k['nfl_mzp'])}: {fnum(pr['nfl_prev'])} → "
+        f"{fnum(pr['actual_nfl'])}.",
+        f"Производительность — НФЛ МЗП на менеджера — {times(k['nfl_per_mgr'])}{ch(k['nfl_per_mgr'])}.",
+        f"Сделок {times(k['deals'])}{ch(k['deals'])}, на менеджера {times(k['deals_per_mgr'])}{ch(k['deals_per_mgr'])}; "
+        f"факт по сделкам {times(k['fact'])}{ch(k['fact'])}, на менеджера {times(k['fact_per_mgr'])}"
+        f"{ch(k['fact_per_mgr'])}.",
+        f"При производительности {y0} года новый штат дал бы {fnum(pr['expected_nfl'])} НФЛ, фактически "
+        f"{fnum(pr['actual_nfl'])} — {'недобор' if pr['gap'] < 0 else 'сверх'} {fnum(abs(pr['gap']))}.",
+        f"Доля МЗП в НФЛ: {fpct(pr['share_prev'])} в {y0} → {fpct(pr['share_cur'])} в {y1}.",
+    ]
+    if not pd.isna(k["staff"]) and not pd.isna(k["nfl_mzp"]) and k["staff"] != 1:
+        el = (k["nfl_mzp"] - 1) / (k["staff"] - 1)
+        out.append(f"На каждый +1% штата НФЛ МЗП изменились на {fnum(el, True, 2)}%.")
+    return out
