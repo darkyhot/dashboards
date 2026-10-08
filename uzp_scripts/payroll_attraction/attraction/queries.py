@@ -215,7 +215,8 @@ GROUP BY src
 
 T_NKEY = "SELECT DISTINCT epk_id FROM t_nfl"
 
-# Консультации ВСП (фильтры заказчика). Сразу сжаты до «ФЛ × месяц → самая ранняя
+# Консультации ВСП (фильтры заказчика). Дата приводится явно — тип колонки на проме
+# не задан профилем, приведение даты к дате ничего не стоит. Сразу сжаты до «ФЛ × месяц → самая ранняя
 # дата»: раннее действие месяца не хуже позднего (конец окна зависит только от
 # месяца), поэтому этого достаточно — это и есть DISTINCT ON заказчика.
 T_VSP = """
@@ -227,21 +228,23 @@ JOIN t_nkey k ON k.epk_id = t.epk_id
 WHERE t.sales_channel_group IN """ + VSP_GROUPS + """
   AND t.fraud_type = 0
   AND t.calc_product IN """ + VSP_PRODUCTS + """
-  AND t.src_report_dt BETWEEN CAST(:act_from AS date) AND CAST(:act_to AS date)
+  AND CAST(t.src_report_dt AS date) BETWEEN CAST(:act_from AS date) AND CAST(:act_to AS date)
   AND t.src_operation_name != """ + VSP_EXCLUDED_OP + """
-GROUP BY t.epk_id, date_trunc('month', t.src_report_dt)
+GROUP BY t.epk_id, date_trunc('month', CAST(t.src_report_dt AS date))
 """
 
-# Консультации СБОЛ (Digital): то же сжатие.
+# Консультации СБОЛ (Digital): то же сжатие. На проме `data_timestamp` — ТЕКСТ, поэтому
+# сначала приведение к дате (как `data_timestamp::date` у заказчика), потом всё
+# остальное: сравнение текста с датой и date_trunc по тексту в Postgres не работают.
+_DIG_DT = "CAST(c.data_timestamp AS date)"
 T_DIG = """
 SELECT c.epk_id,
-       min(CAST(c.data_timestamp AS date)) AS act_dt,
-       """ + valid_to("min(CAST(c.data_timestamp AS date))") + """ AS valid_to
+       min(""" + _DIG_DT + """) AS act_dt,
+       """ + valid_to("min(" + _DIG_DT + ")") + """ AS valid_to
 FROM {schema_t}.ml_ksa_clickstream_events_oaa c
 JOIN t_nkey k ON k.epk_id = c.epk_id
-WHERE c.data_timestamp >= CAST(:act_from AS date)
-  AND c.data_timestamp < CAST(:act_to AS date) + 1
-GROUP BY c.epk_id, date_trunc('month', c.data_timestamp)
+WHERE """ + _DIG_DT + """ BETWEEN CAST(:act_from AS date) AND CAST(:act_to AS date)
+GROUP BY c.epk_id, date_trunc('month', """ + _DIG_DT + """)
 """
 
 # Сделки МЗП: deal_code есть, роль МЗП; одна строка на сделку — из последнего

@@ -432,7 +432,7 @@ CREATE TABLE {t}.bkv_bkv_uzp_data_nfl_channel ({nfl});
 CREATE TABLE {s}.asm_data_operation (
   report_dt date, epk_id bigint, src_report_dt date, sales_channel_group varchar, fraud_type smallint,
   calc_product varchar, src_operation_name varchar);
-CREATE TABLE {t}.ml_ksa_clickstream_events_oaa (epk_id bigint, data_timestamp timestamp);
+CREATE TABLE {t}.ml_ksa_clickstream_events_oaa (epk_id bigint, data_timestamp text);  -- на проме текст
 CREATE TABLE {s}.uzp_dwh_sale_funnel_task (
   report_dt date, tb_id integer, tb_name varchar, gosb_id integer, gosb_name varchar, saphr_gosb_id integer,
   manager_saphr_id bigint, manager_fio varchar, isu_struct_saphr_id bigint, task_struct_saphr_id bigint,
