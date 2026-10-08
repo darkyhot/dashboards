@@ -737,13 +737,14 @@ def s_threshold(res: dict) -> str:
     rows = [[fnum(t) + " ₽"] + [fnum(pv.loc[t, m], True) for m in pv.columns] for t in pv.index]
     return section("threshold", "Порог 2 500 ₽",
                    "Порог фиксирован, а зарплаты индексируются: сам по себе он год к году добавляет получателей. "
-                   "Если картина (знаки и замедление) сохраняется при нулевом пороге, порог ни при чём.",
-                   table(["Порог по организации"] + [f"Год к году, {M.name(m)}" for m in pv.columns], rows))
+                   "Если картина (знаки и замедление) сохраняется при нулевом пороге, порог ни при чём. "
+                   "Вид 2 и организации без порога (образовательные и холдинг-исключение) проходят при любом пороге.",
+                   table(["Порог по тройке"] + [f"Год к году, {M.name(m)}" for m in pv.columns], rows))
 
 
 ORG_HEAD = ["Организация", ORG_ID, "Холдинг", "Отрасль", "Сегмент", "ТБ", "Было ФЛ", "Стало", "Нетто",
             "Реальное сокращение", "% базы", "Перестали в Сбере", "из них: нет зачислений", "ниже порога",
-            "только незарплатные", "Переток в др. орг.", "Реорг.", "Пропустили месяц, вернулись",
+            "только прочие зачисления", "Переток в др. орг.", "Реорг.", "Пропустили месяц, вернулись",
             "Пришли новые", "Пришли из др. орг."]
 N_TEXT = 6
 
@@ -1313,7 +1314,7 @@ def render(res: dict) -> str:
             f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
             f"<title>{esc(title)}</title><style>{CSS}</style></head><body>"
             f"<header><h1>{esc(title)}</h1><div class='meta'>Сформирован {esc(res['generated'])} · "
-            f"схема {esc(res['schema'])} · порог {fnum(res['amt_min'])} ₽ · кодов {len(res['codes'])}</div></header>"
+            f"схема {esc(res['schema'])} · порог {fnum(res['amt_min'])} ₽ по тройке · виды — справочник портфеля</div></header>"
             f"<nav class='bar'>{tabs}<span class='months' role='group' aria-label='Месяц сравнения'>"
             f"<span class='muted' style='font-size:13px;margin-right:4px'>Месяц:</span>{buttons}</span>"
             f"<span class='anchors' data-pane='bank'>"

@@ -1,4 +1,4 @@
-"""Синтетика открытого контура: три витрины в своей схеме `synth_bank_yoy`.
+"""Синтетика открытого контура: витрины и справочники отчёта в своей схеме `synth_bank_yoy`.
 
 Запуск из папки отчёта:  python -m bank_yoy.synth  [--url ...] [--persons 30000]
 
@@ -27,7 +27,13 @@
 * непригодные номера организаций в ведомостях;
 * ИП с ФИО в названии (название не должно попасть в отчёт) и холдинг с ФИО;
 * выделенный холдинг «МИНОБОРОНЫ»: часть его людей уходит из Сбера в августе 2026;
-* пропажа аванса: организации в августе 2026 платят только зарплату.
+* пропажа аванса: организации в августе 2026 платят только зарплату;
+* шум отбора зачислений — постоянный во все месяцы, на год к году не влияет:
+  «Дополнительные», «ИП 1 чел.», организация Сбера (получателями НЕ становятся) и
+  вид 2 ниже порога (становится); образовательные организации — без порога;
+  ТБ 38 перекодируется в ГОСБ 9038.
+Эталон числа получателей-троек по месяцам считается здесь же, pandas-версией
+логики заказчика (`expect["recipients"]`), и сверяется с отчётом точно.
 """
 from __future__ import annotations
 
@@ -76,8 +82,15 @@ SHORT = {"Микро": "ММБ", "Малые": "ММБ", "Средние": "КС
          "Крупнейшие": "КСБ", "Рег. госсектор": "РГС", "Клиенты машиностроения": "СКМ",
          "Фин.институты": "КФИ", "SBI": "БМО", None: "Не в справочнике"}
 TB = [(38, "Северный"), (40, "Южный"), (42, "Западный"), (44, "Восточный"), (52, "Центральный")]
-CODE_NAMES = {1: "Заработная плата", 16: "Аванс по заработной плате", 26: "Отпускные", 28: "Премия",
-              7: "Пособие", 3: "Пенсия НПФ"}
+CODE_NAMES = {1: "Заработная плата", 2: "Денежное довольствие", 16: "Аванс по заработной плате",
+              26: "Отпускные", 28: "Премия", 7: "Пособие", 3: "Пенсия НПФ"}
+PORTFOLIO = {1, 2, 16, 26, 28}           # справочник видов: is_portfolio_enrollment
+SBER_INN = "7707083893"
+NOISE_PERSONS = 300                      # на каждый вид шума
+PAY_SEG = {"Микро": "Микробизнес", "Малые": "Малый бизнес", "Средние": "Средний бизнес",
+           "Крупные": "Крупный бизнес", "Крупнейшие": "Крупнейший бизнес",
+           "Рег. госсектор": "Государственный сектор", "Клиенты машиностроения": "Клиенты машиностроения",
+           "Фин.институты": "CIB", "SBI": "БМО", None: None}
 
 # Базовая текучесть (в месяц) и куда уходит человек.
 HAZARD = 0.010
@@ -246,6 +259,9 @@ class Gen:
         self.ev_adv = set(int(x) for x in self.rng.choice(cand, size=min(20, len(cand)), replace=False))
         taken.update(self.ev_adv)
         self.protected = taken
+        # Образовательные (без порога) — каждая десятая РГС вне событий.
+        self.edu = {o["id"] for o in self.orgs if o["seg"] == "РГС" and o["id"] % 10 == 0
+                    and o["id"] not in taken}
 
     def simulate(self) -> None:
         r = self.rng
@@ -406,7 +422,56 @@ class Gen:
         df["agrmnt_num"] = "Д-" + df["org"].astype(str)
         df["transaction_qty"] = 1
         df["amt"] = df["amt"].round(2)
-        return df.drop(columns=["t", "org"])
+        df["segment_name"] = df["org"].map({o["id"]: PAY_SEG[o["big"]] for o in self.orgs})
+        df["enrollment_kind_descr"] = "Основные"
+        df["market_share_flag_name"] = "Обычный"
+        df = pd.concat([df.drop(columns=["t", "org", "gosb_id", "tb_id"]), self._noise()],
+                       ignore_index=True)
+        self.expect["recipients"] = self._recipients(df)
+        return df
+
+    def _noise(self) -> pd.DataFrame:
+        """Шум отбора: одни и те же ФЛ во все месяцы (год к году не меняется)."""
+        pool = [o for o in self.orgs if o["id"] not in self.protected and o["id"] not in self.edu]
+        kinds = [("dop", 50000.0), ("ip1", 50000.0), ("sber", 50000.0), ("t2", 900.0)]
+        rows = []
+        for kind, amt in kinds:
+            for i in range(NOISE_PERSONS):
+                o = pool[(i * 7 + len(rows)) % len(pool)]
+                epk = 8_000_000_000 + len(rows)
+                for t in range(N_MONTHS):
+                    rows.append({"report_dt": M.shift(START, t), "epk_id": epk,
+                                 "inn": SBER_INN if kind == "sber" else str(o["inn"]),
+                                 "sys_gosb_id": o["gosb"], "sys_tb_id": o["gosb"] // 100,
+                                 "enrollment_type": 2 if kind == "t2" else 1, "amt": amt,
+                                 "enrollment_transcription": CODE_NAMES[2 if kind == "t2" else 1],
+                                 "company_name": o["name"], "agrmnt_num": f"Д-{o['id']}",
+                                 "transaction_qty": 1, "segment_name": PAY_SEG[o["big"]],
+                                 "enrollment_kind_descr": "Дополнительные" if kind == "dop" else "Основные",
+                                 "market_share_flag_name": "ИП 1 чел." if kind == "ip1" else "Обычный"})
+        return pd.DataFrame(rows)
+
+    def exc_inns(self) -> set[int]:
+        return {int(self.orgs[o]["inn"]) for o in self.edu | self.ev_focus}
+
+    def _recipients(self, df: pd.DataFrame) -> dict:
+        """Эталон: получатели-тройки по месяцам — логика заказчика на pandas."""
+        x = df.copy()
+        x["gosb"] = np.where(x["sys_tb_id"] == 38, 9038, x["sys_gosb_id"])
+        relev = ((x["enrollment_kind_descr"] == "Основные") & (x["market_share_flag_name"] != "ИП 1 чел.")
+                 & ~x["inn"].isin([SBER_INN, "Не определено", "0", "-1"]))
+        x["pf"] = relev & x["enrollment_type"].isin(PORTFOLIO)
+        x["t2"] = relev & (x["enrollment_type"] == 2)
+        x = x[x["inn"].str.fullmatch(r"[0-9]{1,12}") & (x["pf"] | x["t2"])].copy()
+        x["inn_n"] = x["inn"].astype("int64")
+        x["amt_pf"] = np.where(x["pf"], x["amt"], 0.0)
+        x["pos_pf"] = x["pf"] & (x["amt"] > 0)
+        x["t2"] = x["t2"] & (x["amt"] > 0)
+        g = x.groupby(["report_dt", "epk_id", "inn_n", "gosb"]).agg(
+            amt_pf=("amt_pf", "sum"), pos_pf=("pos_pf", "any"), t2=("t2", "any")).reset_index()
+        g["exc"] = g["inn_n"].isin(self.exc_inns())
+        ok = g["t2"] | (g["pos_pf"] & (g["exc"] | (g["amt_pf"] > 2500)))
+        return {M.iso(k): int(v) for k, v in g[ok].groupby("report_dt").size().items()}
 
     def epk(self) -> pd.DataFrame:
         rows = []
@@ -416,6 +481,7 @@ class Gen:
             rows.append({"epk_id": 9_000_000 + o["id"], "inn": o["inn"],
                          "segment_name": o["big"], "company_name": o["name"],
                          "holding_name": self._holding(o),
+                         "reference_holding_name": FOCUS_HOLDING if o["id"] in self.ev_focus else None,
                          "industry_name": "Образование" if o["seg"] == "РГС" else "Торговля",
                          "status_name": "Ликвидирована" if o["liquidated"] else "Активна",
                          "tb_id": o["tb"]})
@@ -448,7 +514,7 @@ class Gen:
         return pd.DataFrame(rows)
 
 
-# Прод-схема трёх витрин (имена и типы колонок — как на проме).
+# Прод-схема витрин и справочников (имена и типы колонок — как на проме).
 DDL = """
 DROP SCHEMA IF EXISTS {s} CASCADE;
 CREATE SCHEMA {s};
@@ -470,16 +536,17 @@ CREATE TABLE {s}.uzp_data_epk_consolidation (
   km_gosb_id integer, last_mzp_activity_gosb_id integer, last_deal_gosb_id integer,
   kpp_gosb_id integer, gosb_method_id smallint, status_id smallint, status_name varchar,
   is_educational boolean, is_military boolean, report_id bigint, modified_dttm timestamp);
-CREATE TABLE {s}.uzp_data_payroll_m (
-  acc_num text, acc_open_dt date, acc_subtype smallint, acc_type smallint,
-  actual_client_tid bigint, amt numeric, client_category smallint, company_name text,
-  document_info_sha1 bigint, agrmnt_dt date, agrmnt_num text, enrollment_transcription text,
-  enrollment_type smallint, epk_id bigint, gosb_id integer, sys_gosb_id integer, inn text,
-  inn_parsing text, ipt_name text, sys_osb_id integer, card_type text, modified_dttm timestamp,
-  report_dt date, tb_id smallint, sys_tb_id smallint, transaction_qty smallint, untb bigint,
-  vsp_id integer, sys_vsp_id integer, report_id bigint, is_security_force boolean,
-  segment_name text, enrollment_kind_descr text, market_share_flag_name text,
-  src_system_name text);
+CREATE TABLE {s}.mis_data_payroll_m (
+  acc_num text, acc_open_dt date, actual_client_tid bigint, amt numeric, company_name text,
+  agrmnt_dt date, agrmnt_num text, enrollment_transcription text, enrollment_type smallint,
+  epk_id bigint, sys_gosb_id integer, inn text, ipt_name text, sys_osb_id integer, card_type text,
+  modified_dttm timestamp, report_dt date, sys_tb_id smallint, transaction_qty smallint,
+  sys_vsp_id integer, report_id bigint, is_security_force boolean, segment_name text,
+  enrollment_kind_descr text, market_share_flag_name text, src_system_name text);
+CREATE TABLE {s}.uzp_dim_enrollment_type (
+  enrollment_type_id smallint, enrollment_type_name varchar, is_fot_enrollment boolean,
+  is_portfolio_enrollment boolean);
+CREATE TABLE {s}.uzp_dim_education_organization (inn varchar, company_name varchar);
 """
 
 
@@ -500,6 +567,11 @@ def build(url: str | None = None, persons: int = 30000, schema: str = config.SYN
     g.plan_events()
     g.simulate()
     pay, epk, gosb = g.payroll(), g.epk(), g.gosb()
+    et = pd.DataFrame([{"enrollment_type_id": c, "enrollment_type_name": n,
+                        "is_fot_enrollment": c in PORTFOLIO, "is_portfolio_enrollment": c in PORTFOLIO}
+                       for c, n in CODE_NAMES.items()])
+    edu = pd.DataFrame([{"inn": str(g.orgs[o]["inn"]), "company_name": g.orgs[o]["name"]}
+                        for o in sorted(g.edu)])
     print(f"  ведомости: {len(pay):,} строк; организаций {len(g.orgs):,}", flush=True)
     eng = create_engine(config.db_url(url), future=True)
     with eng.connect() as conn:
@@ -508,8 +580,10 @@ def build(url: str | None = None, persons: int = 30000, schema: str = config.SYN
                 conn.execute(text(stmt))
         _copy(conn, gosb, f"{schema}.uzp_dim_gosb")
         _copy(conn, epk, f"{schema}.uzp_data_epk_consolidation")
-        _copy(conn, pay, f"{schema}.uzp_data_payroll_m")
-        conn.execute(text(f"ANALYZE {schema}.uzp_data_payroll_m"))
+        _copy(conn, pay, f"{schema}.mis_data_payroll_m")
+        _copy(conn, et, f"{schema}.uzp_dim_enrollment_type")
+        _copy(conn, edu, f"{schema}.uzp_dim_education_organization")
+        conn.execute(text(f"ANALYZE {schema}.mis_data_payroll_m"))
         conn.commit()
     config.ensure_dirs()
     path = config.OUTPUT_DIR / "synth_expect.json"

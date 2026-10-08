@@ -365,6 +365,8 @@ def render(res: dict) -> tuple[str, list[str]]:
             used = {a: v for a, v in args.items() if f":{a}" in sql}
             if "focus_holding" in used:
                 used["focus_holding"] = "<название выделенного холдинга>"     # не имя в документе
+            if "exc_holding" in used:
+                used["exc_holding"] = "<название холдинга без порога>"
             L.append(f"### {k}\n\n```sql\n{V._params_comment(used)}{V.hide_col(sql)}\n```\n")
 
     doc = V.sanitize("\n".join(L))

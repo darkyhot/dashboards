@@ -6,7 +6,7 @@
 ПЯТЬ ЛОВУШЕК, на которых такой разбор ломается тихо
 ---------------------------------------------------
 
-1. **Партиция.** `uzp_data_payroll_m` партиционирована по `report_dt`. Запрос без
+1. **Партиция.** `mis_data_payroll_m` партиционирована по `report_dt`. Запрос без
    `report_dt` в WHERE читает всю историю всего банка — на проме это «никогда».
    Каждое обращение к витрине ниже ограничено ОДНИМ месяцем (`= CAST(:m AS date)`),
    и это проверяет самопроверка `check_partition_filter`.
@@ -15,25 +15,66 @@
    маской `INN_OK`, а в условии соединения — внутри `CASE`.
 3. **Диалект 9.4.** Никаких `make_interval(months => n)`, `ON CONFLICT`, `GROUPING
    SETS`. Предыдущий месяц передаётся параметром, а не вычисляется в SQL.
-4. **Список кодов** уезжает ОДНИМ параметром-массивом и сравнивается `= ANY(:codes)`.
-   `IN :codes` через `text()` подставил бы кортеж одним значением.
+4. **Списки значений** (`adv_codes`, `sal_codes`) уезжают ОДНИМ параметром-массивом и
+   сравниваются `= ANY(:x)`. `IN :x` через `text()` подставил бы кортеж одним значением.
 5. **NULL в ключе тройки.** `sys_gosb_id` бывает пуст; NULL не равен NULL, и
    тройка с пустым ГОСБ «исчезала» бы каждый месяц. Поэтому `COALESCE(..., -1)`.
 
-Грейн и порог
--------------
-Получатель — ТРОЙКА (epk_id, inn, ГОСБ). Засчитывается, если сумма по зарплатным
-кодам за месяц В id орг (не в тройке!) больше порога. Порог и ключ счёта живут на
-разных грейнах, поэтому сумма по id орг — оконная функция поверх группировки по
-тройке: HAVING умеет фильтровать только свою группу.
+Отбор зачислений и порог — логика заказчика (портфель, is_salary_client)
+------------------------------------------------------------------------
+Ведомости — `mis_data_payroll_m`, с перекодировками заказчика: ГОСБ (`gosb_fix`) и
+«Не определено» → '0'. Строка релевантна (`_RELEV`): вид «Основные» и не «ИП 1 чел.»
+(с января 2024; ноябрь–декабрь 2023 — без условий), id орг не Сбер и не заглушка.
+Портфельные виды — по справочнику `uzp_dim_enrollment_type.is_portfolio_enrollment`,
+а не списком кодов.
+
+Получатель — ТРОЙКА (epk_id, inn, ГОСБ). Сумма портфельных зачислений `amt_pf`
+считается по ТРОЙКЕ (месяц, ФЛ, ГОСБ, id орг). Тройка — получатель, если у неё есть
+релевантная строка с суммой > 0 и выполнено одно из трёх (`rec`):
+  1) портфельная строка и `amt_pf` > порога;
+  2) вид зачисления 2;
+  3) портфельная строка и id орг без порога (`t_exc`: образовательные и холдинг
+     МИНОБОРОНЫ по `reference_holding_name`).
 """
 from __future__ import annotations
 
 from . import segments as S
 
-CODES = (1, 2, 16, 18, 19, 26, 28, 33, 38, 39, 40, 42, 49, 82, 87, 88, 94, 95)
 AMT_MIN = 2500
 THRESHOLDS = (0, 1000, 5000, 10000)     # плюс AMT_MIN — чувствительность к порогу
+EXC_HOLDING = "МИНОБОРОНЫ"              # холдинг без порога (условие 3 заказчика)
+BAD_INNS = "('7707083893', 'Не определено', '0', '-1')"
+KSB_RAW = ("('СКБ-Средние','СКБ-Прочее','СКБ-Крупные','Средний бизнес','Крупный бизнес',"
+           "'ККСБ - прочие', 'ККСБ - Прочие')")
+MASK = "'^[0-9]{1,12}$'"
+
+
+def gosb_fix(gosb: str, tb: str, seg: str) -> str:
+    """Перекодировка ГОСБ заказчика (сегмент — сырой, из ведомостей)."""
+    return (f"CASE WHEN {tb} = 38 THEN 9038\n         WHEN {gosb} = 1009 THEN 8557\n"
+            f"         WHEN {gosb} = 0 AND {tb} = 40 THEN 9040\n"
+            f"         WHEN {seg} IN {KSB_RAW} AND {gosb} = 8591 THEN 8646\n"
+            f"         ELSE {gosb} END")
+
+
+# Признак relev заказчика (дословно). id орг — после замены «Не определено» → '0';
+# NULL в любом поле даёт «не релевантна» (COALESCE снаружи).
+_RELEV = ("""((p.enrollment_kind_descr = 'Основные' AND p.report_dt >= DATE '2024-01-01')
+          OR (p.report_dt BETWEEN DATE '2023-11-01' AND DATE '2023-12-31'))
+      AND ((p.market_share_flag_name <> 'ИП 1 чел.' AND p.report_dt >= DATE '2024-01-01')
+          OR (p.report_dt BETWEEN DATE '2023-11-01' AND DATE '2023-12-31'))
+      AND (CASE WHEN p.inn = 'Не определено' THEN '0' ELSE p.inn END) NOT IN """ + BAD_INNS)
+_PF = "COALESCE(" + _RELEV + ", false) AND COALESCE(d.is_portfolio_enrollment, false)"
+_T2 = "COALESCE(" + _RELEV + ", false) AND COALESCE(d.enrollment_type_id = 2, false)"
+
+
+def rec(t: str, a: str = "") -> str:
+    """Тройка t_stage (алиас a) — получатель при пороге t (три условия заказчика)."""
+    a = f"{a}." if a else ""
+    return f"({a}t2 OR ({a}pos_pf AND ({a}exc OR {a}amt_pf > {t})))"
+
+
+REC = rec(":amt_min")
 
 INN_OK = "p.inn ~ '^[0-9]{1,12}$'"
 INN_OK_R = "r.inn ~ '^[0-9]{1,12}$'"
@@ -73,26 +114,48 @@ DROP_PROBE_TEMP = "DROP TABLE IF EXISTS t_probe_tmp"
 # нужные месяцы (ряд, месяцы набора, месяц после отчётного) — одна временная
 # таблица, заполняется оператором на партицию (каждый — в statement_timeout).
 # Всё остальное — полнота, ряд, коды, тройки, присутствие ФЛ — считается из неё.
-# Название кода берётся только у зарплатных кодов: объёмный текст по каждой
-# строке всего банка таблица не тащит.
+# Перекодировки заказчика (ГОСБ, «Не определено») и отбор строки делаются здесь
+# же: в копию едут готовые признаки `pf` (релевантная портфельная строка) и `t2`
+# (релевантная строка вида 2), а не поля, из которых они считаются. Название вида
+# берётся только у портфельных строк: объёмный текст по каждой строке всего банка
+# таблица не тащит.
 #
-# Незарплатные строки (пенсии, пособия) нужны только месяцам рабочего набора — по
-# ним отличается «нет зачислений в банке» от «только незарплатные выплаты».
-# Месяцам, которые нужны лишь ряду, достаточно зарплатных кодов: `:all_rows` =
-# false, и копия этих месяцев в разы меньше, как и каждый проход по ней.
+# Прочие строки (пенсии, пособия, «Дополнительные», «ИП 1 чел.») нужны только
+# месяцам рабочего набора — по ним отличается «нет зачислений в банке» от «только
+# прочие зачисления». Месяцам, которые нужны лишь ряду, достаточно строк, которые
+# могут сделать получателя: `:all_rows` = false, и копия этих месяцев в разы меньше.
 T_RAW_MONTH = """
 SELECT p.report_dt,
        p.epk_id,
-       p.inn,
-       p.sys_gosb_id,
+       CASE WHEN p.inn = 'Не определено' THEN '0' ELSE p.inn END AS inn,
+       """ + gosb_fix("p.sys_gosb_id", "p.sys_tb_id", "p.segment_name") + """ AS sys_gosb_id,
        p.sys_tb_id,
        p.{code_col}                                    AS code,
-       CASE WHEN p.{code_col} = ANY(:codes)
+       """ + _PF + """ AS pf,
+       """ + _T2 + """ AS t2,
+       CASE WHEN """ + _PF + """
             THEN p.enrollment_transcription END        AS code_name,
        p.amt
-FROM {schema}.uzp_data_payroll_m p
+FROM {schema}.mis_data_payroll_m p
+LEFT JOIN {schema}.uzp_dim_enrollment_type d ON d.enrollment_type_id = p.{code_col}
 WHERE p.report_dt = CAST(:m AS date)
-  AND (CAST(:all_rows AS boolean) OR p.{code_col} = ANY(:codes))
+  AND (CAST(:all_rows AS boolean)
+       OR (""" + _PF + """) OR (""" + _T2 + """))
+"""
+
+# id орг, которые идут в портфель БЕЗ порога (условие 3 заказчика): образовательные
+# и холдинг :exc_holding (по `reference_holding_name`, как у заказчика). Номер — под
+# маской: в справочнике образовательных он текстовый.
+T_EXC = """
+SELECT inn_exc FROM (
+  SELECT CAST(CAST(d.inn AS text) AS bigint) AS inn_exc
+  FROM {schema}.uzp_dim_education_organization d
+  WHERE CAST(d.inn AS text) ~ """ + MASK + """
+  UNION
+  SELECT c.inn
+  FROM {schema}.uzp_data_epk_consolidation c
+  WHERE c.reference_holding_name = :exc_holding AND c.inn IS NOT NULL
+) t
 """
 
 # Организации справочника ЕПК, свёрнутые до id орг. Свёртка обязательна: у одного id орг
@@ -120,9 +183,13 @@ WHERE e.inn IS NOT NULL
 GROUP BY e.inn
 """
 
-# ВСЕ зарплатные тройки ВСЕХ месяцев копии с суммой по id орг — без порога, ОДНИМ
+# ВСЕ портфельные тройки ВСЕХ месяцев копии с признаками отбора — без порога, ОДНИМ
 # проходом по t_raw. Из неё — и ряд по сегментам при всех порогах (`SERIES_ALL`),
-# и тройки-получатели месяцев набора (`t_pairs`).
+# и тройки-получатели месяцев набора (`t_pairs`). Получатель — `REC` (см. шапку):
+#   amt_pf — сумма релевантных портфельных зачислений тройки (sum_pf заказчика);
+#   pos_pf — есть релевантная портфельная строка с суммой > 0;
+#   t2     — есть релевантная строка вида 2 с суммой > 0;
+#   exc    — id орг без порога (t_exc).
 #
 # Строки с пустым ФЛ или непригодным номером организации (inn = NULL) в t_stage
 # ОСТАЮТСЯ — со счётчиком строк `n_rows`: из них считается полнота загрузки, и
@@ -140,8 +207,9 @@ GROUP BY e.inn
 # кодов, которые классифицированы по названиям ОДИН раз (`CODE_NAMES`): сравнение
 # чисел дешевле регулярки по каждой строке банка.
 T_STAGE = """
-SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.tb_id, x.amt, x.amt_inn, x.n_rows,
+SELECT x.report_dt, x.epk_id, x.inn, x.gosb_id, x.tb_id, x.amt_pf, x.pos_pf, x.t2, x.n_rows,
        x.has_adv, x.has_sal,
+       (e.inn_exc IS NOT NULL)            AS exc,
        COALESCE(o.seg, '""" + S.NO_DIM + """') AS seg,
        COALESCE(o.focus, false)           AS focus
 FROM (
@@ -150,30 +218,33 @@ FROM (
          """ + _INN_R + """                 AS inn,
          COALESCE(r.sys_gosb_id, -1)        AS gosb_id,
          min(r.sys_tb_id)                   AS tb_id,
-         sum(r.amt)                         AS amt,
+         sum(CASE WHEN r.pf THEN r.amt ELSE 0 END) AS amt_pf,
+         bool_or(r.pf AND r.amt > 0)        AS pos_pf,
+         bool_or(r.t2 AND r.amt > 0)        AS t2,
          count(*)                           AS n_rows,
-         bool_or(r.code = ANY(:adv_codes))  AS has_adv,
-         bool_or(r.code = ANY(:sal_codes))  AS has_sal,
-         sum(sum(r.amt)) OVER (PARTITION BY r.report_dt, r.epk_id, """ + _INN_R + """) AS amt_inn
+         bool_or(r.pf AND r.code = ANY(:adv_codes)) AS has_adv,
+         bool_or(r.pf AND r.code = ANY(:sal_codes)) AS has_sal
   FROM t_raw r
-  WHERE r.code = ANY(:codes)
+  WHERE r.pf OR r.t2
   GROUP BY r.report_dt, r.epk_id, """ + _INN_R + """, COALESCE(r.sys_gosb_id, -1)
 ) x
+LEFT JOIN t_exc e ON e.inn_exc = x.inn
 LEFT JOIN t_org o ON o.inn = x.inn
 """
 
-# Получатели: тройки месяцев набора выше порога по id орг — одним запросом.
+# Получатели: тройки месяцев набора, прошедшие отбор, — одним запросом.
 PAIRS_FROM_STAGE = """
-SELECT report_dt, epk_id, inn, gosb_id, tb_id, amt, amt_inn, seg, focus, has_adv, has_sal
+SELECT report_dt, epk_id, inn, gosb_id, tb_id, amt_pf, seg, focus, has_adv, has_sal
 FROM t_stage
-WHERE amt_inn > :amt_min
+WHERE """ + REC + """
   AND """ + VALID + """
   AND report_dt = ANY(CAST(:months AS date[]))
 """
 
 # То же одним запросом по копии — для ПОКАЗА читателю (определение одно).
 T_PAIRS = ("SELECT s.* FROM (" + T_STAGE + ") s\n"
-           "WHERE s.amt_inn > :amt_min AND s.epk_id IS NOT NULL AND s.inn IS NOT NULL\n"
+           "WHERE " + rec(":amt_min", "s") + "\n"
+           "  AND s.epk_id IS NOT NULL AND s.inn IS NOT NULL\n"
            "  AND s.report_dt = ANY(CAST(:months AS date[]))\n")
 
 # ФЛ-месяц поверх троек: сколько id орг и троек у человека и его ОСНОВНОЙ сегмент —
@@ -195,7 +266,7 @@ FROM (
 JOIN (
   SELECT report_dt, epk_id, seg, tb_id, inn,
          row_number() OVER (PARTITION BY report_dt, epk_id
-                            ORDER BY amt_inn DESC, inn, gosb_id) AS rn
+                            ORDER BY amt_pf DESC, inn, gosb_id) AS rn
   FROM t_pairs
 ) m ON m.report_dt = a.report_dt AND m.epk_id = a.epk_id AND m.rn = 1
 """
@@ -220,14 +291,14 @@ SELECT DISTINCT epk_id FROM t_epk
 # Присутствие ФЛ в ведомостях БЕЗ фильтра кода и порога — все месяцы набора ОДНИМ
 # запросом (тот же довод, что у t_stage: цикл по месяцам = полный проход на месяц). Без него
 # не отличить «нет зачислений в банке» от «зарплата ниже порога» и «только
-# незарплатные выплаты» — три разных диагноза.
+# прочие зачисления» — три разных диагноза.
 # Зарплатная сумма берётся только по пригодным id орг: зарплата на id орг, который не
 # сопоставить, получателя не делает (это видно в полноте загрузки).
 T_PERSON = """
 SELECT r.report_dt,
        r.epk_id,
        sum(r.amt) AS amt_all,
-       sum(CASE WHEN r.code = ANY(:codes) AND """ + INN_OK_R + """
+       sum(CASE WHEN r.pf AND """ + INN_OK_R + """
                 THEN r.amt ELSE 0 END) AS amt_codes
 FROM t_raw r
 JOIN t_keys k ON k.epk_id = r.epk_id
@@ -244,11 +315,11 @@ ANALYZE_TMP = "ANALYZE {name}"
 DROP_TMP = "DROP TABLE IF EXISTS {name}"
 
 # Порядок значим: каждая следующая таблица читает предыдущие.
-WORKSET_ORDER = ["t_org", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc", "t_keys", "t_person"]
+WORKSET_ORDER = ["t_org", "t_exc", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc", "t_keys", "t_person"]
 # Порядок для ПОКАЗА: плюс временные таблицы отдельных шагов (t_tflow).
-SHOW_ORDER = ["t_org", "t_raw", "t_stage", "t_ptype", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc",
+SHOW_ORDER = ["t_org", "t_exc", "t_raw", "t_stage", "t_ptype", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc",
               "t_keys", "t_person", "t_tflow", "t_oflow", "t_mv", "t_succ", "t_orgsel"]
-DIST = {"t_org": "inn", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id",
+DIST = {"t_org": "inn", "t_exc": "inn_exc", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id",
         "t_epk_seg": "epk_id", "t_keys": "epk_id", "t_person": "epk_id",
         "t_tflow": "epk_id", "t_oflow": "epk_id", "t_stage": "epk_id",
         "t_mv": "epk_id", "t_succ": "inn_from", "t_orgsel": "inn",
@@ -260,6 +331,7 @@ DIST = {"t_org": "inn", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id
 _ALL = "report_dt = ANY(CAST(:months AS date[]))"
 SHOW_DEFS = {
     "t_org": T_ORG,
+    "t_exc": T_EXC,
     "t_raw": T_RAW_MONTH.replace("p.report_dt = CAST(:m AS date)", "p." + _ALL),
     "t_stage": T_STAGE,
     "t_pairs": T_PAIRS,
@@ -272,7 +344,7 @@ SHOW_DEFS = {
 
 
 # --------------------------------------------------------------------------- #
-# Ряд и зарплатные коды — по копии витрины
+# Ряд и портфельные виды — по копии витрины
 # --------------------------------------------------------------------------- #
 
 # Численность месяца по сегментам и при нескольких порогах. Строка '__ALL__' —
@@ -283,11 +355,11 @@ SHOW_DEFS = {
 SERIES_ALL = """
 WITH e AS (
   SELECT report_dt, seg, epk_id,
-         count(*) FILTER (WHERE amt_inn > :amt_min) AS n_tr,
-         count(*) FILTER (WHERE amt_inn > 0)        AS t0,
-         count(*) FILTER (WHERE amt_inn > 1000)     AS t1000,
-         count(*) FILTER (WHERE amt_inn > 5000)     AS t5000,
-         count(*) FILTER (WHERE amt_inn > 10000)    AS t10000
+         count(*) FILTER (WHERE """ + REC + """) AS n_tr,
+         count(*) FILTER (WHERE """ + rec("0") + """)     AS t0,
+         count(*) FILTER (WHERE """ + rec("1000") + """)  AS t1000,
+         count(*) FILTER (WHERE """ + rec("5000") + """)  AS t5000,
+         count(*) FILTER (WHERE """ + rec("10000") + """) AS t10000
   FROM t_stage WHERE """ + VALID + """
   GROUP BY report_dt, seg, epk_id
 )
@@ -307,9 +379,9 @@ FROM (SELECT report_dt, epk_id, sum(n_tr) AS n_tr, sum(t0) AS t0, sum(t1000) AS 
 GROUP BY report_dt
 """
 
-# Полнота загрузки — по t_stage (зарплатные строки, в т.ч. непригодные): сколько
+# Полнота загрузки — по t_stage (портфельные строки, в т.ч. непригодные): сколько
 # строк, сколько с пригодным номером организации, сколько без ФЛ. Месяцы ряда в
-# копии только зарплатные — полнота везде считается по одним и тем же строкам.
+# копии только строки отбора — полнота везде считается по одним и тем же строкам.
 LOAD_FROM_STAGE = """
 SELECT report_dt,
        sum(n_rows)                                     AS n_rows,
@@ -322,18 +394,18 @@ GROUP BY report_dt
 # Ряд выделенного холдинга — отдельным оператором (свой таймаут), из t_stage.
 SERIES_FOCUS = """
 SELECT report_dt, sum(n_tr) AS n_triples, count(*) FILTER (WHERE n_tr > 0) AS n_epk
-FROM (SELECT report_dt, epk_id, count(*) FILTER (WHERE amt_inn > :amt_min) AS n_tr
+FROM (SELECT report_dt, epk_id, count(*) FILTER (WHERE """ + REC + """) AS n_tr
       FROM t_stage WHERE """ + VALID + """ AND focus
       GROUP BY report_dt, epk_id) e
 GROUP BY report_dt
 """
 
-# Названия зарплатных кодов — по ПЕРВОМУ скопированному месяцу (одна партиция
+# Названия портфельных видов — по ПЕРВОМУ скопированному месяцу (одна партиция
 # в копии, проход дешёвый). Из них в Python — какие коды аванс, какие зарплата.
 CODE_NAMES = """
 SELECT code, min(code_name) AS code_name, count(*) AS n_rows
 FROM t_raw
-WHERE code = ANY(:codes)
+WHERE pf
 GROUP BY code
 """
 
@@ -342,7 +414,8 @@ GROUP BY code
 # «потерял аванс и упал ниже порога» — ровно тот случай, который ищем).
 T_PTYPE = """
 SELECT report_dt, epk_id, inn, min(seg) AS seg, bool_or(focus) AS focus,
-       bool_or(has_adv) AS has_adv, bool_or(has_sal) AS has_sal, max(amt_inn) AS amt_inn,
+       bool_or(has_adv) AS has_adv, bool_or(has_sal) AS has_sal,
+       bool_or(""" + REC + """) AS rec,
        CAST(date_trunc('month', report_dt) + interval '2 month' - interval '1 day' AS date) AS dt_next
 FROM t_stage
 WHERE """ + VALID + """ AND report_dt = ANY(CAST(:pt_months AS date[]))
@@ -362,11 +435,11 @@ PAYTYPE = """
 SELECT b.report_dt AS b_dt, b.seg, b.focus,
        """ + _kind("b") + """ AS kind_b,
        CASE WHEN c.epk_id IS NULL THEN 'none' ELSE """ + _kind("c") + """ END AS kind_c,
-       CASE WHEN c.amt_inn > :amt_min THEN 1 ELSE 0 END AS rec_c,
+       CASE WHEN c.rec THEN 1 ELSE 0 END AS rec_c,
        count(*) AS n_pairs
 FROM t_ptype b
 LEFT JOIN t_ptype c ON c.epk_id = b.epk_id AND c.inn = b.inn AND c.report_dt = b.dt_next
-WHERE b.amt_inn > :amt_min AND b.report_dt = ANY(CAST(:pt_b AS date[]))
+WHERE b.rec AND b.report_dt = ANY(CAST(:pt_b AS date[]))
 GROUP BY 1, 2, 3, 4, 5, 6
 """
 
@@ -386,7 +459,7 @@ SELECT r.report_dt,
 FROM t_raw r
 LEFT JOIN t_org o ON o.inn = """ + _INN_R + """
 WHERE r.report_dt = ANY(CAST(:code_months AS date[]))
-  AND r.code = ANY(:codes)
+  AND r.pf
   AND r.epk_id IS NOT NULL
 GROUP BY r.report_dt, r.code, r.epk_id, COALESCE(o.seg, '""" + S.NO_DIM + """')
 ) x

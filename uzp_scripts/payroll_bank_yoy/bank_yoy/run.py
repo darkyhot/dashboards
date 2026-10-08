@@ -34,7 +34,7 @@ def _months_plan(report_month, n_months: int, avail: set[str]) -> dict:
 
 def run(conn: str | None = None, schema: str | None = None,
         report_month: str = "2026-08", n_months: int = 3,
-        history_months: int = 25, amt_min: int = Q.AMT_MIN, codes=Q.CODES,
+        history_months: int = 25, amt_min: int = Q.AMT_MIN, exc_holding: str = Q.EXC_HOLDING,
         org_opts: dict | None = None,
         focus_holding: str = "МИНОБОРОНЫ",
         adv_pattern: str = A.ADV_RE, sal_pattern: str = A.SAL_RE,
@@ -55,7 +55,7 @@ def run(conn: str | None = None, schema: str | None = None,
     last = M.parse(report_month)
     hist = M.span(M.shift(last, -(history_months - 1)), last)
     res: dict = {"report_month": M.iso(last), "schema": config.SCHEMA, "amt_min": amt_min,
-                 "codes": list(codes), "org_opts": org_opts, "focus_holding": focus_holding,
+                 "exc_holding": exc_holding, "org_opts": org_opts, "focus_holding": focus_holding,
                  "generated": datetime.now().strftime("%Y-%m-%d %H:%M")}
 
     with db.session(engine) as cx:
@@ -65,12 +65,12 @@ def run(conn: str | None = None, schema: str | None = None,
         first = M.shift(last, -(n_months - 1))
         raw_from = min(hist[0], M.shift(first, -LOOKBACK - 12))
         raw_months = M.span(raw_from, M.shift(last, 1))
-        ws = fetch.Workspace(cx, [], {"codes": list(codes), "amt_min": int(amt_min),
+        ws = fetch.Workspace(cx, [], {"exc_holding": exc_holding, "amt_min": int(amt_min),
                                       "focus_holding": focus_holding,
                                       "adv_codes": [-1], "sal_codes": [-1]})
         try:
             # Все строки — только месяцам рабочего набора (кандидатам: какие из них
-            # загружены, станет известно по копии); остальным — зарплатные коды.
+            # загружены, станет известно по копии); остальным — строки отбора.
             full = {M.iso(m) for off in (0, -12)
                     for m in M.span(M.shift(first, -LOOKBACK + off), M.shift(last, 1 + off))}
             rows = ws.build_raw(raw_months, full)
@@ -473,7 +473,7 @@ def _write(res: dict) -> None:
 
     (config.OUTPUT_DIR / "probe.json").write_text(
         json.dumps(res["probe"], ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    cfg = {k: res[k] for k in ("report_month", "schema", "amt_min", "codes", "org_opts",
+    cfg = {k: res[k] for k in ("report_month", "schema", "amt_min", "exc_holding", "org_opts",
                                "report", "work", "generated")}
     cfg["timing_sec"] = res.get("timing", {})
     (config.OUTPUT_DIR / "run_config.json").write_text(

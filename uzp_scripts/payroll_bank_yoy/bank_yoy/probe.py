@@ -4,6 +4,8 @@
 не обнаружилась бы вовсе:
 * имя колонки кода (`enrollment_type` против `enrollment_type_id`) — неверное
   роняет КАЖДЫЙ запрос;
+* есть ли справочники отбора: виды зачислений (`is_portfolio_enrollment`) и
+  образовательные организации — без них отбор заказчика не посчитать;
 * разрешены ли временные таблицы — без них разбор банка не выполним;
 * срез справочника ЕПК.
 
@@ -20,22 +22,32 @@ class ProbeError(RuntimeError):
     pass
 
 
+def _cols(conn, table: str) -> set:
+    cols = db.read_sql(conn, Q.PROBE_COLUMNS, {"schema": config.SCHEMA, "table": table})
+    if cols.empty:
+        raise ProbeError(f"таблица {config.SCHEMA}.{table} не найдена")
+    return set(cols["column_name"])
+
+
 def run(conn) -> dict:
     progress.step("Разведка витрин")
     out: dict = {"schema": config.SCHEMA}
 
-    cols = db.read_sql(conn, Q.PROBE_COLUMNS,
-                       {"schema": config.SCHEMA, "table": "uzp_data_payroll_m"})
-    names = set(cols["column_name"])
-    if not names:
-        raise ProbeError(f"таблица {config.SCHEMA}.uzp_data_payroll_m не найдена")
+    names = _cols(conn, "mis_data_payroll_m")
     code_col = next((c for c in ("enrollment_type", "enrollment_type_id") if c in names), None)
     if code_col is None:
-        raise ProbeError("в uzp_data_payroll_m нет колонки кода зачисления "
+        raise ProbeError("в mis_data_payroll_m нет колонки кода зачисления "
                          "(ни enrollment_type, ни enrollment_type_id)")
-    for need in ("sys_gosb_id", "sys_tb_id", "epk_id", "inn", "amt", "report_dt"):
+    for need in ("sys_gosb_id", "sys_tb_id", "epk_id", "inn", "amt", "report_dt",
+                 "segment_name", "enrollment_kind_descr", "market_share_flag_name"):
         if need not in names:
-            raise ProbeError(f"в uzp_data_payroll_m нет колонки {need}")
+            raise ProbeError(f"в mis_data_payroll_m нет колонки {need}")
+    dim = _cols(conn, "uzp_dim_enrollment_type")
+    for need in ("enrollment_type_id", "is_portfolio_enrollment"):
+        if need not in dim:
+            raise ProbeError(f"в uzp_dim_enrollment_type нет колонки {need}")
+    _cols(conn, "uzp_dim_education_organization")
+    progress.done("справочники отбора на месте: виды зачислений, образовательные организации")
     db.CODE_COL = code_col
     out["code_col"] = code_col
     progress.done(f"колонка кода зачисления: {code_col}")

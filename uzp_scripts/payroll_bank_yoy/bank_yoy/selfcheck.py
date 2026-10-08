@@ -47,7 +47,7 @@ def check_self_contained() -> None:
 def check_partition_filter() -> None:
     """Каждое обращение к ведомостям ограничено ОДНИМ месяцем."""
     for name, sql in Q.all_sql().items():
-        n_ref = sql.count("uzp_data_payroll_m")
+        n_ref = sql.count("payroll_m")
         if not n_ref:
             continue
         n_flt = len(re.findall(r"report_dt\s*(=\s*CAST\(:m AS date\)|>=\s*CAST\(:d_from)", sql))
@@ -80,7 +80,7 @@ def check_shown_sql_escape() -> None:
 
 def check_payroll_once() -> None:
     """Ведомости читает ТОЛЬКО копия t_raw — всё остальное считается из неё."""
-    readers = [n for n, sql in Q.all_sql().items() if "uzp_data_payroll_m" in sql]
+    readers = [n for n, sql in Q.all_sql().items() if "payroll_m" in sql]
     if readers != ["T_RAW_MONTH"]:
         _fail("одна копия ведомостей", f"к витрине обращаются: {readers}")
     if "CREATE_TMP" in Q.T_RAW_MONTH or "INSERT" in Q.T_RAW_MONTH:
@@ -146,8 +146,29 @@ def check_inn_cast() -> None:
         for alias in set(re.findall(r"CAST\((\w+)\.inn AS bigint\)", sql)):
             if f"{alias}.inn ~ '^[0-9]{{1,12}}$'" not in sql:
                 _fail("маска номера организации", f"{name}: приведение {alias}.inn без маски")
-        if re.search(r"IN\s*:codes", sql):
-            _fail("коды", f"{name}: IN :codes вместо = ANY(:codes)")
+        if re.search(r"\bIN\s*:\w+", sql):
+            _fail("списки", f"{name}: IN :список вместо = ANY(:список)")
+
+
+def check_selection() -> None:
+    """Отбор зачислений — логика заказчика: relev, справочник видов, порог по тройке, три условия."""
+    raw, stage = Q.T_RAW_MONTH, Q.T_STAGE
+    for frag in ("mis_data_payroll_m", "uzp_dim_enrollment_type", "is_portfolio_enrollment",
+                 "'Основные'", "'ИП 1 чел.'", "'7707083893'", "'Не определено' THEN '0'",
+                 "THEN 9038", "THEN 8557", "THEN 9040", "THEN 8646"):
+        if frag not in raw:
+            _fail("отбор", f"в копии ведомостей нет «{frag}»")
+    if "OVER" in stage:
+        _fail("отбор", "в t_stage окно: сумма для порога — по тройке, а не по организации")
+    for frag in ("t2 OR", "pos_pf AND", "exc OR", "amt_pf > :amt_min"):
+        if frag not in Q.REC:
+            _fail("отбор", f"в условии получателя нет «{frag}»")
+    for name in ("PAIRS_FROM_STAGE", "T_PAIRS", "SERIES_ALL", "SERIES_FOCUS", "T_PTYPE"):
+        if "amt_pf >" not in getattr(Q, name):
+            _fail("отбор", f"{name} не применяет условие получателя")
+    if "reference_holding_name = :exc_holding" not in Q.T_EXC \
+            or "uzp_dim_education_organization" not in Q.T_EXC:
+        _fail("отбор", "t_exc не из образовательных и холдинга-исключения")
 
 
 def check_placeholders() -> None:
@@ -234,7 +255,7 @@ def check_months() -> None:
 
 CHECKS = [check_self_contained, check_no_blocked_word, check_payroll_once, check_no_distinct, check_names_masked,
           check_shown_sql_escape, check_partition_filter, check_dialect, check_inn_cast,
-          check_placeholders, check_decomp_identity, check_did_identity, check_org_rules,
+          check_placeholders, check_selection, check_decomp_identity, check_did_identity, check_org_rules,
           check_sanitize, check_months]
 
 
@@ -257,6 +278,17 @@ def check_against_synth(res: dict) -> None:
     def need(cond, what):
         (ok if cond else errs).append(what)
 
+    # Отбор зачислений: получатели-тройки по месяцам ряда — точно как эталон
+    # генератора (шум «Дополнительные» / «ИП 1 чел.» / Сбер не прошёл, вид 2 и
+    # организации без порога прошли).
+    ser = res.get("series_raw", pd.DataFrame())
+    if exp.get("recipients") and not ser.empty:
+        got = ser[ser["seg"] == "__ALL__"].set_index("report_dt")["n_triples"]
+        bad = {m: (int(got[m]), n) for m, n in exp["recipients"].items()
+               if m in got.index and int(got[m]) != n}
+        need(not bad and len(set(got.index) & set(exp["recipients"])) > 0,
+             f"получатели по отбору заказчика совпали с эталоном ({len(got)} мес.; расхождения: "
+             f"{dict(list(bad.items())[:3])})")
     # Картина: июнь +, июль +, август − (так заложено).
     need(res["pattern"].startswith("++−"), f"картина «++−» (получено {res['pattern']})")
     # Растворились пришедшие: убыль новичков июня–июля в августе.

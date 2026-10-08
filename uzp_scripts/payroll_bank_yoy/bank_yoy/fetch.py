@@ -39,7 +39,7 @@ class Workspace:
     def __init__(self, conn, months: list, params: dict) -> None:
         self.conn = conn
         self.months = [M.iso(m) for m in sorted({M.parse(x) for x in months})]
-        # codes, amt_min; all_rows — для показанного SQL (копия рабочего набора), при
+        # amt_min, exc_holding; all_rows — для показанного SQL (копия рабочего набора), при
         # заполнении t_raw каждый месяц передаёт свой.
         self.params = {"all_rows": True, **params}
         self.built: list[str] = []
@@ -86,13 +86,16 @@ class Workspace:
     def build_raw(self, months: list, full: set) -> dict[str, int]:
         """ЕДИНСТВЕННОЕ чтение ведомостей: узкая копия витрины `t_raw` за все нужные
         месяцы, оператор на партицию. Месяцы из `full` (рабочий набор) — все строки,
-        остальные (нужны только ряду) — только зарплатные коды. Возвращает число
+        остальные (нужны только ряду) — только строки, способные сделать получателя. Возвращает число
         строк по месяцам: месяц с нулём — месяца нет в витрине."""
         progress.step(f"Копия ведомостей t_raw: {len(months)} мес. "
                       f"({M.label(months[0])}…{M.label(months[-1])})")
         n = self._create("t_org", Q.T_ORG)
         self._analyze("t_org")
         progress.done(f"t_org: {n:,} организаций справочника")
+        n = self._create("t_exc", Q.T_EXC)
+        self._analyze("t_exc")
+        progress.done(f"t_exc: {n:,} id орг без порога (образовательные, «{self.params['exc_holding']}»)")
         rows: dict[str, int] = {}
         for i, m in enumerate(M.iso(x) for x in months):
             t0 = pd.Timestamp.now()
@@ -104,7 +107,7 @@ class Workspace:
                 # Названия кодов — пока в копии один месяц: проход дешёвый.
                 self.code_names = self.opt("code_names", Q.CODE_NAMES)
             sec = (pd.Timestamp.now() - t0).total_seconds()
-            kind = "все строки" if m in full else "зарплатные"
+            kind = "все строки" if m in full else "строки отбора"
             progress.done(f"t_raw · {M.label(m)} ({kind}): {n:,} строк за {sec:.0f} с")
         self._analyze("t_raw")
         progress.done(f"t_raw: всего {sum(rows.values()):,} строк")
@@ -122,7 +125,7 @@ class Workspace:
         all_m = sorted({M.iso(x) for x in hist} | set(self.months))
         t0 = pd.Timestamp.now()
         n = self._create("t_stage", Q.T_STAGE)
-        progress.done(f"t_stage (зарплатные тройки, все месяцы): {n:,} строк за "
+        progress.done(f"t_stage (портфельные тройки, все месяцы): {n:,} строк за "
                       f"{(pd.Timestamp.now() - t0).total_seconds():.0f} с")
         t0 = pd.Timestamp.now()
         # Ряд и полнота — необязательные: если не прочитались, отчёт строится без
@@ -168,7 +171,7 @@ class Workspace:
         t0 = pd.Timestamp.now()
         self.codes = self.opt("code_months", Q.CODE_MONTH,
                               {"code_months": [M.iso(x) for x in code_months]})
-        progress.done(f"зарплатные коды: {(pd.Timestamp.now() - t0).total_seconds():.0f} с")
+        progress.done(f"портфельные виды: {(pd.Timestamp.now() - t0).total_seconds():.0f} с")
         if "t_ptype" in self.built:
             pb = [M.iso(M.shift(x, -1)) for x in self.pt_months
                   if M.iso(M.shift(x, -1)) in set(self.months)]
