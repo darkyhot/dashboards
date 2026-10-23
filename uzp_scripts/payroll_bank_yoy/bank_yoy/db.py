@@ -1,7 +1,7 @@
 """Доступ к БД. Одинаково работает с локальным Postgres и с Greenplum на ядре 9.4 —
 различается только URL.
 
-Плейсхолдеры `{schema}` и `{code_col}` подставляются ЗАМЕНОЙ ПО ИМЕНИ, а не
+Плейсхолдеры `{schema}`, `{schema_t}` и `{code_col}` подставляются ЗАМЕНОЙ ПО ИМЕНИ, а не
 `str.format()`: так квантификатор регулярки `{1,12}` в тексте SQL не нужно
 удваивать, и ловушка «IndexError: Replacement index out of range» исключена.
 """
@@ -70,7 +70,8 @@ def render(sql: str) -> str:
     Этот же текст показывается читателю у блока отчёта: собирать показ вторым
     способом нельзя, он разъедется с исполняемым молча.
     """
-    return sql.replace("{schema}", config.SCHEMA).replace("{code_col}", CODE_COL)
+    return (sql.replace("{schema}", config.SCHEMA).replace("{schema_t}", config.SCHEMA_T)
+            .replace("{code_col}", CODE_COL))
 
 
 def execute(conn: Connection, sql: str, params: dict | None = None) -> int:

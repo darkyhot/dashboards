@@ -22,10 +22,11 @@ class ProbeError(RuntimeError):
     pass
 
 
-def _cols(conn, table: str) -> set:
-    cols = db.read_sql(conn, Q.PROBE_COLUMNS, {"schema": config.SCHEMA, "table": table})
+def _cols(conn, table: str, schema: str | None = None) -> set:
+    schema = schema or config.SCHEMA
+    cols = db.read_sql(conn, Q.PROBE_COLUMNS, {"schema": schema, "table": table})
     if cols.empty:
-        raise ProbeError(f"таблица {config.SCHEMA}.{table} не найдена")
+        raise ProbeError(f"таблица {schema}.{table} не найдена")
     return set(cols["column_name"])
 
 
@@ -47,6 +48,11 @@ def run(conn) -> dict:
         if need not in dim:
             raise ProbeError(f"в uzp_dim_enrollment_type нет колонки {need}")
     _cols(conn, "uzp_dim_education_organization")
+    # Список исключаемых ТИК/ЦИК: без него отчёт молча посчитал бы их — лучше упасть.
+    tik = _cols(conn, "yva_tik_cik", config.SCHEMA_T)
+    for need in ("inn", "is_tik_cik"):
+        if need not in tik:
+            raise ProbeError(f"в {config.SCHEMA_T}.yva_tik_cik нет колонки {need}")
     progress.done("справочники отбора на месте: виды зачислений, образовательные организации")
     db.CODE_COL = code_col
     out["code_col"] = code_col

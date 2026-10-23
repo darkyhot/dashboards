@@ -35,6 +35,13 @@
   2) вид зачисления 2;
   3) портфельная строка и id орг без порога (`t_exc`: образовательные и холдинг
      МИНОБОРОНЫ по `reference_holding_name`).
+
+Исключённые организации (ТИК/ЦИК)
+---------------------------------
+id орг из `{schema_t}.yva_tik_cik` с `is_tik_cik IS TRUE` (`t_tik`) исключаются из
+отчёта ЦЕЛИКОМ: их строки не попадают в копию ведомостей `t_raw`, а сами они — в
+справочник `t_org`. Дальше всё считается из копии, поэтому такие организации не
+видны нигде — ни в численности, ни в переходах, ни в списках.
 """
 from __future__ import annotations
 
@@ -138,7 +145,9 @@ SELECT p.report_dt,
        p.amt
 FROM {schema}.mis_data_payroll_m p
 LEFT JOIN {schema}.uzp_dim_enrollment_type d ON d.enrollment_type_id = p.{code_col}
+LEFT JOIN t_tik k ON k.inn = CASE WHEN """ + INN_OK + """ THEN CAST(p.inn AS bigint) END
 WHERE p.report_dt = CAST(:m AS date)
+  AND k.inn IS NULL
   AND (CAST(:all_rows AS boolean)
        OR (""" + _PF + """) OR (""" + _T2 + """))
 """
@@ -156,6 +165,14 @@ SELECT inn_exc FROM (
   FROM {schema}.uzp_data_epk_consolidation c
   WHERE c.reference_holding_name = :exc_holding AND c.inn IS NOT NULL
 ) t
+"""
+
+# Исключённые организации (ТИК/ЦИК) — маленькая таблица, строится ПЕРВОЙ: её читают
+# копия ведомостей и справочник организаций.
+T_TIK = """
+SELECT DISTINCT k.inn
+FROM {schema_t}.yva_tik_cik k
+WHERE k.is_tik_cik IS TRUE AND k.inn IS NOT NULL
 """
 
 # Организации справочника ЕПК, свёрнутые до id орг. Свёртка обязательна: у одного id орг
@@ -179,7 +196,8 @@ SELECT e.inn,
        bool_or(COALESCE(btrim(e.holding_name), '') = :focus_holding) AS focus,
        NOT bool_or(COALESCE(e.status_name, '') = 'Активна')      AS is_liquidated
 FROM {schema}.uzp_data_epk_consolidation e
-WHERE e.inn IS NOT NULL
+LEFT JOIN t_tik k ON k.inn = e.inn
+WHERE e.inn IS NOT NULL AND k.inn IS NULL
 GROUP BY e.inn
 """
 
@@ -315,11 +333,11 @@ ANALYZE_TMP = "ANALYZE {name}"
 DROP_TMP = "DROP TABLE IF EXISTS {name}"
 
 # Порядок значим: каждая следующая таблица читает предыдущие.
-WORKSET_ORDER = ["t_org", "t_exc", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc", "t_keys", "t_person"]
+WORKSET_ORDER = ["t_tik", "t_org", "t_exc", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc", "t_keys", "t_person"]
 # Порядок для ПОКАЗА: плюс временные таблицы отдельных шагов (t_tflow).
-SHOW_ORDER = ["t_org", "t_exc", "t_raw", "t_stage", "t_ptype", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc",
+SHOW_ORDER = ["t_tik", "t_org", "t_exc", "t_raw", "t_stage", "t_ptype", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc",
               "t_keys", "t_person", "t_tflow", "t_oflow", "t_mv", "t_succ", "t_orgsel"]
-DIST = {"t_org": "inn", "t_exc": "inn_exc", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id",
+DIST = {"t_tik": "inn", "t_org": "inn", "t_exc": "inn_exc", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id",
         "t_epk_seg": "epk_id", "t_keys": "epk_id", "t_person": "epk_id",
         "t_tflow": "epk_id", "t_oflow": "epk_id", "t_stage": "epk_id",
         "t_mv": "epk_id", "t_succ": "inn_from", "t_orgsel": "inn",
@@ -330,6 +348,7 @@ DIST = {"t_org": "inn", "t_exc": "inn_exc", "t_raw": "epk_id", "t_pairs": "epk_i
 # показанному запросу приклеиваются эти определения как CTE (по всем месяцам).
 _ALL = "report_dt = ANY(CAST(:months AS date[]))"
 SHOW_DEFS = {
+    "t_tik": T_TIK,
     "t_org": T_ORG,
     "t_exc": T_EXC,
     "t_raw": T_RAW_MONTH.replace("p.report_dt = CAST(:m AS date)", "p." + _ALL),

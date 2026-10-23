@@ -31,7 +31,9 @@
 * шум отбора зачислений — постоянный во все месяцы, на год к году не влияет:
   «Дополнительные», «ИП 1 чел.», организация Сбера (получателями НЕ становятся) и
   вид 2 ниже порога (становится); образовательные организации — без порога;
-  ТБ 38 перекодируется в ГОСБ 9038.
+  ТБ 38 перекодируется в ГОСБ 9038;
+* организации ТИК/ЦИК (`yva_tik_cik`, признак true) — из отчёта исключаются целиком;
+  ещё две с признаком false — остаются.
 Эталон числа получателей-троек по месяцам считается здесь же, pandas-версией
 логики заказчика (`expect["recipients"]`), и сверяется с отчётом точно.
 """
@@ -262,6 +264,10 @@ class Gen:
         # Образовательные (без порога) — каждая десятая РГС вне событий.
         self.edu = {o["id"] for o in self.orgs if o["seg"] == "РГС" and o["id"] % 10 == 0
                     and o["id"] not in taken}
+        # ТИК/ЦИК: признак true — исключаются, false — нет. Вне событий и образовательных.
+        free = [o["id"] for o in self.orgs if o["id"] not in taken and o["id"] not in self.edu
+                and o["big"] is not None and o["size"] >= 10]
+        self.tik = {o: True for o in free[1:8:2]} | {o: False for o in free[9:13:2]}
 
     def simulate(self) -> None:
         r = self.rng
@@ -463,6 +469,7 @@ class Gen:
         x["pf"] = relev & x["enrollment_type"].isin(PORTFOLIO)
         x["t2"] = relev & (x["enrollment_type"] == 2)
         x = x[x["inn"].str.fullmatch(r"[0-9]{1,12}") & (x["pf"] | x["t2"])].copy()
+        x = x[~x["inn"].isin([str(self.orgs[o]["inn"]) for o, v in self.tik.items() if v])]
         x["inn_n"] = x["inn"].astype("int64")
         x["amt_pf"] = np.where(x["pf"], x["amt"], 0.0)
         x["pos_pf"] = x["pf"] & (x["amt"] > 0)
@@ -547,6 +554,7 @@ CREATE TABLE {s}.uzp_dim_enrollment_type (
   enrollment_type_id smallint, enrollment_type_name varchar, is_fot_enrollment boolean,
   is_portfolio_enrollment boolean);
 CREATE TABLE {s}.uzp_dim_education_organization (inn varchar, company_name varchar);
+CREATE TABLE {s}.yva_tik_cik (inn int8, company_name text, is_tik_cik bool);
 """
 
 
@@ -570,6 +578,9 @@ def build(url: str | None = None, persons: int = 30000, schema: str = config.SYN
     et = pd.DataFrame([{"enrollment_type_id": c, "enrollment_type_name": n,
                         "is_fot_enrollment": c in PORTFOLIO, "is_portfolio_enrollment": c in PORTFOLIO}
                        for c, n in CODE_NAMES.items()])
+    tik = pd.DataFrame([{"inn": int(g.orgs[o]["inn"]), "company_name": g.orgs[o]["name"], "is_tik_cik": v}
+                        for o, v in g.tik.items()])
+    g.expect["tik_inns"] = [int(g.orgs[o]["inn"]) for o, v in g.tik.items() if v]
     edu = pd.DataFrame([{"inn": str(g.orgs[o]["inn"]), "company_name": g.orgs[o]["name"]}
                         for o in sorted(g.edu)])
     print(f"  ведомости: {len(pay):,} строк; организаций {len(g.orgs):,}", flush=True)
@@ -583,6 +594,7 @@ def build(url: str | None = None, persons: int = 30000, schema: str = config.SYN
         _copy(conn, pay, f"{schema}.mis_data_payroll_m")
         _copy(conn, et, f"{schema}.uzp_dim_enrollment_type")
         _copy(conn, edu, f"{schema}.uzp_dim_education_organization")
+        _copy(conn, tik, f"{schema}.yva_tik_cik")
         conn.execute(text(f"ANALYZE {schema}.mis_data_payroll_m"))
         conn.commit()
     config.ensure_dirs()

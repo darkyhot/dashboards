@@ -150,6 +150,18 @@ def check_inn_cast() -> None:
             _fail("списки", f"{name}: IN :список вместо = ANY(:список)")
 
 
+def check_tik_excluded() -> None:
+    """Организации ТИК/ЦИК исключены целиком: t_tik строится первой и вырезается из копии и справочника."""
+    if Q.WORKSET_ORDER[0] != "t_tik":
+        _fail("ТИК/ЦИК", "t_tik строится не первой — копия ведомостей прочитает её раньше")
+    if "is_tik_cik IS TRUE" not in Q.T_TIK or "{schema_t}.yva_tik_cik" not in Q.T_TIK:
+        _fail("ТИК/ЦИК", "t_tik не из yva_tik_cik с is_tik_cik IS TRUE")
+    for name in ("T_RAW_MONTH", "T_ORG"):
+        sql = getattr(Q, name)
+        if "LEFT JOIN t_tik k" not in sql or "k.inn IS NULL" not in sql:
+            _fail("ТИК/ЦИК", f"{name} не исключает организации ТИК/ЦИК")
+
+
 def check_selection() -> None:
     """Отбор зачислений — логика заказчика: relev, справочник видов, порог по тройке, три условия."""
     raw, stage = Q.T_RAW_MONTH, Q.T_STAGE
@@ -255,7 +267,7 @@ def check_months() -> None:
 
 CHECKS = [check_self_contained, check_no_blocked_word, check_payroll_once, check_no_distinct, check_names_masked,
           check_shown_sql_escape, check_partition_filter, check_dialect, check_inn_cast,
-          check_placeholders, check_selection, check_decomp_identity, check_did_identity, check_org_rules,
+          check_placeholders, check_selection, check_tik_excluded, check_decomp_identity, check_did_identity, check_org_rules,
           check_sanitize, check_months]
 
 
@@ -289,6 +301,10 @@ def check_against_synth(res: dict) -> None:
         need(not bad and len(set(got.index) & set(exp["recipients"])) > 0,
              f"получатели по отбору заказчика совпали с эталоном ({len(got)} мес.; расхождения: "
              f"{dict(list(bad.items())[:3])})")
+    # ТИК/ЦИК: исключены все с признаком, и только они.
+    if "tik_inns" in exp:
+        need(res.get("n_tik") == len(exp["tik_inns"]),
+             f"ТИК/ЦИК: исключено {res.get('n_tik')} из {len(exp['tik_inns'])} (признак false не исключён)")
     # Картина: июнь +, июль +, август − (так заложено).
     need(res["pattern"].startswith("++−"), f"картина «++−» (получено {res['pattern']})")
     # Растворились пришедшие: убыль новичков июня–июля в августе.

@@ -43,6 +43,7 @@ class Workspace:
         # заполнении t_raw каждый месяц передаёт свой.
         self.params = {"all_rows": True, **params}
         self.built: list[str] = []
+        self.n_tik = 0
         self.plain_ddl = False
         # Показанные читателю запросы: имя → (самодостаточный текст, параметры).
         self.shown: dict[str, tuple[str, dict]] = {}
@@ -90,6 +91,10 @@ class Workspace:
         строк по месяцам: месяц с нулём — месяца нет в витрине."""
         progress.step(f"Копия ведомостей t_raw: {len(months)} мес. "
                       f"({M.label(months[0])}…{M.label(months[-1])})")
+        n = self._create("t_tik", Q.T_TIK)
+        self._analyze("t_tik")
+        self.n_tik = n
+        progress.done(f"t_tik: {n:,} id орг ТИК/ЦИК — исключены из отчёта целиком")
         n = self._create("t_org", Q.T_ORG)
         self._analyze("t_org")
         progress.done(f"t_org: {n:,} организаций справочника")

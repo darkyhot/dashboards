@@ -16,6 +16,10 @@ from . import REPORT_DIR
 PROM_SCHEMA = "s_grnplm_ld_salesntwrk_pcap_sn_uzp"
 SYNTH_SCHEMA = "synth_bank_yoy"
 SCHEMA = PROM_SCHEMA
+# Техническая схема: список исключаемых организаций ТИК/ЦИК (`yva_tik_cik`). На
+# синтетике — та же схема, что и витрины.
+PROM_SCHEMA_T = "s_grnplm_ld_salesntwrk_pcap_sn_t_uzp"
+SCHEMA_T = PROM_SCHEMA_T
 
 # Всё, что пишет отчёт, лежит ВНУТРИ его папки: отчёт переносится одной папкой.
 OUTPUT_DIR = REPORT_DIR / "output"
@@ -52,6 +56,13 @@ def set_schema(name: str | None) -> str:
     if name:
         SCHEMA = name.strip()
     return SCHEMA
+
+
+def set_schema_t(name: str | None) -> str:
+    global SCHEMA_T
+    if name:
+        SCHEMA_T = name.strip()
+    return SCHEMA_T
 
 
 def db_url(override: str | None = None) -> str:

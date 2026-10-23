@@ -32,7 +32,7 @@ def _months_plan(report_month, n_months: int, avail: set[str]) -> dict:
     return {"report": report, "work": sorted(set(work)), "missing": missing}
 
 
-def run(conn: str | None = None, schema: str | None = None,
+def run(conn: str | None = None, schema: str | None = None, schema_t: str | None = None,
         report_month: str = "2026-08", n_months: int = 3,
         history_months: int = 25, amt_min: int = Q.AMT_MIN, exc_holding: str = Q.EXC_HOLDING,
         org_opts: dict | None = None,
@@ -43,6 +43,7 @@ def run(conn: str | None = None, schema: str | None = None,
     t_start = time.time()
     progress.enable(verbose, show_sql)
     config.set_schema(schema)
+    config.set_schema_t(schema_t)
     config.ensure_dirs()
     org_opts = {"min_base": 20, "min_real": 10, "min_share": 0.05,
                 "reorg_min_share": 0.30, "reorg_min_movers": 5, "max_rows": 3000,
@@ -50,11 +51,12 @@ def run(conn: str | None = None, schema: str | None = None,
                 **(org_opts or {})}
     engine = db.get_engine(config.db_url(conn), int(sql_timeout_min))
     db.ping(engine)
-    progress.done(f"БД доступна, схема {config.SCHEMA}")
+    progress.done(f"БД доступна, схема {config.SCHEMA}, исключения ТИК/ЦИК — {config.SCHEMA_T}")
 
     last = M.parse(report_month)
     hist = M.span(M.shift(last, -(history_months - 1)), last)
-    res: dict = {"report_month": M.iso(last), "schema": config.SCHEMA, "amt_min": amt_min,
+    res: dict = {"report_month": M.iso(last), "schema": config.SCHEMA, "schema_t": config.SCHEMA_T,
+                 "amt_min": amt_min,
                  "exc_holding": exc_holding, "org_opts": org_opts, "focus_holding": focus_holding,
                  "generated": datetime.now().strftime("%Y-%m-%d %H:%M")}
 
@@ -74,6 +76,7 @@ def run(conn: str | None = None, schema: str | None = None,
             full = {M.iso(m) for off in (0, -12)
                     for m in M.span(M.shift(first, -LOOKBACK + off), M.shift(last, 1 + off))}
             rows = ws.build_raw(raw_months, full)
+            res["n_tik"] = ws.n_tik
             ws.params["all_rows"] = True       # для показанного SQL: копия рабочего набора
             # Аванс и зарплата — по названиям кодов из первого скопированного месяца.
             pc = A.classify_codes(ws.code_names, adv_pattern, sal_pattern)
@@ -473,7 +476,7 @@ def _write(res: dict) -> None:
 
     (config.OUTPUT_DIR / "probe.json").write_text(
         json.dumps(res["probe"], ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    cfg = {k: res[k] for k in ("report_month", "schema", "amt_min", "exc_holding", "org_opts",
+    cfg = {k: res[k] for k in ("report_month", "schema", "schema_t", "n_tik", "amt_min", "exc_holding", "org_opts",
                                "report", "work", "generated")}
     cfg["timing_sec"] = res.get("timing", {})
     (config.OUTPUT_DIR / "run_config.json").write_text(
