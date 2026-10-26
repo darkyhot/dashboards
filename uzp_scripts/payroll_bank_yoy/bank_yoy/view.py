@@ -22,6 +22,8 @@ import pandas as pd
 
 from . import analyze as A
 from . import charts as C
+from . import dims as D
+from . import geo as G
 from . import months as M
 from . import names as N
 from . import segments as S
@@ -729,6 +731,68 @@ def s_tb(res: dict) -> str:
                    "(`sys_tb_id`), сортировка — по итогу ТБ.", per_month(res, build))
 
 
+def _dim_heat(t: pd.DataFrame, head: str, top: int | None = None) -> str:
+    """Тепловая карта «значение × сегмент» (изменение год к году) + было/стало."""
+    if t is None or t.empty:
+        return "<p class='muted'>Нет данных.</p>"
+    x = t if top is None else t.head(top)
+    cols = D.seg_cols(x) + [D.TOTAL]
+    heat = C.heatmap(list(x.index), cols, lambda r, c: float(x.loc[r, c]), lambda v: fnum(v, True),
+                     row_head=head, total_col=D.TOTAL,
+                     tipf=lambda r, c, v: f"{r} · {c}|{fnum(v, True)} получателей год к году")
+    rows = [[r, fnum(x.loc[r, "was"]), fnum(x.loc[r, "now"]), fnum(x.loc[r, D.TOTAL], True),
+             fpct(x.loc[r, "pct"]), fpct(x.loc[r, "share_bank"])] for r in x.index]
+    det = table([head, "Было", "Стало", "Изменение", "Изменение, %", "Доля в изменении банка"], rows)
+    return heat + f"<details><summary>Было и стало</summary>{det}</details>"
+
+
+def s_dims(res: dict) -> str:
+    def build(m):
+        d = (res.get("dims") or {}).get(m) or {}
+        ind, geo = d.get("ind") or {}, d.get("geo") or {}
+        if not ind and not geo:
+            return "<p class='muted'>Отрасли и территория не прочитаны.</p>"
+        y1, y0 = M.parse(m).year, M.parse(m).year - 1
+        out = []
+        if ind:
+            ag = ind["agree"]
+            agt = table(["Сегмент", f"Получателей, {M.name(m)} {y1}", "Отрасль ЕПК есть",
+                         "Отрасль по названию есть", "Обе оценки есть", "Совпали"],
+                        [[r.seg, fnum(r.n), fpct(r.epk_known), fpct(r.name_known), fnum(r.both), fpct(r.agree)]
+                         for r in ag.itertuples()], strong_rows={0})
+            cr = ind["cross"]
+            crt = C.heatmap(list(cr.index), list(cr.columns), lambda r, c: float(cr.loc[r, c]),
+                            lambda v: fnum(v), row_head="ЕПК ↓ / по названию →",
+                            tipf=lambda r, c, v: f"ЕПК: {r} · по названию: {c}|{fnum(v)} получателей")
+            out.append(f"<h3>Отрасль по справочнику ЕПК</h3>{_dim_heat(ind['epk'], 'Отрасль ЕПК')}"
+                       f"<h3>Отрасль по названию организации</h3>{_dim_heat(ind['name'], 'Отрасль по названию')}"
+                       f"<h3>Сравнение двух оценок</h3><p class='muted'>Доли — от получателей месяца. "
+                       f"«Совпали» — среди получателей, у которых есть обе оценки (без «Прочее» в ЕПК).</p>"
+                       f"{agt}<details><summary>Матрица: отрасль ЕПК × отрасль по названию</summary>{crt}</details>")
+        if geo:
+            cv = geo["cov"]
+            tot = cv["total"] or 1
+            out.append(
+                f"<h3>Субъекты РФ</h3><p class='muted'>Территория — из справочника ЕПК по связке id орг + ГОСБ "
+                f"тройки: найдена у {fpct(cv['pair'] / tot)} получателей {esc(M.gen(m))} (ОКТМО — "
+                f"{fpct(cv['oktmo'] / tot)}, только ОКАТО — {fpct(cv['okato'] / tot)}); ещё "
+                f"{fpct(cv['inn_only'] / tot)} — id орг в ЕПК есть, но в другом ГОСБ; "
+                f"{fpct(cv['none'] / tot)} — нет ни кода, ни id орг. До района (а не только субъекта) "
+                f"определено {fpct(cv['district'] / tot)}.</p>"
+                f"{_dim_heat(geo['subject'], 'Субъект РФ', top=40)}"
+                f"<h3>Районы: где больше всего снизилось</h3>"
+                f"<p class='muted'>Район — первые 5 знаков ОКТМО (или ОКАТО), названия — классификаторы "
+                f"Росстата. Код без названия — район упразднён до 2022 года.</p>"
+                f"{_dim_heat(geo['district'], 'Район', top=40)}")
+        return "".join(out) + sql_box(res, [f"ind_yoy_{m}", f"geo_yoy_{m}"])
+    html = section("dims", "Отрасли и районы",
+                   "Изменение получателей год к году по отраслям и территории, в разрезе сегментов. "
+                   "Отрасль — двумя способами: справочник ЕПК и правила по названию организации; "
+                   "территория — ОКТМО/ОКАТО справочника ЕПК. Каждая таблица складывается в изменение банка.",
+                   per_month(res, build))
+    return G.html_safe(html)
+
+
 def s_threshold(res: dict) -> str:
     th = res["thresholds"]
     if th.empty:
@@ -1295,7 +1359,7 @@ def render(res: dict) -> str:
              f"к {M.parse(last).year - 1}")
     nav = [("summary", "Итог"), ("august", "Перенос?"), ("series", "Ряд"), ("decomp", "Разложение"), ("did", "Почему хуже"),
            ("cohorts", "Пришедшие"), ("multi", "Совместительство"), ("season", "Сезон"), ("paytype", "Аванс/ЗП"),
-           ("flows", "Перетоки"), ("tb", "Территория"), ("threshold", "Порог"),
+           ("flows", "Перетоки"), ("tb", "Территория"), ("dims", "Отрасли и районы"), ("threshold", "Порог"),
            ("orgs", "Организации"), ("checks", "Проверки")]
     fnav = [("f-summary", "Итог"), ("f-series", "Ряд"), ("f-decomp", "Разложение"), ("f-orgs", "Организации"),
             ("f-more", "Пропуск, пришедшие, аванс")]
@@ -1303,7 +1367,7 @@ def render(res: dict) -> str:
     buttons = "".join(f'<button type="button" data-month="{m}" aria-pressed="{"true" if m == last else "false"}">'
                       f'{esc(M.name(m))}</button>' for m in rep)
     bank = "".join([s_summary(res), s_august(res), s_series(res), s_decomp(res), s_did(res), s_cohorts(res),
-                    s_multi(res), s_season(res), s_paytype(res), s_flows(res), s_tb(res), s_threshold(res),
+                    s_multi(res), s_season(res), s_paytype(res), s_flows(res), s_tb(res), s_dims(res), s_threshold(res),
                     s_orgs(res), s_checks(res)])
     body = (f"<div data-pane='bank'>{bank}</div>"
             f"<div data-pane='focus' hidden>{s_focus(res)}</div>")

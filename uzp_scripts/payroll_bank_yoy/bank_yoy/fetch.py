@@ -98,6 +98,9 @@ class Workspace:
         n = self._create("t_org", Q.T_ORG)
         self._analyze("t_org")
         progress.done(f"t_org: {n:,} организаций справочника")
+        n = self._create("t_geo", Q.T_GEO)
+        self._analyze("t_geo")
+        progress.done(f"t_geo: {n:,} пар id орг × ГОСБ с ОКТМО/ОКАТО в справочнике ЕПК")
         n = self._create("t_exc", Q.T_EXC)
         self._analyze("t_exc")
         progress.done(f"t_exc: {n:,} id орг без порога (образовательные, «{self.params['exc_holding']}»)")
@@ -327,6 +330,13 @@ def orgs(ws: Workspace, b, c, o: dict, tag: str) -> dict[str, pd.DataFrame]:
             "reorg": ws.opt(f"org_reorg_{tag}", Q.ORG_REORG, p),
             "break": ws.opt(f"org_break_{tag}", Q.ORG_BREAK, p),
             "focus": ws.opt(f"org_focus_{tag}", Q.ORG_FOCUS, p)}
+
+
+def dims_yoy(ws: Workspace, c, tag: str) -> dict[str, pd.DataFrame]:
+    """Отрасли и районы: год к году для отчётного месяца c."""
+    p = {"b": M.iso(M.shift(c, -12)), "c": M.iso(c)}
+    return {"ind": ws.opt(f"ind_yoy_{tag}", Q.IND_YOY, p),
+            "geo": ws.opt(f"geo_yoy_{tag}", Q.GEO_YOY, p)}
 
 
 def august(ws: Workspace, m, hole_min_base: int, max_rows: int, break_max: int = 40) -> dict:

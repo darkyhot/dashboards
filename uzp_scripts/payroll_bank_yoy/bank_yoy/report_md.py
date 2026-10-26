@@ -294,6 +294,17 @@ def render(res: dict) -> tuple[str, list[str]]:
         L.append(_md_table(["ТБ"] + cols, [[al("ТБ", r)] + [fnum(tb.loc[r, c], True) for c in cols]
                                             for r in tb.index]))
 
+    ind = ((res.get("dims") or {}).get(last) or {}).get("ind") or {}
+    for key, title in (("epk", "справочник ЕПК"), ("name", "по названию организации")):
+        t = ind.get(key)
+        if t is None or t.empty:
+            continue
+        cols = [c for c in t.columns if c not in ("was", "now", "pct", "share_bank")]
+        L.append(f"## Отрасль ({title}): изменение получателей год к году, {M.long(last)}\n")
+        L.append(_md_table(["Отрасль"] + cols + ["Было", "%"],
+                           [[r] + [fnum(t.loc[r, c], True) for c in cols]
+                            + [fnum(t.loc[r, "was"]), fpct(t.loc[r, "pct"])] for r in t.index]))
+
     for m in rep:
         o = res["orgs"][m]
         smr, lst = o["summary"], o["list"]

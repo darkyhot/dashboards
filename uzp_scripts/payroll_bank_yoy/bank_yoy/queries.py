@@ -45,6 +45,7 @@ id орг из `{schema_t}.yva_tik_cik` с `is_tik_cik IS TRUE` (`t_tik`) иск
 """
 from __future__ import annotations
 
+from . import industry as I
 from . import segments as S
 
 AMT_MIN = 2500
@@ -186,7 +187,10 @@ WHERE k.is_tik_cik IS TRUE AND k.inn IS NOT NULL
 # и название с ФИО (у ИП, главы КФХ — фамилия, имя и отчество человека) дальше
 # выборки не уходит — вместо него показывается id орг.
 # `focus` — организация выделенного холдинга (отдельная вкладка отчёта).
+# `ind_name` — отрасль по НАЗВАНИЮ (правила `industry.py`), рядом с отраслью ЕПК.
 T_ORG = """
+SELECT t.*, """ + I.sql_case("t.org_name") + """ AS ind_name
+FROM (
 SELECT e.inn,
        min(""" + S.seg_case("e.segment_name") + """)            AS seg,
        count(DISTINCT """ + S.seg_case("e.segment_name") + """) AS n_seg,
@@ -199,6 +203,39 @@ FROM {schema}.uzp_data_epk_consolidation e
 LEFT JOIN t_tik k ON k.inn = e.inn
 WHERE e.inn IS NOT NULL AND k.inn IS NULL
 GROUP BY e.inn
+) t
+"""
+
+# Территория (id орг, ГОСБ) по справочнику ЕПК: первые 5 знаков ОКТМО и ОКАТО (субъект
+# + район). Связка — по id орг И ГОСБ: у организации с филиалами в разных районах
+# у каждого ГОСБ свой код. ГОСБ ЕПК перекодируется так же, как в ведомостях (КСБ —
+# по сегменту справочника), иначе ключ тройки и ключ справочника разойдутся.
+# Код хранится числом: ведущий ноль субъектов 01–09 потерян, длина значения
+# говорит, какой это код — до 8 знаков 8-значный, 9–11 — 11-значный.
+def _code5(col: str) -> str:
+    v = f"CAST({col} AS text)"
+    return (f"CASE WHEN {col} > 0 AND length({v}) <= 8 THEN substr(lpad({v}, 8, '0'), 1, 5)\n"
+            f"              WHEN {col} > 0 AND length({v}) <= 11 THEN substr(lpad({v}, 11, '0'), 1, 5) END")
+
+
+T_GEO = """
+SELECT inn, gosb_id, min(oktmo5) AS oktmo5, min(okato5) AS okato5,
+       count(DISTINCT oktmo5) AS n_oktmo
+FROM (
+  SELECT e.inn,
+         CASE WHEN e.tb_id = 38 THEN 9038
+              WHEN e.gosb_id = 1009 THEN 8557
+              WHEN e.gosb_id = 0 AND e.tb_id = 40 THEN 9040
+              WHEN """ + S.seg_case("e.segment_name") + """ = 'КСБ' AND e.gosb_id = 8591 THEN 8646
+              ELSE e.gosb_id END                     AS gosb_id,
+         """ + _code5("e.oktmo") + """ AS oktmo5,
+         """ + _code5("e.okato") + """ AS okato5
+  FROM {schema}.uzp_data_epk_consolidation e
+  LEFT JOIN t_tik k ON k.inn = e.inn
+  WHERE e.inn IS NOT NULL AND e.gosb_id IS NOT NULL AND k.inn IS NULL
+    AND (e.oktmo IS NOT NULL OR e.okato IS NOT NULL)
+) x
+GROUP BY inn, gosb_id
 """
 
 # ВСЕ портфельные тройки ВСЕХ месяцев копии с признаками отбора — без порога, ОДНИМ
@@ -333,11 +370,11 @@ ANALYZE_TMP = "ANALYZE {name}"
 DROP_TMP = "DROP TABLE IF EXISTS {name}"
 
 # Порядок значим: каждая следующая таблица читает предыдущие.
-WORKSET_ORDER = ["t_tik", "t_org", "t_exc", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc", "t_keys", "t_person"]
+WORKSET_ORDER = ["t_tik", "t_org", "t_geo", "t_exc", "t_raw", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc", "t_keys", "t_person"]
 # Порядок для ПОКАЗА: плюс временные таблицы отдельных шагов (t_tflow).
-SHOW_ORDER = ["t_tik", "t_org", "t_exc", "t_raw", "t_stage", "t_ptype", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc",
+SHOW_ORDER = ["t_tik", "t_org", "t_geo", "t_exc", "t_raw", "t_stage", "t_ptype", "t_pairs", "t_epk", "t_epk_seg", "t_epk_foc",
               "t_keys", "t_person", "t_tflow", "t_oflow", "t_mv", "t_succ", "t_orgsel"]
-DIST = {"t_tik": "inn", "t_org": "inn", "t_exc": "inn_exc", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id",
+DIST = {"t_tik": "inn", "t_org": "inn", "t_geo": "inn", "t_exc": "inn_exc", "t_raw": "epk_id", "t_pairs": "epk_id", "t_epk": "epk_id",
         "t_epk_seg": "epk_id", "t_keys": "epk_id", "t_person": "epk_id",
         "t_tflow": "epk_id", "t_oflow": "epk_id", "t_stage": "epk_id",
         "t_mv": "epk_id", "t_succ": "inn_from", "t_orgsel": "inn",
@@ -350,6 +387,7 @@ _ALL = "report_dt = ANY(CAST(:months AS date[]))"
 SHOW_DEFS = {
     "t_tik": T_TIK,
     "t_org": T_ORG,
+    "t_geo": T_GEO,
     "t_exc": T_EXC,
     "t_raw": T_RAW_MONTH.replace("p.report_dt = CAST(:m AS date)", "p." + _ALL),
     "t_stage": T_STAGE,
@@ -742,6 +780,46 @@ TB_SEG = """
 SELECT report_dt, tb_id, seg, count(*) AS n_triples
 FROM t_pairs
 GROUP BY report_dt, tb_id, seg
+"""
+
+# Отрасли год к году: получатели (тройки) в b и c по сегменту, отрасли ЕПК и отрасли
+# по названию — одним проходом по t_pairs (грейн id орг × сегмент, потом справочник).
+def _pair_bc(keys: str) -> str:
+    return f"""
+  SELECT {keys},
+         count(*) FILTER (WHERE report_dt = CAST(:b AS date)) AS n_b,
+         count(*) FILTER (WHERE report_dt = CAST(:c AS date)) AS n_c
+  FROM t_pairs
+  WHERE report_dt IN (CAST(:b AS date), CAST(:c AS date))
+  GROUP BY {keys}
+"""
+IND_YOY = """
+WITH x AS (""" + _pair_bc("inn, seg") + """)
+SELECT x.seg,
+       CASE WHEN o.inn IS NULL THEN '""" + I.NO_NAME + """'
+            ELSE COALESCE(NULLIF(btrim(o.industry_name), ''), 'Отрасль не указана') END AS ind_epk,
+       COALESCE(o.ind_name, '""" + I.NO_NAME + """') AS ind_name,
+       sum(x.n_b) AS n_b, sum(x.n_c) AS n_c,
+       count(*) FILTER (WHERE x.n_b > 0) AS orgs_b,
+       count(*) FILTER (WHERE x.n_c > 0) AS orgs_c
+FROM x LEFT JOIN t_org o ON o.inn = x.inn
+GROUP BY 1, 2, 3
+"""
+
+# Районы год к году: по связке (id орг, ГОСБ) тройки. `match` — нашлась ли территория
+# по паре, или в ЕПК есть только сам id орг (в другом ГОСБ), или нет ничего: так
+# видно, сколько теряет соединение по ГОСБ.
+GEO_YOY = """
+WITH x AS (""" + _pair_bc("inn, gosb_id, seg") + """),
+gi AS (SELECT DISTINCT inn FROM t_geo)
+SELECT x.seg, g.oktmo5, g.okato5,
+       CASE WHEN g.inn IS NOT NULL THEN 'pair'
+            WHEN gi.inn IS NOT NULL THEN 'inn_only' ELSE 'none' END AS match,
+       sum(x.n_b) AS n_b, sum(x.n_c) AS n_c
+FROM x
+LEFT JOIN t_geo g ON g.inn = x.inn AND g.gosb_id = x.gosb_id
+LEFT JOIN gi ON gi.inn = x.inn
+GROUP BY 1, 2, 3, 4
 """
 
 TB_DIM = """

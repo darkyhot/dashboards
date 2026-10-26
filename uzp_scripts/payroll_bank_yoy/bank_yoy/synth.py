@@ -33,7 +33,12 @@
   вид 2 ниже порога (становится); образовательные организации — без порога;
   ТБ 38 перекодируется в ГОСБ 9038;
 * организации ТИК/ЦИК (`yva_tik_cik`, признак true) — из отчёта исключаются целиком;
-  ещё две с признаком false — остаются.
+  ещё две с признаком false — остаются;
+* отрасль: корень отрасли в названии (у части — МБОУ), отрасль ЕПК у трети организаций
+  совпадает с правилами по названию, у трети — «Прочее», у трети пуста;
+* территория: ОКТМО (11- и 8-значные), только ОКАТО, только субъект, без кода; второй
+  ГОСБ — свой район; у части организаций ГОСБ справочника не тот, что в ведомостях
+  (связка id орг + ГОСБ не находит), субъект 01 — с потерянным ведущим нулём.
 Эталон числа получателей-троек по месяцам считается здесь же, pandas-версией
 логики заказчика (`expect["recipients"]`), и сверяется с отчётом точно.
 """
@@ -48,7 +53,8 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 
-from . import config
+from . import config, geo
+from . import industry as I
 from . import months as M
 
 START = date(2024, 8, 31)       # idx 0
@@ -109,6 +115,9 @@ SPLIT_GOSB_SHARE = 0.12
 JUNK_INN_SHARE = 0.004
 FOCUS_HOLDING = "МИНОБОРОНЫ"
 FOCUS_LEAVE_AUG26 = 0.15
+# Корень отрасли в названии (k % 8) и субъект РФ территории по ТБ.
+NAME_STEM = ["", "Строй", "Агро", "Транс", "Торг", "Сервис", "Энерго", "Хлеб"]
+TB_SUBJECT = {38: "46", 40: "03", 42: "01", 44: "65", 52: "45"}
 SURNAMES = ["Иванов", "Петров", "Сидоров", "Кузнецов", "Смирнов", "Попов", "Волков", "Зайцев"]
 FIRST = ["Иван", "Пётр", "Сергей", "Андрей", "Олег", "Николай"]
 PATR = ["Иванович", "Петрович", "Сергеевич", "Андреевич", "Олегович", "Николаевич"]
@@ -141,7 +150,9 @@ class Gen:
         k = len(self.orgs)
         # Каждая четвёртая микро — ИП: в названии ФИО, показывать нельзя.
         name = (f"ИП {SURNAMES[k % 8]}{k} {FIRST[k % 6]} {PATR[k % 6]}"
-                if big == "Микро" and k % 4 == 0 else f"ООО «Синтетика {k:04d}»")
+                if big == "Микро" and k % 4 == 0
+                else f"МБОУ СОШ № {k}" if big == "Рег. госсектор" and k % 2 == 0
+                else f"ООО «{NAME_STEM[k % 8]}Синтетика {k:04d}»")
         o = {"id": k, "inn": self.next_inn, "big": big, "seg": SHORT[big],
              "tb": tb, "gosb": gosb, "gosb2": gosb2, "size": size,
              "name": name, "liquidated": False,
@@ -480,25 +491,55 @@ class Gen:
         ok = g["t2"] | (g["pos_pf"] & (g["exc"] | (g["amt_pf"] > 2500)))
         return {M.iso(k): int(v) for k, v in g[ok].groupby("report_dt").size().items()}
 
+    def _codes(self, o: dict, gosb: int) -> dict:
+        """ОКТМО/ОКАТО пары (организация, ГОСБ): разные варианты заполнения по id."""
+        subj = TB_SUBJECT[o["tb"]]
+        okt = sorted(c for c in geo._load("oktmo_districts.csv") if c.startswith(subj) and not c.endswith("000"))
+        oka = sorted(c for c in geo._load("okato_districts.csv") if c.startswith(subj) and not c.endswith("000"))
+        h = (o["id"] * 7 + gosb) % 20
+        out = {"oktmo": None, "okato": None}
+        if h < 10:                                       # ОКТМО 11 знаков (+ ОКАТО)
+            out["oktmo"] = int(okt[(o["id"] + gosb) % len(okt)] + "000001")
+            out["okato"] = int(oka[(o["id"] + gosb) % len(oka)] + "000000")
+        elif h < 12:                                     # ОКТМО 8 знаков
+            out["oktmo"] = int(okt[(o["id"] + gosb) % len(okt)] + "000")
+        elif h < 15:                                     # только ОКАТО
+            out["okato"] = int(oka[(o["id"] + gosb) % len(oka)] + "000000")
+        elif h < 17:                                     # только субъект
+            out["oktmo"] = int(subj + "000000000")
+        return out                                       # иначе — кода нет
+
     def epk(self) -> pd.DataFrame:
         rows = []
         for o in self.orgs:
             if o["big"] is None:
                 continue
-            rows.append({"epk_id": 9_000_000 + o["id"], "inn": o["inn"],
-                         "segment_name": o["big"], "company_name": o["name"],
-                         "holding_name": self._holding(o),
-                         "reference_holding_name": FOCUS_HOLDING if o["id"] in self.ev_focus else None,
-                         "industry_name": "Образование" if o["seg"] == "РГС" else "Торговля",
-                         "status_name": "Ликвидирована" if o["liquidated"] else "Активна",
-                         "tb_id": o["tb"]})
+            grp = I.classify(o["name"])
+            ind = (grp if grp != I.UNKNOWN else None) if o["id"] % 3 == 0 \
+                else "Прочее" if o["id"] % 3 == 1 else None
+            # Каждая двадцатая — ГОСБ справочника не совпадает с ведомостями.
+            g_epk = o["gosb"] + 1 if o["id"] % 20 == 7 else o["gosb"]
+            base = {"inn": o["inn"],
+                    "segment_name": o["big"], "company_name": o["name"],
+                    "holding_name": self._holding(o),
+                    "reference_holding_name": FOCUS_HOLDING if o["id"] in self.ev_focus else None,
+                    "industry_name": ind,
+                    "status_name": "Ликвидирована" if o["liquidated"] else "Активна",
+                    "tb_id": o["tb"]}
+            rows.append({"epk_id": 9_000_000 + o["id"], **base, "gosb_id": g_epk, **self._codes(o, g_epk)})
+            if o["gosb2"]:                               # филиал во втором ГОСБ — свой район
+                rows.append({"epk_id": 9_600_000 + o["id"], **base, "gosb_id": o["gosb2"],
+                             **self._codes(o, o["gosb2"])})
         # Одна организация с двумя ЕПК — живой и ликвидированной: жива.
         if rows:
             dup = dict(rows[0])
             dup["epk_id"] += 500_000
             dup["status_name"] = "Ликвидирована"
             rows.append(dup)
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        for c in ("oktmo", "okato", "gosb_id"):
+            df[c] = df[c].astype("Int64")          # NaN не должен превратить код в 1.0e10
+        return df
 
     def _holding(self, o: dict):
         if o["id"] in self.ev_focus:

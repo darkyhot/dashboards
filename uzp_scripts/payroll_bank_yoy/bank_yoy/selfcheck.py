@@ -162,6 +162,32 @@ def check_tik_excluded() -> None:
             _fail("ТИК/ЦИК", f"{name} не исключает организации ТИК/ЦИК")
 
 
+def check_industry_geo() -> None:
+    """Отрасль по названию и справочники территорий: правила на примерах, CSV без слова-блокатора."""
+    from . import geo as G, industry as I
+    cases = {"МБОУ СОШ № 5": "Здравоохранение, образование", "ГБУЗ ЦРБ": "Здравоохранение, образование",
+             "Администрация района": "Органы гос. и мун. управления",
+             "ООО «ГазСтройИнвест»": "Строительство", "АО «Авиакомпания Север»": "Транспорт и логистика",
+             "ООО «Транснефть»": "Нефтегазовая промышленность", "ООО «ТД Весна»": "Торговля",
+             "ООО «Оптика»": I.UNKNOWN, "ООО «Ромашка»": I.UNKNOWN, "ООО «агрохолдинг»": "Сельское хозяйство",
+             "ПАО Сбербанк": "Финансовая деятельность", "ООО «УК Дом»": "Операции с недвижимым имущ."}
+    for name, want in cases.items():
+        if I.classify(name) != want:
+            _fail("отрасль по названию", f"{name}: {I.classify(name)} вместо {want}")
+    sql = I.sql_case("t.org_name")
+    if sql.count("WHEN") != len(I.RULES) + 1 or "upper(" in sql:
+        _fail("отрасль по названию", "CASE не повторяет правила или зависит от локали")
+    w = V.BLOCKED.lower()
+    for path in G.REF_DIR.glob("*.csv"):
+        if w in path.read_text(encoding="utf-8").lower():
+            _fail("справочники территорий", f"{path.name}: слово-блокатор не экранировано")
+    if not G.district("01512", "oktmo").startswith("Алтайский край: "):
+        _fail("справочники территорий", G.district("01512", "oktmo"))
+    probe = "Цел" + w + "ый район"
+    if G.unescape(G.escape(probe)) != probe or w in G.html_safe(probe).lower():
+        _fail("справочники территорий", "экранирование слова-блокатора")
+
+
 def check_selection() -> None:
     """Отбор зачислений — логика заказчика: relev, справочник видов, порог по тройке, три условия."""
     raw, stage = Q.T_RAW_MONTH, Q.T_STAGE
@@ -267,7 +293,7 @@ def check_months() -> None:
 
 CHECKS = [check_self_contained, check_no_blocked_word, check_payroll_once, check_no_distinct, check_names_masked,
           check_shown_sql_escape, check_partition_filter, check_dialect, check_inn_cast,
-          check_placeholders, check_selection, check_tik_excluded, check_decomp_identity, check_did_identity, check_org_rules,
+          check_placeholders, check_selection, check_tik_excluded, check_industry_geo, check_decomp_identity, check_did_identity, check_org_rules,
           check_sanitize, check_months]
 
 
@@ -305,6 +331,27 @@ def check_against_synth(res: dict) -> None:
     if "tik_inns" in exp:
         need(res.get("n_tik") == len(exp["tik_inns"]),
              f"ТИК/ЦИК: исключено {res.get('n_tik')} из {len(exp['tik_inns'])} (признак false не исключён)")
+    # Отрасли и районы: SQL-правила по названию = Python-правила (у трети организаций
+    # отрасль ЕПК заложена равной Python-классификации), территория по паре id орг + ГОСБ.
+    dm = (res.get("dims") or {}).get(last) or {}
+    ag = (dm.get("ind") or {}).get("agree")
+    if ag is not None and not ag.empty:
+        a0 = ag.iloc[0]
+        need(a0["agree"] > 0.999 and a0["name_known"] > 0.5,
+             f"отрасль по названию в SQL = в Python (совпали {a0['agree']:.1%}, по названию определено "
+             f"{a0['name_known']:.0%})")
+    else:
+        need(False, "отрасли посчитаны")
+    gv = (dm.get("geo") or {}).get("cov")
+    if gv:
+        t = gv["total"] or 1
+        dist = (dm["geo"]["district"].index.astype(str))
+        need(0.4 < gv["pair"] / t < 0.98 and gv["inn_only"] > 0 and gv["oktmo"] > 0 and gv["okato"] > 0,
+             f"территория: по паре {gv['pair'] / t:.0%}, только id орг {gv['inn_only'] / t:.1%}")
+        need(any(d.startswith("Алтайский край: ") and "ОКТМО" not in d and "ОКАТО" not in d for d in dist),
+             "территория: субъект 01 (ведущий ноль) и 8-значный ОКТМО расшифрованы")
+    else:
+        need(False, "территория посчитана")
     # Картина: июнь +, июль +, август − (так заложено).
     need(res["pattern"].startswith("++−"), f"картина «++−» (получено {res['pattern']})")
     # Растворились пришедшие: убыль новичков июня–июля в августе.

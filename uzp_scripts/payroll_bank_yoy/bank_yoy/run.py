@@ -9,6 +9,7 @@ import pandas as pd
 
 from . import analyze as A
 from . import config, db, fetch, probe, progress
+from . import dims as D
 from . import months as M
 from . import queries as Q
 
@@ -172,6 +173,9 @@ def run(conn: str | None = None, schema: str | None = None, schema_t: str | None
                 res["orgs_raw"][M.iso(m)] = fetch.orgs(ws, M.shift(m, -12), m, org_opts, M.iso(m))
                 n = len(res["orgs_raw"][M.iso(m)]["list"])
                 progress.done(f"{M.label(m)}: в списке {n:,} организаций")
+            progress.step("Отрасли и районы: год к году по сегментам")
+            res["dims_raw"] = {M.iso(m): fetch.dims_yoy(ws, m, M.iso(m)) for m in report}
+            progress.done("отрасли (ЕПК и по названию) и территория (ОКТМО/ОКАТО)")
             if res["has_next"]:
                 progress.step(f"{M.label(last)}: потеря или перенос в {M.label(M.shift(last, 1))}")
                 res["aug_raw"] = fetch.august(ws, last, org_opts["hole_min_base"], 300,
@@ -328,6 +332,25 @@ def compute(res: dict) -> None:
     res["seasonal"] = A.seasonal_table(res["seasonal_raw"], have_next)
     res["code_tables"] = {M.iso(m): A.code_table(res["codes_raw"], m) for m in report}
     res["tb"] = {M.iso(m): A.tb_table(res["tb_seg_raw"], res["tb_dim"], m) for m in report}
+    res["dims"] = {}
+    for m in report:
+        mi = M.iso(m)
+        raw = res["dims_raw"].get(mi, {})
+        res["dims"][mi] = {"ind": D.industry(raw.get("ind")), "geo": D.territory(raw.get("geo"))}
+        # Разрезы складываются в банк: Σ изменений = изменение получателей за тот же год.
+        ser = res.get("series_raw", pd.DataFrame())
+        if not ser.empty:
+            sa = ser[ser["seg"] == "__ALL__"].set_index("report_dt")["n_triples"].astype(float)
+            pm = M.iso(M.shift(m, -12))
+            if mi in sa.index and pm in sa.index:
+                bank = float(sa[mi] - sa[pm])
+                for k, t in (("отрасли ЕПК", res["dims"][mi]["ind"].get("epk")),
+                             ("отрасли по названию", res["dims"][mi]["ind"].get("name")),
+                             ("субъекты", res["dims"][mi]["geo"].get("subject")),
+                             ("районы", res["dims"][mi]["geo"].get("district"))):
+                    if t is not None and not t.empty:
+                        checks.append(A.check(f"{k}: Σ = изменение банка ({M.label(m)})",
+                                              float(t["Итого"].sum()) - bank))
 
     res["orgs"] = {}
     for m in report:
