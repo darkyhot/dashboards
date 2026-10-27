@@ -62,7 +62,11 @@ def gi_of(y: int, m: int) -> int:
 
 GI_STOP = gi_of(2025, 6)
 GI_RECLASS = gi_of(2025, 3)
+GI_REORG = gi_of(2025, 9)
 AUGS = [i for i in range(N_GEN) if M.shift(START, i).month == 8]
+# Сезон длиной 3 мес. (авг–окт) — ловится; 4 мес. (авг–ноя) — уже не сезон.
+SEAS3 = [i for i in range(N_GEN) if M.shift(START, i).month in (8, 9, 10)]
+SEAS4 = [i for i in range(N_GEN) if M.shift(START, i).month in (8, 9, 10, 11)]
 
 
 class Gen:
@@ -106,6 +110,10 @@ class Gen:
         self.o_tik_false = special("tik_false")
         self.o_flap = special("flap", big="Малые", pay="Малый бизнес")
         self.o_seas = special("seas", big="Малые", pay="Малый бизнес")
+        self.o_seas3 = special("seas3", big="Рег. госсектор", pay="Государственный сектор")
+        self.o_seas4 = special("seas4", big="Рег. госсектор", pay="Государственный сектор")
+        self.o_reorg_a = special("reorg_a", gosbs=[(44, 8612)])
+        self.o_reorg_b = special("reorg_b", gosbs=[(44, 8612)])
         self.plain = list(range(n))
 
     # ------------------------------------------------------------- люди --
@@ -169,6 +177,19 @@ class Gen:
                             N_GEN - 1 - int(r.integers(0, 8)), mode=mode)
         for _ in range(40):                                         # сезонники
             self._spell(self._epk(), self.o_seas, 0, 0, N_GEN - 1, mode="zp", skip=AUGS)
+        for org_s, skip in ((self.o_seas3, SEAS3), (self.o_seas4, SEAS4)):
+            for _ in range(30):                                     # многомесячный сезон
+                self._spell(self._epk(), org_s, 0, 0, N_GEN - 1, mode="zp", skip=skip)
+        for _ in range(60):                                         # реорганизация A → B
+            epk = self._epk()
+            self._spell(epk, self.o_reorg_a, 0, 0, GI_REORG - 1)
+            self._spell(epk, self.o_reorg_b, 0, GI_REORG, N_GEN - 1)
+        for _ in range(30):                                         # «Дополнительные» на стыке отбора
+            epk = self._epk()
+            org = int(r.choice(self.plain))
+            for gi in range(gi_of(2023, 11), gi_of(2024, 3) + 1):
+                self.noise.append(self._row(gi, epk, org, 0, 1, 40_000,
+                                            enrollment_kind_descr="Дополнительные"))
         for _ in range(30):                                         # «мигающие»
             self._spell(self._epk(), self.o_flap, 0, int(r.integers(0, 10)), N_GEN - 1, mode="flap")
         for _ in range(60):                                         # разовые
@@ -218,7 +239,7 @@ class Gen:
                "sys_gosb_id": g, "sys_tb_id": tb, "enrollment_type": code, "amt": round(float(amt), 2),
                "segment_name": o["pay"], "enrollment_kind_descr": "Основные",
                "market_share_flag_name": "Прочие", "company_name": o["name"],
-               "enrollment_transcription": CODES.get(code, ("?",))[0]}
+               "enrollment_transcription": CODES.get(code, ("?",))[0], "transaction_qty": 1}
         row.update(kw)
         return row
 
@@ -240,8 +261,9 @@ class Gen:
                     if r.random() < 0.5:
                         rows.append(self._row(gi, s["epk"], s["org"], s["gk"], 16, sal * 0.4))
                         rows.append(self._row(gi, s["epk"], s["org"], s["gk"], 1, sal * 0.6))
-                    else:
-                        rows.append(self._row(gi, s["epk"], s["org"], s["gk"], 1, sal))
+                    else:                                   # одна строка, иногда 2 транзакции
+                        rows.append(self._row(gi, s["epk"], s["org"], s["gk"], 1, sal,
+                                              transaction_qty=2 if r.random() < 0.1 else 1))
                     if r.random() < 0.05:
                         rows.append(self._row(gi, s["epk"], s["org"], s["gk"], 1, -500))  # сторно
                     if r.random() < 0.05:
@@ -274,6 +296,7 @@ class Gen:
                 rows.append(self._row(gi, None, org, 0, 1, 50_000))
             else:
                 rows.append(self._row(gi, epk, org, 0, 2, 1000))           # вид 2 ниже порога
+        rows += self.noise
         df = pd.DataFrame(rows)
         df["epk_id"] = df["epk_id"].astype("Int64")
         return df
@@ -304,6 +327,10 @@ class Gen:
                 pay = o["pay"]
                 if o["role"] == "reclass" and gi >= GI_RECLASS:
                     pay = "Средний бизнес"
+                # Последний месяц истории загружен наполовину (по чётным организациям):
+                # текущая сегментация обязана взять предпоследний, полный месяц.
+                if gi == N_GEN - 1 and o["k"] % 2 == 0:
+                    continue
                 for tb, g in o["gosbs"]:
                     rows.append({"report_dt": date(d.year, d.month, 1).isoformat(), "inn": o["inn"],
                                  "tb_id": tb, "gosb_id": g, "segment_name": pay})
@@ -360,7 +387,8 @@ def generate(persons: int = 2000) -> dict:
     }
     roles = {o["role"]: int(o["inn"]) for o in g.orgs if o["role"] != "plain"}
     t["expect"] = {**g.expect, "roles": roles, "report_month": REPORT_MONTH,
-                   "gi_stop": GI_STOP, "gi_reclass": GI_RECLASS, "start": M.iso(START)}
+                   "gi_stop": GI_STOP, "gi_reclass": GI_RECLASS, "gi_reorg": GI_REORG,
+                   "start": M.iso(START)}
     return t
 
 

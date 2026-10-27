@@ -71,6 +71,20 @@ def execute(conn: Connection, sql: str, params: dict | None = None) -> int:
         raise
 
 
+def execute_tx(conn: Connection, statements: list[str], params: dict | None = None) -> None:
+    """Несколько операторов ОДНОЙ транзакцией: либо все, либо ни одного."""
+    try:
+        for s in statements:
+            s = render(s)
+            progress.sql(s, params)
+            conn.execute(text(s), params or {})
+        conn.commit()
+    except Exception as ex:
+        rollback(conn)
+        raise_if_kerberos(ex)
+        raise
+
+
 def read_sql(conn: Connection, sql: str, params: dict | None = None) -> pd.DataFrame:
     sql = render(sql)
     progress.sql(sql, params)
