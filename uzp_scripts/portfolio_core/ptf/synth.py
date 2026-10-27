@@ -40,11 +40,11 @@ REPORT_MONTH = "2026-10"
 SEED = 20261027
 SBER = "7707083893"
 
-# код → (название, портфельный, ФОТ, зп)
-CODES = {1: ("Заработная плата", True, True, True), 16: ("Аванс", True, True, True),
-         2: ("Денежное довольствие", True, True, True), 26: ("Отпускные", True, True, True),
-         28: ("Премия", True, True, False), 7: ("Пособие", False, False, False),
-         40: ("Командировочные", False, False, False), 3: ("Пенсия НПФ", False, False, False)}
+# код → (название, портфельный, ФОТ)
+CODES = {1: ("Заработная плата", True, True), 16: ("Аванс", True, True),
+         2: ("Денежное довольствие", True, True), 26: ("Отпускные", True, True),
+         28: ("Премия", True, True), 7: ("Пособие", False, False),
+         40: ("Командировочные", False, False), 3: ("Пенсия НПФ", False, False)}
 
 # (ТБ, ГОСБ сырой). Перекодировки: ТБ 38 → 9038, ГОСБ 1009 → 8557, ГОСБ 0 в ТБ 40 → 9040,
 # ГОСБ 8591 при КСБ-сегменте ведомостей → 8646.
@@ -322,7 +322,7 @@ CREATE TABLE {s}.uzp_data_payroll_m (
   enrollment_kind_descr text, market_share_flag_name text, src_system_name text);
 CREATE TABLE {s}.uzp_dim_enrollment_type (
   enrollment_type_id smallint, enrollment_type_name varchar, is_fot_enrollment boolean,
-  is_portfolio_enrollment boolean, is_fl_enrollment boolean);
+  is_portfolio_enrollment boolean);
 CREATE TABLE {s}.uzp_dim_education_organization (inn varchar, company_name varchar);
 CREATE TABLE {s}.uzp_data_epk_consolidation (
   epk_id bigint, inn bigint, company_name varchar, segment_name varchar, holding_name varchar,
@@ -352,8 +352,7 @@ def generate(persons: int = 2000) -> dict:
         "epk": g.epk(),
         "seg_hist": g.seg_hist(),
         "codes": pd.DataFrame([{"enrollment_type_id": c, "enrollment_type_name": v[0],
-                                "is_portfolio_enrollment": v[1], "is_fot_enrollment": v[2],
-                                "is_fl_enrollment": v[3]} for c, v in CODES.items()]),
+                                "is_portfolio_enrollment": v[1], "is_fot_enrollment": v[2]} for c, v in CODES.items()]),
         "edu": pd.DataFrame([{"inn": g.orgs[g.o_edu]["inn"], "company_name": "МБОУ Школа"}]),
         "tik": pd.DataFrame([{"inn": int(g.orgs[g.o_tik]["inn"]), "company_name": "ТИК", "is_tik_cik": True},
                              {"inn": int(g.orgs[g.o_tik_false]["inn"]), "company_name": "ТИК2",

@@ -141,14 +141,16 @@ def t_months(months: list[str]) -> str:
 
 # --------------------------------------------------------------------------- #
 # Тройки по месяцам — ЕДИНСТВЕННОЕ чтение ведомостей, оператор на месяц.
-#   st: P — в портфеле; Z — есть зп-коды (is_fl_enrollment), но не в портфеле;
-#       N — только не зп коды. Тройки без положительных сумм не берутся.
+#   st: P — в портфеле; Z — есть портфельные строки (зп-коды, is_portfolio_enrollment),
+#       но тройка не в портфеле (ниже порога); N — только не портфельные виды.
+#   Отбор строк — как в payroll_bank_yoy (T_RAW_MONTH), ведомости — {payroll}.
+#   Тройки без положительных сумм не берутся.
 #   В портфеле: вид 2, или портфельная строка и (без порога или сумма > порога).
 #   pf_amt / fot_amt — суммы строк, которые засчитал бы эталон заказчика.
 # --------------------------------------------------------------------------- #
 T_TR_MONTH = """
 SELECT CAST(:mi AS integer) AS mi, x.epk_id, x.org_id, x.gosb_id, x.tb_id,
-       CASE WHEN x.in_pf THEN 'P' WHEN x.pos_fl THEN 'Z' ELSE 'N' END AS st,
+       CASE WHEN x.in_pf THEN 'P' WHEN x.pos_pf THEN 'Z' ELSE 'N' END AS st,
        CASE WHEN x.in_pf
             THEN x.a_t2 + CASE WHEN x.exc OR x.sum_pf > :amt_min THEN x.a_pf ELSE 0 END
             ELSE 0 END                                        AS pf_amt,
@@ -167,7 +169,6 @@ FROM (
            sum(CASE WHEN COALESCE(d.is_fot_enrollment, false) THEN p.amt ELSE 0 END)       AS sum_fot,
            bool_or(COALESCE(d.is_portfolio_enrollment, false) AND p.amt > 0)    AS pos_pf,
            bool_or(COALESCE(d.enrollment_type_id = 2, false) AND p.amt > 0)     AS pos_t2,
-           bool_or(COALESCE(d.is_fl_enrollment, false) AND p.amt > 0)           AS pos_fl,
            bool_or(p.amt > 0)                                                   AS pos_any,
            sum(CASE WHEN p.amt > 0 AND COALESCE(d.enrollment_type_id = 2, false)
                     THEN p.amt ELSE 0 END)                                      AS a_t2,
@@ -241,7 +242,8 @@ FROM t_tr WHERE st = 'P'
 GROUP BY mi, org_id
 """
 
-# Смены зп ↔ не зп: тройка в соседних месяцах сменила группу (P/Z — зп, N — не зп).
+# Смены зп ↔ не зп: тройка в соседних месяцах сменила группу (P/Z — портфельные
+# виды, N — только не портфельные).
 T_FLIP = """
 SELECT c.epk_id, c.org_id, c.gosb_id, c.mi, (c.st = 'N') AS to_nonzp
 FROM t_tr c

@@ -54,8 +54,8 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
     mi_of = {m: i for i, m in enumerate(months)}
     last = len(months) - 1
 
-    codes = {int(r.enrollment_type_id): (bool(r.is_portfolio_enrollment), bool(r.is_fot_enrollment),
-                                         bool(r.is_fl_enrollment)) for r in t["codes"].itertuples()}
+    codes = {int(r.enrollment_type_id): (bool(r.is_portfolio_enrollment), bool(r.is_fot_enrollment))
+             for r in t["codes"].itertuples()}
     tik = {int(r.inn) for r in t["tik"].itertuples() if r.is_tik_cik}
     epk = t["epk"]
     exc = {int(x) for x in t["edu"]["inn"] if DIGITS.match(str(x))}
@@ -101,7 +101,7 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
     ST, PFA, FOTA, TB = {}, {}, {}, {}
     for key, rr in rows.items():
         o = key[2]
-        fl = lambda c: codes.get(c, (False, False, False))     # noqa: E731
+        fl = lambda c: codes.get(c, (False, False))            # noqa: E731
         sum_pf = sum(a for c, a, _ in rr if fl(c)[0])
         sum_fot = sum(a for c, a, _ in rr if fl(c)[1])
         is_exc = o in exc
@@ -114,7 +114,7 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
             continue
         if sal:
             st = "P"
-        elif any(a > 0 and fl(c)[2] for c, a, _ in rr):
+        elif any(a > 0 and fl(c)[0] for c, a, _ in rr):
             st = "Z"
         else:
             st = "N"
