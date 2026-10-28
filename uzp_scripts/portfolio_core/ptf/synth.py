@@ -26,6 +26,7 @@ import argparse
 import io
 import json
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -40,11 +41,10 @@ REPORT_MONTH = "2026-10"
 SEED = 20261027
 SBER = "7707083893"
 
-# код → (название, портфельный, ФОТ)
-CODES = {1: ("Заработная плата", True, True), 16: ("Аванс", True, True),
-         2: ("Денежное довольствие", True, True), 26: ("Отпускные", True, True),
-         28: ("Премия", True, True), 7: ("Пособие", False, False),
-         40: ("Командировочные", False, False), 3: ("Пенсия НПФ", False, False)}
+# код → (название, портфельный, ФОТ): справочник видов зачислений, выгрузка с прома 28.10.2026.
+_CODES_DF = pd.read_csv(Path(__file__).with_name("enrollment_type.csv"), sep=";")
+CODES = {int(r.enrollment_type_id): (r.enrollment_type_name, bool(r.is_portfolio_enrollment),
+                                     bool(r.is_fot_enrollment)) for r in _CODES_DF.itertuples()}
 
 # (ТБ, ГОСБ сырой). Перекодировки: ТБ 38 → 9038, ГОСБ 1009 → 8557, ГОСБ 0 в ТБ 40 → 9040,
 # ГОСБ 8591 при КСБ-сегменте ведомостей → 8646.
@@ -269,9 +269,9 @@ class Gen:
                     if r.random() < 0.05:
                         rows.append(self._row(gi, s["epk"], s["org"], s["gk"], 7, 3000))
                 elif mode == "nonzp":
-                    rows.append(self._row(gi, s["epk"], s["org"], s["gk"], int(r.choice([7, 40])), 6000))
+                    rows.append(self._row(gi, s["epk"], s["org"], s["gk"], int(r.choice([7, 17])), 6000))
                     if r.random() < 0.3:
-                        rows.append(self._row(gi, s["epk"], s["org"], s["gk"], 28, 1500))  # премия ниже порога
+                        rows.append(self._row(gi, s["epk"], s["org"], s["gk"], 18, 1500))  # премия ниже порога
                 elif mode == "below":
                     rows.append(self._row(gi, s["epk"], s["org"], s["gk"], 1, float(r.uniform(500, 2400))))
                 elif mode == "small":

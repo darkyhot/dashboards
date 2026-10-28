@@ -639,27 +639,47 @@ WHERE j.slice_type = 'bank'
 # × ТБ × ГОСБ» и крупные организации (их ячейки) по ключевым мерам. Копится: честная
 # проверка сторожа «на дату» и пересчёт прошлого по срезам. Мелкие организации среза =
 # атом − крупные, отдельно не хранятся.
+# Меры поколения — они же входы сторожа. Помесячные движения разложены до причин ухода
+# (календарь виден по «вернулся в M+1» и «одна выплата», остановка организации — по
+# lb_org_stopped) и до людей / совместительства (fl_*). Год к году — полное тождество.
 VINT_MEAS = {
     "pf_recip": "pf_recip", "pf_fl": "pf_fl", "any_recip": "any_recip", "raw_rows": "raw_rows",
     "fot_amt": "fot_amt", "single_pay_recip": "single_pay_recip", "multi_recip": "multi_recip",
     "one_time_pf": "one_time_pf",
     "m_base_pf": "m_base_pf", "m_in_from_outside": "m_in_from_outside",
+    "m_in_returned": "m_in_returned",
     "m_in_from_other_org": "m_in_from_other_org",
     "m_in_codes": "m_in_from_nonzp + m_in_from_zp_out",
     "m_out_left_bank": "m_out_left_bank", "m_lb_unknown": "m_lb_unknown",
+    "m_lb_seasonal": "m_lb_seasonal", "m_lb_org_stopped": "m_lb_org_stopped",
+    "m_lb_one_time": "m_lb_one_time",
     "m_out_to_other_org": "m_out_to_other_org", "m_out_codes": "m_out_to_nonzp + m_out_zp_out",
+    "m_out_temp": "m_out_temp",
+    "m_fl_in": "m_fl_in", "m_fl_out": "m_fl_out", "m_fl_conc": "m_fl_conc",
     "y_base_pf": "y_base_pf", "y_in_from_outside": "y_in_from_outside",
-    "y_in_from_other_org": "y_in_from_other_org", "y_out_left_bank": "y_out_left_bank",
-    "y_out_to_other_org": "y_out_to_other_org",
+    "y_in_from_other_org": "y_in_from_other_org", "y_in_codes": "y_in_from_nonzp + y_in_from_zp_out",
+    "y_out_left_bank": "y_out_left_bank", "y_out_to_other_org": "y_out_to_other_org",
+    "y_out_codes": "y_out_to_nonzp + y_out_zp_out", "y_fl_conc": "y_fl_conc",
 }
+VINT_FLOAT = {"pf_fl", "m_fl_in", "m_fl_out", "m_fl_conc", "y_fl_conc"}
+
+
+def vint_type(m: str) -> str:
+    return "float8" if m in VINT_FLOAT else "numeric" if m == "fot_amt" else "bigint"
+
 
 CREATE_VINTAGE = """
 CREATE TABLE IF NOT EXISTS {schema_t}.yva_ptf_vintage (
   run_id bigint, def_ver integer, lvl varchar(8), report_dt date, seg_rep varchar(64),
   sys_tb_id integer, sys_gosb_id integer, org_id bigint,
-  """ + ", ".join(f"{m} {'float8' if m == 'pf_fl' else 'numeric' if m == 'fot_amt' else 'bigint'}"
-                  for m in VINT_MEAS) + """
+  """ + ", ".join(f"{m} {vint_type(m)}" for m in VINT_MEAS) + """
 )"""
+
+# Таблица поколений копится: новые меры добавляются столбцами, у старых прогонов — пусто.
+VINT_COLS = """
+SELECT column_name FROM information_schema.columns
+WHERE table_schema = :schema AND table_name = 'yva_ptf_vintage'
+"""
 
 
 def insert_vintage() -> str:

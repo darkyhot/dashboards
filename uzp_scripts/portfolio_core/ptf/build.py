@@ -185,6 +185,12 @@ def run(conn: str = "", report_month: str = "", schema: str | None = None,
             db.execute_tx(c, Q.SWAP)
             progress.done("сводка и потоки подменены одной транзакцией")
             db.execute(c, Q.CREATE_VINTAGE)
+            have = set(db.read_sql(c, Q.VINT_COLS, {"schema": config.SCHEMA_T})["column_name"])
+            for m in Q.VINT_MEAS:
+                if m not in have:
+                    db.execute(c, f"ALTER TABLE {{schema_t}}.yva_ptf_vintage "
+                                  f"ADD COLUMN {m} {Q.vint_type(m)}")
+                    progress.done(f"в yva_ptf_vintage добавлен столбец {m}")
             nv = db.execute(c, Q.insert_vintage(), {"run_id": run_id, "def_ver": Q.DEF_VER,
                                                     "vint_org_min": vint_org_min})
             progress.done(f"поколение {run_id}: {nv:,} строк в yva_ptf_vintage")

@@ -16,7 +16,7 @@ import pandas as pd
 from . import REPORT_DIR, db
 from . import sql as Q
 
-ALLOWED_IMPORTS = {"__future__", "argparse", "calendar", "collections", "contextlib", "datetime",
+ALLOWED_IMPORTS = {"__future__", "argparse", "calendar", "collections", "contextlib", "dataclasses", "datetime",
                    "functools", "inspect", "io", "json", "os", "pathlib", "re", "statistics", "sys", "time",
                    "typing", "numpy", "pandas", "sqlalchemy"}
 
@@ -257,10 +257,13 @@ def check_against_synth(conn_url: str, tables: dict, pair_min: int = 10) -> bool
     report("журнал: портфель банка = сводка",
            [] if (jb.sort_index() == s.groupby("report_dt")["pf_recip"].sum().sort_index()).all()
            else ["итоги по месяцам расходятся"])
-    va = got["vintage"].query("lvl == 'atom'").groupby("report_dt")["pf_recip"].sum()
-    report("поколение: атомы = сводка",
-           [] if (va.sort_index() == s.groupby("report_dt")["pf_recip"].sum().sort_index()).all()
-           else ["итоги по месяцам расходятся"])
+    va = got["vintage"].query("lvl == 'atom'").groupby("report_dt")[list(Q.VINT_MEAS)].sum()
+    bad = []
+    for m, e in Q.VINT_MEAS.items():
+        sv = sum(s[x.strip()].fillna(0) for x in e.split("+")).groupby(s["report_dt"]).sum()
+        if not np.allclose(va[m].sort_index().astype(float), sv.sort_index().astype(float), atol=1e-6):
+            bad.append(m)
+    report("поколение: атомы = сводка по всем мерам", [f"расходятся: {bad}"] if bad else [])
     for name, good, detail in scenarios(got, tables["expect"]):
         ok &= good
         print(f"{'✓' if good else '✗'} {name}" + (f" — {detail}" if detail else ""), flush=True)
