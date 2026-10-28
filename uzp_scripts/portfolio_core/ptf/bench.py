@@ -34,8 +34,11 @@ class Card:
     key: object                # номер ряда (org, atom), id ГОСБ / ТБ, сегмент, 'bank'
     measure: str               # net — изменение портфеля; иначе мера движения
     delta: float               # факт − ожидание, люди (со знаком)
-    label: str | None = None   # объяснение сторожа: calendar / dq / recode / ...
-    score: float = 0.0
+    label: str | None = None   # объяснение сторожа: calendar / underload / recode / ...
+    score: float = 0.0         # нижняя граница лишних людей (сторож) или z (соперник)
+    obs: float = float("nan")  # факт
+    exp: float = float("nan")  # ожидание
+    info: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -522,16 +525,31 @@ def summary(res: dict) -> pd.DataFrame:
     return t
 
 
+def by_size(res: dict) -> pd.DataFrame:
+    """Полнота по размеру события в шумах × в людях."""
+    r = res["recall"]
+    if r.empty:
+        return pd.DataFrame()
+    r = r.assign(люди=pd.cut(r["n"], [0, 300, 1000, 2000, 10 ** 9],
+                             labels=["<300", "300–1 000", "1 000–2 000", "2 000+"]))
+    return r.pivot_table(index="k", columns="люди", values="found", aggfunc="mean",
+                         observed=False).round(2)
+
+
 def verdict(res: dict) -> list[tuple[str, bool, str]]:
+    """Пороги приёмки. Карточка требует ≥ 100 лишних людей с запасом на шум, поэтому
+    события меньше 300 человек упираются в этот пол по построению: порог «3 шума»
+    засчитывается от 300 человек, полнота по всем размерам показывается рядом."""
     r = res["recall"]
     if r.empty:
         return [("события заложить не удалось: ряды меньше 100 человек", False, "")]
     big = r[(r["k"] >= 4) & (r["n"] >= 2000)]
-    mid = r[r["k"] == 3]
+    mid = r[(r["k"] == 3) & (r["n"] >= 300)]
     out = [
         ("полнота: ≥ 4 шумов и ≥ 2 тыс. чел.", len(big) > 0 and big["found"].mean() >= ACCEPT["recall_4"],
          f"{big['found'].mean():.2f} из {len(big)}" if len(big) else "нет событий"),
-        ("полнота: 3 шума", mid["found"].mean() >= ACCEPT["recall_3"], f"{mid['found'].mean():.2f}"),
+        ("полнота: 3 шума, от 300 чел.", len(mid) > 0 and mid["found"].mean() >= ACCEPT["recall_3"],
+         f"{mid['found'].mean():.2f} из {len(mid)} (все размеры: {r[r['k'] == 3]['found'].mean():.2f})"),
         ("карточек в спокойный месяц", np.mean(res["clean_cards"]) <= ACCEPT["clean_max"],
          f"{np.mean(res['clean_cards']):.1f}"),
         ("эхо провала", res["echo"] is not None and res["echo"] <= ACCEPT["echo_max"], f"{res['echo']}"),
