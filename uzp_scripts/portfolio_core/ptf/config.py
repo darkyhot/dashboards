@@ -12,7 +12,7 @@ SYNTH_SCHEMA = "synth_ptf"                                # открытый к�
 
 SCHEMA = PROM_SCHEMA
 SCHEMA_T = PROM_SCHEMA_T
-PAYROLL = "uzp_data_payroll_m"                            # ведомости
+PAYROLL = "mis_data_payroll_m"                            # ведомости
 SEG_HIST = "uzp_data_payroll_segment_month_2021"          # исторический сегмент
 
 OUTPUT_DIR = REPORT_DIR / "output"

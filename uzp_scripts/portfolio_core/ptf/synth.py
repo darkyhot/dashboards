@@ -340,7 +340,7 @@ class Gen:
 DDL = """
 DROP SCHEMA IF EXISTS {s} CASCADE;
 CREATE SCHEMA {s};
-CREATE TABLE {s}.uzp_data_payroll_m (
+CREATE TABLE {s}.mis_data_payroll_m (
   acc_num text, acc_open_dt date, actual_client_tid bigint, amt numeric, company_name text,
   agrmnt_dt date, agrmnt_num text, enrollment_transcription text, enrollment_type smallint,
   epk_id bigint, sys_gosb_id integer, inn text, ipt_name text, sys_osb_id integer, card_type text,
@@ -400,7 +400,7 @@ def build(url: str | None = None, persons: int = 2000, schema: str = config.SYNT
         for stmt in DDL.format(s=schema).split(";"):
             if stmt.strip():
                 conn.execute(text(stmt))
-        _copy(conn, t["payroll"], f"{schema}.uzp_data_payroll_m")
+        _copy(conn, t["payroll"], f"{schema}.mis_data_payroll_m")
         _copy(conn, t["codes"], f"{schema}.uzp_dim_enrollment_type")
         _copy(conn, t["edu"], f"{schema}.uzp_dim_education_organization")
         _copy(conn, t["epk"], f"{schema}.uzp_data_epk_consolidation")
