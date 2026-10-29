@@ -63,7 +63,7 @@ def flow_obs(p: Panel, f: str) -> np.ndarray:
 
 def _groups(p: Panel, rows: np.ndarray) -> np.ndarray:
     """Группа сравнения: атом — сегмент; организация — сегмент × класс размера."""
-    seg = p.meta.loc[rows, "seg_rep"].astype(str).to_numpy()
+    seg = p.meta.loc[rows, "seg_rep"].astype(str).to_numpy(dtype=str)   # из БД приходит object
     if p.meta.at[rows[0], "lvl"] == "org":
         size = np.nanmedian(p.x["pf_recip"][rows], axis=1)
         cls = np.digitize(np.nan_to_num(size), SIZE_EDGES).astype(str)
