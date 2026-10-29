@@ -80,8 +80,12 @@ def load(conn, run_id: int | None = None) -> Panel:
             FROM {{schema_t}}.yva_ptf_vintage
             WHERE run_id = :r AND lvl = 'org' AND report_dt = CAST(:m AS date)""", p)
         orgs.append(o)
-    return from_frames(months, pd.concat(atoms, ignore_index=True),
-                       pd.concat(orgs, ignore_index=True))
+    p = from_frames(months, pd.concat(atoms, ignore_index=True), pd.concat(orgs, ignore_index=True))
+    empty = [m for m in MEAS if np.isnan(p.x[m]).all()]
+    if empty:
+        print(f"ВНИМАНИЕ: в поколении прогона {run_id} пусты меры {', '.join(empty)} — прогон "
+              "был до их добавления. Сторож без них ошибается; нужен новый прогон подложки.")
+    return p
 
 
 def from_frames(months: list[str], atoms: pd.DataFrame, org_cells: pd.DataFrame) -> Panel:
