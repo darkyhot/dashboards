@@ -179,7 +179,18 @@ def simulate(seed: int = 1, n_orgs: int = 3000, gosb_per_tb: int = 6,
             lvl="org", org_id=np.arange(1, n_orgs + 1) + 10 ** 9, atom=org_atom),
     ], ignore_index=True)[["lvl", "org_id", "seg_rep", "sys_tb_id", "sys_gosb_id", "atom"]]
     xs = {m: np.vstack([agg[m], x[m][na:]]) for m in MEAS}
-    return Panel(months, meta, xs)
+    scopes = {}
+    for level, col in (("atom", "atom"), ("gosb", "sys_gosb_id"), ("tb", "sys_tb_id")):
+        a = np.full((n, T), -1, dtype=np.int64)
+        a[na:] = meta.loc[na:, col].to_numpy(dtype=np.int64)[:, None]
+        scopes[level] = a
+    flows = pd.DataFrame({
+        "row": np.repeat(np.arange(na, n), T), "t": np.tile(np.arange(T), n_orgs),
+        "atom": np.repeat(org_atom, T),
+        "in_other": xs["m_in_from_other_org"][na:].ravel(),
+        "out_other": xs["m_out_to_other_org"][na:].ravel(),
+    }).set_index(["row", "t", "atom"]).sort_index()
+    return Panel(months, meta, xs, scopes, flows)
 
 
 def _fill_yoy(x: dict, T: int) -> None:
@@ -243,6 +254,23 @@ def inject(p: Panel, ev: Event) -> Panel:
     p = p.copy()
     t, n = ev.t, ev.n
     k = ev.kind
+    # Закладка использует главную ячейку. Если в реальном месяце организация
+    # расположена иначе, после закладки нельзя утверждать полное вложение в неё.
+    for r in (ev.row, ev.row2) if k == "reorg" else (ev.row,):
+        if r < 0 or p.meta.at[r, "lvl"] != "org":
+            continue
+        atom = int(p.meta.at[r, "atom"])
+        if atom < 0:
+            continue
+        for level, col in (("atom", "atom"), ("gosb", "sys_gosb_id"), ("tb", "sys_tb_id")):
+            if level not in p.org_scopes:
+                continue
+            scope = p.org_scopes[level][r, t:]
+            scope[scope != p.meta.at[atom, col]] = -1
+            if k == "recode":
+                dst = p.meta.at[ev.row2, col]
+                if dst != p.meta.at[atom, col]:
+                    scope[:] = -1
     if k in ("leave", "stop", "codes"):
         rows = _rows(p, ev.row)
         flow = "m_out_codes" if k == "codes" else "m_out_left_bank"
@@ -313,7 +341,30 @@ def inject(p: Panel, ev: Event) -> Panel:
             _add(p, [r], "raw_rows", t, t, -round(1.45 * d))
     else:
         raise ValueError(f"неизвестное событие {k}")
+    _inject_cell_flows(p, ev)
     return p
+
+
+def _inject_cell_flows(p: Panel, ev: Event) -> None:
+    """Та же закладка в детализации потоков организации; исходная панель уже скопирована."""
+    if p.org_flows.empty:
+        return
+    changes = []
+    if ev.kind in ("recode", "reorg", "conc"):
+        changes.append((ev.row, int(p.meta.at[ev.row, "atom"]), "out_other"))
+    if ev.kind == "reorg":
+        changes.append((ev.row2, int(p.meta.at[ev.row2, "atom"]), "in_other"))
+    elif ev.kind == "recode":
+        changes.append((ev.row, ev.row2, "in_other"))
+    for r, a, f in changes:
+        if p.meta.at[r, "lvl"] != "org" or a < 0:
+            continue
+        key = (r, ev.t, a)
+        if key not in p.org_flows.index:
+            p.org_flows.loc[key, :] = 0.0
+        p.org_flows.at[key, f] += ev.n
+    if changes:
+        p.org_flows.sort_index(inplace=True)
 
 
 def _move(p: Panel, a: list[int], b: list[int], t: int, n: int) -> None:

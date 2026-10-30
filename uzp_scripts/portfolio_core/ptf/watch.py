@@ -15,8 +15,9 @@ L = |факт − ожидание| − z·s ≥ max(100, 0,1% базы); пор
 прошлых месяцах (эмпирический нуль) срабатываний ≤ 0,5 в месяц, и не ниже поправки на
 число проверок.
 
-**Порядок**: качество данных (недогруз ТБ в последнем месяце) → организации (их
-отклонения вычитаются из атомов) → атомы → ГОСБ и ТБ → банк и сегменты.
+**Порядок**: организации → атомы (включая недогруз ТБ) → ГОСБ и ТБ → банк и сегменты.
+Все уровни считаются по исходным наблюдениям. Повторные карточки убираются только
+при подтверждённом вложении территории и совпадении направления отклонения.
 """
 from __future__ import annotations
 
@@ -208,10 +209,95 @@ def _card(p: Panel, level: str, key, f: str, sc: dict, i: int, L: float, label=N
 # --------------------------------------------------------------------------- #
 # Сторож
 # --------------------------------------------------------------------------- #
+def _contained(p: Panel, t: int, child: Card, level: str, key, f: str) -> bool:
+    """Весь ряд дочерней карточки входит в территорию родителя, без догадки
+    по главной ячейке. Для прихода без возвратов нужна также привязка прошлого месяца."""
+    if isinstance(key, (int, np.integer)) and key < 0:
+        return False
+    if child.level == "org":
+        if level == "bank":
+            return True
+        scopes = getattr(p, "org_scopes", {}).get(level)
+        if scopes is None or scopes[child.key, t] != key:
+            return False
+        return (f != "in_outside" or t == 0
+                or not np.nan_to_num(p.x["m_out_temp"][child.key, t - 1])
+                or scopes[child.key, t - 1] == key)
+    if child.level == "atom" and level in ("gosb", "tb"):
+        return p.meta.at[child.key, "sys_" + level + "_id"] == key
+    if child.level == "gosb" and level == "tb":
+        rows = p.meta.loc[p.atoms]
+        tbs = rows.loc[rows["sys_gosb_id"] == child.key, "sys_tb_id"]
+        return len(tbs) > 0 and bool((tbs == key).all())
+    return False
+
+
+def _recode_part(p: Panel, t: int, c: Card, level: str, key, f: str, d: float) -> float:
+    """Часть смены ГОСБ по фактическим потокам организации в данной территории.
+    Ожидание организации распределяется по медиане долей её потока за прошлые
+    месяцы. Без достаточной истории вычитается всё ожидание организации.
+    Наблюдения не меняются; чужой всплеск не используется как адрес перехода."""
+    cells = getattr(p, "org_flows", None)
+    if c.label != "recode" or f not in ("in_other", "out_other") or d <= 0 or cells is None or cells.empty:
+        return 0.0
+    try:
+        local = cells.xs((c.key, t), level=("row", "t"))
+    except KeyError:
+        return 0.0
+    def inside(atoms):
+        valid = np.asarray(atoms) >= 0
+        if level == "bank":
+            return valid
+        if level == "atom":
+            return valid & (np.asarray(atoms) == key)
+        col = {"gosb": "sys_gosb_id", "tb": "sys_tb_id", "seg": "seg_rep"}.get(level)
+        mask = np.zeros(len(atoms), dtype=bool)
+        if col:
+            mask[valid] = (p.meta.loc[np.asarray(atoms)[valid], col] == key).to_numpy()
+        return mask
+
+    local = local.loc[inside(local.index)]
+    total = p.x[FLOWS[f][0]][c.key, t]
+    expected = max(0.0, total - d)
+    history = cells.xs(c.key, level="row")
+    times = history.index.get_level_values("t")
+    history = history.loc[(times >= max(0, t - HIST)) & (times < t)]
+    totals = history[f].groupby(level="t").sum(min_count=1)
+    totals = totals.loc[totals > 0]
+    known = (history.index.get_level_values("atom") >= 0).all()
+    if len(totals) >= 4 and known:
+        part = history.loc[inside(history.index.get_level_values("atom")), f].groupby(level="t").sum()
+        share = float(np.median(part.reindex(totals.index, fill_value=0) / totals))
+        expected *= share
+    # Местный всплеск может быть больше общего: в другой ячейке поток одновременно
+    # оказался ниже ожидания. Ограничение общим d создало бы ложный остаток здесь.
+    return max(0.0, float(local[f].sum()) - expected) if np.isfinite(total) else 0.0
+
+
+def _covered(p: Panel, t: int, level: str, key, f: str, d: float,
+             cards: list[Card], score: float = 0.0, minimum: float = MIN_PEOPLE) -> bool:
+    """Уже показанные события объясняют ≥70% отклонения того же направления.
+    Суммы организаций, атомов и ГОСБ проверяются отдельно: смешивать их нельзя,
+    иначе одна и та же группа людей будет учтена несколько раз. Если остаток всё
+    ещё проходит исходный порог значимости, родительская карточка сохраняется."""
+    if not np.isfinite(d) or d == 0:
+        return False
+    amounts = {}
+    for c in cards:
+        explained = c.info.get("explains", {})
+        value = explained.get(f, c.delta / FLOWS[f][1] if c.measure == f else 0.0)
+        if not np.isfinite(value) or np.sign(value) != np.sign(d):
+            continue
+        if not _contained(p, t, c, level, key, f):
+            value = _recode_part(p, t, c, level, key, f, value)
+        amounts[c.level] = amounts.get(c.level, 0.0) + abs(value)
+    amount = max(amounts.values(), default=0.0)
+    return amount >= 0.7 * abs(d) and score - amount < minimum
+
+
 def detect(p: Panel, t: int) -> list[Card]:
     cards: list[Card] = []
     obs = {f: flow_obs(p, f) for f in FLOWS}
-    recoded: set = set()                     # (атом, мера), объяснённые сменой ГОСБ
     last = t == len(p.months) - 1
 
     # 1. Организации
@@ -233,17 +319,8 @@ def detect(p: Panel, t: int) -> list[Card]:
                 lb = np.nan_to_num(p.x["m_lb_org_stopped"][r, t])
                 if lb >= 0.5 * d:
                     label = "stop"
-            cards.append(_card(p, "org", r, f, so[f], i, L, label))
-            # вычесть отклонение организации из её атома (и для смены ГОСБ — из атома,
-            # куда пришли)
-            a_row = int(p.meta.at[r, "atom"])
-            if label == "recode":
-                dst = _recode_dst(p, obs, r, b, t)
-                obs["out_other"][a_row, t] -= a
-                obs["in_other"][dst, t] -= b
-                recoded |= {(a_row, "out_other"), (dst, "in_other")}
-            elif a_row >= 0:
-                obs[f][a_row, t] -= d
+            info = {"explains": {"out_other": a, "in_other": b}} if label == "recode" else {}
+            cards.append(_card(p, "org", r, f, so[f], i, L, label, **info))
 
     # 2. Атомы
     atoms = p.atoms
@@ -251,19 +328,19 @@ def detect(p: Panel, t: int) -> list[Card]:
     hits = pick(sa, atoms)
     under = _underload(p, atoms, sa, t) if last else set()
     for r, f, L, d, i in hits:
+        if _covered(p, t, "atom", r, f, d, cards, L, floor_of(sa[f]["base"][i])):
+            continue
         tb = int(p.meta.at[r, "sys_tb_id"])
         label = "underload" if (tb in under and f == "out_left") else None
-        if (r, f) in recoded:
-            label = "recode"
         cards.append(_card(p, "atom", r, f, sa[f], i, L, label))
     for tb in under:
         cards.append(Card("tb", tb, "out_left", 0.0, label="underload"))
     for c in cards:
-        if c.level == "org" and int(p.meta.at[c.key, "sys_tb_id"]) in under and c.measure == "out_left":
+        if (c.level == "org" and c.measure == "out_left"
+                and any(_contained(p, t, c, "tb", tb, "out_left") for tb in under)):
             c.label = c.label or "underload"
 
-    # 3. ГОСБ и ТБ — сумма атомов, ещё не объяснённая карточками атомов
-    flagged = {(c.key, c.measure) for c in cards if c.level == "atom"}
+    # 3. ГОСБ и ТБ — исходные суммы атомов; повторные события не показываем.
     for lvl, col in (("gosb", "sys_gosb_id"), ("tb", "sys_tb_id")):
         keys = p.meta.loc[atoms, col].to_numpy()
         for f, sc in sa.items():
@@ -275,12 +352,11 @@ def detect(p: Panel, t: int) -> list[Card]:
                 own = 1.4826 * np.median(np.abs(Rg - np.median(Rg)))
                 s = max(np.sqrt(np.nansum(sc["s"][idx] ** 2)), own)
                 base = np.nansum(sc["base"][idx])
-                expl = sum(sc["d"][j] for j in idx if (int(atoms[j]), f) in flagged)
-                if abs(expl) >= 0.7 * abs(d):
-                    continue
                 zs = NormalDist().inv_cdf(1 - FALSE_PER_LEVEL / 2 / (len(np.unique(keys)) * len(FLOWS)))
                 L = abs(d) - max(zs, 4.0) * s
                 if L >= max(MIN_PEOPLE, MIN_SHARE * base):
+                    if _covered(p, t, lvl, int(k), f, d, cards, L, max(MIN_PEOPLE, MIN_SHARE * base)):
+                        continue
                     label = "underload" if (lvl == "tb" and k in under and f == "out_left") else None
                     if label is None and lvl == "gosb" and f == "out_left":
                         tb = int(p.meta.loc[atoms[idx[0]], "sys_tb_id"])
@@ -291,6 +367,11 @@ def detect(p: Panel, t: int) -> list[Card]:
 
     # 4. Банк и сегменты — по тому же месяцу год назад
     tcards = _temporal(p, atoms, obs, t)
+    recodes = [c for c in cards if c.level == "org" and c.label == "recode"]
+    for c in tcards:
+        if not c.label and _covered(p, t, c.level, c.key, c.measure, c.obs - c.exp,
+                                    recodes, c.score):
+            c.label = "recode"
     if under:
         tbs = p.meta.loc[atoms, "sys_tb_id"].to_numpy()
         segs = p.meta.loc[atoms, "seg_rep"].astype(str).to_numpy()
@@ -305,21 +386,6 @@ def detect(p: Panel, t: int) -> list[Card]:
 
     cards.sort(key=lambda c: -c.score)
     return cards[:MAX_CARDS]
-
-
-def _recode_dst(p: Panel, obs: dict, r: int, n: float, t: int) -> int:
-    """Атом того же ТБ, куда пришли люди организации, сменившей ГОСБ: наибольший приход
-    из других организаций, близкий к n. Нет такого — свой атом."""
-    a_row = int(p.meta.at[r, "atom"])
-    tb = p.meta.at[r, "sys_tb_id"]
-    atoms = p.atoms
-    same = atoms[(p.meta.loc[atoms, "sys_tb_id"].to_numpy() == tb) & (atoms != a_row)]
-    if len(same) == 0:
-        return a_row
-    hist = obs["in_other"][same, max(0, t - HIST):t]
-    v = np.nan_to_num(obs["in_other"][same, t] - np.nanmedian(hist, axis=1))
-    j = int(np.argmax(v))
-    return int(same[j]) if v[j] >= 0.6 * n else a_row
 
 
 def _underload(p: Panel, atoms: np.ndarray, sa: dict, t: int) -> set:
@@ -410,12 +476,34 @@ def where(p: Panel, c: Card) -> str:
 
 
 def cards_frame(p: Panel, cards: list[Card], t: int) -> pd.DataFrame:
-    return pd.DataFrame([{
-        "месяц": p.months[t], "уровень": c.level, "где": where(p, c),
-        "что": MEASURE_RU.get(c.measure, c.measure),
-        "факт": round(c.obs) if np.isfinite(c.obs) else None,
-        "ожидание": round(c.exp) if np.isfinite(c.exp) else None,
-        "влияние на портфель": round(c.delta),
-        "лишних не меньше": round(c.score),
-        "объяснение": LABEL_RU.get(c.label, "") if c.label else "",
-    } for c in cards])
+    """Факт — исходная мера поколения. Для прихода извне ожидание переведено
+    в тот же масштаб: к нему возвращена поправка на возвраты после провала.
+    delta — отклонение вклада потока от ожидания, а не изменение всего портфеля."""
+    records = []
+    for c in cards:
+        actual, expected = c.obs, c.exp
+        if c.measure == "in_outside" and np.isfinite(c.obs):
+            if c.level in ("org", "atom"):
+                rows = [int(c.key)]
+            else:
+                rows = p.atoms
+                col = {"gosb": "sys_gosb_id", "tb": "sys_tb_id", "seg": "seg_rep"}.get(c.level)
+                if col:
+                    rows = rows[(p.meta.loc[rows, col] == c.key).to_numpy()]
+            raw = p.x[FLOWS[c.measure][0]][rows, t]
+            actual = float(np.nansum(raw)) if np.isfinite(raw).any() else np.nan
+            expected = c.exp + actual - c.obs
+        what = MEASURE_RU.get(c.measure, c.measure)
+        if np.isfinite(c.obs) and np.isfinite(c.exp):
+            what += ": больше ожидания" if c.obs > c.exp else ": меньше ожидания" if c.obs < c.exp else ""
+        records.append({
+            "месяц": p.months[t], "уровень": c.level, "где": where(p, c),
+            "что": what,
+            "факт": round(actual) if np.isfinite(actual) else None,
+            "ожидание": round(expected) if np.isfinite(expected) else None,
+            "отклонение вклада в портфель": round(c.delta),
+            "сверх шума, не меньше": round(c.score),
+            "объяснение": LABEL_RU.get(c.label, "") if c.label else "",
+        })
+    return pd.DataFrame(records, columns=["месяц", "уровень", "где", "что", "факт", "ожидание",
+                                          "отклонение вклада в портфель", "сверх шума, не меньше", "объяснение"])

@@ -4,6 +4,7 @@
 * `atom` — сегмент отчётного месяца × ТБ × ГОСБ (вся сводка, без пропусков);
 * `org`  — крупная организация целиком (итог по всем её ГОСБ) и её главная ячейка
   (атом, где у неё больше всего получателей) — туда же ложится закладка стенда.
+  Помесячное полное вложение в атом / ГОСБ / ТБ хранится отдельно в org_scopes.
 
 Панель — массивы numpy [ряд × месяц] по каждой мере: сторож и стенд считают на них
 векторно. Всё, где есть человек, сюда не попадает — только агрегаты поколения.
@@ -32,6 +33,12 @@ class Panel:
     months: list[str]                      # 'ГГГГ-ММ-ДД', по возрастанию
     meta: pd.DataFrame                     # ряд: lvl, org_id, seg_rep, sys_tb_id, sys_gosb_id, atom
     x: dict[str, np.ndarray] = field(default_factory=dict)   # мера → [ряд × месяц], NaN — нет
+    # Территория, целиком содержащая организацию в данном месяце. -1 — несколько
+    # территорий или привязка неизвестна. Главная ячейка из meta этого не гарантирует.
+    org_scopes: dict[str, np.ndarray] = field(default_factory=dict)
+    # Потоки между организациями по фактическим ячейкам: индекс (row, t, atom).
+    # Нужны для локализации смены ГОСБ без угадывания принимающей ячейки.
+    org_flows: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     @property
     def atoms(self) -> np.ndarray:
@@ -42,7 +49,8 @@ class Panel:
         return np.flatnonzero(self.meta["lvl"].to_numpy() == "org")
 
     def copy(self) -> "Panel":
-        return Panel(list(self.months), self.meta.copy(), {k: v.copy() for k, v in self.x.items()})
+        return Panel(list(self.months), self.meta.copy(), {k: v.copy() for k, v in self.x.items()},
+                     {k: v.copy() for k, v in self.org_scopes.items()}, self.org_flows.copy())
 
     def identity_gap(self, t: int) -> np.ndarray:
         """Тождество месяца t по каждому ряду: портфель − база − (пришли − ушли)."""
@@ -120,4 +128,21 @@ def from_frames(months: list[str], atoms: pd.DataFrame, org_cells: pd.DataFrame)
     for m in MEAS:
         x[m][ar, at] = atoms[m].to_numpy(dtype=float)
         x[m][orr, ot] = otot[m].to_numpy(dtype=float)
-    return Panel(months, meta, x)
+    cells = org_cells[["org_id", "report_dt"] + ATOM_KEYS].copy()
+    cells["atom"] = [aidx.get(tuple(r), -1) for r in cells[ATOM_KEYS].itertuples(index=False)]
+    scopes = {}
+    for level, col in (("atom", "atom"), ("gosb", "sys_gosb_id"), ("tb", "sys_tb_id")):
+        loc = cells.groupby(["org_id", "report_dt"])[col].agg(["min", "max"])
+        values = np.where(loc["min"] == loc["max"], loc["min"], -1)
+        a = np.full((n, T), -1, dtype=np.int64)
+        rr = [orow[o] for o in loc.index.get_level_values("org_id")]
+        tt = [mi[m] for m in loc.index.get_level_values("report_dt")]
+        a[rr, tt] = values
+        scopes[level] = a
+    flows = pd.DataFrame({
+        "row": org_cells["org_id"].map(orow).to_numpy(),
+        "t": org_cells["report_dt"].map(mi).to_numpy(), "atom": cells["atom"].to_numpy(),
+        "in_other": org_cells["m_in_from_other_org"].to_numpy(dtype=float),
+        "out_other": org_cells["m_out_to_other_org"].to_numpy(dtype=float),
+    }).groupby(["row", "t", "atom"])[["in_other", "out_other"]].sum(min_count=1)
+    return Panel(months, meta, x, scopes, flows)
