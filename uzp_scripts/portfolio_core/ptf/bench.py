@@ -82,7 +82,8 @@ def sim_months(first: str = "2024-01", last: str = "2026-09") -> list[str]:
 
 
 def simulate(seed: int = 1, n_orgs: int = 3000, gosb_per_tb: int = 6,
-             tail_mean: float = 22_000, months: list[str] | None = None) -> Panel:
+             tail_mean: float = 22_000, months: list[str] | None = None,
+             noise_scale: float = 1.) -> Panel:
     """Чистый фон: никаких событий, только сезонность, текучесть и «комки»."""
     rng = np.random.default_rng(seed)
     months = months or sim_months()
@@ -115,7 +116,7 @@ def simulate(seed: int = 1, n_orgs: int = 3000, gosb_per_tb: int = 6,
     k = np.concatenate([np.full(na, 30.0), np.full(n_orgs, 5.0)])
     r_out = 0.05 * rng.gamma(k, 1 / k)
     r_in = r_out * (1 + rng.normal(0.01, 0.01, n))
-    sig = np.concatenate([np.full(na, 0.06), np.full(n_orgs, 0.3)])
+    sig = noise_scale * np.concatenate([np.full(na, 0.06), np.full(n_orgs, 0.3)])
 
     x = {m: np.full((n, T), np.nan) for m in MEAS}
     base = s0.copy()
@@ -190,7 +191,102 @@ def simulate(seed: int = 1, n_orgs: int = 3000, gosb_per_tb: int = 6,
         "in_other": xs["m_in_from_other_org"][na:].ravel(),
         "out_other": xs["m_out_to_other_org"][na:].ravel(),
     }).set_index(["row", "t", "atom"]).sort_index()
-    return Panel(months, meta, xs, scopes, flows)
+    stock = pd.DataFrame({"row": np.repeat(np.arange(na, n), T),
+                          "t": np.tile(np.arange(T), n_orgs), "atom": np.repeat(org_atom, T),
+                          **{m: xs[m][na:].ravel() for m in
+                             ("pf_recip", "m_base_pf", "pf_fl", "multi_recip")}})
+    stock = stock.set_index(["row", "t", "atom"]).sort_index()
+    return Panel(months, meta, xs, scopes, flows, stock)
+
+
+def vary_departure_reasons(p: Panel, seed: int = 41) -> Panel:
+    """Чистый стресс состава уходов: разные доли причин и их плавные колебания.
+    Вызывать до распределения организаций по ГОСБ. Меняется только разметка причин,
+    общий уход и портфель сохраняются. Хвост атома и организации моделируются отдельно.
+    """
+    q = p.copy()
+    atoms, orgs = p.atoms, p.orgs
+    atom = p.meta.loc[orgs, "atom"].to_numpy(dtype=int)
+    scope = p.org_scopes.get("atom")
+    if scope is None or (atom < 0).any() or not np.all(scope[orgs] == atom[:, None]):
+        raise ValueError("Стресс причин нужен до распределения организаций по ГОСБ")
+    rows = np.r_[atoms, orgs]
+    na, T = len(atoms), len(p.months)
+    local_index = {int(r): i for i, r in enumerate(atoms)}
+    destination = np.array([local_index[int(a)] for a in atom])
+    parts = {}
+    for m in ("m_out_left_bank", "m_lb_seasonal", "m_lb_org_stopped"):
+        parts[m] = p.x[m][rows].copy()
+        np.subtract.at(parts[m], destination, p.x[m][orgs])
+        if np.nanmin(parts[m]) < -1e-6:
+            raise ValueError("Организации превышают итог атома")
+    rng = np.random.default_rng(seed)
+    mean = rng.uniform(.75, .97, len(rows))
+    shift = np.zeros(len(rows))
+    proportion = np.empty((len(rows), T))
+    for t in range(T):
+        shift = .7 * shift + rng.normal(0, .02, len(rows))
+        proportion[:, t] = np.clip(mean + shift, .5, .995)
+    rest = np.maximum(parts["m_out_left_bank"] - parts["m_lb_seasonal"] - parts["m_lb_org_stopped"], 0.)
+    unknown = rest * proportion
+    for m, values in (("m_lb_unknown", unknown), ("m_lb_one_time", rest - unknown)):
+        q.x[m][rows] = values
+        np.add.at(q.x[m], atom, values[na:])
+    return q
+
+
+def spread_organizations(p: Panel, seed: int = 31, fraction: float = .4) -> Panel:
+    """Независимый от детектора стресс: 40% организаций распределены между двумя ГОСБ.
+    Линейное распределение агрегатов сохраняет тождества и общие итоги организации.
+    Доли — модельные веса, поэтому внутри стресс-панели допустимы дробные агрегаты."""
+    q = p.copy()
+    rng = np.random.default_rng(seed)
+    new_flows, new_stock = [], []
+    for r in rng.permutation(p.orgs)[:int(fraction * len(p.orgs))]:
+        a = int(p.meta.at[r, "atom"])
+        scope = p.org_scopes.get("atom")
+        if a < 0 or scope is None or (scope[r] != a).any():
+            continue
+        dst = p.atoms[(p.meta.loc[p.atoms, "seg_rep"].to_numpy() == p.meta.at[a, "seg_rep"])
+                      & (p.meta.loc[p.atoms, "sys_tb_id"].to_numpy() == p.meta.at[a, "sys_tb_id"])
+                      & (p.meta.loc[p.atoms, "sys_gosb_id"].to_numpy() != p.meta.at[a, "sys_gosb_id"])]
+        if not len(dst):
+            continue
+        b = int(rng.choice(dst))
+        share = float(rng.uniform(.2, .45))
+        for m in MEAS:
+            amount = np.nan_to_num(p.x[m][r]) * share
+            q.x[m][a] -= amount
+            q.x[m][b] += amount
+        for frame, extra in ((q.org_flows, new_flows), (q.org_stock, new_stock)):
+            if frame.empty:
+                continue
+            mask = frame.index.get_level_values("row") == r
+            portion = frame.loc[mask].copy()
+            frame.loc[mask, :] *= 1 - share
+            portion *= share
+            portion = portion.reset_index()
+            portion["atom"] = b
+            extra.append(portion.set_index(["row", "t", "atom"]))
+        for level in ("atom", "gosb"):
+            q.org_scopes[level][r] = -1
+    for attr, extra in (("org_flows", new_flows), ("org_stock", new_stock)):
+        if extra:
+            frame = pd.concat([getattr(q, attr)] + extra)
+            setattr(q, attr, frame.groupby(level=["row", "t", "atom"]).sum(min_count=1).sort_index())
+    return q
+
+
+def with_history_events(p: Panel, seed: int = 43) -> Panel:
+    """В прошлых месяцах есть реальные отдельные события; последний месяц не меняется
+    напрямую. Проверяет, не превращается ли вся история событий в общий порог шума."""
+    q = p.copy()
+    rng = np.random.default_rng(seed)
+    for t in range(max(14, len(p.months) - 18), len(p.months) - 6, 2):
+        events = pick_events(q, rng, "hire" if t % 4 else "leave", 6., t, 1, people=3000)
+        if events:
+            q = inject(q, events[0])
+    return q
 
 
 def _fill_yoy(x: dict, T: int) -> None:
@@ -239,17 +335,20 @@ def _stock(p: Panel, rows, t: int, d: float, fl: float | None = None) -> None:
     через 12 мес. Сопутствующие остатки — пропорционально."""
     T = len(p.months) - 1
     fl = d if fl is None else fl
+    old_pf = p.x["pf_recip"][rows, t:T + 1].copy()
+    # Сопутствующие счётчики — доля виртуальной когорты в исходном остатке,
+    # а не фиксированные 1,45 строки или 0,2 одиночной выплаты на человека.
+    for m in ("any_recip", "raw_rows", "fot_amt", "single_pay_recip"):
+        old = p.x[m][rows, t:T + 1]
+        ratio = np.divide(old, old_pf, out=np.zeros_like(old), where=old_pf > 0)
+        p.x[m][rows, t:T + 1] = old + d * ratio
     _add(p, rows, "pf_recip", t, T, d)
     _add(p, rows, "pf_fl", t, T, fl)
-    _add(p, rows, "any_recip", t, T, d)
-    _add(p, rows, "raw_rows", t, T, round(1.45 * d))
-    _add(p, rows, "fot_amt", t, T, 55_000.0 * d)
-    _add(p, rows, "single_pay_recip", t, T, round(0.2 * d))
     _add(p, rows, "m_base_pf", t + 1, T, d)
     _add(p, rows, "y_base_pf", t + 12, T, d)
 
 
-def inject(p: Panel, ev: Event) -> Panel:
+def _inject_at_main(p: Panel, ev: Event) -> Panel:
     """Закладывает событие или артефакт в копию панели."""
     p = p.copy()
     t, n = ev.t, ev.n
@@ -277,8 +376,12 @@ def inject(p: Panel, ev: Event) -> Panel:
         _add(p, rows, flow, t, t, n)
         if k != "codes":
             _add(p, rows, "m_lb_org_stopped" if k == "stop" else "m_lb_unknown", t, t, n)
-        _add(p, rows, "m_fl_out", t, t, n)
-        _stock(p, rows, t, -n)
+        fl_n = float(p.x["pf_fl"][ev.row, t]) if k == "stop" else n
+        _add(p, rows, "m_fl_out", t, t, fl_n)
+        if k == "stop":
+            _add(p, rows, "multi_recip", t, t, -float(p.x["multi_recip"][ev.row, t]))
+        fl = -fl_n if k == "stop" else None
+        _stock(p, rows, t, -n, fl=fl)
         _add(p, rows, "y_out_codes" if k == "codes" else "y_out_left_bank", t, t + 11, n)
     elif k == "hire":
         rows = _rows(p, ev.row)
@@ -319,52 +422,226 @@ def inject(p: Panel, ev: Event) -> Panel:
         for m in ("m_fl_conc", "pf_fl"):
             _add(p, [o], m, t, t if m == "m_fl_conc" else len(p.months) - 1, h)
         _add(p, [o], "multi_recip", t, len(p.months) - 1, -n)
-    elif k == "calendar":
-        # выплата за 1-е ушла в прошлый месяц: доля людей «пропала» на месяц и вернулась
-        base = np.nan_to_num(p.x["m_base_pf"][:, t])
-        nn = np.round(ev.q * base)
-        for r in np.flatnonzero(nn > 0):
-            sub = Event("dip", t, int(nn[r]), row=r)
-            p = _inject_rows(p, sub, [r])
-        _add_vec(p, "single_pay_recip", t, np.round(3 * ev.q * base))
-    elif k == "underload":
-        rows = np.flatnonzero((p.meta["sys_tb_id"].to_numpy() == ev.tb))
-        for r in rows:
-            f = ev.q * np.nan_to_num(p.x["pf_recip"][r, t])
-            d = round(f)
-            if d <= 0:
-                continue
-            for m in ("m_out_left_bank", "m_lb_unknown", "m_fl_out"):
-                _add(p, [r], m, t, t, d)
-            for m in ("pf_recip", "pf_fl", "any_recip"):
-                _add(p, [r], m, t, t, -d)
-            _add(p, [r], "raw_rows", t, t, -round(1.45 * d))
     else:
         raise ValueError(f"неизвестное событие {k}")
-    _inject_cell_flows(p, ev)
     return p
 
 
-def _inject_cell_flows(p: Panel, ev: Event) -> None:
-    """Та же закладка в детализации потоков организации; исходная панель уже скопирована."""
-    if p.org_flows.empty:
-        return
-    changes = []
-    if ev.kind in ("recode", "reorg", "conc"):
-        changes.append((ev.row, int(p.meta.at[ev.row, "atom"]), "out_other"))
-    if ev.kind == "reorg":
-        changes.append((ev.row2, int(p.meta.at[ev.row2, "atom"]), "in_other"))
-    elif ev.kind == "recode":
-        changes.append((ev.row, ev.row2, "in_other"))
-    for r, a, f in changes:
-        if p.meta.at[r, "lvl"] != "org" or a < 0:
+def cohort_capacity(p: Panel, r: int, t: int, kind: str) -> dict[int, float]:
+    """Когорта, которую можно убрать без отрицательных остатков и будущей базы.
+    Для организации используются её реальные ячейки, а не главная за всё окно."""
+    end = t + 1 if kind == "dip" else len(p.months)
+    if kind == "stop" and t != len(p.months) - 1:
+        return {}
+    if p.meta.at[r, "lvl"] == "org":
+        if p.org_stock.empty:
+            return {}
+        try:
+            stock = p.org_stock.xs(r, level="row")
+        except KeyError:
+            return {}
+        ts = stock.index.get_level_values("t")
+        stock = stock.loc[(ts >= t) & (ts < end)]
+        caps = {}
+        for a, g in stock.groupby(level="atom"):
+            if a < 0 or len(g) != end - t:
+                continue
+            cols = ["pf_recip"] + ([] if kind == "stop" else ["pf_fl"])
+            if kind == "conc":
+                cols.append("multi_recip")
+            values = g[cols].to_numpy()
+            if not np.isfinite(values).all():
+                continue
+            caps[int(a)] = max(0., float(values.min()))
+            if kind not in ("stop", "conc"):
+                singles = (g["pf_recip"] - g["multi_recip"]).to_numpy()
+                caps[int(a)] = min(caps[int(a)], max(0., float(np.min(singles))))
+    else:
+        caps = {r: float("inf")}
+    for a in list(caps):
+        cols = ["pf_recip"] + ([] if kind == "stop" else ["pf_fl"])
+        if kind == "conc":
+            cols.append("multi_recip")
+        values = np.concatenate([p.x[m][a, t:end] for m in cols])
+        if kind not in ("stop", "conc"):
+            values = np.r_[values, p.x["pf_recip"][a, t:end] - p.x["multi_recip"][a, t:end]]
+        if kind != "stop" and t + 1 < len(p.months):
+            next_end = t + 2 if kind == "dip" else end
+            values = np.r_[values, p.x["m_base_pf"][a, t + 1:next_end]]
+        caps[a] = min(caps[a], max(0., float(values.min()))) if np.isfinite(values).all() else 0.
+    return caps
+
+
+def cohort_allocation(p: Panel, r: int, t: int, n: int, kind: str, adding=False,
+                      source: int | None = None) -> dict[int, float]:
+    if adding:
+        if p.meta.at[r, "lvl"] == "org":
+            try:
+                s = p.org_stock.xs((r, t), level=("row", "t"))["pf_recip"]
+            except KeyError:
+                raise ValueError("Нет помесячной привязки организации для закладки")
+            caps = {int(a): max(0., float(v)) for a, v in s.items() if a >= 0 and np.isfinite(v)}
+        else:
+            caps = {r: 1.}
+        if sum(caps.values()) <= 0:
+            raise ValueError("Нет ячейки для прихода когорты")
+    else:
+        caps = cohort_capacity(p, r, t, kind)
+        if source is not None:
+            caps = {source: caps.get(source, 0.)}
+        if n > sum(caps.values()) + 1e-6:
+            raise ValueError(f"Размер когорты {n} превышает доступный остаток {sum(caps.values()):.0f}")
+    total = sum(caps.values())
+    if n <= 0 or total <= 0:
+        raise ValueError("Пустая когорта")
+    return {a: n * c / total for a, c in caps.items() if c > 0}
+
+
+def inject(p: Panel, ev: Event) -> Panel:
+    """Согласованная закладка с распределением по реальным ячейкам организации."""
+    if ev.kind in ("calendar", "underload"):
+        return _inject_artifact(p, ev)
+    adding = ev.kind == "hire"
+    source = ev.extra.get("source_atom") if ev.kind == "recode" else None
+    alloc = cohort_allocation(p, ev.row, ev.t, ev.n, ev.kind, adding, source)
+    alloc2 = (cohort_allocation(p, ev.row2, ev.t, ev.n, ev.kind, adding=True)
+              if ev.kind == "reorg" else {})
+    ev.extra["allocation"] = alloc
+    if alloc2:
+        ev.extra["allocation2"] = alloc2
+    if ev.kind == "recode":
+        src = next(iter(alloc)) if len(alloc) == 1 else None
+        if (src is None or ev.row2 not in p.atoms
+                or p.meta.at[src, "seg_rep"] != p.meta.at[ev.row2, "seg_rep"]
+                or p.meta.at[src, "sys_tb_id"] != p.meta.at[ev.row2, "sys_tb_id"]
+                or p.meta.at[src, "sys_gosb_id"] == p.meta.at[ev.row2, "sys_gosb_id"]):
+            raise ValueError("Смена ГОСБ должна сохранять сегмент и ТБ и менять ГОСБ")
+    q = _inject_at_main(p, ev)
+    # Сначала берём изменения самой организации; ошибочную привязку расчёта к одному
+    # атому полностью заменяем реальным распределением. Факты подложки не меняются.
+    participants = [(ev.row, alloc)] + ([(ev.row2, alloc2)] if alloc2 else [])
+    if ev.kind == "recode":
+        for m in MEAS:
+            q.x[m][p.atoms] = p.x[m][p.atoms]
+        for a, n in alloc.items():
+            _move(q, [a], [ev.row2], ev.t, n)
+            for t in range(ev.t, len(p.months)):
+                src_key, dst_key = (ev.row, t, a), (ev.row, t, ev.row2)
+                if dst_key not in q.org_stock.index:
+                    q.org_stock.loc[dst_key, :] = 0.
+                for m in ("pf_recip", "pf_fl") + (("m_base_pf",) if t > ev.t else ()):
+                    q.org_stock.at[src_key, m] -= n
+                    q.org_stock.at[dst_key, m] += n
+    else:
+        deltas = {r: {m: np.nan_to_num(q.x[m][r] - p.x[m][r], nan=0.) for m in MEAS}
+                  for r, _ in participants}
+        for m in MEAS:
+            q.x[m][p.atoms] = p.x[m][p.atoms]
+        for r, portions in participants:
+            if p.meta.at[r, "lvl"] == "atom":
+                for m in MEAS:
+                    q.x[m][r] += deltas[r][m]
+                continue
+            for a, n in portions.items():
+                for m in MEAS:
+                    q.x[m][a] += deltas[r][m] * (n / ev.n)
+                if ev.kind == "stop":
+                    for stock in ("pf_fl", "multi_recip"):
+                        old = p.org_stock.at[(r, ev.t, a), stock]
+                        q.x[stock][a, ev.t] = p.x[stock][a, ev.t] - old
+        if ev.kind == "conc":
+            a = int(ev.extra["other_atom"])
+            _add(q, [a], "m_fl_conc", ev.t, ev.t, ev.n / 2)
+            _add(q, [a], "pf_fl", ev.t, len(p.months) - 1, ev.n / 2)
+            _add(q, [a], "multi_recip", ev.t, len(p.months) - 1, -ev.n)
+    q.org_flows = p.org_flows.copy()
+    for r, portions in participants:
+        if p.meta.at[r, "lvl"] != "org":
             continue
-        key = (r, ev.t, a)
-        if key not in p.org_flows.index:
-            p.org_flows.loc[key, :] = 0.0
-        p.org_flows.at[key, f] += ev.n
-    if changes:
-        p.org_flows.sort_index(inplace=True)
+        for a, n in portions.items():
+            for m in q.org_stock.columns:
+                if (r, ev.t, a) not in q.org_stock.index:
+                    continue
+                times = np.arange(ev.t, len(p.months))
+                keys = [(r, int(t), a) for t in times if (r, int(t), a) in q.org_stock.index]
+                for key in keys:
+                    delta = np.nan_to_num(q.x[m][r, key[1]] - p.x[m][r, key[1]])
+                    q.org_stock.at[key, m] += delta * n / ev.n
+                    if ev.kind == "stop" and m in ("pf_fl", "multi_recip"):
+                        q.org_stock.at[key, m] = 0.
+            for f, col in (("in_other", "m_in_from_other_org"), ("out_other", "m_out_to_other_org")):
+                d = q.x[col][r, ev.t] - p.x[col][r, ev.t]
+                if not np.isfinite(d) or d == 0:
+                    continue
+                cell = ev.row2 if ev.kind == "recode" and f == "in_other" else a
+                key = (r, ev.t, cell)
+                if key not in q.org_flows.index:
+                    q.org_flows.loc[key, :] = 0.
+                q.org_flows.at[key, f] += d * n / ev.n
+    if not q.org_flows.empty:
+        q.org_flows.sort_index(inplace=True)
+    if not q.org_stock.empty:
+        q.org_stock.sort_index(inplace=True)
+    for m in ("pf_recip", "pf_fl", "multi_recip", "m_base_pf") + tuple(IN_M + OUT_M):
+        introduced = (q.x[m] < -1e-6) & (p.x[m] >= -1e-6)
+        if introduced.any():
+            raise ValueError(f"Закладка создала отрицательное значение {m}")
+    for count in ("pf_fl", "multi_recip"):
+        invalid = (q.x[count] > q.x["pf_recip"] + 1e-6) & (p.x[count] <= p.x["pf_recip"] + 1e-6)
+        if invalid.any():
+            raise ValueError(f"Закладка создала {count} больше портфеля")
+    gap = q.identity_gap(ev.t) - p.identity_gap(ev.t)
+    if np.nanmax(np.abs(gap)) > 1e-5:
+        raise ValueError("Закладка нарушила тождество движений")
+    return q
+
+
+def _inject_artifact(p: Panel, ev: Event) -> Panel:
+    """Артефакт изменяет долю остатка, сохраняя дробных людей и совместительство."""
+    q = p.copy()
+    t = ev.t
+    if ev.kind == "calendar":
+        if t >= len(p.months) - 1:
+            raise ValueError("У календарного сдвига должен наблюдаться месяц возврата")
+        wanted = np.round(ev.q * np.nan_to_num(p.x["m_base_pf"][:, t]))
+        available = np.minimum(np.nan_to_num(p.x["pf_recip"][:, t]),
+                               np.nan_to_num(p.x["m_base_pf"][:, t + 1]))
+        lost = np.minimum(wanted, np.maximum(available, 0.))
+        lost[~np.isfinite(p.x["m_out_temp"][:, t])] = 0.
+    else:
+        fraction = np.zeros(len(p.meta))
+        atoms = p.atoms[p.meta.loc[p.atoms, "sys_tb_id"].to_numpy() == ev.tb]
+        fraction[atoms] = ev.q
+        if not p.org_stock.empty:
+            current = p.org_stock.xs(t, level="t").reset_index()
+            current = current.loc[current["atom"].isin(atoms)]
+            affected = current.groupby("row")["pf_recip"].sum()
+            for r, amount in affected.items():
+                total = p.x["pf_recip"][r, t]
+                fraction[r] = ev.q * amount / total if total > 0 else 0.
+        lost = fraction * np.nan_to_num(p.x["pf_recip"][:, t])
+    for r in np.flatnonzero(lost > 0):
+        n = float(lost[r])
+        old_pf = p.x["pf_recip"][r, t]
+        share = n / old_pf
+        fl = p.x["pf_fl"][r, t] * share
+        for m in ("m_out_left_bank", "m_lb_unknown"):
+            _add(q, [r], m, t, t, n)
+        _add(q, [r], "m_fl_out", t, t, fl)
+        for m in ("pf_recip", "pf_fl", "any_recip", "multi_recip", "raw_rows", "fot_amt", "single_pay_recip"):
+            q.x[m][r, t] *= 1 - share
+        if ev.kind == "calendar":
+            _add(q, [r], "m_out_temp", t, t, n)
+            _add(q, [r], "m_base_pf", t + 1, t + 1, -n)
+            for m in ("m_in_from_outside", "m_in_returned"):
+                _add(q, [r], m, t + 1, t + 1, n)
+            _add(q, [r], "m_fl_in", t + 1, t + 1, fl)
+            _add(q, [r], "y_out_left_bank", t, t, n)
+            room = max(0., q.x["pf_recip"][r, t] - q.x["single_pay_recip"][r, t])
+            _add(q, [r], "single_pay_recip", t, t, min(3 * n, room))
+    return q
+
+
 
 
 def _move(p: Panel, a: list[int], b: list[int], t: int, n: int) -> None:
@@ -379,23 +656,8 @@ def _move(p: Panel, a: list[int], b: list[int], t: int, n: int) -> None:
     _add(p, b, "y_in_from_other_org", t, t + 11, n)
 
 
-def _inject_rows(p: Panel, ev: Event, rows: list[int]) -> Panel:
-    """Провал на месяц ровно в указанных рядах (без атома организации)."""
-    t, n = ev.t, ev.n
-    for m in ("m_out_left_bank", "m_lb_unknown", "m_out_temp", "m_fl_out"):
-        _add(p, rows, m, t, t, n)
-    for m in ("pf_recip", "pf_fl", "any_recip"):
-        _add(p, rows, m, t, t, -n)
-    _add(p, rows, "m_base_pf", t + 1, t + 1, -n)
-    for m in ("m_in_from_outside", "m_in_returned", "m_fl_in"):
-        _add(p, rows, m, t + 1, t + 1, n)
-    _add(p, rows, "y_out_left_bank", t, t, n)
-    return p
 
 
-def _add_vec(p: Panel, m: str, t: int, d: np.ndarray) -> None:
-    v = p.x[m][:, t]
-    p.x[m][:, t] = np.where(np.isnan(v), v, v + d)
 
 
 # --------------------------------------------------------------------------- #
@@ -405,40 +667,79 @@ def net(p: Panel, t: int) -> np.ndarray:
     return p.x["pf_recip"][:, t] - p.x["m_base_pf"][:, t]
 
 
-def row_noise(p: Panel, t: int, rows: np.ndarray, hist: int = 12) -> np.ndarray:
-    """Шум изменения портфеля ряда: 1,4826 × MAD за прошлые месяцы (минимум 1)."""
+EVENT_MEASURE = {"leave": "m_out_left_bank", "stop": "m_out_left_bank", "dip": "m_out_left_bank",
+                 "hire": "m_in_from_outside", "codes": "m_out_codes",
+                 "reorg": "m_out_to_other_org", "conc": "m_out_to_other_org"}
+FLOW_ALIAS = {"m_in_from_outside": "in_outside", "m_in_from_other_org": "in_other",
+              "m_in_codes": "in_codes", "m_out_left_bank": "out_left",
+              "m_out_to_other_org": "out_other", "m_out_codes": "out_codes"}
+
+
+def row_noise(p: Panel, t: int, rows: np.ndarray, hist: int = 12,
+              measure: str | None = None) -> np.ndarray:
+    """MAD именно изменяемого потока, а не разности прихода и ухода."""
     lo = max(0, t - hist)
-    h = np.stack([net(p, s)[rows] for s in range(lo, t)], axis=1)
+    h = (p.x[measure][rows, lo:t] if measure else
+         np.stack([net(p, s)[rows] for s in range(lo, t)], axis=1))
     med = np.nanmedian(h, axis=1, keepdims=True)
     return np.maximum(1.4826 * np.nanmedian(np.abs(h - med), axis=1), 1.0)
 
 
 def pick_events(p: Panel, rng, kind: str, k: float, t: int, n_ev: int,
-                min_people: int = 100) -> list[Event]:
+                min_people: int = 300, people: int | None = None) -> list[Event]:
     """n_ev событий типа kind размером k шумов в месяце t, в разных рядах."""
     org_kinds = {"stop", "reorg", "conc", "codes"}
     pool = p.orgs if kind in org_kinds or rng.random() < 0.5 else p.atoms
-    base = np.nan_to_num(p.x["pf_recip"][pool, t - 1])
-    nz = row_noise(p, t, pool)
-    size = np.maximum(min_people, np.round(k * nz))
+    if kind == "dip" and t >= len(p.months) - 1:
+        return []  # в последнем месяце возврат ещё не наблюдается
+    base = np.nan_to_num(p.x["pf_recip"][pool, t])
+    nz = row_noise(p, t, pool, measure=EVENT_MEASURE[kind])
+    size = np.full(len(pool), people) if people is not None else np.maximum(min_people, np.round(k * nz))
     ok = (base >= 2 * size) if kind != "stop" else (base >= min_people)
     cand = pool[ok]
     if len(cand) == 0:
         return []
-    chosen = rng.choice(cand, size=min(n_ev, len(cand)), replace=False)
     out = []
-    for r in chosen:
+    for r in rng.permutation(cand)[:100]:
         i = int(np.flatnonzero(pool == r)[0])
         n = int(base[i]) if kind == "stop" else int(size[i])
         ev = Event(kind, t, n, row=int(r), sign=(1 if kind == "hire" else -1),
-                   extra={"k": k, "noise": float(nz[i])})
+                   extra={"k": k, "noise": float(nz[i]), "effective_k": n / nz[i],
+                          "size_mode": "people" if people is not None else "noise"})
         if kind == "reorg":
             others = cand[cand != r]
-            ev.row2 = int(rng.choice(others)) if len(others) else int(r)
+            if not len(others):
+                continue
+            ev.row2 = int(rng.choice(others))
         if kind == "conc":
-            ev.extra["other_atom"] = int(rng.choice(p.atoms))
+            cap = np.nanmin(p.x["multi_recip"][p.atoms, t:], axis=1)
+            available = p.atoms[(cap >= n) & (p.atoms != p.meta.at[r, "atom"])]
+            if not len(available):
+                continue
+            ev.extra["other_atom"] = int(rng.choice(available))
+        if kind != "hire" and sum(cohort_capacity(p, int(r), t, kind).values()) + 1e-6 < n:
+            continue
+        if not np.isfinite(p.x[EVENT_MEASURE[kind]][r, t]):
+            continue
         out.append(ev)
+        if len(out) >= n_ev:
+            break
     return out
+
+
+def pick_recode(p: Panel, rng, t: int) -> Event | None:
+    """Перенос части одной реальной ячейки в другой ГОСБ того же сегмента и ТБ."""
+    order = p.orgs[np.argsort(np.nan_to_num(p.x["pf_recip"][p.orgs, t]))[::-1]]
+    for r in order:
+        caps = cohort_capacity(p, int(r), t, "recode")
+        for a, cap in sorted(caps.items(), key=lambda item: -item[1]):
+            dst = p.atoms[(p.meta.loc[p.atoms, "sys_tb_id"].to_numpy() == p.meta.at[a, "sys_tb_id"])
+                          & (p.meta.loc[p.atoms, "seg_rep"].to_numpy() == p.meta.at[a, "seg_rep"])
+                          & (p.meta.loc[p.atoms, "sys_gosb_id"].to_numpy() != p.meta.at[a, "sys_gosb_id"])]
+            if cap >= 600 and len(dst):
+                return Event("recode", t, int(cap / 2), row=int(r), row2=int(rng.choice(dst)),
+                             extra={"source_atom": a})
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -461,26 +762,50 @@ def baseline(p: Panel, t: int, z_min: float = 4.0, min_people: int = 100,
         for r in rows[(z >= z_min) & (np.abs(dev) >= min_people)]:
             if r not in best or z[r] > best[r].score:
                 lvl = p.meta.at[r, "lvl"]
-                best[r] = Card(lvl, int(r), name, float(dev[r]), score=float(z[r]))
+                sign = -1 if name in OUT_M else 1
+                best[r] = Card(lvl, int(r), name, sign * float(dev[r]), score=float(z[r]))
     return sorted(best.values(), key=lambda c: -abs(c.delta))[:top]
 
 
 # --------------------------------------------------------------------------- #
 # Метрики
 # --------------------------------------------------------------------------- #
-def _where(p: Panel, r: int) -> dict:
+def _where(p: Panel, r: int, t: int | None = None) -> dict:
     a = int(p.meta.at[r, "atom"])
+    if t is not None and p.meta.at[r, "lvl"] == "org" and not p.org_stock.empty:
+        try:
+            loc = p.org_stock.xs((r, t), level=("row", "t"))["pf_recip"]
+            if len(loc):
+                a = int(loc.idxmax())
+        except KeyError:
+            pass
+    if a < 0:
+        return {"org": r, "atom": None, "gosb": None, "tb": None, "seg": None}
     m = p.meta.iloc[a]
     return {"org": r if p.meta.at[r, "lvl"] == "org" else None, "atom": a,
             "gosb": int(m["sys_gosb_id"]), "tb": int(m["sys_tb_id"]), "seg": m["seg_rep"]}
 
 
-def match(p: Panel, cards: list[Card], r: int, sign: int) -> str | None:
+def match(p: Panel, cards: list[Card], r: int, sign: int, before: list[Card] | None = None,
+          measure: str | None = None, min_effect: float = 0., t: int | None = None) -> str | None:
     """Самый точный уровень карточки, указавшей на ряд r с нужным знаком."""
-    w = _where(p, r)
+    w = _where(p, r, t)
+    expected = FLOW_ALIAS.get(measure, measure)
+    previous = {(c.level, c.key): c for c in before or []}
+
+    def effect(c):
+        if expected is None or c.measure == "net" or FLOW_ALIAS.get(c.measure, c.measure) == expected:
+            return c.delta
+        return c.info.get("flows", {}).get(expected, {}).get("delta")
+
     got = []
     for c in cards:
-        if c.label in ARTIFACTS or np.sign(c.delta) != sign:
+        value = effect(c)
+        if c.label in ARTIFACTS or value is None or np.sign(value) != sign:
+            continue
+        old = previous.get((c.level, c.key))
+        old_value = effect(old) if old is not None else None
+        if before is not None and old_value is not None and sign * (value - old_value) < min_effect:
             continue
         if c.level == "org" and c.key == w["org"]:
             got.append("org")
@@ -493,67 +818,165 @@ def match(p: Panel, cards: list[Card], r: int, sign: int) -> str | None:
     return min(got, key=LEVELS.index) if got else None
 
 
-def evaluate(detect, p: Panel, seed: int = 7, months_back: int = 6,
-             sizes=(3.0, 4.0, 6.0), per_cell: int = 20, kinds=EVENT_KINDS) -> dict:
-    """Экзамен: полнота по типу × размеру, точность места, ложные на чистых месяцах,
-    эхо (провал прошлого месяца), утечка артефактов."""
+def make_plan(p: Panel, seed: int = 7, months_back: int = 6,
+              sizes=(3.0, 4.0, 6.0), per_cell: int = 10, kinds=EVENT_KINDS,
+              people_sizes=(300, 1000, 3000), per_size: int = 3) -> dict:
+    """Единая детерминированная жеребьёвка для стенда и его диагностики."""
     rng = np.random.default_rng(seed)
-    T = len(p.months)
-    ts = list(range(max(13, T - months_back), T))
-    rec = []
+    ts = list(range(max(13, len(p.months) - months_back), len(p.months)))
+    if not ts:
+        raise ValueError("Для стенда нужно не менее 14 месяцев")
+    trials, skipped = [], []
     for kind in kinds:
-        for k in sizes if kind != "stop" else (0.0,):
-            for _ in range(per_cell):
-                t = int(rng.choice(ts))
-                evs = pick_events(p, rng, kind, k, t, 1)
-                if not evs:
-                    continue
-                ev = evs[0]
-                q = inject(p, ev)
-                cards = detect(q, t)
-                targets = [(ev.row, ev.sign)] + ([(ev.row2, 1)] if kind == "reorg" else [])
-                for r, sgn in targets:
-                    lv = match(q, cards, r, sgn)
-                    rec.append({"kind": kind, "k": k, "n": ev.n, "lvl": p.meta.at[r, "lvl"],
-                                "found": lv is not None and LEVELS.index(lv) <= LEVELS.index("tb"),
-                                "exact": lv in ("org", "atom"), "level": lv})
-    recall = pd.DataFrame(rec)
-
-    clean = [len(detect(p, t)) for t in ts]
-
-    echo = []
+        bands = [(k, None, per_cell) for k in sizes] if kind != "stop" else [(0., None, per_cell)]
+        if kind != "stop":
+            bands += [(0., n, per_size) for n in people_sizes]
+        for k, people, count in bands:
+            for _ in range(count):
+                eligible_ts = ts[:-1] if kind == "dip" else ts
+                t = ts[-1] if kind == "stop" else int(rng.choice(eligible_ts or ts))
+                events = pick_events(p, rng, kind, k, t, 1, people=people)
+                if events:
+                    trials.append(events[0])
+                else:
+                    skipped.append({"kind": kind, "t": t, "k": k, "people": people,
+                                    "reason": "нет подходящей когорты"})
+    echoes = []
     for _ in range(per_cell):
         t = int(rng.choice(ts[1:])) if len(ts) > 1 else ts[0]
-        evs = pick_events(p, rng, "dip", 4.0, t - 1, 1)
-        if evs:
-            q = inject(p, evs[0])
-            echo.append(match(q, detect(q, t), evs[0].row, 1) is not None)
+        echoes.extend(pick_events(p, rng, "dip", 4., t - 1, 1))
+    t = ts[-1]
+    artifacts = {"calendar": Event("calendar", t - 1, 0, q=.005),
+                 "underload": Event("underload", t, 0, tb=int(rng.choice(
+                     p.meta.loc[p.atoms, "sys_tb_id"].unique())), q=.08)}
+    recode = pick_recode(p, rng, t)
+    if recode is not None:
+        artifacts["recode"] = recode
+    return {"trials": trials, "echoes": echoes, "artifacts": artifacts,
+            "skipped": skipped, "ts": ts, "seed": seed}
+
+
+def evaluate(detect, p: Panel, seed: int = 7, months_back: int = 6,
+             sizes=(3.0, 4.0, 6.0), per_cell: int = 10, kinds=EVENT_KINDS,
+             people_sizes=(300, 1000, 3000), per_size: int = 3, plan: dict | None = None,
+             clean_is_known: bool = False, progress=None) -> dict:
+    """Экзамен: полнота по типу × размеру, точность места, ложные на чистых месяцах,
+    эхо (провал прошлого месяца), утечка артефактов."""
+    plan = plan or make_plan(p, seed, months_back, sizes, per_cell, kinds, people_sizes, per_size)
+    ts = plan["ts"]
+    backgrounds = {t: detect(p, t) for t in sorted(set(ts + [ts[-1] - 1]))}
+    rec = []
+    invalid = []
+    for index, ev in enumerate(plan["trials"]):
+        t, kind = ev.t, ev.kind
+        try:
+            q = inject(p, ev)
+        except ValueError as exc:
+            invalid.append({"kind": kind, "t": t, "row": ev.row, "n": ev.n, "error": str(exc)})
+            continue
+        cards = detect(q, t)
+        targets = [(ev.row, ev.sign, EVENT_MEASURE[kind])]
+        if kind == "reorg":
+            targets.append((ev.row2, 1, "m_in_from_other_org"))
+        for r, sgn, measure in targets:
+            noise = float(row_noise(p, t, np.array([r]), measure=measure)[0])
+            lv = match(p, cards, r, sgn, backgrounds[t], measure, max(1., .5 * ev.n), t)
+            rec.append({"kind": kind, "k": ev.extra["k"], "effective_k": ev.n / noise,
+                        "mode": ev.extra["size_mode"], "noise": noise,
+                        "n": ev.n, "t": t, "row": r, "measure": measure,
+                        "lvl": p.meta.at[r, "lvl"], "found": lv is not None and LEVELS.index(lv) <= LEVELS.index("tb"),
+                        "exact": lv in ("org", "atom"), "level": lv})
+        if progress and (index + 1) % 25 == 0:
+            progress(f"Проверено событий: {index + 1}/{len(plan['trials'])}")
+    recall = pd.DataFrame(rec)
+
+    clean = [sum(c.label not in ARTIFACTS for c in backgrounds[t]) for t in ts]
+
+    echo = []
+    for ev in plan["echoes"]:
+        try:
+            q = inject(p, ev)
+        except ValueError as exc:
+            invalid.append({"kind": "echo", "t": ev.t, "error": str(exc)})
+            continue
+        t = ev.t + 1
+        if t not in backgrounds:
+            backgrounds[t] = detect(p, t)
+        echo.append(match(p, detect(q, t), ev.row, 1, backgrounds[t],
+                          "m_in_from_outside", max(1., .5 * ev.n), t) is not None)
 
     leak = {}
-    t = ts[-1]
-    base_cards = detect(p, t)
-    q = inject(p, Event("calendar", t - 1, 0, q=0.005))
-    leak["calendar"] = (_extra_cards(detect(q, t - 1), detect(p, t - 1))
-                        + _extra_cards(detect(q, t), base_cards))
-    tb = int(rng.choice(p.meta.loc[p.atoms, "sys_tb_id"].unique()))
-    q = inject(p, Event("underload", t, 0, tb=tb, q=0.08))
-    leak["underload"] = _extra_cards(detect(q, t), base_cards)
-    o = p.orgs
-    if len(o) >= 2:
-        r = int(o[np.nanargmax(np.nan_to_num(p.x["pf_recip"][o, t - 1]))])
-        same = p.atoms[(p.meta.loc[p.atoms, "sys_tb_id"] == p.meta.at[r, "sys_tb_id"]).to_numpy()]
-        dst = int(rng.choice(same[same != p.meta.at[r, "atom"]])) if len(same) > 1 else r
-        n = int(0.5 * np.nan_to_num(p.x["pf_recip"][r, t - 1]))
-        q = inject(p, Event("recode", t, n, row=r, row2=dst))
-        leak["recode"] = _extra_cards(detect(q, t), base_cards)
+    details = {}
+    for name, ev in plan["artifacts"].items():
+        try:
+            q = inject(p, ev)
+        except ValueError as exc:
+            invalid.append({"kind": name, "t": ev.t, "error": str(exc)})
+            continue
+        months = (ev.t, ev.t + 1) if name == "calendar" else (ev.t,)
+        frames, total = [], 0
+        for t in months:
+            after = detect(q, t)
+            before = backgrounds[t]
+            extra = extra_cards(after, before, p=p, changed=q, t=t)
+            total += len(extra)
+            frames.append({"t": t, "before": before, "after": after, "extra": extra})
+        leak[name] = total
+        details[name] = {"event": ev, "frames": frames}
     return {"recall": recall, "clean_cards": clean, "echo": float(np.mean(echo)) if echo else None,
-            "leak": leak}
+            "leak": leak, "artifact_details": details, "invalid": pd.DataFrame(invalid),
+            "skipped": pd.DataFrame(plan["skipped"]), "clean_is_known": clean_is_known,
+            "protocol": 2, "plan": plan, "backgrounds": backgrounds}
 
 
 def _extra_cards(cards: list[Card], clean: list[Card]) -> int:
     """Карточки, которых не было в чистом месяце и которые не помечены как артефакт."""
-    was = {(c.level, c.key) for c in clean}
-    return sum(1 for c in cards if c.label not in ARTIFACTS and (c.level, c.key) not in was)
+    return len(extra_cards(cards, clean))
+
+
+def extra_cards(cards: list[Card], clean: list[Card], p: Panel | None = None,
+                 changed: Panel | None = None, t: int | None = None) -> list[Card]:
+    """Новая мера/направление либо материальное усиление существующего сигнала."""
+    was = {(c.level, c.key, c.measure, int(np.sign(c.delta))): c for c in clean
+           if c.label not in ARTIFACTS}
+    result = []
+    def replaced(c):
+        if p is None or changed is None or t is None:
+            return False
+        measure = FLOW_ALIAS.get(c.measure, c.measure)
+        col = next((m for m, f in FLOW_ALIAS.items() if f == measure), None)
+        if col is None:
+            return False
+        if c.level in ("org", "atom"):
+            rows = np.array([c.key])
+        else:
+            rows = p.atoms
+            dim = {"gosb": "sys_gosb_id", "tb": "sys_tb_id", "seg": "seg_rep"}.get(c.level)
+            if dim:
+                rows = rows[(p.meta.loc[rows, dim] == c.key).to_numpy()]
+        if not np.isclose(np.nansum(p.x[col][rows, t]), np.nansum(changed.x[col][rows, t]), atol=1e-6, rtol=0):
+            return False
+        amounts = {}
+        for old in clean:
+            if (old.label in ARTIFACTS or FLOW_ALIAS.get(old.measure, old.measure) != measure
+                    or np.sign(old.delta) != np.sign(c.delta)):
+                continue
+            contained = False
+            if old.level == "org" and c.level in p.org_scopes:
+                contained = p.org_scopes[c.level][old.key, t] == c.key
+            elif old.level == "atom" and c.level in ("gosb", "tb"):
+                contained = p.meta.at[old.key, "sys_" + c.level + "_id"] == c.key
+            if contained:
+                amounts[old.level] = amounts.get(old.level, 0.) + abs(old.delta)
+        return max(amounts.values(), default=0.) >= .7 * abs(c.delta)
+    for c in cards:
+        if c.label in ARTIFACTS:
+            continue
+        old = was.get((c.level, c.key, c.measure, int(np.sign(c.delta))))
+        if old is None or abs(c.delta) - abs(old.delta) >= max(100., .1 * abs(old.delta)):
+            if not replaced(c):
+                result.append(c)
+    return result
 
 
 ACCEPT = {
@@ -571,7 +994,7 @@ def summary(res: dict) -> pd.DataFrame:
         return pd.DataFrame(columns=["kind", "k", "событий", "найдено", "точно", "людей_медиана"])
     t = (r.groupby(["kind", "k"])
          .agg(событий=("found", "size"), найдено=("found", "mean"), точно=("exact", "mean"),
-              людей_медиана=("n", "median"))
+              людей_медиана=("n", "median"), шумов_медиана=("effective_k", "median"))
          .round(2).reset_index())
     return t
 
@@ -594,17 +1017,27 @@ def verdict(res: dict) -> list[tuple[str, bool, str]]:
     r = res["recall"]
     if r.empty:
         return [("события заложить не удалось: ряды меньше 100 человек", False, "")]
-    big = r[(r["k"] >= 4) & (r["n"] >= 2000)]
-    mid = r[(r["k"] == 3) & (r["n"] >= 300)]
+    actual_k = r["effective_k"] if "effective_k" in r else r["k"]
+    big = r[(actual_k >= 3.95) & (r["n"] >= 2000) & (r["kind"] != "stop")]
+    mid = r[(abs(actual_k - 3) <= .15) & (r["n"] >= 300)]
     out = [
         ("полнота: ≥ 4 шумов и ≥ 2 тыс. чел.", len(big) > 0 and big["found"].mean() >= ACCEPT["recall_4"],
          f"{big['found'].mean():.2f} из {len(big)}" if len(big) else "нет событий"),
         ("полнота: 3 шума, от 300 чел.", len(mid) > 0 and mid["found"].mean() >= ACCEPT["recall_3"],
          f"{mid['found'].mean():.2f} из {len(mid)} (все размеры: {r[r['k'] == 3]['found'].mean():.2f})"),
-        ("карточек в спокойный месяц", np.mean(res["clean_cards"]) <= ACCEPT["clean_max"],
-         f"{np.mean(res['clean_cards']):.1f}"),
         ("эхо провала", res["echo"] is not None and res["echo"] <= ACCEPT["echo_max"], f"{res['echo']}"),
     ]
+    if res.get("clean_is_known", True):
+        out.append(("ложных карточек на чистом фоне", np.mean(res["clean_cards"]) <= ACCEPT["clean_max"],
+                    f"{np.mean(res['clean_cards']):.1f}"))
+    invalid = res.get("invalid", pd.DataFrame())
+    out.append(("закладки без ошибок и отрицательных остатков", invalid.empty, f"ошибок {len(invalid)}"))
+    planned = {ev.kind for ev in res.get("plan", {}).get("trials", [])}
+    for kind in sorted(planned):
+        n = int((r["kind"] == kind).sum())
+        out.append((f"покрытие типа {kind}", n > 0, f"целей {n}"))
     for a, v in res["leak"].items():
         out.append((f"артефакт «{a}» не даёт карточек", v <= ACCEPT["leak_max"], f"лишних {v}"))
+    for a in ARTIFACTS - res["leak"].keys():
+        out.append((f"артефакт «{a}» проверен", False, "нет допустимой закладки"))
     return out

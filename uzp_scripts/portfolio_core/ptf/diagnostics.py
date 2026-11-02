@@ -9,47 +9,31 @@ from .inputs import Panel
 
 
 def recode_event(p: Panel, seed: int = 7, months_back: int = 6,
-                 sizes=(3.0, 4.0, 6.0), per_cell: int = 20,
-                 kinds=bench.EVENT_KINDS) -> bench.Event:
+                 sizes=(3.0, 4.0, 6.0), per_cell: int = 10,
+                 kinds=bench.EVENT_KINDS, people_sizes=(300, 1000, 3000), per_size=3) -> bench.Event:
     """Повторить только жеребьёвку evaluate, чтобы получить тот же случай смены ГОСБ.
     Параметры должны совпадать с прошедшим стендом. Детектор здесь не вызывается."""
-    rng = np.random.default_rng(seed)
-    ts = list(range(max(13, len(p.months) - months_back), len(p.months)))
-    if not ts or len(p.orgs) < 2:
-        raise ValueError("Для случая смены ГОСБ нужны минимум 14 месяцев и две организации")
-    for kind in kinds:
-        for k in sizes if kind != "stop" else (0.0,):
-            for _ in range(per_cell):
-                t = int(rng.choice(ts))
-                bench.pick_events(p, rng, kind, k, t, 1)
-    for _ in range(per_cell):
-        t = int(rng.choice(ts[1:])) if len(ts) > 1 else ts[0]
-        bench.pick_events(p, rng, "dip", 4.0, t - 1, 1)
-    rng.choice(p.meta.loc[p.atoms, "sys_tb_id"].unique())  # выбор ТБ для недогруза
-    t = ts[-1]
-    o = p.orgs
-    r = int(o[np.nanargmax(np.nan_to_num(p.x["pf_recip"][o, t - 1]))])
-    same = p.atoms[(p.meta.loc[p.atoms, "sys_tb_id"] == p.meta.at[r, "sys_tb_id"]).to_numpy()]
-    dst = int(rng.choice(same[same != p.meta.at[r, "atom"]])) if len(same) > 1 else r
-    n = int(0.5 * np.nan_to_num(p.x["pf_recip"][r, t - 1]))
-    return bench.Event("recode", t, n, row=r, row2=dst)
+    plan = bench.make_plan(p, seed, months_back, sizes, per_cell, kinds, people_sizes, per_size)
+    event = plan["artifacts"].get("recode")
+    if event is None:
+        raise ValueError("Нет допустимого переноса в другой ГОСБ того же сегмента и ТБ")
+    return event
 
 
-def recode_report(p: Panel, **params) -> dict[str, pd.DataFrame]:
+def recode_report(p: Panel, event=None, before=None, after=None, **params) -> dict[str, pd.DataFrame]:
     """Тот же recode, что в evaluate: два запуска детектора вместо полного стенда.
     Вывод: размер закладки, ограничения источника, отбор потоков организации,
     её итоговая карточка и именно те карточки, которые счётчик считает лишними."""
-    ev = recode_event(p, **params)
+    ev = event if event is not None else recode_event(p, **params)
     t, r = ev.t, ev.row
-    src = int(p.meta.at[r, "atom"])
+    src = int(ev.extra["source_atom"])
     if src < 0 or p.meta.at[ev.row2, "lvl"] != "atom":
         raise ValueError("Стенд выбрал некорректный атом для смены ГОСБ: "
                          f"источник={src}, приёмник={ev.row2}. Нужен разбор закладки.")
     q = bench.inject(p, ev)
-    before = watch.detect(p, t)
-    after = watch.detect(q, t)
-    was = {(c.level, c.key) for c in before}
-    extra = [c for c in after if c.label not in bench.ARTIFACTS and (c.level, c.key) not in was]
+    before = watch.detect(p, t) if before is None else before
+    after = watch.detect(q, t) if after is None else after
+    extra = bench.extra_cards(after, before, p=p, changed=q, t=t)
     org_cards = [c for c in after if c.level == "org" and c.key == r]
     facts = [
         ("месяц", p.months[t]), ("id орг", p.meta.at[r, "org_id"]),
@@ -82,10 +66,12 @@ def recode_report(p: Panel, **params) -> dict[str, pd.DataFrame]:
     a, b = (float(scans["после"][f]["d"][i]) for f in ("out_other", "in_other"))
     facts.append(("выполнено условие парного прихода и ухода",
                   bool(a > 0 and b > 0 and min(a, b) >= .6 * max(a, b))))
+    localized = next((c for c in watch._cell_recodes(q, t) if c.key == r), None)
+    facts.append(("переход подтверждён по отдельным ячейкам", localized is not None))
     # Оценка потенциального объяснения — даже если организация не прошла отбор.
     # Она выводится для диагностики, а не используется для изменения карточек.
-    candidate = bench.Card("org", r, "out_other", -a, label="recode",
-                           info={"explains": {"out_other": a, "in_other": b}})
+    candidate = localized or bench.Card("org", r, "out_other", -a, label="recode",
+                                        info={"explains": {"out_other": a, "in_other": b}})
     extra_frame = watch.cards_frame(q, extra, t)
     parts = []
     for c in extra:

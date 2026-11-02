@@ -16,7 +16,7 @@ import pandas as pd
 from . import REPORT_DIR, db
 from . import sql as Q
 
-ALLOWED_IMPORTS = {"__future__", "argparse", "calendar", "collections", "contextlib", "dataclasses", "datetime",
+ALLOWED_IMPORTS = {"__future__", "argparse", "calendar", "collections", "contextlib", "dataclasses", "datetime", "hashlib", "html",
                    "functools", "inspect", "io", "json", "os", "pathlib", "re", "statistics", "sys", "time",
                    "typing", "numpy", "pandas", "sqlalchemy"}
 

@@ -39,6 +39,9 @@ class Panel:
     # Потоки между организациями по фактическим ячейкам: индекс (row, t, atom).
     # Нужны для локализации смены ГОСБ без угадывания принимающей ячейки.
     org_flows: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Остатки по фактическим ячейкам: ограничивают размер когорты стенда.
+    org_stock: pd.DataFrame = field(default_factory=pd.DataFrame)
+    run_id: int | None = None
 
     @property
     def atoms(self) -> np.ndarray:
@@ -50,7 +53,8 @@ class Panel:
 
     def copy(self) -> "Panel":
         return Panel(list(self.months), self.meta.copy(), {k: v.copy() for k, v in self.x.items()},
-                     {k: v.copy() for k, v in self.org_scopes.items()}, self.org_flows.copy())
+                     {k: v.copy() for k, v in self.org_scopes.items()}, self.org_flows.copy(),
+                     self.org_stock.copy(), self.run_id)
 
     def identity_gap(self, t: int) -> np.ndarray:
         """Тождество месяца t по каждому ряду: портфель − база − (пришли − ушли)."""
@@ -89,6 +93,7 @@ def load(conn, run_id: int | None = None) -> Panel:
             WHERE run_id = :r AND lvl = 'org' AND report_dt = CAST(:m AS date)""", p)
         orgs.append(o)
     p = from_frames(months, pd.concat(atoms, ignore_index=True), pd.concat(orgs, ignore_index=True))
+    p.run_id = run_id
     empty = [m for m in MEAS if np.isnan(p.x[m]).all()]
     if empty:
         print(f"ВНИМАНИЕ: в поколении прогона {run_id} пусты меры {', '.join(empty)} — прогон "
@@ -145,4 +150,10 @@ def from_frames(months: list[str], atoms: pd.DataFrame, org_cells: pd.DataFrame)
         "in_other": org_cells["m_in_from_other_org"].to_numpy(dtype=float),
         "out_other": org_cells["m_out_to_other_org"].to_numpy(dtype=float),
     }).groupby(["row", "t", "atom"])[["in_other", "out_other"]].sum(min_count=1)
-    return Panel(months, meta, x, scopes, flows)
+    stock = pd.DataFrame({"row": org_cells["org_id"].map(orow).to_numpy(),
+                          "t": org_cells["report_dt"].map(mi).to_numpy(),
+                          "atom": cells["atom"].to_numpy(),
+                          **{m: org_cells[m].to_numpy(dtype=float)
+                             for m in ("pf_recip", "m_base_pf", "pf_fl", "multi_recip")}})
+    stock = stock.groupby(["row", "t", "atom"]).sum(min_count=1)
+    return Panel(months, meta, x, scopes, flows, stock)
