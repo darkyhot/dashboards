@@ -262,96 +262,58 @@ SELECT
 FROM series WHERE report_dt >= DATE '2025-01-31'
 ORDER BY inn, report_dt;
 
--- 3. Каждый ЕПК списка × каждый месяц, в том числе месяцы без зачислений.
--- Наличие премиального ПУ задаётся предоставленным списком, не выводится из выплат.
--- has_payroll_* — портфель по правилам; has_zp_* — именно ЗП/аванс (коды 1/16).
-WITH a AS (
+-- 3. Премиальные ЕПК: каждый месяц, включая месяцы без выплат.
+-- ЗП-выплаты — портфельные виды из справочника, включая вид 2.
+-- Суммы до отсечки включают все положительные выплаты соответствующих видов.
+-- Учтённые ЗП-выплаты и признак получателя — по правилам portfolio_core.
+WITH payments AS (
     SELECT report_dt, epk_id,
-           bool_or(amt_pos > 0) AS has_any_payment,
-           bool_or(counted_fl) AS has_payroll_sber,
-           bool_or(counted_fl AND in_holding) AS has_payroll_holding,
-           bool_or(relev AND code IN (1, 16) AND amt_pos > 0) AS has_zp_before_threshold,
-           bool_or(counted_fl AND code IN (1, 16)) AS has_zp_sber,
-           bool_or(counted_fl AND code IN (1, 16) AND in_holding) AS has_zp_holding,
-           bool_or(excluded_fl_threshold) AS has_below_threshold,
-           sum(fot_counted) AS fot_sber,
-           sum(CASE WHEN in_holding THEN fot_counted ELSE 0 END) AS fot_holding,
-           sum(fot_excluded_threshold) AS fot_excluded_threshold
-    FROM tmp_sibur_calc WHERE in_premium_list GROUP BY report_dt, epk_id
+           bool_or(counted_fl) AS is_recipient,
+           sum(CASE WHEN is_pf OR code = 2 THEN amt_pos ELSE 0 END) AS salary_amt,
+           sum(CASE WHEN counted_fl THEN amt_pos ELSE 0 END) AS counted_salary_amt,
+           sum(CASE WHEN is_pf OR code = 2 THEN 0 ELSE amt_pos END) AS other_amt
+    FROM tmp_sibur_calc
+    WHERE in_premium_list
+    GROUP BY report_dt, epk_id
 )
 SELECT
-    m.report_dt AS "Отчетный месяц",
-    e.epk_id AS "ЕПК ФЛ",
-    COALESCE(a.has_any_payment, FALSE) AS "Есть зачисления в Сбер",
-    COALESCE(a.has_payroll_sber, FALSE) AS "Учтен в портфеле Сбера",
-    COALESCE(a.has_payroll_holding, FALSE) AS "Учтен в портфеле холдинга",
-    COALESCE(a.has_zp_before_threshold, FALSE) AS "Есть ЗП или аванс до отсечки",
-    COALESCE(a.has_zp_sber, FALSE) AS "Учтены ЗП или аванс в Сбере",
-    COALESCE(a.has_zp_holding, FALSE) AS "Учтены ЗП или аванс холдинга",
-    COALESCE(a.has_below_threshold, FALSE) AS "Есть отсеченные выплаты",
-    COALESCE(a.fot_sber, 0) AS "ФОТ в Сбере, руб.",
-    COALESCE(a.fot_holding, 0) AS "ФОТ от холдинга, руб.",
-    COALESCE(a.fot_excluded_threshold, 0) AS "Отсеченный ФОТ, руб."
-FROM tmp_sibur_months m CROSS JOIN tmp_sibur_epk e
-LEFT JOIN a ON a.report_dt = m.report_dt AND a.epk_id = e.epk_id
+    m.report_dt AS "Дата",
+    e.epk_id AS "ЕПК ИД",
+    CASE WHEN COALESCE(p.is_recipient, false)
+         THEN 'Является' ELSE 'Не является' END AS "Получатель ЗП",
+    COALESCE(p.salary_amt, 0) AS "Сумма ЗП выплат",
+    COALESCE(p.counted_salary_amt, 0) AS "Учтенные ЗП выплаты",
+    COALESCE(p.other_amt, 0) AS "Сумма не ЗП выплат"
+FROM tmp_sibur_months m
+CROSS JOIN tmp_sibur_epk e
+LEFT JOIN payments p ON p.report_dt = m.report_dt AND p.epk_id = e.epk_id
 ORDER BY e.epk_id, m.report_dt;
 
--- 4. ФЛ с одной ЗП/авансом или одной портфельной выплатой за месяц от холдинга.
--- Частота — SUM(transaction_qty), НЕ count строк и НЕ число видов выплат.
--- Считаем до отсечки, чтобы вторая выплата < 2500 не сделала две выплаты одной.
--- Частоту считаем по всем ГОСБ и всем ИНН холдинга вместе; затем выводим ИНН плательщика.
--- Фильтр relev соответствует portfolio_core; признаки отсечки показаны отдельно.
--- Коды 1/16 — именно ЗП/аванс; премии/отпускные не подменяют регулярную выплату.
--- Неизвестная transaction_qty: оценка NULL -> 1, но доказанная частота = NULL.
-WITH by_org AS (
-    SELECT report_dt, epk_id, inn,
-           sum(CASE WHEN is_pf OR code = 2 THEN n_pay ELSE 0 END) AS portfolio_pay_qty,
-           sum(CASE WHEN is_pf OR code = 2 THEN n_unknown_qty ELSE 0 END) AS pf_unknown_qty,
-           sum(CASE WHEN code IN (1, 16) THEN n_pay ELSE 0 END) AS zp_pay_qty,
-           sum(CASE WHEN code IN (1, 16) THEN n_unknown_qty ELSE 0 END) AS zp_unknown_qty,
-           sum(CASE WHEN code = 1 THEN amt_pos ELSE 0 END) AS salary_amt,
-           sum(CASE WHEN code = 16 THEN amt_pos ELSE 0 END) AS advance_amt,
-           sum(fot_counted) AS fot_counted,
-           bool_or(counted_fl) AS counted_fl,
-           bool_or(excluded_fl_threshold) AS has_excluded_fl_part
-    FROM tmp_sibur_calc WHERE in_holding AND relev AND amt_pos > 0
-    GROUP BY report_dt, epk_id, inn
-), by_person AS (
-    SELECT report_dt, epk_id, sum(portfolio_pay_qty) AS holding_portfolio_pay_qty,
-           sum(pf_unknown_qty) AS pf_unknown_qty,
-           sum(zp_pay_qty) AS holding_zp_pay_qty, sum(zp_unknown_qty) AS zp_unknown_qty
-    FROM by_org GROUP BY report_dt, epk_id
+-- 4. Количество ФЛ по месяцу и ИНН; каждый ФЛ учитывается один раз внутри ИНН.
+-- Частота ЗП/аванса: SUM(transaction_qty), коды 1/16, объединяем все ГОСБ.
+-- Считаем до отсечки 2500, чтобы не потерять вторую небольшую выплату.
+-- Неизвестная частота исключается из счётчиков: NULL -> 1 не доказывает одну выплату.
+-- Две выплаты — ровно две транзакции ЗП/аванса от данного ИНН за месяц.
+WITH persons AS (
+    SELECT report_dt, inn, epk_id,
+           sum(n_pay) AS pay_qty,
+           sum(CASE WHEN code = 16 THEN n_pay ELSE 0 END) AS advance_qty,
+           sum(CASE WHEN code = 1 THEN n_pay ELSE 0 END) AS salary_qty
+    FROM tmp_sibur_raw
+    WHERE in_holding AND relev AND amt_pos > 0 AND code IN (1, 16)
+    GROUP BY report_dt, inn, epk_id
+    HAVING sum(n_unknown_qty) = 0
 )
 SELECT
-    o.report_dt AS "Отчетный месяц",
-    o.epk_id AS "ЕПК ФЛ",
-    o.inn AS "ИНН плательщика",
-    o.zp_pay_qty AS "ЗП и авансы от ИНН, оценка",
-    p.holding_zp_pay_qty AS "ЗП и авансы холдинга, оценка",
-    CASE WHEN p.zp_unknown_qty = 0 THEN p.holding_zp_pay_qty END AS "ЗП и авансы холдинга, факт",
-    p.holding_portfolio_pay_qty AS "Выплаты холдинга, оценка",
-    CASE WHEN p.pf_unknown_qty = 0 THEN p.holding_portfolio_pay_qty END AS "Выплаты холдинга, факт",
-    p.holding_zp_pay_qty = 1 AS "Одна ЗП или аванс, оценка",
-    p.holding_portfolio_pay_qty = 1 AS "Одна выплата холдинга, оценка",
-    o.salary_amt AS "Заработная плата, руб.",
-    o.advance_amt AS "Аванс, руб.",
-    o.fot_counted AS "Учтенный ФОТ, руб.",
-    o.counted_fl AS "ФЛ учтен в портфеле",
-    o.has_excluded_fl_part AS "Есть отсеченные выплаты",
-    p.zp_unknown_qty AS "Строк без частоты ЗП и аванса",
-    CASE
-        WHEN p.zp_unknown_qty > 0
-             OR (p.holding_portfolio_pay_qty = 1 AND p.pf_unknown_qty > 0)
-            THEN 'Частота требует проверки: неизвестно количество транзакций'
-        WHEN p.holding_zp_pay_qty = 0
-            THEN 'Одна портфельная выплата иного вида; проверить регулярные ЗП/аванс'
-        WHEN o.advance_amt > 0
-            THEN 'Одна выплата: аванс; проверить перечисление ЗП в другой банк'
-        ELSE 'Одна выплата: ЗП; проверить перечисление аванса в другой банк'
-    END AS "Причина проверки",
-    CAST('Нет данных о зачислениях в другие банки; разделение не подтверждено' AS text) AS "Выплата в другой банк"
-FROM by_org o JOIN by_person p ON p.report_dt = o.report_dt AND p.epk_id = o.epk_id
-WHERE (p.holding_zp_pay_qty = 1 AND o.zp_pay_qty > 0)
-   OR (p.holding_portfolio_pay_qty = 1 AND o.portfolio_pay_qty > 0)
-ORDER BY o.epk_id, o.report_dt, o.inn;
-
+    m.report_dt AS "Дата",
+    i.inn AS "ИНН",
+    sum(CASE WHEN p.pay_qty = 1 AND p.advance_qty = 1
+             THEN 1 ELSE 0 END) AS "ФЛ с одной выплатой аванса",
+    sum(CASE WHEN p.pay_qty = 1 AND p.salary_qty = 1
+             THEN 1 ELSE 0 END) AS "ФЛ с одной выплатой ЗП",
+    sum(CASE WHEN p.pay_qty = 2 THEN 1 ELSE 0 END) AS "ФЛ с двумя выплатами"
+FROM tmp_sibur_months m
+CROSS JOIN tmp_sibur_inn i
+LEFT JOIN persons p ON p.report_dt = m.report_dt AND p.inn = i.inn
+GROUP BY m.report_dt, i.inn
+ORDER BY i.inn, m.report_dt;
