@@ -156,11 +156,13 @@ def simulate(seed: int = 1, n_orgs: int = 3000, gosb_per_tb: int = 6,
             "single_pay_recip": rng.binomial(pf.astype(int), 0.2), "multi_recip": multi,
             "one_time_pf": rng.binomial(pf.astype(int), 0.01),
             "m_base_pf": base, "m_in_from_outside": in_out, "m_in_returned": in_ret,
+            "m_in_temp_outside": temp_prev,
             "m_in_from_other_org": in_oth, "m_in_codes": in_codes,
             "m_out_left_bank": out_left, "m_lb_seasonal": seas, "m_lb_org_stopped": 0 * pf,
             "m_lb_one_time": one, "m_lb_unknown": out_left - seas - one,
             "m_out_to_other_org": out_oth, "m_out_codes": out_codes,
             "m_out_temp": temp if t < T - 1 else np.full(n, np.nan),
+            "m_out_temp_left": temp if t < T - 1 else np.full(n, np.nan),
             "m_fl_in": fl_in, "m_fl_out": fl_out, "m_fl_conc": (pf_fl - fl_prev) - fl_in + fl_out,
         }
         for m, v in vals.items():
@@ -391,12 +393,12 @@ def _inject_at_main(p: Panel, ev: Event) -> Panel:
         _add(p, rows, "y_in_from_outside", t, t + 11, n)
     elif k == "dip":
         rows = _rows(p, ev.row)
-        for m in ("m_out_left_bank", "m_lb_unknown", "m_out_temp", "m_fl_out"):
+        for m in ("m_out_left_bank", "m_lb_unknown", "m_out_temp", "m_out_temp_left", "m_fl_out"):
             _add(p, rows, m, t, t, n)
         for m in ("pf_recip", "pf_fl", "any_recip"):
             _add(p, rows, m, t, t, -n)
         _add(p, rows, "m_base_pf", t + 1, t + 1, -n)
-        for m in ("m_in_from_outside", "m_in_returned", "m_fl_in"):
+        for m in ("m_in_from_outside", "m_in_returned", "m_in_temp_outside", "m_fl_in"):
             _add(p, rows, m, t + 1, t + 1, n)
         _add(p, rows, "y_out_left_bank", t, t, n)
     elif k == "reorg":
@@ -632,8 +634,9 @@ def _inject_artifact(p: Panel, ev: Event) -> Panel:
             q.x[m][r, t] *= 1 - share
         if ev.kind == "calendar":
             _add(q, [r], "m_out_temp", t, t, n)
+            _add(q, [r], "m_out_temp_left", t, t, n)
             _add(q, [r], "m_base_pf", t + 1, t + 1, -n)
-            for m in ("m_in_from_outside", "m_in_returned"):
+            for m in ("m_in_from_outside", "m_in_returned", "m_in_temp_outside"):
                 _add(q, [r], m, t + 1, t + 1, n)
             _add(q, [r], "m_fl_in", t + 1, t + 1, fl)
             _add(q, [r], "y_out_left_bank", t, t, n)

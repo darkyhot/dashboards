@@ -28,6 +28,7 @@ import pandas as pd
 
 from .bench import Card
 from .inputs import Panel
+from .presentation import org_code
 
 FLOWS = {   # имя → (столбец, знак влияния на портфель)
     "in_outside": ("m_in_from_outside", +1),
@@ -50,12 +51,23 @@ SIZE_EDGES = [3_000, 10_000]
 # --------------------------------------------------------------------------- #
 # Ряды и ожидания
 # --------------------------------------------------------------------------- #
-def calendar_component(p: Panel) -> np.ndarray:
+def _exact_measure(p: Panel, name: str) -> np.ndarray:
+    if name not in p.x or not np.isfinite(p.x[name]).any():
+        raise ValueError(f"В поколении нет точной меры {name}. Нужна обновлённая сборка подложки; "
+                         "общий счётчик временных уходов не заменяет эту меру.")
+    return p.x[name]
+
+
+def calendar_component(p: Panel, *, legacy_replay: bool = False) -> np.ndarray:
     """Общая добавка временных уходов на базу. Ищется по большинству ТБ, с ростом
     одиночных выплат и подтверждённым возвратом. Отдельный провал организации
     этим правилом не снимается. Последний месяц без будущего не корректируется."""
     base = p.x["m_base_pf"]
-    temp = p.x["m_out_temp"]
+    # Старое правило разрешено только для воспроизведения уже полученного отчёта.
+    temp = p.x["m_out_temp"] if legacy_replay else _exact_measure(p, "m_out_temp_left")
+    left = p.x["m_out_left_bank"]
+    if not legacy_replay and np.any(np.isfinite(temp) & ((temp < 0) | (temp > left + 1e-6))):
+        raise ValueError("Временных уходов из банка больше общего ухода: противоречивое поколение")
     atoms = p.atoms
     tbs = p.meta.loc[atoms, "sys_tb_id"].to_numpy()
     keys = np.unique(tbs)
@@ -86,8 +98,10 @@ def flow_obs(p: Panel, f: str) -> np.ndarray:
     col = FLOWS[f][0]
     x = p.x[col].copy()
     if f == "in_outside":
-        back = np.zeros_like(x)
-        back[:, 1:] = np.nan_to_num(p.x["m_out_temp"][:, :-1])
+        back = _exact_measure(p, "m_in_temp_outside")
+        if np.any(np.isfinite(back) & ((back < 0) | (back > x + 1e-6))):
+            raise ValueError("Точных возвратов извне больше общего прихода: противоречивое поколение")
+        # Неизвестное пересечение не превращается в ноль или догадку по прошлому месяцу.
         x = x - back
     elif f == "out_left":
         x -= calendar_component(p)
@@ -199,7 +213,7 @@ def z_star(n_tests: int, past_z: list[np.ndarray]) -> float:
 # --------------------------------------------------------------------------- #
 # Уровень рядов (организации или атомы)
 # --------------------------------------------------------------------------- #
-def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict) -> dict:
+def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict, details: bool = False) -> dict:
     """Для каждой меры: оценка месяца t и порог z по эмпирическому нулю."""
     g = _groups(p, rows, t)
     tb = p.meta.loc[rows, "sys_tb_id"].to_numpy()
@@ -210,12 +224,33 @@ def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict) -> dict:
         obs = obs_all[f][rows]
         e = raw_expect(obs, base, g, tb)
         cur = score(obs, e, base, cls, t)
-        past = []
+        past, sources = [], []
         for h in range(max(HIST + 1, t - CALIB), t):
             sh = score(obs, e, base, cls, h)
             big = np.abs(sh["d"]) >= floor_of(sh["base"])
             past.append(np.nan_to_num(sh["z"][big]))
+            if details:
+                eligible = np.flatnonzero(big)
+                values = np.abs(np.nan_to_num(sh["z"][eligible]))
+                keep = min(len(values), int(FALSE_PER_LEVEL * CALIB) + 1)
+                selected = np.argpartition(values, len(values) - keep)[-keep:] if keep else []
+                for j in selected:
+                    i, r = int(eligible[j]), int(rows[eligible[j]])
+                    sources.append({"месяц": p.months[h],
+                        "ряд": org_code(r) if p.meta.at[r, "lvl"] == "org" else f"Атом R{r:05d}",
+                        "факт": float(sh["obs"][i]), "ожидание": float(sh["E"][i]),
+                        "шум": float(sh["s"][i]), "модуль z": float(values[j])})
         cur["zs"] = z_star(len(rows) * len(FLOWS), past)
+        if details:
+            normal = z_star(len(rows) * len(FLOWS), [])
+            sources.sort(key=lambda r: r["модуль z"], reverse=True)
+            k = int(FALSE_PER_LEVEL * len(past))
+            empirical = sources[k]["модуль z"] + 1e-9 if len(sources) > k else 0.
+            selected = sorted(set(range(min(3, len(sources)))) | ({k} if k < len(sources) else set()))
+            contributors = [{"ранг": i + 1, **sources[i],
+                             "задаёт порог": i == k and empirical >= normal} for i in selected]
+            cur["calibration"] = {"normal_z": normal, "empirical_z": empirical,
+                                  "history_months": len(past), "contributors": contributors}
         out[f] = cur
     return out
 
@@ -578,7 +613,7 @@ def _temporal(p: Panel, atoms: np.ndarray, obs: dict, t: int) -> list[Card]:
                 continue
             label = None
             if f == "out_left" and d > 0:
-                temp = np.nansum(p.x["m_out_temp"][rows], axis=0)
+                temp = np.nansum(p.x["m_out_temp_left"][rows], axis=0)
                 single = np.nansum(p.x["single_pay_recip"][rows], axis=0)
                 temp_d = temp[t] - temp[t - 12] * (base[t] / max(base[t - 12], 1))
                 if np.isfinite(temp_d) and temp_d >= 0.5 * d and single[t] > single[t - 1]:
@@ -602,7 +637,7 @@ def where(p: Panel, c: Card) -> str:
     if c.level in ("org", "atom"):
         m = p.meta.iloc[c.key]
         place = f"{m['seg_rep']}, ТБ {m['sys_tb_id']}, ГОСБ {m['sys_gosb_id']}"
-        return f"организация {m['org_id']} (главная ячейка: {place})" if c.level == "org" else place
+        return f"{org_code(c.key)} (главная ячейка: {place})" if c.level == "org" else place
     return {"gosb": f"ГОСБ {c.key}", "tb": f"ТБ {c.key}", "seg": f"сегмент {c.key}",
             "bank": "банк"}[c.level]
 

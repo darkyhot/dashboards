@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import bench, diagnostics, watch
+from . import bench, diagnostics, presentation, watch
 from .inputs import Panel
 
 
@@ -34,7 +34,7 @@ def _plain(value):
 def fingerprint() -> dict[str, str]:
     folder = Path(__file__).parent
     return {name: hashlib.sha256((folder / name).read_bytes()).hexdigest()
-            for name in ("inputs.py", "bench.py", "watch.py", "diagnostics.py", "acceptance.py")}
+            for name in ("inputs.py", "bench.py", "watch.py", "diagnostics.py", "acceptance.py", "presentation.py")}
 
 
 def quality(p: Panel) -> pd.DataFrame:
@@ -42,7 +42,7 @@ def quality(p: Panel) -> pd.DataFrame:
     records = []
     for name, x in p.x.items():
         relevant = active.copy()
-        if name == "m_out_temp":
+        if name in ("m_out_temp", "m_out_temp_left"):
             relevant[:, -1] = False  # нет следующего месяца — не дефект заполнения
         records.append({"мера": name, "сравнимых ячеек": int(relevant.sum()),
                         "пустых среди сравнимых": int((relevant & ~np.isfinite(x)).sum()),
@@ -90,10 +90,12 @@ def _missed_details(p, result, limit):
         target = int(row["row"])
         rows = p.orgs if p.meta.at[target, "lvl"] == "org" else p.atoms
         i = int(np.flatnonzero(rows == target)[0])
-        records = []
+        records, calibration = [], {}
         for when, panel in (("до", p), ("после", q)):
             obs = {f: watch.flow_obs(panel, f) for f in watch.FLOWS}
-            scans = watch.scan_rows(panel, rows, ev.t, obs)
+            scans = watch.scan_rows(panel, rows, ev.t, obs, details=when == "после")
+            if when == "после":
+                calibration = {f: s["calibration"] for f, s in scans.items()}
             picked = {rr: f for rr, f, *_ in watch.pick(scans, rows)}.get(target)
             for f, s in scans.items():
                 records.append({"когда": when, "поток": f, "факт": s["obs"][i],
@@ -101,6 +103,7 @@ def _missed_details(p, result, limit):
                                 "сверх шума": abs(s["d"][i]) - s["zs"] * s["s"][i],
                                 "минимум": watch.floor_of(s["base"][i]), "выбран": picked == f})
         reports.append({"event": ev, "target": target, "size_sigma": row["effective_k"],
+                        "measure": row["measure"], "calibration": calibration,
                         "where": watch.where(p, bench.Card(p.meta.at[target, "lvl"], target, "net", 0)),
                         "table": pd.DataFrame(records).round(2)})
         if len(reports) >= limit:
@@ -115,6 +118,7 @@ def _table(frame):
 
 
 def _write_html(path, data):
+    data = presentation.mask(data)
     check = data["checks"]
     passed = bool(check["пройдена"].all())
     body = ["<h1>Приёмка сторожа</h1>",
@@ -145,8 +149,13 @@ def _write_html(path, data):
     for item in data["missed_details"]:
         ev = item["event"]
         body += ["<details><summary>" + html.escape(
-            f'{ev.kind}, {data["input"]["months"][ev.t]}, {ev.n} человек, {item["where"]}') + "</summary>",
-            _table(item["table"]), "</details>"]
+            f'{ev["kind"]}, {data["input"]["months"][ev["t"]]}, {ev["n"]} человек, {item["where"]}') + "</summary>",
+            _table(item["table"])]
+        calibration = item.get("calibration", {}).get(presentation.target_flow(item))
+        if calibration:
+            body += ["<p>Источники исторического порога:</p>",
+                     _table(pd.DataFrame(calibration["contributors"]))]
+        body.append("</details>")
     for title, frame in (("Ошибки закладки", data["invalid"]), ("Пропущенные попытки закладки", data["skipped"]),
                          ("Заполнение мер", data["quality"]),
                          ("Полнота разметки причин ухода", data["reason_partition"]), ("Все цели испытаний", data["recall"]),
@@ -201,6 +210,7 @@ def run(p: Panel, out_dir="output/watch_acceptance", compare=True, known_clean=F
             "reason_partition": reason_partition(p),
             "recode_diagnostics": recode_details, "missed_details": _missed_details(p, result, max_details),
             "invalid": result["invalid"], "skipped": result["skipped"]}
+    data = presentation.mask(data, p)
     # Сохраняем результат сторожа до сравнения: уже есть полный файл, даже если
     # последующий долгий расчёт соперника будет остановлен пользователем.
     paths = {"html": folder / "report.html", "json": folder / "report.json"}

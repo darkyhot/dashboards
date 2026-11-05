@@ -246,6 +246,8 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
                 else:
                     x = "in_new_bank"
                 L[(mi, o, g)][x] += 1
+                if kk == 1 and mi - 2 in p_m[trip] and x in ("in_new_bank", "in_returned"):
+                    L[(mi, o, g)]["in_temp_outside"] += 1
                 if not p_by_pm.get((B, e)):
                     L[(mi, o, g)]["fl_in"] += 1.0 / len(p_by_pm[(mi, e)])
                 if kk == 1 and x.startswith("in_oth_"):
@@ -273,6 +275,8 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
                 if not p_by_pm.get((m2, e)):
                     L[(m2, o, g)]["fl_out"] += 1.0 / len(p_by_pm[(mi, e)])
                 L[(m2, o, g)]["out_temp"] += (m2 + 1) in p
+                if x.startswith("lb_") and (m2 + 1) in p:
+                    L[(m2, o, g)]["out_temp_left"] += 1
                 L[(m2, o, g)]["out_ten_" + _ten(p, mi)] += 1
                 if kk == 1 and x.startswith("out_oth_"):
                     moves_out[(m2, e)].append((o, g))
@@ -363,6 +367,8 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
                 row[f"{b}_{c}"] = val[c] if ok else None
         Lm = lab["m"].get(key, {})
         row["m_out_temp"] = Lm.get("out_temp", 0) if mi - 1 >= cmp0 and mi + 1 <= last else None
+        row["m_out_temp_left"] = Lm.get("out_temp_left", 0) if mi - 1 >= cmp0 and mi + 1 <= last else None
+        row["m_in_temp_outside"] = Lm.get("in_temp_outside", 0) if mi - 2 >= cmp0 else None
         for tt in Q.TEN:
             row[f"m_out_ten_{tt}"] = (Lm.get(f"out_ten_{tt}", 0)
                                       if mi - 1 >= cmp0 and mi - 1 - MEM >= 0 else None)

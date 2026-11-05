@@ -95,7 +95,10 @@ def load(conn, run_id: int | None = None) -> Panel:
     p = from_frames(months, pd.concat(atoms, ignore_index=True), pd.concat(orgs, ignore_index=True))
     p.run_id = run_id
     empty = [m for m in MEAS if np.isnan(p.x[m]).all()]
-    if empty:
+    if empty and set(empty) <= {"m_in_temp_outside", "m_out_temp_left"}:
+        print("Старое поколение: нет точных мер маршрутов возврата. "
+              "Диагностика старого отчёта доступна; новый сторож требует обновлённой сборки.")
+    elif empty:
         print(f"ВНИМАНИЕ: в поколении прогона {run_id} пусты меры {', '.join(empty)} — прогон "
               "был до их добавления. Сторож без них ошибается; нужен новый прогон подложки.")
     return p

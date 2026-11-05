@@ -70,7 +70,8 @@ def base_cols(b: str) -> list[str]:
     return [c for c in cols if not (b == "y" and c == "lb_seasonal")]
 
 
-M_ONLY = ["m_out_temp", "m_out_ten_lt3", "m_out_ten_3_12", "m_out_ten_12p"]
+M_ONLY = ["m_out_temp", "m_out_temp_left", "m_in_temp_outside",
+          "m_out_ten_lt3", "m_out_ten_3_12", "m_out_ten_12p"]
 
 
 def final_columns() -> list[str]:
@@ -313,7 +314,9 @@ SELECT c.mi, c.epk_id, c.org_id, c.gosb_id,
                       ELSE 'in_oth_other' END
             WHEN """ + rng("pr.b_p", "c.mi - :k - 12", "c.mi - :k - 1") + """ <> 0 THEN 'in_returned'
             ELSE 'in_new_bank' END                                         AS lab,
-       CASE WHEN pb.k_pf IS NULL THEN CAST(1.0 / pc.k_pf AS float8) ELSE 0 END AS fl
+       CASE WHEN pb.k_pf IS NULL THEN CAST(1.0 / pc.k_pf AS float8) ELSE 0 END AS fl,
+       CASE WHEN :k = 1 AND """ + bit("th.b_p", "c.mi - 2") + """ = 1
+            THEN 1 ELSE 0 END AS in_temp
 FROM t_tr c
 JOIN t_pm pc ON pc.epk_id = c.epk_id AND pc.mi = c.mi
 JOIN t_thist th ON """ + _tj("th", "c") + """
@@ -371,13 +374,17 @@ def _count_cols(col: str, labels: list[str], prefix: str = "") -> str:
 
 def agg_in(part: str) -> str:
     return (f"SELECT mi, org_id, gosb_id,\n       {_count_cols('lab', IN_LABELS)},\n"
-            f"       sum(fl) AS fl_in\nFROM {part}\nGROUP BY mi, org_id, gosb_id")
+            f"       sum(fl) AS fl_in,\n"
+            f"       sum(CASE WHEN lab IN ('in_new_bank', 'in_returned') THEN in_temp ELSE 0 END) "
+            f"AS in_temp_outside\nFROM {part}\nGROUP BY mi, org_id, gosb_id")
 
 
 def agg_out(part: str) -> str:
     return (f"SELECT mi, org_id, gosb_id,\n       {_count_cols('lab', OUT_LABELS)},\n"
             f"       {_count_cols('ten', TEN, 'out_ten_')},\n"
-            f"       sum(fl) AS fl_out, sum(out_temp) AS out_temp\nFROM {part}\nGROUP BY mi, org_id, gosb_id")
+            f"       sum(fl) AS fl_out, sum(out_temp) AS out_temp,\n"
+            f"       sum(CASE WHEN lab LIKE 'lb_%' THEN out_temp ELSE 0 END) "
+            f"AS out_temp_left\nFROM {part}\nGROUP BY mi, org_id, gosb_id")
 
 
 # --------------------------------------------------------------------------- #
@@ -530,6 +537,10 @@ def final_select() -> str:
                   f"LEFT JOIN t_out_{b} o_{b} ON o_{b}.mi = k.mi AND " + kj.format(a=f"o_{b}")]
     sel.append("CASE WHEN k.mi - 1 >= :cmp0 AND k.mi + 1 <= :last "
                "THEN COALESCE(o_m.out_temp, 0) END AS m_out_temp")
+    sel.append("CASE WHEN k.mi - 1 >= :cmp0 AND k.mi + 1 <= :last "
+               "THEN COALESCE(o_m.out_temp_left, 0) END AS m_out_temp_left")
+    sel.append("CASE WHEN k.mi - 2 >= :cmp0 "
+               "THEN COALESCE(i_m.in_temp_outside, 0) END AS m_in_temp_outside")
     for t in TEN:
         sel.append(f"CASE WHEN k.mi - 1 >= :cmp0 AND k.mi - 1 - {MEM} >= 0 "
                    f"THEN COALESCE(o_m.out_ten_{t}, 0) END AS m_out_ten_{t}")
@@ -648,6 +659,7 @@ VINT_MEAS = {
     "one_time_pf": "one_time_pf",
     "m_base_pf": "m_base_pf", "m_in_from_outside": "m_in_from_outside",
     "m_in_returned": "m_in_returned",
+    "m_in_temp_outside": "m_in_temp_outside",
     "m_in_from_other_org": "m_in_from_other_org",
     "m_in_codes": "m_in_from_nonzp + m_in_from_zp_out",
     "m_out_left_bank": "m_out_left_bank", "m_lb_unknown": "m_lb_unknown",
@@ -655,6 +667,7 @@ VINT_MEAS = {
     "m_lb_one_time": "m_lb_one_time",
     "m_out_to_other_org": "m_out_to_other_org", "m_out_codes": "m_out_to_nonzp + m_out_zp_out",
     "m_out_temp": "m_out_temp",
+    "m_out_temp_left": "m_out_temp_left",
     "m_fl_in": "m_fl_in", "m_fl_out": "m_fl_out", "m_fl_conc": "m_fl_conc",
     "y_base_pf": "y_base_pf", "y_in_from_outside": "y_in_from_outside",
     "y_in_from_other_org": "y_in_from_other_org", "y_in_codes": "y_in_from_nonzp + y_in_from_zp_out",

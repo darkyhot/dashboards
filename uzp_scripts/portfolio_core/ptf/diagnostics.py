@@ -1,11 +1,121 @@
 """Короткая диагностика на уже загруженной панели, без БД и полного стенда."""
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 
 from . import bench, watch
 from .inputs import Panel
+from .presentation import org_code
+
+
+def august_calendar_case(p: Panel, year: int = 2026) -> dict:
+    """C01: факты июля–сентября двух лет, без БД, детектора и оценки причины.
+
+    Суммируются только атомы. Неизвестная мера среди активных атомов не становится
+    нулём или неполной банковской суммой. Доли ФЛ и счётчики совместительства
+    сохраняют свои единицы и не выдаются за уникальных людей сегмента.
+    """
+    months = {m[:7]: t for t, m in enumerate(p.months)}
+    stocks = {"pf_recip": "Получатели (тройки)", "pf_fl": "ФЛ (доли)",
+              "multi_recip": "Совмест. (тройки)"}
+    indicators = {"single_pay_recip": "Одна выплата (тройки)",
+                  "m_out_temp": "Пропуск и возврат в М+1", "m_in_returned": "Вернулись извне"}
+    measures = {**stocks, **indicators}
+    values, issues, checks = [], [], []
+    normalized = {f: watch.flow_obs(p, f) for f in ("in_outside", "out_left")}
+    for y in (year - 1, year):
+        for month in (7, 8, 9):
+            key = f"{y}-{month:02d}"
+            t = months.get(key)
+            row = {"Месяц": key}
+            active = np.isfinite(p.x["pf_recip"][p.atoms, t]) if t is not None else np.zeros(len(p.atoms), bool)
+            for measure, label in measures.items():
+                v = p.x[measure][p.atoms, t] if t is not None else np.full(len(p.atoms), np.nan)
+                missing = active & ~np.isfinite(v)
+                row[label] = float(v[active].sum()) if active.any() and not missing.any() else np.nan
+                if not active.any() or missing.any():
+                    why = "нет месяца" if t is None else "нет активных атомов" if not active.any() else "неполная мера"
+                    if measure == "m_out_temp" and t == len(p.months) - 1:
+                        why = "нет следующего месяца для подтверждения"
+                    issues.append({"Месяц": key, "Мера": measure, "Причина": why,
+                                   "Нет значений": int(missing.sum())})
+            values.append(row)
+            check = {"Месяц": key}
+            for f, obs in normalized.items():
+                for level, rows in (("атом", p.atoms), ("орг", p.orgs)):
+                    check[f"{f}: {level}, <0"] = int(np.sum(obs[rows, t] < -1e-6)) if t is not None else np.nan
+            checks.append(check)
+    frame = pd.DataFrame(values)
+
+    def changes(labels):
+        records = []
+        for i, month in enumerate((7, 8, 9)):
+            before, after = frame.iloc[i], frame.iloc[i + 3]
+            records.append({"Месяц": f"{year}-{month:02d}",
+                            **{label: after[label] - before[label] for label in labels}})
+        return pd.DataFrame(records)
+
+    names = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+    calendar = "; ".join(f"{d:%d.%m.%Y} — {names[d.weekday()]}" for d in
+                         (date(year - 1, 8, 1), date(year, 7, 31), date(year, 8, 1)))
+    return {"case_id": "C01", "year": year, "calendar": calendar, "run_id": p.run_id,
+            "stocks": frame[["Месяц", *stocks.values()]], "stock_changes": changes(stocks.values()),
+            "indicators": frame[["Месяц", *indicators.values()]], "indicator_changes": changes(indicators.values()),
+            "normalization": pd.DataFrame(checks), "availability": pd.DataFrame(issues),
+            "notes": ["Наблюдаемые атомы банка; полнота самой загрузки проверяется по журналу.",
+                      "Доли ФЛ и тройки — разные единицы. Счётчик совместителей не равен числу дополнительных работ.",
+                      "Одна выплата и совместительство могут пересекаться; размер пересечения в поколении не сохранён.",
+                      "m_out_temp охватывает временные уходы разных типов, а не только уход из банка.",
+                      "Вернулись извне — часть прихода извне; это не все возвраты временно исчезнувших троек.",
+                      "Разности год к году здесь не являются причинным разложением календарного эффекта."]}
+
+
+def threshold_snapshot(p: Panel, data: dict) -> dict:
+    """Один разбор порогов по уже загруженной панели. БД и закладки не запускаются.
+    Выбирается месяц самого большого порога среди сохранённых пропусков.
+    """
+    from . import presentation
+
+    header = data.get("input")
+    if header and (header["months"] != p.months or header["atoms"] != len(p.atoms)
+                   or header["organizations"] != len(p.orgs)
+                   or (header.get("run_id") is not None and p.run_id is not None and header["run_id"] != p.run_id)):
+        raise ValueError("Панель и отчёт относятся к разным поколениям. Нужен panel из того же запуска приёмки.")
+    data = presentation.mask(data, p)
+    selected, maximum = None, -1.
+    for item in data.get("missed_details", []):
+        table = pd.DataFrame(item["table"])
+        flow = presentation.target_flow(item)
+        values = table.loc[(table["когда"] == "после") & (table["поток"] == flow), "порог z"]
+        if len(values) and np.isfinite(values.iloc[0]) and values.iloc[0] > maximum:
+            selected, maximum = item, float(values.iloc[0])
+    t = selected["event"]["t"] if selected else len(p.months) - 1
+    level = p.meta.at[selected["target"], "lvl"] if selected else ("org" if len(p.orgs) else "atom")
+    rows = p.orgs if level == "org" else p.atoms
+    legacy = any(m not in p.x or not np.isfinite(p.x[m]).any()
+                 for m in ("m_in_temp_outside", "m_out_temp_left"))
+    if legacy:
+        # Воспроизводим старый JSON, не запуская сторож на неподходящем поколении.
+        obs = {f: p.x[col].copy() for f, (col, _) in watch.FLOWS.items()}
+        obs["in_outside"][:, 1:] -= np.nan_to_num(p.x["m_out_temp"][:, :-1])
+        obs["out_left"] -= watch.calendar_component(p, legacy_replay=True)
+    else:
+        obs = {f: watch.flow_obs(p, f) for f in watch.FLOWS}
+    scans = watch.scan_rows(p, rows, t, obs, details=True)
+    priority = presentation.target_flow(selected) if selected else None
+    summary, sources = [], []
+    for flow, s in scans.items():
+        c = s["calibration"]
+        summary.append({"Поток": flow, "Нормальный z": c["normal_z"],
+                        "Исторический z": c["empirical_z"], "Итоговый z": s["zs"]})
+        sources.append({"flow": flow, "threshold": s["zs"], "normal": c["normal_z"],
+                        "contributors": pd.DataFrame(c["contributors"])})
+    sources.sort(key=lambda s: (s["flow"] != priority, -s["threshold"]))
+    return {"month": p.months[t], "level": level, "summary": pd.DataFrame(summary), "sources": sources,
+            "legacy_replay": legacy}
 
 
 def recode_event(p: Panel, seed: int = 7, months_back: int = 6,
@@ -36,7 +146,7 @@ def recode_report(p: Panel, event=None, before=None, after=None, **params) -> di
     extra = bench.extra_cards(after, before, p=p, changed=q, t=t)
     org_cards = [c for c in after if c.level == "org" and c.key == r]
     facts = [
-        ("месяц", p.months[t]), ("id орг", p.meta.at[r, "org_id"]),
+        ("месяц", p.months[t]), ("организация", org_code(r)),
         ("людей в закладке", ev.n),
         ("источник", watch.where(p, bench.Card("atom", src, "out_other", 0))),
         ("приёмник", watch.where(p, bench.Card("atom", ev.row2, "in_other", 0))),
