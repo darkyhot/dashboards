@@ -70,7 +70,8 @@ class WatchRegressionTests(unittest.TestCase):
         self.assertTrue(any(c.level == "org" and c.key == org and c.delta < -10_000
                             for c in cards))
         for c in cards:
-            if c.level == "atom" and c.key in (0, 1) and c.measure == "out_codes":
+            if (c.level == "atom" and c.key in (0, 1) and c.measure == "out_codes"
+                    and c.info.get("scope", "all") == "all"):
                 self.assertLess(c.delta, 0)
                 self.assertEqual(c.obs, p.x["m_out_codes"][c.key, -1])
         self.assertTrue(seen_atoms)
@@ -254,6 +255,8 @@ class WatchRegressionTests(unittest.TestCase):
         p = self.panel.copy()
         r, branch = int(p.orgs[0]), 15
         p.x["m_out_codes"][r, -1] = 20
+        p.org_flows.at[(r, 32, 0), "out_codes"] = 12.
+        p.org_flows.at[(r, 32, 1), "out_codes"] = 8.
         p.x["m_out_codes"][:2, -1] = 200
         for m in ("pf_recip", "pf_fl", "m_base_pf"):
             p.x[m][r] += 1_000_000

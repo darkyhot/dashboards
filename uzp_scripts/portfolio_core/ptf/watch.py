@@ -9,11 +9,13 @@
 ТБ их снимает. Для банка и сегмента других ТБ нет — там ожидание по тому же месяцу год
 назад с поправкой на текущий уровень, а найденное подписывается по признакам.
 
-**Шум** — пуассоновский с «комковатостью» организаций: s² = E + κ²E², κ по классу
-размера из прошлых месяцев. **Отбор** — нижняя граница лишних людей
-L = |факт − ожидание| − z·s ≥ max(100, 0,1% базы); порог каждого потока учитывает число
-проверок и прошлые отклонения. Эмпирический бюджет — 0,5 на поток в месяц;
-общее число ложных тревог по всем потокам и уровням проверяет стенд.
+**Шум** — положительная модель log(1 + поток), собственный и групповой MAD.
+**Отбор** — расстояние в людях за границу прогнозного интервала не меньше
+max(100, 0,1% базы). Центр прошлых ошибок калибрует масштаб; отдельный исторический
+выброс общий порог не задаёт. Номинальный бюджет — 0,5 на уровень, 2,5
+на пять уровней вместе; фактические ложные тревоги проверяются стендом. Общий атом и
+остаток вне крупных организаций делят бюджет атомов и один порог материальности.
+Старое счётчиковое правило доступно только для воспроизведения старых отчётов.
 
 **Порядок**: организации → атомы (включая недогруз ТБ) → ГОСБ и ТБ → банк и сегменты.
 Все уровни считаются по исходным наблюдениям. Повторные карточки убираются только
@@ -27,7 +29,7 @@ import numpy as np
 import pandas as pd
 
 from .bench import Card
-from .inputs import Panel
+from .inputs import Panel, residual_panel
 from .presentation import org_code
 
 FLOWS = {   # имя → (столбец, знак влияния на портфель)
@@ -43,6 +45,7 @@ CALIB = 12           # месяцев для эмпирического нуля
 MIN_PEOPLE = 100
 MIN_SHARE = 0.001
 FALSE_PER_LEVEL = 0.5
+LEGACY_FALSE_PER_LEVEL = 0.5
 PRIOR = 20.0         # сила подтягивания сдвига к 1, в ожидаемых людях
 MAX_CARDS = 25
 SIZE_EDGES = [3_000, 10_000]
@@ -77,10 +80,18 @@ def _exact_measure(p: Panel, name: str) -> np.ndarray:
     return p.x[name]
 
 
-def calendar_component(p: Panel, *, legacy_replay: bool = False) -> np.ndarray:
+def calendar_component(p: Panel, *, legacy_replay: bool = False,
+                       reference: Panel | None = None) -> np.ndarray:
     """Общая добавка временных уходов на базу. Ищется по большинству ТБ, с ростом
     одиночных выплат и подтверждённым возвратом. Отдельный провал организации
     этим правилом не снимается. Последний месяц без будущего не корректируется."""
+    allocation_base = p.x["m_base_pf"]
+    allocation_temp = p.x["m_out_temp"] if legacy_replay else _exact_measure(p, "m_out_temp_left")
+    if not legacy_replay and np.any(np.isfinite(allocation_temp) & (
+            (allocation_temp < 0) | (allocation_temp > p.x["m_out_left_bank"] + 1e-6))):
+        raise ValueError("Временных уходов из банка больше общего ухода: противоречивое поколение")
+    if reference is not None:
+        p = reference
     base = p.x["m_base_pf"]
     # Старое правило разрешено только для воспроизведения уже полученного отчёта.
     temp = p.x["m_out_temp"] if legacy_replay else _exact_measure(p, "m_out_temp_left")
@@ -90,7 +101,7 @@ def calendar_component(p: Panel, *, legacy_replay: bool = False) -> np.ndarray:
     atoms = p.atoms
     tbs = p.meta.loc[atoms, "sys_tb_id"].to_numpy()
     keys = np.unique(tbs)
-    result = np.zeros_like(base)
+    result = np.zeros_like(allocation_base)
     if len(keys) < 3:
         return result
     b = np.array([np.nansum(base[atoms[tbs == k]], axis=0) for k in keys])
@@ -107,11 +118,15 @@ def calendar_component(p: Panel, *, legacy_replay: bool = False) -> np.ndarray:
             continue
         common = float(np.median(delta[valid]))
         if common > 0:
-            result[:, t] = np.minimum(np.nan_to_num(temp[:, t]), common * np.nan_to_num(base[:, t]))
+            if legacy_replay:
+                result[:, t] = np.minimum(np.nan_to_num(allocation_temp[:, t]),
+                                          common * np.nan_to_num(allocation_base[:, t]))
+            else:
+                result[:, t] = np.minimum(allocation_temp[:, t], common * allocation_base[:, t])
     return result
 
 
-def flow_obs(p: Panel, f: str) -> np.ndarray:
+def flow_obs(p: Panel, f: str, *, calendar_reference: Panel | None = None) -> np.ndarray:
     """Факт меры по всем рядам и месяцам. «Пришли извне» — без вернувшихся из провала
     прошлого месяца (они уже объяснены «ушёл и вернулся»)."""
     col = FLOWS[f][0]
@@ -123,7 +138,7 @@ def flow_obs(p: Panel, f: str) -> np.ndarray:
         # Неизвестное пересечение не превращается в ноль или догадку по прошлому месяцу.
         x = x - back
     elif f == "out_left":
-        x -= calendar_component(p)
+        x -= calendar_component(p, reference=calendar_reference)
     return x
 
 
@@ -198,7 +213,7 @@ def kappa2(obs: np.ndarray, e: np.ndarray, th: np.ndarray, t: int, cls: np.ndarr
     return out
 
 
-def score(obs: np.ndarray, e: np.ndarray, base: np.ndarray, cls: np.ndarray, t: int,
+def _count_score(obs: np.ndarray, e: np.ndarray, base: np.ndarray, cls: np.ndarray, t: int,
           *, legacy_replay: bool = False) -> dict:
     """Факт, ожидание, шум и z месяца t (по данным до t). Шум — не меньше собственного
     разброса ряда в прошлом (устойчивая оценка): ряд, где сидит «комковатая»
@@ -229,13 +244,14 @@ def floor_of(base: np.ndarray) -> np.ndarray:
     return np.maximum(MIN_PEOPLE, MIN_SHARE * np.nan_to_num(base))
 
 
-def z_star(n_tests: int, past_z: list[np.ndarray]) -> float:
-    """Порог: поправка на число проверок и эмпирический нуль (≤ 0,5 в месяц в прошлом)."""
-    zb = NormalDist().inv_cdf(1 - FALSE_PER_LEVEL / 2 / max(n_tests, 1))
+def z_star(n_tests: int, past_z: list[np.ndarray], budget: float | None = None) -> float:
+    """Поправка на число проверок; прежний хвост используется только в replay."""
+    budget = FALSE_PER_LEVEL if budget is None else budget
+    zb = NormalDist().inv_cdf(1 - budget / 2 / max(n_tests, 1))
     if not past_z:
         return zb
     pool = np.sort(np.abs(np.concatenate(past_z)))[::-1]
-    k = int(FALSE_PER_LEVEL * len(past_z))
+    k = int(budget * len(past_z))
     ze = pool[k] + 1e-9 if len(pool) > k else 0.0
     return max(zb, ze)
 
@@ -243,7 +259,7 @@ def z_star(n_tests: int, past_z: list[np.ndarray]) -> float:
 # --------------------------------------------------------------------------- #
 # Уровень рядов (организации или атомы)
 # --------------------------------------------------------------------------- #
-def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict, details: bool = False,
+def _count_scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict, details: bool = False,
               *, legacy_replay: bool = False) -> dict:
     """Для каждой меры: оценка месяца t и порог z по эмпирическому нулю."""
     g = _groups(p, rows, t)
@@ -254,11 +270,11 @@ def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict, details: bool =
     for f in FLOWS:
         obs = obs_all[f][rows]
         e = raw_expect(obs, base, g, tb)
-        cur = score(obs, e, base, cls, t, legacy_replay=legacy_replay)
+        cur = _count_score(obs, e, base, cls, t, legacy_replay=legacy_replay)
         past, sources, excluded = [], [], []
         excluded_count = 0
         for h in range(max(HIST + 1, t - CALIB), t):
-            sh = score(obs, e, base, cls, h, legacy_replay=legacy_replay)
+            sh = _count_score(obs, e, base, cls, h, legacy_replay=legacy_replay)
             big = np.abs(sh["d"]) >= floor_of(sh["base"])
             admissible = np.ones(len(rows), dtype=bool) if legacy_replay else sh["E"] >= MIN_NULL_MEAN
             eligible = big & admissible
@@ -283,11 +299,11 @@ def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict, details: bool =
                         "ряд": org_code(r) if p.meta.at[r, "lvl"] == "org" else f"Атом R{r:05d}",
                         "факт": float(sh["obs"][i]), "ожидание": float(sh["E"][i]),
                         "шум": float(sh["s"][i]), "модуль z": float(values[j])})
-        cur["zs"] = z_star(len(rows) * len(FLOWS), past)
+        cur["zs"] = z_star(len(rows) * len(FLOWS), past, LEGACY_FALSE_PER_LEVEL)
         if details:
-            normal = z_star(len(rows) * len(FLOWS), [])
+            normal = z_star(len(rows) * len(FLOWS), [], LEGACY_FALSE_PER_LEVEL)
             sources.sort(key=lambda r: r["модуль z"], reverse=True)
-            k = int(FALSE_PER_LEVEL * len(past))
+            k = int(LEGACY_FALSE_PER_LEVEL * len(past))
             empirical = sources[k]["модуль z"] + 1e-9 if len(sources) > k else 0.
             selected = sorted(set(range(min(3, len(sources)))) | ({k} if k < len(sources) else set()))
             contributors = [{"ранг": i + 1, **sources[i],
@@ -302,11 +318,32 @@ def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict, details: bool =
     return out
 
 
+def score(obs, e, base, cls, t, *, legacy_replay=False):
+    if legacy_replay:
+        return _count_score(obs, e, base, cls, t, legacy_replay=True)
+    from .count_model import score as positive_score
+    return positive_score(obs, e, base, cls, t)
+
+
+def scan_rows(p, rows, t, obs_all, details=False, *, legacy_replay=False):
+    if legacy_replay:
+        return _count_scan_rows(p, rows, t, obs_all, details, legacy_replay=True)
+    from .count_model import scan_rows as positive_scan
+    return positive_scan(p, rows, t, obs_all, details)
+
+
+def excess(sc):
+    if "upper" in sc:
+        return np.where(np.isfinite(sc["d"]),
+                        np.maximum(sc["obs"] - sc["upper"], sc["lower"] - sc["obs"]), np.nan)
+    return np.abs(sc["d"]) - sc["zs"] * sc["s"]
+
+
 def pick(scan: dict, rows: np.ndarray) -> list[tuple]:
     """(ряд, мера, L, d) для прошедших отбор; одна лучшая мера на ряд."""
     best = {}
     for f, sc in scan.items():
-        L = np.abs(sc["d"]) - sc["zs"] * sc["s"]
+        L = excess(sc)
         ok = (L >= floor_of(sc["base"])) & np.isfinite(L)
         for i in np.flatnonzero(ok):
             r = int(rows[i])
@@ -325,7 +362,7 @@ def _qualified(scan: dict, i: int) -> dict:
     """Все прошедшие отбор потоки строки, даже если заголовок карточки один."""
     result = {}
     for f, s in scan.items():
-        L = abs(s["d"][i]) - s["zs"] * s["s"][i]
+        L = excess(s)[i]
         if np.isfinite(L) and L >= floor_of(s["base"][i]):
             result[f] = {"obs": float(s["obs"][i]), "exp": float(s["E"][i]),
                          "delta": FLOWS[f][1] * float(s["d"][i]), "score": float(L)}
@@ -351,6 +388,8 @@ def _contained(p: Panel, t: int, child: Card, level: str, key, f: str) -> bool:
                 or scopes[child.key, t - 1] == key)
     if child.level == "atom" and level in ("gosb", "tb"):
         return p.meta.at[child.key, "sys_" + level + "_id"] == key
+    if child.level == "atom" and level == "atom":
+        return child.key == key and child.info.get("scope") == "other_orgs"
     if child.level == "gosb" and level == "tb":
         rows = p.meta.loc[p.atoms]
         tbs = rows.loc[rows["sys_gosb_id"] == child.key, "sys_tb_id"]
@@ -412,11 +451,12 @@ def _cell_recodes(p: Panel, t: int) -> list[Card]:
     if p.org_flows.empty or t < 4:
         return []
     try:
-        current = p.org_flows.xs(t, level="t").copy()
+        current = p.org_flows.xs(t, level="t")[["in_other", "out_other"]].copy()
     except KeyError:
         return []
     times = p.org_flows.index.get_level_values("t")
-    history = p.org_flows.loc[(times >= max(0, t - HIST)) & (times < t)].reset_index(level="t", drop=True)
+    history = p.org_flows.loc[(times >= max(0, t - HIST)) & (times < t),
+                             ["in_other", "out_other"]].reset_index(level="t", drop=True)
     med = history.groupby(level=["row", "atom"]).median()
     mad = (history - med.reindex(history.index)).abs().groupby(level=["row", "atom"]).median() * 1.4826
     center = med.reindex(current.index).fillna(0.)
@@ -493,9 +533,12 @@ def _covered(p: Panel, t: int, level: str, key, f: str, d: float,
             continue
         if not _contained(p, t, c, level, key, f):
             value = _recode_part(p, t, c, level, key, f, value)
-        level_units = units.setdefault(c.level, {})
+        unit = "other_orgs" if c.info.get("scope") == "other_orgs" else c.level
+        level_units = units.setdefault(unit, {})
         level_units[c.key] = max(level_units.get(c.key, 0.), abs(value))
-    amount = max((sum(v.values()) for v in units.values()), default=0.0)
+    # Организации и остаток атомов — непересекающиеся совокупности.
+    disjoint = sum(units.get("org", {}).values()) + sum(units.get("other_orgs", {}).values())
+    amount = max(disjoint, max((sum(v.values()) for v in units.values()), default=0.0))
     return amount >= 0.7 * abs(d) and score - amount < minimum
 
 
@@ -537,6 +580,19 @@ def detect(p: Panel, t: int) -> list[Card]:
     sa = scan_rows(p, atoms, t, obs)
     hits = pick(sa, atoms)
     under = _underload(p, atoms, sa, t) if last else set()
+    residual = residual_panel(p)
+    if residual is not None:
+        residual_obs = {f: flow_obs(residual, f, calendar_reference=p) for f in FLOWS}
+        sr = scan_rows(residual, residual.atoms, t, residual_obs)
+        # Материальность относится ко всему атому, а не к меньшему остатку.
+        for sc in sr.values():
+            sc["base"] = p.x["m_base_pf"][atoms, t]
+        for r, f, L, d, i in pick(sr, residual.atoms):
+            parent = int(atoms[r])
+            tb = int(p.meta.at[parent, "sys_tb_id"])
+            label = "underload" if tb in under and f == "out_left" else None
+            cards.append(_card(p, "atom", parent, f, sr[f], i, L, label,
+                               scope="other_orgs", flows=_qualified(sr, i)))
     for r, f, L, d, i in hits:
         explanations = cards + [c for c in evidence if not any(
             old.level == "org" and old.key == c.key and old.label == "recode" for old in cards)]
@@ -684,7 +740,9 @@ def where(p: Panel, c: Card) -> str:
     if c.level in ("org", "atom"):
         m = p.meta.iloc[c.key]
         place = f"{m['seg_rep']}, ТБ {m['sys_tb_id']}, ГОСБ {m['sys_gosb_id']}"
-        return f"{org_code(c.key)} (главная ячейка: {place})" if c.level == "org" else place
+        if c.level == "org":
+            return f"{org_code(c.key)} (главная ячейка: {place})"
+        return place + ("; прочие организации" if c.info.get("scope") == "other_orgs" else "")
     return {"gosb": f"ГОСБ {c.key}", "tb": f"ТБ {c.key}", "seg": f"сегмент {c.key}",
             "bank": "банк"}[c.level]
 
@@ -694,8 +752,14 @@ def cards_frame(p: Panel, cards: list[Card], t: int) -> pd.DataFrame:
     в тот же масштаб: к нему возвращена поправка на возвраты после провала.
     delta — отклонение вклада потока от ожидания, а не изменение всего портфеля."""
     records = []
+    residual = None
     for c in cards:
         actual, expected = c.obs, c.exp
+        source = p
+        if c.info.get("scope") == "other_orgs":
+            if residual is None:
+                residual = residual_panel(p)
+            source = residual
         if c.measure in ("in_outside", "out_left") and np.isfinite(c.obs):
             if c.level in ("org", "atom"):
                 rows = [int(c.key)]
@@ -704,19 +768,22 @@ def cards_frame(p: Panel, cards: list[Card], t: int) -> pd.DataFrame:
                 col = {"gosb": "sys_gosb_id", "tb": "sys_tb_id", "seg": "seg_rep"}.get(c.level)
                 if col:
                     rows = rows[(p.meta.loc[rows, col] == c.key).to_numpy()]
-            raw = p.x[FLOWS[c.measure][0]][rows, t]
+            if source is not p:
+                rows = [int(np.flatnonzero(p.atoms == c.key)[0])]
+            raw = source.x[FLOWS[c.measure][0]][rows, t]
             actual = float(np.nansum(raw)) if np.isfinite(raw).any() else np.nan
             expected = c.exp + actual - c.obs
         what = MEASURE_RU.get(c.measure, c.measure)
         if np.isfinite(c.obs) and np.isfinite(c.exp):
             what += ": больше ожидания" if c.obs > c.exp else ": меньше ожидания" if c.obs < c.exp else ""
         records.append({
-            "месяц": p.months[t], "уровень": c.level, "где": where(p, c),
+            "месяц": p.months[t], "уровень": c.level,
+            "где": where(p, c),
             "что": what,
             "факт": round(actual) if np.isfinite(actual) else None,
             "ожидание": round(expected) if np.isfinite(expected) else None,
             "отклонение вклада в портфель": round(c.delta),
-            "сверх шума, не меньше": round(c.score),
+            "сверх шума, не меньше": int(np.floor(c.score)),
             "объяснение": LABEL_RU.get(c.label, "") if c.label else "",
         })
     return pd.DataFrame(records, columns=["месяц", "уровень", "где", "что", "факт", "ожидание",

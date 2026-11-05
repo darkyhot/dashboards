@@ -44,7 +44,7 @@ class CalibrationTests(unittest.TestCase):
         new = watch.scan_rows(p, p.orgs, t, obs, details=True)["in_other"]
         self.assertGreater(old["zs"], 100.)
         self.assertLess(new["zs"], old["zs"] / 10.)
-        self.assertGreaterEqual(new["zs"], watch.z_star(len(p.orgs) * len(watch.FLOWS), []))
+        self.assertLessEqual(new["calibration"]["expected_false_bound"], watch.FALSE_PER_LEVEL)
         self.assertGreaterEqual(new["calibration"]["excluded_count"], 7)
         self.assertTrue(all(r["ожидание"] < watch.MIN_NULL_MEAN
                             for r in new["calibration"]["excluded"]))
@@ -86,7 +86,7 @@ class CalibrationTests(unittest.TestCase):
         del p.x["m_out_temp_left"]
         old = diagnostics.threshold_snapshot(p, {})
         self.assertTrue(old["legacy_replay"])
-        self.assertEqual(old["calibration_revision"], 2)
+        self.assertEqual(old["calibration_revision"], 3)
         self.assertEqual(len(old["comparison"]), len(watch.FLOWS))
         table = old["comparison"].set_index("Поток")
         # Последний месяц уже вне окна семи событий, сравнение доступно без полной приёмки.

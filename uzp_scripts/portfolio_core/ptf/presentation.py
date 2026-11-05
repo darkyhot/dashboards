@@ -245,6 +245,8 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         title = f"Пороги: {snapshot['month']}, {snapshot['level']}"
         if snapshot.get("legacy_replay"):
             notes.append("Воспроизведение старого отчёта: прежняя коррекция возвратов, только диагностика.")
+        notes.append("Новая модель оценивает log(1 + поток); старый и новый z имеют разные шкалы. "
+                     "Качество сравнивается по найденным событиям и ложным карточкам.")
         if page == 1:
             if "comparison" in snapshot:
                 blocks = [("Проверка правки калибровки", _frame(snapshot["comparison"]))]
@@ -262,7 +264,10 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
             blocks = [(f"{source['flow']}: источники порога", _frame(source["contributors"]))]
             notes.append(f"Поправка на число проверок: {source['normal']:.2f}; "
                          f"итоговый порог: {source['threshold']:.2f}.")
-            notes.append("Первые три строки хвоста и строка, определяющая исторический порог.")
+            notes.append("Крупные прошлые отклонения показаны для проверки. В новой модели "
+                         "порог задаёт масштаб центра ошибок, а не отдельная строка хвоста."
+                         if source.get("model") == "positive_count" else
+                         "Первые три строки хвоста и строка, определяющая исторический порог.")
         notes.append("Условные коды строк не содержат исходных номеров организаций.")
     elif section == "качество":
         frame = _frame(data["reason_partition"])

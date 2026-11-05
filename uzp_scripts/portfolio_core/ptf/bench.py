@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from . import months as M
-from .inputs import IN_M, MEAS, OUT_M, Panel
+from .inputs import CELL_MEAS, IN_M, MEAS, OUT_M, Panel
 
 # --------------------------------------------------------------------------- #
 # Карточка и событие
@@ -190,8 +190,7 @@ def simulate(seed: int = 1, n_orgs: int = 3000, gosb_per_tb: int = 6,
     flows = pd.DataFrame({
         "row": np.repeat(np.arange(na, n), T), "t": np.tile(np.arange(T), n_orgs),
         "atom": np.repeat(org_atom, T),
-        "in_other": xs["m_in_from_other_org"][na:].ravel(),
-        "out_other": xs["m_out_to_other_org"][na:].ravel(),
+        **{flow: xs[measure][na:].ravel() for flow, measure in CELL_MEAS.items()},
     }).set_index(["row", "t", "atom"]).sort_index()
     stock = pd.DataFrame({"row": np.repeat(np.arange(na, n), T),
                           "t": np.tile(np.arange(T), n_orgs), "atom": np.repeat(org_atom, T),
@@ -429,6 +428,33 @@ def _inject_at_main(p: Panel, ev: Event) -> Panel:
     return p
 
 
+def _atom_stock(p: Panel, atom: int, measure: str) -> np.ndarray:
+    """Остаток, доступный событию атома, которое не меняет отслеживаемые организации."""
+    values = p.x[measure][atom].copy()
+    if p.org_stock.empty or measure not in p.org_stock:
+        return values
+    local = p.org_stock.loc[p.org_stock.index.get_level_values("atom") == atom, measure]
+    grouped = local.groupby(level="t")
+    known = grouped.sum(min_count=1)
+    known[grouped.count() != grouped.size()] = np.nan
+    values[known.index.to_numpy(dtype=int)] -= known.to_numpy()
+    return values
+
+
+def _atom_stocks(p: Panel, measure: str) -> np.ndarray:
+    values = p.x[measure][p.atoms].copy()
+    if p.org_stock.empty or measure not in p.org_stock:
+        return values
+    grouped = p.org_stock[measure].groupby(level=["atom", "t"])
+    known = grouped.sum(min_count=1)
+    known[grouped.count() != grouped.size()] = np.nan
+    aa = pd.Index(p.atoms).get_indexer(known.index.get_level_values("atom"))
+    tt = known.index.get_level_values("t").to_numpy(dtype=int)
+    valid = aa >= 0
+    values[aa[valid], tt[valid]] -= known.to_numpy()[valid]
+    return values
+
+
 def cohort_capacity(p: Panel, r: int, t: int, kind: str) -> dict[int, float]:
     """Когорта, которую можно убрать без отрицательных остатков и будущей базы.
     Для организации используются её реальные ячейки, а не главная за всё окно."""
@@ -461,15 +487,18 @@ def cohort_capacity(p: Panel, r: int, t: int, kind: str) -> dict[int, float]:
     else:
         caps = {r: float("inf")}
     for a in list(caps):
+        def stock(measure):
+            return (_atom_stock(p, a, measure) if p.meta.at[r, "lvl"] == "atom"
+                    else p.x[measure][a])
         cols = ["pf_recip"] + ([] if kind == "stop" else ["pf_fl"])
         if kind == "conc":
             cols.append("multi_recip")
-        values = np.concatenate([p.x[m][a, t:end] for m in cols])
+        values = np.concatenate([stock(m)[t:end] for m in cols])
         if kind not in ("stop", "conc"):
-            values = np.r_[values, p.x["pf_recip"][a, t:end] - p.x["multi_recip"][a, t:end]]
+            values = np.r_[values, stock("pf_recip")[t:end] - stock("multi_recip")[t:end]]
         if kind != "stop" and t + 1 < len(p.months):
             next_end = t + 2 if kind == "dip" else end
-            values = np.r_[values, p.x["m_base_pf"][a, t + 1:next_end]]
+            values = np.r_[values, stock("m_base_pf")[t + 1:next_end]]
         caps[a] = min(caps[a], max(0., float(values.min()))) if np.isfinite(values).all() else 0.
     return caps
 
@@ -571,15 +600,16 @@ def inject(p: Panel, ev: Event) -> Panel:
                     q.org_stock.at[key, m] += delta * n / ev.n
                     if ev.kind == "stop" and m in ("pf_fl", "multi_recip"):
                         q.org_stock.at[key, m] = 0.
-            for f, col in (("in_other", "m_in_from_other_org"), ("out_other", "m_out_to_other_org")):
-                d = q.x[col][r, ev.t] - p.x[col][r, ev.t]
-                if not np.isfinite(d) or d == 0:
+            for f, col in CELL_MEAS.items():
+                if f not in q.org_flows:
                     continue
                 cell = ev.row2 if ev.kind == "recode" and f == "in_other" else a
-                key = (r, ev.t, cell)
-                if key not in q.org_flows.index:
-                    q.org_flows.loc[key, :] = 0.
-                q.org_flows.at[key, f] += d * n / ev.n
+                delta = q.x[col][r] - p.x[col][r]
+                for h in np.flatnonzero(np.isfinite(delta) & (abs(delta) > 1e-9)):
+                    key = (r, int(h), cell)
+                    if key not in q.org_flows.index:
+                        q.org_flows.loc[key, :] = 0.
+                    q.org_flows.at[key, f] += delta[h] * n / ev.n
     if not q.org_flows.empty:
         q.org_flows.sort_index(inplace=True)
     if not q.org_stock.empty:
@@ -642,6 +672,34 @@ def _inject_artifact(p: Panel, ev: Event) -> Panel:
             _add(q, [r], "y_out_left_bank", t, t, n)
             room = max(0., q.x["pf_recip"][r, t] - q.x["single_pay_recip"][r, t])
             _add(q, [r], "single_pay_recip", t, t, min(3 * n, room))
+    # Сохраняем те же изменения в фактических ячейках. Иначе проверка остатка
+    # принимает несогласованность самого стенда за независимое событие.
+    if not p.org_stock.empty:
+        current = p.org_stock.xs(t, level="t").reset_index()
+        for r, cells in current.groupby("row"):
+            amount = cells["pf_recip"].to_numpy(dtype=float)
+            if ev.kind == "underload":
+                amount = np.where(cells["atom"].isin(atoms), amount, 0.)
+            total = amount.sum()
+            if total <= 0 or lost[int(r)] <= 0:
+                continue
+            for cell, weight in zip(cells["atom"], amount / total):
+                if weight <= 0:
+                    continue
+                for frame_name, measures in (("org_stock", {m: m for m in p.org_stock.columns}),
+                                              ("org_flows", CELL_MEAS)):
+                    frame = getattr(q, frame_name)
+                    for column, measure in measures.items():
+                        if column not in frame:
+                            continue
+                        delta = q.x[measure][int(r)] - p.x[measure][int(r)]
+                        for h in np.flatnonzero(np.isfinite(delta) & (abs(delta) > 1e-9)):
+                            key = (int(r), int(h), int(cell))
+                            if key not in frame.index:
+                                frame.loc[key, :] = 0.
+                            frame.at[key, column] += delta[h] * weight
+        q.org_stock.sort_index(inplace=True)
+        q.org_flows.sort_index(inplace=True)
     return q
 
 
@@ -715,7 +773,7 @@ def pick_events(p: Panel, rng, kind: str, k: float, t: int, n_ev: int,
                 continue
             ev.row2 = int(rng.choice(others))
         if kind == "conc":
-            cap = np.nanmin(p.x["multi_recip"][p.atoms, t:], axis=1)
+            cap = np.nanmin(_atom_stocks(p, "multi_recip")[:, t:], axis=1)
             available = p.atoms[(cap >= n) & (p.atoms != p.meta.at[r, "atom"])]
             if not len(available):
                 continue
@@ -794,7 +852,7 @@ def match(p: Panel, cards: list[Card], r: int, sign: int, before: list[Card] | N
     """Самый точный уровень карточки, указавшей на ряд r с нужным знаком."""
     w = _where(p, r, t)
     expected = FLOW_ALIAS.get(measure, measure)
-    previous = {(c.level, c.key): c for c in before or []}
+    previous = {(c.level, c.key, c.info.get("scope", "all")): c for c in before or []}
 
     def effect(c):
         if expected is None or c.measure == "net" or FLOW_ALIAS.get(c.measure, c.measure) == expected:
@@ -806,7 +864,7 @@ def match(p: Panel, cards: list[Card], r: int, sign: int, before: list[Card] | N
         value = effect(c)
         if c.label in ARTIFACTS or value is None or np.sign(value) != sign:
             continue
-        old = previous.get((c.level, c.key))
+        old = previous.get((c.level, c.key, c.info.get("scope", "all")))
         old_value = effect(old) if old is not None else None
         if before is not None and old_value is not None and sign * (value - old_value) < min_effect:
             continue
@@ -929,7 +987,7 @@ def evaluate(detect, p: Panel, seed: int = 7, months_back: int = 6,
     return {"recall": recall, "clean_cards": clean, "echo": float(np.mean(echo)) if echo else None,
             "leak": leak, "artifact_details": details, "invalid": pd.DataFrame(invalid),
             "skipped": pd.DataFrame(plan["skipped"]), "clean_is_known": clean_is_known,
-            "protocol": 2, "plan": plan, "backgrounds": backgrounds}
+            "protocol": 3, "plan": plan, "backgrounds": backgrounds}
 
 
 def _extra_cards(cards: list[Card], clean: list[Card]) -> int:
@@ -940,10 +998,14 @@ def _extra_cards(cards: list[Card], clean: list[Card]) -> int:
 def extra_cards(cards: list[Card], clean: list[Card], p: Panel | None = None,
                  changed: Panel | None = None, t: int | None = None) -> list[Card]:
     """Новая мера/направление либо материальное усиление существующего сигнала."""
-    was = {(c.level, c.key, c.measure, int(np.sign(c.delta))): c for c in clean
+    was = {(c.level, c.key, c.measure, int(np.sign(c.delta)), c.info.get("scope", "all")): c for c in clean
            if c.label not in ARTIFACTS}
     result = []
     def replaced(c):
+        # У остатка своя совокупность. Карточка крупной организации не может
+        # объяснить его изменение, даже если общий итог атома не изменился.
+        if c.info.get("scope") == "other_orgs":
+            return False
         if p is None or changed is None or t is None:
             return False
         measure = FLOW_ALIAS.get(c.measure, c.measure)
@@ -975,7 +1037,7 @@ def extra_cards(cards: list[Card], clean: list[Card], p: Panel | None = None,
     for c in cards:
         if c.label in ARTIFACTS:
             continue
-        old = was.get((c.level, c.key, c.measure, int(np.sign(c.delta))))
+        old = was.get((c.level, c.key, c.measure, int(np.sign(c.delta)), c.info.get("scope", "all")))
         if old is None or abs(c.delta) - abs(old.delta) >= max(100., .1 * abs(old.delta)):
             if not replaced(c):
                 result.append(c)

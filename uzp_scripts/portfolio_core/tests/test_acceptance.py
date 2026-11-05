@@ -20,7 +20,7 @@ class AcceptanceTests(unittest.TestCase):
                                  people_sizes=(1000,), per_size=1)
             saved = json.loads(run["paths"]["json"].read_text())
             page = run["paths"]["html"].read_text()
-            self.assertEqual(saved["protocol"], 2)
+            self.assertEqual(saved["protocol"], 3)
             self.assertEqual(len(saved["recall"]), len(run["result"]["recall"]))
             self.assertEqual(len(saved["cards"]), len(run["data"]["cards"]))
             self.assertIn("baseline_checks", saved)

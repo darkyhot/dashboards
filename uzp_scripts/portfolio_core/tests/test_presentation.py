@@ -92,9 +92,12 @@ class PresentationTests(unittest.TestCase):
             for field in plain[flow]:
                 np.testing.assert_array_equal(plain[flow][field], detailed[flow][field])
             trace = detailed[flow]["calibration"]
-            self.assertAlmostEqual(detailed[flow]["zs"], max(trace["normal_z"], trace["empirical_z"]))
+            self.assertAlmostEqual(detailed[flow]["zs"], trace["empirical_z"])
             contributors = trace["contributors"]
-            if trace["empirical_z"] > trace["normal_z"]:
+            if trace.get("model") == "positive_count":
+                self.assertAlmostEqual(detailed[flow]["zs"], trace["critical_z"] * trace["scale"])
+                self.assertTrue(all(not r["задаёт порог"] for r in contributors))
+            elif trace["empirical_z"] > trace["normal_z"]:
                 selected = next(r for r in contributors if r["задаёт порог"])
                 self.assertAlmostEqual(selected["модуль z"] + 1e-9, trace["empirical_z"])
         self.assertTrue(detailed["out_codes"]["calibration"]["contributors"])

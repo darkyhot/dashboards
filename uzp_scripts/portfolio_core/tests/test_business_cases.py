@@ -122,6 +122,7 @@ class BusinessReportTests(unittest.TestCase):
         notebook = json.loads((Path(__file__).resolve().parents[1] / "portfolio_core.ipynb").read_text())
         source = next("".join(c["source"]) for c in notebook["cells"]
                       if "СТОРОЖ: РЕЗУЛЬТАТЫ ДЛЯ ФОТОГРАФИРОВАНИЯ" in "".join(c["source"]))
+        source = source.replace('PHOTO_SECTION = "итог"', 'PHOTO_SECTION = "пороги"')
         p = secondary_job_gap()
         del p.x["m_in_temp_outside"]
         del p.x["m_out_temp_left"]

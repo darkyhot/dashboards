@@ -112,7 +112,7 @@ def threshold_snapshot(p: Panel, data: dict) -> dict:
         c = s["calibration"]
         summary.append({"Поток": flow, "Нормальный z": c["normal_z"],
                         "Исторический z": c["empirical_z"], "Итоговый z": s["zs"]})
-        sources.append({"flow": flow, "threshold": s["zs"], "normal": c["normal_z"],
+        sources.append({"flow": flow, "threshold": s["zs"], "normal": c["normal_z"], "model": c.get("model"),
                         "contributors": pd.DataFrame(c["contributors"])})
         after = corrected[flow]
         comparison.append({"Поток": flow, "Было z": s["zs"] if legacy else np.nan,
@@ -129,7 +129,7 @@ def threshold_snapshot(p: Panel, data: dict) -> dict:
                                   "Шум": row["шум"], "z": row["модуль z"]})
     remaining.sort(key=lambda r: -r["z"])
     return {"month": p.months[t], "level": level, "summary": pd.DataFrame(summary), "sources": sources,
-            "legacy_replay": legacy, "comparison": pd.DataFrame(comparison), "calibration_revision": 2,
+            "legacy_replay": legacy, "comparison": pd.DataFrame(comparison), "calibration_revision": 3,
             "remaining": pd.DataFrame(remaining[:1])}
 
 
@@ -183,7 +183,7 @@ def recode_report(p: Panel, event=None, before=None, after=None, **params) -> di
         scans[name] = scan
         picked = {rr: f for rr, f, *_ in watch.pick(scan, panel.orgs)}.get(r)
         for f, s in scan.items():
-            score = abs(s["d"][i]) - s["zs"] * s["s"][i]
+            score = watch.excess(s)[i]
             records.append({"когда": name, "поток": f, "факт": s["obs"][i],
                             "ожидание": s["E"][i], "отклонение": s["d"][i],
                             "шум": s["s"][i], "порог z": s["zs"], "сверх шума": score,

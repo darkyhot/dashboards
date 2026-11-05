@@ -34,7 +34,7 @@ def _plain(value):
 def fingerprint() -> dict[str, str]:
     folder = Path(__file__).parent
     return {name: hashlib.sha256((folder / name).read_bytes()).hexdigest()
-            for name in ("inputs.py", "bench.py", "watch.py", "diagnostics.py", "acceptance.py", "presentation.py")}
+            for name in ("inputs.py", "bench.py", "watch.py", "count_model.py", "diagnostics.py", "acceptance.py", "presentation.py")}
 
 
 def quality(p: Panel) -> pd.DataFrame:
@@ -126,7 +126,7 @@ def _write_html(path, data):
             f'<p>Поколение {html.escape(str(data["input"]["run_id"]))}; '
             f'{html.escape(data["input"]["months"][0])} — {html.escape(data["input"]["months"][-1])}. '
             f'Протокол {data["protocol"]}. Время: {data["seconds"]:.1f} с.</p>',
-            "<p>Протокол 2 проверяет появление или усиление сигнала нужного потока относительно исходного фона. "
+            "<p>Протокол 3 проверяет появление или усиление сигнала нужного потока в той же совокупности относительно исходного фона; размер когорты ограничен её собственным остатком. "
             "Результаты прежнего протокола напрямую с ним не сравниваются. Шум измеряется по изменяемому потоку; "
             "если сработал минимум размера, показан фактический размер в шумах.</p>",
             "<h2>Проверки</h2>", _table(check),
@@ -165,7 +165,8 @@ def _write_html(path, data):
              html.escape(json.dumps(data["files"], ensure_ascii=False, indent=2)), "</pre></details>",
              "<p>Факт в карточке — исходный поток. Ожидание включает учтённые возвраты и общий календарный "
              "компонент. Отклонение вклада в портфель — разница с ожиданием со знаком потока. "
-             "Карточки разных уровней могут пересекаться; их нельзя суммировать.</p>"]
+             "Карточки разных уровней, а также полный атом и его «прочие организации», "
+             "могут пересекаться; их нельзя суммировать.</p>"]
     document = '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Приёмка сторожа</title>'
     document += "<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1500px;margin:32px auto;padding:0 24px;color:#182b32}" 
     document += "h1,h2{color:#174e45}.status{font-weight:bold}.scroll{overflow:auto;margin:12px 0}table{border-collapse:collapse;font-size:13px}"
@@ -200,7 +201,7 @@ def run(p: Panel, out_dir="output/watch_acceptance", compare=True, known_clean=F
     recode_details = diagnostics.recode_report(
         p, event=recode["event"], before=recode["frames"][0]["before"], after=recode["frames"][0]["after"]
     ) if recode else {}
-    data = {"protocol": 2, "input": {"run_id": p.run_id, "months": p.months,
+    data = {"protocol": 3, "model": "positive_count_and_cell_remainder", "input": {"run_id": p.run_id, "months": p.months,
              "atoms": len(p.atoms), "organizations": len(p.orgs)}, "params": params,
             "files": fingerprint(), "known_clean": known_clean, "checks": _checks(result),
             "summary": bench.summary(result), "recall": result["recall"],

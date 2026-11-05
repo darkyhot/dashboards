@@ -26,6 +26,9 @@ LB_M = ["m_lb_seasonal", "m_lb_org_stopped", "m_lb_one_time", "m_lb_unknown"]
 IN_Y = ["y_in_from_outside", "y_in_from_other_org", "y_in_codes"]
 OUT_Y = ["y_out_left_bank", "y_out_to_other_org", "y_out_codes"]
 ATOM_KEYS = ["seg_rep", "sys_tb_id", "sys_gosb_id"]
+CELL_MEAS = dict(zip(("in_outside", "in_other", "in_codes", "out_left", "out_other", "out_codes",
+                      "in_temp_outside", "out_temp_left"),
+                     IN_M + OUT_M + ["m_in_temp_outside", "m_out_temp_left"]))
 
 
 @dataclass
@@ -42,6 +45,8 @@ class Panel:
     # Остатки по фактическим ячейкам: ограничивают размер когорты стенда.
     org_stock: pd.DataFrame = field(default_factory=pd.DataFrame)
     run_id: int | None = None
+    scope: str = "all"                    # all / other_orgs — разные совокупности
+    material_base: np.ndarray | None = None  # база полного атома для материальности остатка
 
     @property
     def atoms(self) -> np.ndarray:
@@ -54,7 +59,8 @@ class Panel:
     def copy(self) -> "Panel":
         return Panel(list(self.months), self.meta.copy(), {k: v.copy() for k, v in self.x.items()},
                      {k: v.copy() for k, v in self.org_scopes.items()}, self.org_flows.copy(),
-                     self.org_stock.copy(), self.run_id)
+                     self.org_stock.copy(), self.run_id, self.scope,
+                     None if self.material_base is None else self.material_base.copy())
 
     def identity_gap(self, t: int) -> np.ndarray:
         """Тождество месяца t по каждому ряду: портфель − база − (пришли − ушли)."""
@@ -150,9 +156,8 @@ def from_frames(months: list[str], atoms: pd.DataFrame, org_cells: pd.DataFrame)
     flows = pd.DataFrame({
         "row": org_cells["org_id"].map(orow).to_numpy(),
         "t": org_cells["report_dt"].map(mi).to_numpy(), "atom": cells["atom"].to_numpy(),
-        "in_other": org_cells["m_in_from_other_org"].to_numpy(dtype=float),
-        "out_other": org_cells["m_out_to_other_org"].to_numpy(dtype=float),
-    }).groupby(["row", "t", "atom"])[["in_other", "out_other"]].sum(min_count=1)
+        **{flow: org_cells[measure].to_numpy(dtype=float) for flow, measure in CELL_MEAS.items()},
+    }).groupby(["row", "t", "atom"])[list(CELL_MEAS)].sum(min_count=1)
     stock = pd.DataFrame({"row": org_cells["org_id"].map(orow).to_numpy(),
                           "t": org_cells["report_dt"].map(mi).to_numpy(),
                           "atom": cells["atom"].to_numpy(),
@@ -160,3 +165,52 @@ def from_frames(months: list[str], atoms: pd.DataFrame, org_cells: pd.DataFrame)
                              for m in ("pf_recip", "m_base_pf", "pf_fl", "multi_recip")}})
     stock = stock.groupby(["row", "t", "atom"]).sum(min_count=1)
     return Panel(months, meta, x, scopes, flows, stock)
+
+
+def has_cell_detail(p: Panel) -> bool:
+    return (not p.org_flows.empty and set(CELL_MEAS) <= set(p.org_flows.columns)
+            and not p.org_stock.empty
+            and {"pf_recip", "m_base_pf", "pf_fl", "multi_recip"} <= set(p.org_stock.columns))
+
+
+def residual_panel(p: Panel) -> Panel | None:
+    """Атом минус отслеживаемые организации по их фактическим ячейкам.
+
+    Вычитание исходных счётчиков предшествует коррекции возвратов/календаря.
+    Отрицательный остаток или неизвестная привязка — ошибка данных, не ноль.
+    Для старой панели без полного набора ячеечных потоков канал недоступен.
+    """
+    if not has_cell_detail(p):
+        return None
+    atoms = p.atoms
+    x = {}
+    for frame, mapping in ((p.org_stock, {m: m for m in ("pf_recip", "m_base_pf", "pf_fl", "multi_recip")}),
+                           (p.org_flows, CELL_MEAS)):
+        if (frame.index.get_level_values("atom") < 0).any():
+            raise ValueError("Остаток организаций: неизвестна фактическая ячейка организации")
+        for column, measure in mapping.items():
+            grouped = frame[column].groupby(level=["atom", "t"])
+            sums = grouped.sum(min_count=1)
+            # Один пропуск не должен исчезать в сумме остальных организаций.
+            sums[grouped.count() != grouped.size()] = np.nan
+            total = np.zeros((len(atoms), len(p.months)))
+            aa = pd.Index(atoms).get_indexer(sums.index.get_level_values("atom"))
+            if (aa < 0).any():
+                raise ValueError("Остаток организаций: ячейки организации нет в сводке")
+            total[aa, sums.index.get_level_values("t").to_numpy(dtype=int)] = sums.to_numpy()
+            remainder = p.x[measure][atoms] - total
+            bad = np.argwhere(remainder < -1e-6)
+            if len(bad):
+                a, t = bad[0]
+                raise ValueError(f"Остаток организаций отрицателен для {measure}: "
+                                 f"Атом R{int(atoms[a]):05d}, {p.months[t]}, "
+                                 f"итог {p.x[measure][atoms[a], t]:.6g}, "
+                                 f"организации {total[a, t]:.6g}. "
+                                 "Нужна проверка согласованности ячеек и сводки")
+            # Только округлительный след вычитания, не исправление отрицательных данных.
+            remainder[(remainder < 0) & (remainder >= -1e-6)] = 0.
+            x[measure] = remainder
+    meta = p.meta.loc[atoms].reset_index(drop=True).copy()
+    meta["atom"] = np.arange(len(atoms))
+    return Panel(list(p.months), meta, x, run_id=p.run_id, scope="other_orgs",
+                 material_base=p.x["m_base_pf"][atoms])
