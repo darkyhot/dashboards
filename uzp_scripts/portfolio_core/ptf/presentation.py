@@ -246,7 +246,17 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         if snapshot.get("legacy_replay"):
             notes.append("Воспроизведение старого отчёта: прежняя коррекция возвратов, только диагностика.")
         if page == 1:
-            blocks = [("Пороги потоков", _frame(snapshot["summary"]))]
+            if "comparison" in snapshot:
+                blocks = [("Проверка правки калибровки", _frame(snapshot["comparison"]))]
+                remaining = _frame(snapshot.get("remaining", []))
+                if not remaining.empty:
+                    blocks.append(("Наибольший оставшийся исторический порог", remaining))
+                notes += ["Не для фона — крупные отклонения с ожиданием меньше 5 или без достаточной истории.",
+                          "Нет оценки — строки без достаточных данных для собственного статистического сигнала."]
+                if snapshot.get("legacy_replay"):
+                    notes.append("Проверяются порог и достаточность истории; возвраты пока по прежним данным. Это не полная приёмка.")
+            else:
+                blocks = [("Пороги потоков", _frame(snapshot["summary"]))]
         elif page <= pages:
             source = snapshot["sources"][page - 2]
             blocks = [(f"{source['flow']}: источники порога", _frame(source["contributors"]))]

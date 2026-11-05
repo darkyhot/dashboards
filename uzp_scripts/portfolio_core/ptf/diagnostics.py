@@ -104,18 +104,33 @@ def threshold_snapshot(p: Panel, data: dict) -> dict:
         obs["out_left"] -= watch.calendar_component(p, legacy_replay=True)
     else:
         obs = {f: watch.flow_obs(p, f) for f in watch.FLOWS}
-    scans = watch.scan_rows(p, rows, t, obs, details=True)
+    scans = watch.scan_rows(p, rows, t, obs, details=True, legacy_replay=legacy)
+    corrected = watch.scan_rows(p, rows, t, obs, details=True) if legacy else scans
     priority = presentation.target_flow(selected) if selected else None
-    summary, sources = [], []
+    summary, sources, comparison = [], [], []
     for flow, s in scans.items():
         c = s["calibration"]
         summary.append({"Поток": flow, "Нормальный z": c["normal_z"],
                         "Исторический z": c["empirical_z"], "Итоговый z": s["zs"]})
         sources.append({"flow": flow, "threshold": s["zs"], "normal": c["normal_z"],
                         "contributors": pd.DataFrame(c["contributors"])})
+        after = corrected[flow]
+        comparison.append({"Поток": flow, "Было z": s["zs"] if legacy else np.nan,
+                           "Стало z": after["zs"],
+                           "Не для фона": after["calibration"]["excluded_count"],
+                           "Нет оценки": after["calibration"]["unsupported_current"]})
     sources.sort(key=lambda s: (s["flow"] != priority, -s["threshold"]))
+    remaining = []
+    for flow, sc in corrected.items():
+        for row in sc["calibration"]["contributors"]:
+            if row["задаёт порог"]:
+                remaining.append({"Поток": flow, "Месяц": row["месяц"], "Ряд": row["ряд"],
+                                  "Факт": row["факт"], "Ожидание": row["ожидание"],
+                                  "Шум": row["шум"], "z": row["модуль z"]})
+    remaining.sort(key=lambda r: -r["z"])
     return {"month": p.months[t], "level": level, "summary": pd.DataFrame(summary), "sources": sources,
-            "legacy_replay": legacy}
+            "legacy_replay": legacy, "comparison": pd.DataFrame(comparison), "calibration_revision": 2,
+            "remaining": pd.DataFrame(remaining[:1])}
 
 
 def recode_event(p: Panel, seed: int = 7, months_back: int = 6,

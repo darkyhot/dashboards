@@ -46,11 +46,30 @@ FALSE_PER_LEVEL = 0.5
 PRIOR = 20.0         # сила подтягивания сдвига к 1, в ожидаемых людях
 MAX_CARDS = 25
 SIZE_EDGES = [3_000, 10_000]
+MIN_HISTORY = 6      # минимум месяцев с наблюдаемой ненулевой базой для собственного ряда
+MIN_NULL_MEAN = 5.0  # низкие счётчики не калибруют нормальную аппроксимацию общего фона
 
 
 # --------------------------------------------------------------------------- #
 # Ряды и ожидания
 # --------------------------------------------------------------------------- #
+def _nanmedian(a: np.ndarray, axis=None, keepdims: bool = False):
+    """Пустой срез остаётся неизвестным, без предупреждения NumPy и подмены нулём."""
+    a = np.asarray(a, dtype=float)
+    if axis is None:
+        return np.nan if not a.size or np.isnan(a).all() else np.nanmedian(a)
+    if a.shape[axis] == 0:
+        shape = list(a.shape)
+        if keepdims:
+            shape[axis] = 1
+        else:
+            shape.pop(axis)
+        return np.full(shape, np.nan)
+    missing = np.isnan(a).all(axis=axis, keepdims=True)
+    value = np.nanmedian(np.where(missing, 0., a), axis=axis, keepdims=keepdims)
+    return np.where(missing if keepdims else np.squeeze(missing, axis=axis), np.nan, value)
+
+
 def _exact_measure(p: Panel, name: str) -> np.ndarray:
     if name not in p.x or not np.isfinite(p.x[name]).any():
         raise ValueError(f"В поколении нет точной меры {name}. Нужна обновлённая сборка подложки; "
@@ -113,7 +132,7 @@ def _groups(p: Panel, rows: np.ndarray, t: int | None = None) -> np.ndarray:
     seg = p.meta.loc[rows, "seg_rep"].astype(str).to_numpy(dtype=str)   # из БД приходит object
     if p.meta.at[rows[0], "lvl"] == "org":
         end = len(p.months) if t is None else t
-        size = np.nanmedian(p.x["pf_recip"][rows, max(0, end - HIST):end], axis=1)
+        size = _nanmedian(p.x["pf_recip"][rows, max(0, end - HIST):end], axis=1)
         cls = np.digitize(np.nan_to_num(size), SIZE_EDGES).astype(str)
         seg = np.char.add(np.char.add(seg, "|"), cls)
     _, g = np.unique(seg, return_inverse=True)
@@ -142,9 +161,9 @@ def raw_expect(obs: np.ndarray, base: np.ndarray, g: np.ndarray, tb: np.ndarray)
     for k in range(K):
         others = [j for j in range(K) if j != k]
         cnt = np.sum(~np.isnan(r_gk[:, others, :]), axis=1)
-        med = np.nanmedian(r_gk[:, others, :], axis=1)
+        med = _nanmedian(r_gk[:, others, :], axis=1)
         loo_g[:, k, :] = np.where(cnt >= 3, med, np.nan)
-        loo_all[k] = np.nanmedian(r_k[others], axis=0)
+        loo_all[k] = _nanmedian(r_k[others], axis=0)
     rate = loo_g[g, ti]
     rate = np.where(np.isnan(rate), loo_all[ti], rate)
     e = base * rate
@@ -158,7 +177,7 @@ def offsets(obs: np.ndarray, e: np.ndarray, t: int) -> np.ndarray:
     o, ee = obs[:, w], e[:, w]
     with np.errstate(divide="ignore", invalid="ignore"):
         r = np.where(ee > 0, o / ee, np.nan)
-    med = np.nanmedian(np.where(np.isnan(r).all(1, keepdims=True), 1.0, r), axis=1)
+    med = _nanmedian(np.where(np.isnan(r).all(1, keepdims=True), 1.0, r), axis=1)
     se = np.nansum(ee, axis=1)
     return (se * med + PRIOR) / (se + PRIOR)
 
@@ -179,7 +198,8 @@ def kappa2(obs: np.ndarray, e: np.ndarray, th: np.ndarray, t: int, cls: np.ndarr
     return out
 
 
-def score(obs: np.ndarray, e: np.ndarray, base: np.ndarray, cls: np.ndarray, t: int) -> dict:
+def score(obs: np.ndarray, e: np.ndarray, base: np.ndarray, cls: np.ndarray, t: int,
+          *, legacy_replay: bool = False) -> dict:
     """Факт, ожидание, шум и z месяца t (по данным до t). Шум — не меньше собственного
     разброса ряда в прошлом (устойчивая оценка): ряд, где сидит «комковатая»
     организация, шумит сильнее среднего по классу."""
@@ -187,12 +207,22 @@ def score(obs: np.ndarray, e: np.ndarray, base: np.ndarray, cls: np.ndarray, t: 
     k2 = kappa2(obs, e, th, t, cls)
     w = slice(max(0, t - HIST), t)
     R = obs[:, w] - e[:, w] * th[:, None]                       # прошлые отклонения
-    med = np.nanmedian(R, axis=1, keepdims=True)
-    own = 1.4826 * np.nanmedian(np.abs(R - med), axis=1)
+    observed = np.isfinite(R) & np.isfinite(base[:, w]) & (base[:, w] > 0)
+    n_history = observed.sum(axis=1)
+    if not legacy_replay:
+        R = np.where(observed, R, np.nan)
+    med = _nanmedian(R, axis=1, keepdims=True)
+    own = 1.4826 * _nanmedian(np.abs(R - med), axis=1)
     E = e[:, t] * th
     s = np.sqrt(np.maximum(np.maximum(E, 0) + k2 * E ** 2 + 1, np.nan_to_num(own) ** 2))
     d = obs[:, t] - E
-    return {"obs": obs[:, t], "E": E, "s": s, "z": d / s, "d": d, "base": base[:, t], "R": R}
+    supported = (n_history >= MIN_HISTORY) & np.isfinite(base[:, t]) & (base[:, t] > 0)
+    unsupported_material = (~supported) & (np.abs(d) >= floor_of(base[:, t]))
+    if not legacy_replay:
+        E, s, d = (np.where(supported, v, np.nan) for v in (E, s, d))
+    return {"obs": obs[:, t], "E": E, "s": s, "z": d / s, "d": d,
+            "base": base[:, t], "R": R, "n_history": n_history,
+            "unsupported_material": unsupported_material}
 
 
 def floor_of(base: np.ndarray) -> np.ndarray:
@@ -213,24 +243,37 @@ def z_star(n_tests: int, past_z: list[np.ndarray]) -> float:
 # --------------------------------------------------------------------------- #
 # Уровень рядов (организации или атомы)
 # --------------------------------------------------------------------------- #
-def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict, details: bool = False) -> dict:
+def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict, details: bool = False,
+              *, legacy_replay: bool = False) -> dict:
     """Для каждой меры: оценка месяца t и порог z по эмпирическому нулю."""
     g = _groups(p, rows, t)
     tb = p.meta.loc[rows, "sys_tb_id"].to_numpy()
     base = p.x["m_base_pf"][rows]
-    cls = np.digitize(np.nan_to_num(np.nanmedian(p.x["pf_recip"][rows, max(0, t - HIST):t], axis=1)), SIZE_EDGES)
+    cls = np.digitize(np.nan_to_num(_nanmedian(p.x["pf_recip"][rows, max(0, t - HIST):t], axis=1)), SIZE_EDGES)
     out = {}
     for f in FLOWS:
         obs = obs_all[f][rows]
         e = raw_expect(obs, base, g, tb)
-        cur = score(obs, e, base, cls, t)
-        past, sources = [], []
+        cur = score(obs, e, base, cls, t, legacy_replay=legacy_replay)
+        past, sources, excluded = [], [], []
+        excluded_count = 0
         for h in range(max(HIST + 1, t - CALIB), t):
-            sh = score(obs, e, base, cls, h)
+            sh = score(obs, e, base, cls, h, legacy_replay=legacy_replay)
             big = np.abs(sh["d"]) >= floor_of(sh["base"])
-            past.append(np.nan_to_num(sh["z"][big]))
+            admissible = np.ones(len(rows), dtype=bool) if legacy_replay else sh["E"] >= MIN_NULL_MEAN
+            eligible = big & admissible
+            past.append(np.nan_to_num(sh["z"][eligible]))
+            excluded_count += int(np.sum(big & ~admissible))
+            if not legacy_replay:
+                excluded_count += int(np.sum(sh["unsupported_material"]))
             if details:
-                eligible = np.flatnonzero(big)
+                for j in np.flatnonzero(big & ~admissible):
+                    r = int(rows[j])
+                    excluded.append({"месяц": p.months[h],
+                        "ряд": org_code(r) if p.meta.at[r, "lvl"] == "org" else f"Атом R{r:05d}",
+                        "факт": float(sh["obs"][j]), "ожидание": float(sh["E"][j]),
+                        "модуль z": float(abs(sh["z"][j])), "причина": "малое ожидание"})
+                eligible = np.flatnonzero(eligible)
                 values = np.abs(np.nan_to_num(sh["z"][eligible]))
                 keep = min(len(values), int(FALSE_PER_LEVEL * CALIB) + 1)
                 selected = np.argpartition(values, len(values) - keep)[-keep:] if keep else []
@@ -250,7 +293,11 @@ def scan_rows(p: Panel, rows: np.ndarray, t: int, obs_all: dict, details: bool =
             contributors = [{"ранг": i + 1, **sources[i],
                              "задаёт порог": i == k and empirical >= normal} for i in selected]
             cur["calibration"] = {"normal_z": normal, "empirical_z": empirical,
-                                  "history_months": len(past), "contributors": contributors}
+                                  "history_months": len(past), "contributors": contributors,
+                                  "excluded_count": excluded_count,
+                                  "excluded": sorted(excluded, key=lambda r: -r["модуль z"])[:3],
+                                  "unsupported_current": int(np.sum(~np.isfinite(cur["z"]) & np.isfinite(obs[:, t]))),
+                                  "legacy_replay": legacy_replay}
         out[f] = cur
     return out
 
