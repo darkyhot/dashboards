@@ -628,81 +628,122 @@ def inject(p: Panel, ev: Event) -> Panel:
     return q
 
 
+def _cell_changes(frame: pd.DataFrame, changes: list[pd.DataFrame]) -> pd.DataFrame:
+    """Пакетное изменение существующих ячеек, без добавления выдуманных нулей."""
+    if frame.empty or not changes:
+        return frame
+    delta = pd.concat(changes).groupby(level=["row", "t", "atom"]).sum(min_count=1)
+    if len(delta.index.difference(frame.index)):
+        raise ValueError("Для артефакта нет исходной ячейки организации")
+    columns = [c for c in delta if c in frame]
+    if columns:
+        frame.loc[delta.index, columns] = frame.loc[delta.index, columns] + delta[columns]
+    return frame.sort_index()
+
+
 def _inject_artifact(p: Panel, ev: Event) -> Panel:
-    """Артефакт изменяет долю остатка, сохраняя дробных людей и совместительство."""
-    q = p.copy()
-    t = ev.t
-    if ev.kind == "calendar":
-        if t >= len(p.months) - 1:
-            raise ValueError("У календарного сдвига должен наблюдаться месяц возврата")
-        wanted = np.round(ev.q * np.nan_to_num(p.x["m_base_pf"][:, t]))
-        available = np.minimum(np.nan_to_num(p.x["pf_recip"][:, t]),
-                               np.nan_to_num(p.x["m_base_pf"][:, t + 1]))
-        lost = np.minimum(wanted, np.maximum(available, 0.))
-        lost[~np.isfinite(p.x["m_out_temp"][:, t])] = 0.
+    """Одна когорта по фактическим ячейкам и остатку, затем суммы по организации.
+
+    Доля совместителей и долевые ФЛ берутся внутри каждой ячейки. Их нельзя
+    распределять обратно по долям общего портфеля организации: состав различается.
+    """
+    if not 0 <= ev.q <= 1:
+        raise ValueError("Доля артефакта должна быть от 0 до 1")
+    q, t, atoms = p.copy(), ev.t, p.atoms
+    calendar = ev.kind == "calendar"
+    if calendar and t >= len(p.months) - 1:
+        raise ValueError("У календарного сдвига должен наблюдаться месяц возврата")
+    stock_measures = ["pf_recip", "m_base_pf", "pf_fl", "multi_recip"]
+    if len(p.orgs) and p.org_stock.empty:
+        raise ValueError("Для артефакта нужна детализация остатков организаций по ячейкам")
+    if p.org_stock.empty:
+        current = pd.DataFrame(columns=["row", "atom"] + stock_measures)
     else:
-        fraction = np.zeros(len(p.meta))
-        atoms = p.atoms[p.meta.loc[p.atoms, "sys_tb_id"].to_numpy() == ev.tb]
-        fraction[atoms] = ev.q
-        if not p.org_stock.empty:
-            current = p.org_stock.xs(t, level="t").reset_index()
-            current = current.loc[current["atom"].isin(atoms)]
-            affected = current.groupby("row")["pf_recip"].sum()
-            for r, amount in affected.items():
-                total = p.x["pf_recip"][r, t]
-                fraction[r] = ev.q * amount / total if total > 0 else 0.
-        lost = fraction * np.nan_to_num(p.x["pf_recip"][:, t])
-    for r in np.flatnonzero(lost > 0):
-        n = float(lost[r])
-        old_pf = p.x["pf_recip"][r, t]
-        share = n / old_pf
-        fl = p.x["pf_fl"][r, t] * share
-        for m in ("m_out_left_bank", "m_lb_unknown"):
-            _add(q, [r], m, t, t, n)
-        _add(q, [r], "m_fl_out", t, t, fl)
-        for m in ("pf_recip", "pf_fl", "any_recip", "multi_recip", "raw_rows", "fot_amt", "single_pay_recip"):
-            q.x[m][r, t] *= 1 - share
-        if ev.kind == "calendar":
-            _add(q, [r], "m_out_temp", t, t, n)
-            _add(q, [r], "m_out_temp_left", t, t, n)
-            _add(q, [r], "m_base_pf", t + 1, t + 1, -n)
-            for m in ("m_in_from_outside", "m_in_returned", "m_in_temp_outside"):
-                _add(q, [r], m, t + 1, t + 1, n)
-            _add(q, [r], "m_fl_in", t + 1, t + 1, fl)
-            _add(q, [r], "y_out_left_bank", t, t, n)
-            room = max(0., q.x["pf_recip"][r, t] - q.x["single_pay_recip"][r, t])
-            _add(q, [r], "single_pay_recip", t, t, min(3 * n, room))
-    # Сохраняем те же изменения в фактических ячейках. Иначе проверка остатка
-    # принимает несогласованность самого стенда за независимое событие.
-    if not p.org_stock.empty:
         current = p.org_stock.xs(t, level="t").reset_index()
-        for r, cells in current.groupby("row"):
-            amount = cells["pf_recip"].to_numpy(dtype=float)
-            if ev.kind == "underload":
-                amount = np.where(cells["atom"].isin(atoms), amount, 0.)
-            total = amount.sum()
-            if total <= 0 or lost[int(r)] <= 0:
-                continue
-            for cell, weight in zip(cells["atom"], amount / total):
-                if weight <= 0:
-                    continue
-                for frame_name, measures in (("org_stock", {m: m for m in p.org_stock.columns}),
-                                              ("org_flows", CELL_MEAS)):
-                    frame = getattr(q, frame_name)
-                    for column, measure in measures.items():
-                        if column not in frame:
-                            continue
-                        delta = q.x[measure][int(r)] - p.x[measure][int(r)]
-                        for h in np.flatnonzero(np.isfinite(delta) & (abs(delta) > 1e-9)):
-                            key = (int(r), int(h), int(cell))
-                            if key not in frame.index:
-                                frame.loc[key, :] = 0.
-                            frame.at[key, column] += delta[h] * weight
-        q.org_stock.sort_index(inplace=True)
-        q.org_flows.sort_index(inplace=True)
+    # Остаток — отдельная непересекающаяся часть атома; его состав не угадывается.
+    tail = pd.DataFrame({"row": atoms, "atom": atoms,
+                         **{m: _atom_stocks(p, m)[:, t] for m in stock_measures}})
+    components = pd.concat([current, tail], ignore_index=True)
+    rr = components["row"].to_numpy(dtype=int)
+    aa = components["atom"].to_numpy(dtype=int)
+    if (aa < 0).any():
+        raise ValueError("Для артефакта неизвестна фактическая ячейка организации")
+    known = p.meta.loc[rr, "lvl"].to_numpy() == "org"
+    pf = components["pf_recip"].to_numpy(dtype=float)
+    valid = np.isfinite(components[stock_measures].to_numpy(dtype=float)).all(axis=1)
+    if np.any(valid & (components[stock_measures].to_numpy(dtype=float).min(axis=1) < -1e-6)):
+        raise ValueError("В исходном составе артефакта отрицательный остаток")
+    fraction = np.zeros(len(p.meta))
+    if calendar:
+        available = np.minimum(p.x["pf_recip"][atoms, t], p.x["m_base_pf"][atoms, t + 1])
+        wanted = np.minimum(np.round(ev.q * p.x["m_base_pf"][atoms, t]), available)
+        fraction[atoms] = np.divide(wanted, p.x["pf_recip"][atoms, t],
+            out=np.zeros(len(atoms)), where=p.x["pf_recip"][atoms, t] > 0)
+        fraction[atoms[~np.isfinite(p.x["m_out_temp"][atoms, t])]] = 0.
+    else:
+        fraction[atoms[p.meta.loc[atoms, "sys_tb_id"].to_numpy() == ev.tb]] = ev.q
+    removed = np.where(valid & (pf > 0), pf * fraction[aa], 0.)
+    if calendar:
+        next_base = np.zeros(len(components))
+        if known.any():
+            keys = pd.MultiIndex.from_arrays([rr[known], np.full(known.sum(), t + 1), aa[known]],
+                                              names=["row", "t", "atom"])
+            next_base[known] = p.org_stock["m_base_pf"].reindex(keys, fill_value=0.).to_numpy()
+        next_base[~known] = _atom_stocks(p, "m_base_pf")[:, t + 1]
+        # Нельзя вернуть временную когорту в несуществующую базу следующего месяца.
+        removed = np.minimum(removed, np.maximum(next_base, 0.))
+        removed[~np.isfinite(removed)] = 0.
+    take = removed > 0
+    components, rr, aa, known, pf, removed = (v[take] if isinstance(v, np.ndarray) else v.loc[take]
+                                            for v in (components, rr, aa, known, pf, removed))
+    if not len(removed):
+        return q
+    share = removed / pf
+    losses = {m: components[m].to_numpy(dtype=float) * share
+              for m in ("pf_recip", "pf_fl", "multi_recip")}
+
+    def aggregate(measure, month, delta):
+        # Для остатка row уже равен атому; для организации её локальный вклад
+        # добавляется и в строку организации, и в атом.
+        np.add.at(q.x[measure][:, month], rr, delta)
+        np.add.at(q.x[measure][:, month], aa[known], delta[known])
+
+    for m, loss in losses.items():
+        aggregate(m, t, -loss)
+    for m in ("m_out_left_bank", "m_lb_unknown"):
+        aggregate(m, t, removed)
+    aggregate("m_fl_out", t, losses["pf_fl"])
+    total_removed = p.x["pf_recip"][:, t] - q.x["pf_recip"][:, t]
+    total_share = np.divide(total_removed, p.x["pf_recip"][:, t], out=np.zeros(len(p.meta)),
+                            where=p.x["pf_recip"][:, t] > 0)
+    for m in ("any_recip", "raw_rows", "fot_amt", "single_pay_recip"):
+        q.x[m][:, t] = p.x[m][:, t] * (1 - total_share)
+    if calendar:
+        for m in ("m_out_temp", "m_out_temp_left", "y_out_left_bank"):
+            aggregate(m, t, removed)
+        aggregate("m_base_pf", t + 1, -removed)
+        for m in ("m_in_from_outside", "m_in_returned", "m_in_temp_outside"):
+            aggregate(m, t + 1, removed)
+        aggregate("m_fl_in", t + 1, losses["pf_fl"])
+        room = np.maximum(q.x["pf_recip"][:, t] - q.x["single_pay_recip"][:, t], 0.)
+        q.x["single_pay_recip"][:, t] += np.minimum(3 * total_removed, room)
+    if known.any():
+        def indexed(values, month):
+            return pd.DataFrame(values, index=pd.MultiIndex.from_arrays(
+                [rr[known], np.full(known.sum(), month), aa[known]], names=["row", "t", "atom"]))
+        stock_delta = [indexed({m: -loss[known] for m, loss in losses.items()}, t)]
+        flow_delta = [indexed({"out_left": removed[known]}, t)]
+        if calendar:
+            stock_delta.append(indexed({"m_base_pf": -removed[known]}, t + 1))
+            flow_delta[0]["out_temp_left"] = removed[known]
+            flow_delta.append(indexed({"in_outside": removed[known],
+                                       "in_temp_outside": removed[known]}, t + 1))
+        # Нули здесь — отсутствие изменения, не подстановка исходного наблюдения.
+        q.org_stock = _cell_changes(q.org_stock, [d.reindex(columns=stock_measures, fill_value=0.)
+                                                 for d in stock_delta])
+        q.org_flows = _cell_changes(q.org_flows, [d.reindex(columns=list(CELL_MEAS), fill_value=0.)
+                                                 for d in flow_delta])
     return q
-
-
 
 
 def _move(p: Panel, a: list[int], b: list[int], t: int, n: int) -> None:
@@ -920,51 +961,63 @@ def make_plan(p: Panel, seed: int = 7, months_back: int = 6,
 def evaluate(detect, p: Panel, seed: int = 7, months_back: int = 6,
              sizes=(3.0, 4.0, 6.0), per_cell: int = 10, kinds=EVENT_KINDS,
              people_sizes=(300, 1000, 3000), per_size: int = 3, plan: dict | None = None,
-             clean_is_known: bool = False, progress=None) -> dict:
+             clean_is_known: bool = False, progress=None, completed: dict | None = None) -> dict:
     """Экзамен: полнота по типу × размеру, точность места, ложные на чистых месяцах,
     эхо (провал прошлого месяца), утечка артефактов."""
     plan = plan or make_plan(p, seed, months_back, sizes, per_cell, kinds, people_sizes, per_size)
     ts = plan["ts"]
-    backgrounds = {t: detect(p, t) for t in sorted(set(ts + [ts[-1] - 1]))}
-    rec = []
-    invalid = []
-    for index, ev in enumerate(plan["trials"]):
-        t, kind = ev.t, ev.kind
-        try:
-            q = inject(p, ev)
-        except ValueError as exc:
-            invalid.append({"kind": kind, "t": t, "row": ev.row, "n": ev.n, "error": str(exc)})
-            continue
-        cards = detect(q, t)
-        targets = [(ev.row, ev.sign, EVENT_MEASURE[kind])]
-        if kind == "reorg":
-            targets.append((ev.row2, 1, "m_in_from_other_org"))
-        for r, sgn, measure in targets:
-            noise = float(row_noise(p, t, np.array([r]), measure=measure)[0])
-            lv = match(p, cards, r, sgn, backgrounds[t], measure, max(1., .5 * ev.n), t)
-            rec.append({"kind": kind, "k": ev.extra["k"], "effective_k": ev.n / noise,
-                        "mode": ev.extra["size_mode"], "noise": noise,
-                        "n": ev.n, "t": t, "row": r, "measure": measure,
-                        "lvl": p.meta.at[r, "lvl"], "found": lv is not None and LEVELS.index(lv) <= LEVELS.index("tb"),
-                        "exact": lv in ("org", "atom"), "level": lv})
-        if progress and (index + 1) % 25 == 0:
-            progress(f"Проверено событий: {index + 1}/{len(plan['trials'])}")
-    recall = pd.DataFrame(rec)
+    if completed is None:
+        backgrounds = {t: detect(p, t) for t in sorted(set(ts + [ts[-1] - 1]))}
+        rec = []
+        invalid = []
+        for index, ev in enumerate(plan["trials"]):
+            t, kind = ev.t, ev.kind
+            try:
+                q = inject(p, ev)
+            except ValueError as exc:
+                invalid.append({"kind": kind, "t": t, "row": ev.row, "n": ev.n, "error": str(exc)})
+                continue
+            cards = detect(q, t)
+            targets = [(ev.row, ev.sign, EVENT_MEASURE[kind])]
+            if kind == "reorg":
+                targets.append((ev.row2, 1, "m_in_from_other_org"))
+            for r, sgn, measure in targets:
+                noise = float(row_noise(p, t, np.array([r]), measure=measure)[0])
+                lv = match(p, cards, r, sgn, backgrounds[t], measure, max(1., .5 * ev.n), t)
+                rec.append({"kind": kind, "k": ev.extra["k"], "effective_k": ev.n / noise,
+                            "mode": ev.extra["size_mode"], "noise": noise,
+                            "n": ev.n, "t": t, "row": r, "measure": measure,
+                            "lvl": p.meta.at[r, "lvl"], "found": lv is not None and LEVELS.index(lv) <= LEVELS.index("tb"),
+                            "exact": lv in ("org", "atom"), "level": lv})
+            if progress and (index + 1) % 25 == 0:
+                progress(f"Проверено событий: {index + 1}/{len(plan['trials'])}")
+        recall = pd.DataFrame(rec)
 
-    clean = [sum(c.label not in ARTIFACTS for c in backgrounds[t]) for t in ts]
+        clean = [sum(c.label not in ARTIFACTS for c in backgrounds[t]) for t in ts]
 
-    echo = []
-    for ev in plan["echoes"]:
-        try:
-            q = inject(p, ev)
-        except ValueError as exc:
-            invalid.append({"kind": "echo", "t": ev.t, "error": str(exc)})
-            continue
-        t = ev.t + 1
-        if t not in backgrounds:
-            backgrounds[t] = detect(p, t)
-        echo.append(match(p, detect(q, t), ev.row, 1, backgrounds[t],
-                          "m_in_from_outside", max(1., .5 * ev.n), t) is not None)
+        echo = []
+        for ev in plan["echoes"]:
+            try:
+                q = inject(p, ev)
+            except ValueError as exc:
+                invalid.append({"kind": "echo", "t": ev.t, "error": str(exc)})
+                continue
+            t = ev.t + 1
+            if t not in backgrounds:
+                backgrounds[t] = detect(p, t)
+            echo.append(match(p, detect(q, t), ev.row, 1, backgrounds[t],
+                              "m_in_from_outside", max(1., .5 * ev.n), t) is not None)
+
+    else:
+        if completed.get("plan") is not plan:
+            raise ValueError("Продолжение стенда относится к другому плану")
+        backgrounds = dict(completed["backgrounds"])
+        recall = completed["recall"].copy()
+        clean = list(completed["clean_cards"])
+        echo = list(completed["echo_values"])
+        invalid = []
+        if progress:
+            progress("Фон, события и эхо восстановлены из завершённых этапов; проверяются артефакты.")
 
     leak = {}
     details = {}

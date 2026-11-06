@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import sys
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -13,6 +14,88 @@ import pandas as pd
 
 from . import bench, diagnostics, presentation, watch
 from .inputs import Panel
+
+
+def _code_signature(code):
+    """Семантика функции без номеров строк, с рекурсивным учётом вложенного кода."""
+    return (code.co_code, tuple(_code_signature(v) if hasattr(v, "co_code") else v
+                               for v in code.co_consts), code.co_names, code.co_varnames,
+            code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount,
+            code.co_freevars, code.co_cellvars, code.co_flags, getattr(code, "co_exceptiontable", b""))
+
+
+def _default_signature(value):
+    if isinstance(value, float) and not np.isfinite(value):
+        return ("float", str(value))
+    if isinstance(value, (tuple, list)):
+        return tuple(_default_signature(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _default_signature(v) for k, v in value.items()}
+    return value
+
+
+def method_signature():
+    """Код модели и обычных закладок до/после reload. Артефакты можно исправлять
+    отдельно, но изменение отбора или событий запрещает повторное использование."""
+    from . import count_model, inputs
+    signatures = {}
+    for module in (watch, count_model, inputs, bench):
+        for name, value in vars(module).items():
+            if module is bench and name in ("_inject_artifact", "_cell_changes", "evaluate"):
+                continue
+            if name.isupper():
+                try:
+                    signatures[(module.__name__, name)] = json.dumps(_plain(value), sort_keys=True)
+                except TypeError:
+                    if isinstance(value, (set, frozenset)):
+                        signatures[(module.__name__, name)] = tuple(sorted(value))
+            if getattr(value, "__module__", None) != module.__name__:
+                continue
+            members = vars(value).items() if isinstance(value, type) else [("", value)]
+            for member, function in members:
+                function = function.fget if isinstance(function, property) else function
+                if hasattr(function, "__code__"):
+                    signatures[(module.__name__, name, member)] = (
+                        _code_signature(function.__code__), _default_signature(function.__defaults__),
+                        _default_signature(function.__kwdefaults__))
+    return signatures
+
+
+def recover_artifact_failure(previous_signature):
+    """Прочитать завершённые этапы только из последней ошибки данного стенда.
+    Объекты остаются в памяти текущего ядра; файлы и данные наружу не передаются.
+    Старый аварийный результат не считается завершённой приёмкой.
+    """
+    if previous_signature != method_signature():
+        return None
+    traceback = getattr(sys, "last_traceback", None)
+    if traceback is None:
+        traceback = getattr(getattr(sys, "last_exc", None), "__traceback__", None)
+    params = {}
+    while traceback is not None:
+        frame = traceback.tb_frame
+        local = frame.f_locals
+        if (frame.f_code.co_name == "run"
+                and Path(frame.f_code.co_filename).resolve() == Path(__file__).resolve()):
+            params = dict(local.get("params", {}))
+        if (frame.f_code.co_name == "evaluate"
+                and Path(frame.f_code.co_filename).resolve() == Path(bench.__file__).resolve()
+                and local.get("name") in ("calendar", "underload", "recode")
+                and isinstance(local.get("recall"), pd.DataFrame)
+                and not local.get("invalid")):
+            plan = local["plan"]
+            count = sum(2 if e.kind == "reorg" else 1 for e in plan["trials"])
+            if len(local["recall"]) != count or len(local.get("echo", [])) != len(plan["echoes"]):
+                return None
+            p = local["p"]
+            if local["detect"].__module__ != watch.__name__:
+                return None
+            return {"panel": p, "params": params, "known_clean": local["clean_is_known"],
+                    "completed": {"plan": plan,
+                    "backgrounds": local["backgrounds"], "recall": local["recall"],
+                    "clean_cards": local["clean"], "echo_values": local["echo"]}}
+        traceback = traceback.tb_next
+    return None
 
 
 def _plain(value):
@@ -176,15 +259,16 @@ def _write_html(path, data):
 
 
 def run(p: Panel, out_dir="output/watch_acceptance", compare=True, known_clean=False,
-        max_details=12, progress=print, **params) -> dict:
+        max_details=12, progress=print, completed=None, **params) -> dict:
     """Сохранить весь результат одним запуском. Подложка и настройки БД не меняются."""
     start = time.monotonic()
     folder = Path(out_dir)
     folder.mkdir(parents=True, exist_ok=True)
-    plan = bench.make_plan(p, **params)
+    plan = bench.make_plan(p, **params) if completed is None else completed["plan"]
     if progress:
         progress(f"Приёмка: {len(plan['trials'])} событий; пропущено попыток {len(plan['skipped'])}")
-    result = bench.evaluate(watch.detect, p, plan=plan, clean_is_known=known_clean, progress=progress)
+    result = bench.evaluate(watch.detect, p, plan=plan, clean_is_known=known_clean,
+                            progress=progress, completed=completed)
     frames, secondary = [], []
     for t in plan["ts"]:
         cards = result["backgrounds"][t]
@@ -210,7 +294,8 @@ def run(p: Panel, out_dir="output/watch_acceptance", compare=True, known_clean=F
             "leak": result["leak"], "quality": quality(p), "artifacts": artifacts,
             "reason_partition": reason_partition(p),
             "recode_diagnostics": recode_details, "missed_details": _missed_details(p, result, max_details),
-            "invalid": result["invalid"], "skipped": result["skipped"]}
+            "invalid": result["invalid"], "skipped": result["skipped"],
+            "recovered_stages": ["background", "events", "echo"] if completed is not None else []}
     data = presentation.mask(data, p)
     # Сохраняем результат сторожа до сравнения: уже есть полный файл, даже если
     # последующий долгий расчёт соперника будет остановлен пользователем.
