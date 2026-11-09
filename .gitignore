@@ -16,3 +16,4 @@ output/forecast_lab/
 output/payroll_rgs_cohort/
 # Ожидания синтетики — генерируемый артефакт открытого контура (python3 -m synth)
 output/synth_payroll_expect.json
+.venv/

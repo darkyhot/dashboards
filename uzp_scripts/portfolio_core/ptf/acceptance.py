@@ -154,44 +154,123 @@ def _checks(result):
                          for name, ok, detail in bench.verdict(result)])
 
 
-def _missed_details(p, result, limit):
+def _event_of(plan, row):
+    """Закладка, давшая цель recall; у реорганизации цель — любая из двух сторон."""
+    t, target, kind, n = int(row["t"]), int(row["row"]), row["kind"], int(row["n"])
+    return next((ev for ev in plan["trials"] if ev.t == t and ev.kind == kind
+                 and ev.n == n and target in (ev.row, ev.row2)), None)
+
+
+def _target_scan(p, ev, target, cache):
+    """Нужный ряд до и после закладки — тем же первичным отбором, что у сторожа.
+
+    «Запас» — watch.excess: превышение факта над прогнозной границей (положительная
+    модель). Ряд проходит первичный отбор, если запас не меньше минимума. Скан «до»
+    зависит только от месяца и уровня, поэтому кэшируется между целями.
+    """
+    lvl = p.meta.at[target, "lvl"]
+    rows = p.orgs if lvl == "org" else p.atoms
+    i = int(np.flatnonzero(rows == target)[0])
+    if (ev.t, lvl) not in cache:
+        obs = {f: watch.flow_obs(p, f) for f in watch.FLOWS}
+        cache[(ev.t, lvl)] = watch.scan_rows(p, rows, ev.t, obs)
+    q = bench.inject(p, ev)
+    obs = {f: watch.flow_obs(q, f) for f in watch.FLOWS}
+    after = watch.scan_rows(q, rows, ev.t, obs, details=True)
+    records = []
+    for when, scans in (("до", cache[(ev.t, lvl)]), ("после", after)):
+        picked = {rr: f for rr, f, *_ in watch.pick(scans, rows)}.get(target)
+        for f, s in scans.items():
+            records.append({"когда": when, "поток": f, "факт": s["obs"][i], "ожидание": s["E"][i],
+                            "граница": s["upper"][i] if "upper" in s else np.nan,
+                            "шум": s["s"][i], "порог z": s["zs"], "сверх шума": watch.excess(s)[i],
+                            "минимум": watch.floor_of(s["base"][i]), "выбран": picked == f})
+    return {"table": pd.DataFrame(records).round(2),
+            "calibration": {f: s["calibration"] for f, s in after.items()},
+            "where": watch.where(p, bench.Card(lvl, target, "net", 0))}
+
+
+def _missed_details(p, result, limit, select=None):
     r = result["recall"]
     if r.empty or limit <= 0:
         return []
-    missed = r.loc[~r["found"]].sort_values("n", ascending=False)
-    reports, seen = [], set()
+    missed = r.loc[~r["found"].astype(bool) & (True if select is None else select)]
+    missed = missed.sort_values("n", ascending=False)
+    reports, seen, cache = [], set(), {}
     for _, row in missed.iterrows():
         key = (int(row["t"]), int(row["row"]), row["kind"], int(row["n"]))
         if key in seen:
             continue
         seen.add(key)
-        ev = next((ev for ev in result["plan"]["trials"] if ev.t == key[0] and ev.kind == key[2]
-                   and ev.n == key[3] and key[1] in (ev.row, ev.row2)), None)
+        ev = _event_of(result["plan"], row)
         if ev is None:
             continue
-        q = bench.inject(p, ev)
         target = int(row["row"])
-        rows = p.orgs if p.meta.at[target, "lvl"] == "org" else p.atoms
-        i = int(np.flatnonzero(rows == target)[0])
-        records, calibration = [], {}
-        for when, panel in (("до", p), ("после", q)):
-            obs = {f: watch.flow_obs(panel, f) for f in watch.FLOWS}
-            scans = watch.scan_rows(panel, rows, ev.t, obs, details=when == "после")
-            if when == "после":
-                calibration = {f: s["calibration"] for f, s in scans.items()}
-            picked = {rr: f for rr, f, *_ in watch.pick(scans, rows)}.get(target)
-            for f, s in scans.items():
-                records.append({"когда": when, "поток": f, "факт": s["obs"][i],
-                                "ожидание": s["E"][i], "шум": s["s"][i], "порог z": s["zs"],
-                                "сверх шума": abs(s["d"][i]) - s["zs"] * s["s"][i],
-                                "минимум": watch.floor_of(s["base"][i]), "выбран": picked == f})
+        scan = _target_scan(p, ev, target, cache)
         reports.append({"event": ev, "target": target, "size_sigma": row["effective_k"],
-                        "measure": row["measure"], "calibration": calibration,
-                        "where": watch.where(p, bench.Card(p.meta.at[target, "lvl"], target, "net", 0)),
-                        "table": pd.DataFrame(records).round(2)})
+                        "measure": row["measure"], **scan})
         if len(reports) >= limit:
             break
     return reports
+
+
+def saved_result(p, data):
+    """Цели и план стенда без повторного расчёта: recall из отчёта, план — той же
+    детерминированной жеребьёвкой. Отчёт обязан относиться к этой панели."""
+    header = data["input"]
+    if (header["months"] != p.months or header["atoms"] != len(p.atoms)
+            or header["organizations"] != len(p.orgs)
+            or (header.get("run_id") is not None and p.run_id is not None and str(header["run_id"]) != str(p.run_id))):
+        raise ValueError("Панель и отчёт относятся к разным поколениям. Нужен panel того же запуска приёмки.")
+    recall = pd.DataFrame(data["recall"])
+    plan = bench.make_plan(p, **(data.get("params") or {}))
+    lost = [i for i, row in recall.iterrows() if _event_of(plan, row) is None]
+    if lost:
+        raise ValueError(f"План стенда не восстановился: {len(lost)} целей без закладки. "
+                         "Нужен res_acceptance в памяти того же ядра.")
+    return {"recall": recall, "plan": plan}
+
+
+def weak_misses(p, res, progress=print) -> dict:
+    """Разбор целей «около трёх шумов, ≥ 300 чел.» — ровно тех, что считает приёмка.
+
+    Обзор по всем целям группы и подробная таблица по каждому пропуску. Стенд и сборка
+    не запускаются: результат берётся из res_acceptance в памяти, а после перезапуска
+    ядра — из сохранённого отчёта и восстановленного плана.
+    """
+    result = res.get("result") or saved_result(p, res["data"])
+    r = result["recall"]
+    _, mid = bench.acceptance_groups(r)
+    targets = r.loc[mid].sort_values(["found", "n"], ascending=[True, False])
+    overview, details, cache = [], [], {}
+    for number, (_, row) in enumerate(targets.iterrows(), start=1):
+        if progress:
+            progress(f"Слабые цели: {number}/{len(targets)}")
+        ev = _event_of(result["plan"], row)
+        target = int(row["row"])
+        scan = _target_scan(p, ev, target, cache)
+        flow = bench.FLOW_ALIAS[row["measure"]]
+        table = scan["table"]
+        after = table.loc[(table["когда"] == "после") & (table["поток"] == flow)].iloc[0]
+        calibration = scan["calibration"][flow]
+        found = bool(row["found"])
+        level = row.get("level")
+        overview.append({
+            "№": number, "тип": row["kind"], "месяц": p.months[int(row["t"])][:7],
+            "ряд": "орг." if p.meta.at[target, "lvl"] == "org" else "атом",
+            "людей": int(row["n"]), "шумов стенда": round(float(row["effective_k"]), 2),
+            "найдено": level if found else ("нет" if level is None or pd.isna(level) else f"нет ({level})"),
+            "факт": after["факт"], "ожидание": after["ожидание"], "граница": after["граница"],
+            "запас": after["сверх шума"], "минимум": after["минимум"],
+            "отбор": bool(np.isfinite(after["сверх шума"]) and after["сверх шума"] >= after["минимум"]),
+            "выбран поток": bool(after["выбран"]),
+            "масштаб": round(float(calibration.get("scale", np.nan)), 2),
+            "порог z": round(float(calibration.get("critical_z", np.nan)), 2)})
+        if not found:
+            details.append({"event": ev, "target": target, "size_sigma": row["effective_k"],
+                            "measure": row["measure"], **scan})
+    return presentation.mask({"overview": pd.DataFrame(overview), "details": details,
+                              "months": p.months}, p)
 
 
 def _table(frame):

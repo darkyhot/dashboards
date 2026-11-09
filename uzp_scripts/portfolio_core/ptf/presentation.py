@@ -105,6 +105,32 @@ def target_flow(item):
     return FLOW_ALIAS[EVENT_MEASURE[ev["kind"]]]
 
 
+def _miss_page(item, months):
+    """Страница одного пропущенного события: нужный поток до/после и источник порога."""
+    ev = item["event"]
+    flow = target_flow(item)
+    table = _frame(item["table"])
+    table = table.loc[table["поток"] == flow]
+    title = f"{ev['kind']}: {ev['n']} человек; {item['size_sigma']:.2f} шума"
+    notes = [months[ev["t"]] + "; " + item["where"],
+             "Запас должен быть не меньше минимума, чтобы пройти первичный отбор."]
+    blocks = [("Нужный поток до и после закладки", table.drop(columns=["поток"]).rename(
+        columns={"когда": "Когда", "факт": "Факт", "ожидание": "Ожидание", "граница": "Граница",
+                 "шум": "Шум", "порог z": "Порог z", "сверх шума": "Запас", "минимум": "Минимум",
+                 "выбран": "Выбран"}))]
+    calibration = item.get("calibration", {}).get(flow, {})
+    if calibration:
+        blocks.append(("Источники исторического порога", _frame(calibration.get("contributors", []))))
+        line = (f"Поправка на число проверок: {calibration['normal_z']:.2f}; "
+                f"исторический порог: {calibration['empirical_z']:.2f}.")
+        if "critical_z" in calibration:
+            line += f" С материальностью: {calibration['critical_z']:.2f}; масштаб {calibration['scale']:.2f}."
+        notes.append(line)
+    else:
+        notes.append("В этом отчёте источники исторического порога ещё не записаны.")
+    return title, blocks, notes
+
+
 def photo_page(data, section="итог", page=1, month=None, panel=None):
     """Одна страница, без БД и детектора. Принимает DataFrame или загруженный JSON."""
     from .bench import ACCEPT
@@ -164,25 +190,33 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         details = data.get("missed_details", [])
         pages = max(1, len(details))
         if 1 <= page <= len(details):
-            item = details[page - 1]
-            ev = item["event"]
-            flow = target_flow(item)
-            table = _frame(item["table"])
-            table = table.loc[table["поток"] == flow]
-            title = f"{ev['kind']}: {ev['n']} человек; {item['size_sigma']:.2f} шума"
-            notes += [data["input"]["months"][ev["t"]] + "; " + item["where"],
-                      "Граница должна быть не меньше минимума, чтобы пройти первичный отбор."]
-            blocks = [("Нужный поток до и после закладки", table.drop(columns=["поток"]).rename(
-                columns={"когда": "Когда", "факт": "Факт", "ожидание": "Ожидание", "шум": "Шум",
-                         "порог z": "Порог z", "сверх шума": "Граница", "минимум": "Минимум", "выбран": "Выбран"}))]
-            calibration = item.get("calibration", {}).get(flow, {})
-            if calibration:
-                blocks.append(("Источники исторического порога", _frame(calibration.get("contributors", []))))
-                notes.append(f"Поправка на число проверок: {calibration['normal_z']:.2f}; "
-                             f"исторический порог: {calibration['empirical_z']:.2f}.")
-            else:
-                notes.append("В этом отчёте источники исторического порога ещё не записаны.")
+            title, blocks, notes = _miss_page(details[page - 1], data["input"]["months"])
             notes.append(f"Сохранено разборов: {len(details)}. Это выборка крупнейших пропусков.")
+    elif section == "слабые":
+        weak = data.get("weak_misses")
+        if not weak:
+            raise ValueError('Разбор слабых целей не рассчитан: запустите ячейку с PHOTO_SECTION = "слабые"')
+        overview, details = _frame(weak["overview"]), weak["details"]
+        per = 8
+        first = max(1, (len(overview) + per - 1) // per)
+        pages = first + len(details)
+        if page <= first:
+            found = int((~overview["найдено"].astype(str).str.startswith("нет")).sum()) if len(overview) else 0
+            title = f"Слабые цели (≈3 шума, ≥300 чел.): найдено {found} из {len(overview)}"
+            part = overview.iloc[(page - 1) * per:page * per]
+            if part.empty:
+                blocks = [("Целей нет", part)]
+            else:
+                blocks = [("Цели", part[["№", "тип", "месяц", "ряд", "людей", "шумов стенда", "найдено"]]),
+                          ("Первичный отбор нужного потока после закладки",
+                           part[["№", "факт", "ожидание", "граница", "запас", "минимум", "отбор",
+                                 "выбран поток", "масштаб", "порог z"]])]
+            notes += ["Запас = факт − прогнозная граница; отбор пройден, если запас ≥ минимума.",
+                      "Масштаб > 1 — порог расширен по реальной истории ошибок ряда.",
+                      f"Страницы {first + 1}–{pages}: подробно по каждому пропуску." if details else "Пропусков нет."]
+        elif page <= pages:
+            title, blocks, notes = _miss_page(details[page - first - 1], weak["months"])
+            title = f"Пропуск {page - first}/{len(details)} — " + title
     elif section == "бизнес":
         from .business import compact
 
@@ -276,7 +310,7 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         pages = max(1, (len(frame) + 7) // 8)
         blocks = [("Разметка причин: последние шесть месяцев", frame.iloc[(page - 1) * 8:page * 8])]
     else:
-        raise ValueError("Раздел: бизнес, итог, карточки, пропуски, календарь, кейс-август, пороги или качество")
+        raise ValueError("Раздел: бизнес, итог, карточки, пропуски, слабые, календарь, кейс-август, пороги или качество")
     if page > pages:
         raise ValueError(f"Страница должна быть от 1 до {pages}")
     return {"title": title, "page": page, "pages": pages, "blocks": blocks, "notes": notes}

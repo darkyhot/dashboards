@@ -1128,6 +1128,15 @@ def by_size(res: dict) -> pd.DataFrame:
                          observed=False).round(2)
 
 
+def acceptance_groups(r: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Маски целей приёмки: крупные (≥ 4 шумов, ≥ 2 000 чел.) и «около трёх шумов» (≥ 300 чел.).
+    Одно определение для вердикта и для разбора пропусков."""
+    actual_k = r["effective_k"] if "effective_k" in r else r["k"]
+    big = (actual_k >= 3.95) & (r["n"] >= 2000) & (r["kind"] != "stop")
+    mid = (abs(actual_k - 3) <= .15) & (r["n"] >= 300)
+    return big, mid
+
+
 def verdict(res: dict) -> list[tuple[str, bool, str]]:
     """Пороги приёмки. Карточка требует ≥ 100 лишних людей с запасом на шум, поэтому
     события меньше 300 человек упираются в этот пол по построению: порог «3 шума»
@@ -1135,9 +1144,8 @@ def verdict(res: dict) -> list[tuple[str, bool, str]]:
     r = res["recall"]
     if r.empty:
         return [("события заложить не удалось: ряды меньше 100 человек", False, "")]
-    actual_k = r["effective_k"] if "effective_k" in r else r["k"]
-    big = r[(actual_k >= 3.95) & (r["n"] >= 2000) & (r["kind"] != "stop")]
-    mid = r[(abs(actual_k - 3) <= .15) & (r["n"] >= 300)]
+    big_mask, mid_mask = acceptance_groups(r)
+    big, mid = r[big_mask], r[mid_mask]
     out = [
         ("полнота: ≥ 4 шумов и ≥ 2 тыс. чел.", len(big) > 0 and big["found"].mean() >= ACCEPT["recall_4"],
          f"{big['found'].mean():.2f} из {len(big)}" if len(big) else "нет событий"),
