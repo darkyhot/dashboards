@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 from ... import llm as llm_mod
 from ... import progress
@@ -23,6 +24,15 @@ BATCH_STEPS = (30, 10, 3, 1)   # шаги деградации размера б
 PROMPT_CHAR_LIMIT = 40_000     # больше в один запрос не отправляем — делим заранее
 CALLS_BUDGET_FACTOR = 4        # максимум вызовов = фактор × число исходных батчей
 ZERO_STREAK_ABORT = 3          # столько пустых ответов подряд = LLM недоступна по смыслу
+# Шлюз не ответил ни разу за целый ТБ — значит лежит, и следующим ТБ отчёта по сети
+# аудит даже не начинаем. Сбрасывается вызовом reset_gateway() в начале генерации.
+_GATEWAY_DOWN = False
+
+
+def reset_gateway() -> None:
+    """Забыть про отказ шлюза — вызывается в начале каждой генерации отчёта."""
+    global _GATEWAY_DOWN
+    _GATEWAY_DOWN = False
 
 
 def notes_text(notes) -> str:
@@ -93,35 +103,159 @@ def _parse_items(raw: str) -> list[dict]:
     return out
 
 
-def _prompt(chunk: list[dict]) -> str:
-    # Названия ГОСБ и компаний в LLM НЕ отправляем (шлюз блокирует запросы с
-    # чувствительной географией). Для ответа они не нужны: ключ — числовые id.
-    lines = []
+def _facts_line(f: dict) -> str:
+    """Строка ФАКТОВ из витрины — формулировки без внутреннего жаргона.
+
+    Раньше здесь стояло «свежих сделок нет», и модель читала это как «сделки нет»
+    даже когда рядом шли план/факт по сделке. Теперь про сделку говорится ровно одно
+    утверждение, и отдельно проговаривается случай, когда сделка НЕ предполагается.
+
+    По сделкам берём ТОЛЬКО «старый» месяц: свежие (последние 2 мес) ещё могут
+    реализоваться, их факт=0 — норма, а не недоработка.
+    """
+    if not f:
+        return "—"
+    parts: list[str] = []
+    if f.get("potential"):
+        parts.append(f"потенциал привлечения {int(f['potential'])} чел")
+    if f.get("outflow_fl"):
+        parts.append(f"отток {int(f['outflow_fl'])} чел "
+                     f"(ФОТ {float(f.get('outflow_fot_mln', 0)):.1f} млн ₽)")
+    if f.get("avg_salary"):
+        parts.append(f"средняя ЗП ~{float(f['avg_salary']) / 1000:.0f} тыс ₽")
+    # состояние задач: открытая и не просроченная задача — это НЕ недоработка
+    n_ip, n_cl = int(f.get("n_in_progress", 0)), int(f.get("n_closed", 0))
+    if n_ip:
+        parts.append(f"задач ещё В РАБОТЕ {n_ip} (не закрыты и НЕ просрочены)")
+    if n_cl:
+        parts.append(f"закрытых задач {n_cl}"
+                     + (", среди них есть успешные" if f.get("any_success")
+                        else ", успешных среди них нет"))
+    elif not n_ip:
+        parts.append("закрытых задач нет")
+    if f.get("n_overdue"):
+        parts.append(f"ПРОСРОЧЕНО задач {int(f['n_overdue'])}")
+    # Сделки: одно утверждение вместо двух противоречивых. План берётся АГРЕГАТОМ по
+    # закрытым месяцам (у организации могло быть несколько сделок на один месяц), факт —
+    # реально пришедшие получатели из витрины премирования.
+    if float(f.get("plan_np_due", 0)) > 0:
+        parts.append(f"по сделкам, срок которых уже прошёл ({int(f.get('due_months', 0))} мес): "
+                     f"планировали {float(f['plan_np_due']):.0f} получателей, "
+                     f"пришло {float(f.get('fact_np_due', 0)):.0f}")
+    elif not f.get("deal_expected"):
+        parts.append("сделка по этим задачам НЕ предполагается — её отсутствие НЕ дефект")
+    else:
+        parts.append("сделка заведена недавно — о зачислениях судить рано")
+    if f.get("deadline"):
+        parts.append(f"в тексте назван срок {f['deadline']} — он ЕЩЁ НЕ НАСТУПИЛ")
+    # --- фактический отток за три закрытых месяца ---
+    # Возврат называем отдельно: организация, откуда ушли и вернулись, отработана,
+    # а та же цифра ухода без возврата означает потерю.
+    if f.get("out_gone"):
+        ret = float(f.get("out_returned", 0))
+        kept = float(f.get("out_kept", 0))
+        back = (f", из них вернулись {ret:.0f}" if ret else ", никто не вернулся")
+        parts.append(f"фактический отток за 3 закрытых месяца "
+                     f"{float(f['out_gone']):.0f} чел{back} — потеряно {kept:.0f}")
+        # отработка ИМЕННО ОТТОКА, в месяц ухода и следующий за ним
+        if f.get("out_worked"):
+            parts.append("отток в месяц ухода ОТРАБОТАН: задача по оттоку закрыта "
+                         "успешно — не предлагай «начать отработку»")
+        elif not int(f.get("out_tasks", 0)):
+            parts.append("в месяц ухода и следующий задач НЕ БЫЛО вовсе")
+        elif not int(f.get("out_tasks_outflow", 0)):
+            parts.append(f"в месяц ухода были задачи ({int(f['out_tasks'])}), но ни "
+                         f"одной ПО ОТТОКУ")
+        else:
+            parts.append(f"задачи по оттоку были ({int(f['out_tasks_outflow'])}), но ни "
+                         f"одна не закрыта успешно")
+    if f.get("pipe_np_cur"):
+        parts.append(f"на текущий месяц в пайплайне запланировано "
+                     f"{float(f['pipe_np_cur']):.0f} получателей — работа уже идёт")
+    return "; ".join(parts)
+
+
+def _note_line(n) -> str:
+    if not isinstance(n, dict):
+        return f" - {n}"
+    meta = " · ".join(x for x in (n.get("date", ""), n.get("author", ""),
+                                  n.get("role", "")) if x)
+    ts = f'[{n.get("type", "")}/{n.get("status", "")}]'
+    if n.get("overdue"):
+        state = " (ПРОСРОЧЕНА)"
+    elif n.get("in_progress"):
+        state = " (ещё в работе — результата ждать рано)"
+    elif n.get("closed_same_day"):
+        state = " (закрыта в день создания)"
+    else:
+        state = ""
+    return f' - {meta} · {ts}{state} {n.get("text", "")}'.rstrip()
+
+
+def _prompt(chunk: list[dict], ref_label: str = "") -> str:
+    # Названия ГОСБ/компаний и ФИО в LLM НЕ отправляем (шлюз блокирует чувствительное;
+    # автор — обезличенный токен «Сотрудник-NN»). Ключ ответа — числовые id.
+    blocks = []
     for o in chunk:
-        notes = " ⏵ ".join(n["text"] if isinstance(n, dict) else str(n) for n in o["notes"])
-        lines.append(
-            f'gosb_id={o["gosb_id"]} inn={o["inn"]} '
-            f'| сегмент: {o.get("segment", "")} | активности: {notes}'
+        notes = "\n".join(_note_line(n) for n in o["notes"])
+        blocks.append(
+            f'## gosb_id={o["gosb_id"]} inn={o["inn"]} | сегмент: {o.get("segment", "")}'
+            f' | рычаг: {o.get("lever", "")}\n'
+            f'ФАКТЫ: {_facts_line(o.get("facts", {}))}\n'
+            f'ХРОНОЛОГИЯ:\n{notes}'
         )
+    now = (f"Сейчас {ref_label}. Всё, что назначено на месяц ПОЗЖЕ {ref_label}, ещё не "
+           f"наступило и недоработкой НЕ является.\n" if ref_label else "")
     return (
-        "Ты — аналитик зарплатных проектов банка. Ниже по каждой паре "
-        "(ГОСБ, организация) даны ВСЕ содержательные комментарии сотрудников и "
-        "анкеты по задачам за 3 месяца. Работа ведётся отдельно в каждом ГОСБ.\n"
-        "Ответь БЕЗ рассуждений и пояснений: на каждую входную строку — ровно один "
-        "JSON-объект на отдельной строке (формат JSONL, без общего массива, без ```):\n"
-        '{"gosb_id": <число как во входе>, "inn": <число как во входе>, '
-        '"reason": "<причина текущего положения, ≤8 слов>", '
-        '"worth": "да|нет — есть ли смысл вести работу в ЭТОМ ГОСБ", '
-        '"action": "<что конкретно сделать, ≤12 слов>"}\n'
-        "В текстах reason и action НЕ употребляй слово «ИНН» — пиши «организация».\n"
-        f"Строк на входе: {len(chunk)} — верни столько же строк ответа.\n\n"
-        + "\n".join(lines)
+        "Ты — старший аналитик зарплатных проектов банка. По каждой паре "
+        "(ГОСБ, организация) даны ФАКТЫ из витрины и ХРОНОЛОГИЯ активностей "
+        "сотрудников за 3 месяца. Работа ведётся отдельно в каждом ГОСБ.\n"
+        + now +
+        "ГЛАВНЫЙ ВОПРОС: есть ли ПРЯМО СЕЙЧАС действие, которое зависит ОТ БАНКА и "
+        "может дать получателей. Если такого действия нет — так и скажи, не придумывай "
+        "поручений. Придирки к формулировкам никому не нужны.\n"
+        "Ответь БЕЗ рассуждений: на каждую пару — ровно один JSON-объект на отдельной "
+        "строке (JSONL, без общего массива, без ```):\n"
+        '{"gosb_id": <как во входе>, "inn": <как во входе>, '
+        '"verdict": "work|no_point|in_progress", '
+        '"can_influence": "да|нет", '
+        '"quality": "качественно|формально|не отработана|—", '
+        '"contradiction": "да|нет", '
+        '"outflow_worked": "да|нет|—", "attract_real": "да|нет|—", '
+        '"reason": "<причина/суть, ≤10 слов>", "action": "<что сделать, ≤12 слов>"}\n'
+        "Правила оценки:\n"
+        "• can_influence=нет — причина ВНЕ зоны влияния банка: отпуска или сезонность, "
+        "сокращение штата либо ликвидация у клиента, перевод людей в другой регион, "
+        "решение принимает головной офис вне этого ГОСБ. Тогда verdict=no_point, "
+        "action=«Мониторинг, действий не требуется». Сезонный отток или отпуска значат, "
+        "что клиент ОСТАЛСЯ с нами — это не потеря.\n"
+        "• verdict=in_progress — работа идёт и ждать нормально: задача не закрыта и НЕ "
+        "просрочена, или назван срок позже текущего месяца, или сделка заведена недавно. "
+        "Это НЕ недоработка; action — «Проконтролировать в <срок>».\n"
+        "• verdict=work — только если банк может сделать конкретный следующий шаг СЕЙЧАС "
+        "(перезвонить, встретиться с ЛПР, пересмотреть условия, закрыть просрочку).\n"
+        "• verdict=no_point — влиять нечем (см. can_influence) либо ликвидация/банкротство.\n"
+        "• quality=«не отработана» — ТОЛЬКО когда задачи закрыты или просрочены, а "
+        "содержательной работы в них нет. Если задача ещё в работе и не просрочена — "
+        "ставь «—»: спрашивать результат рано.\n"
+        "• quality=формально — заявлен успех, но по заведённой сделке факт 0 при плане>0, "
+        "либо задача закрыта в день создания, либо комментарий дежурный. Если сделка по "
+        "задачам НЕ предполагается, её отсутствие формальностью НЕ считается.\n"
+        "• contradiction=да — разные сотрудники противоречат друг другу (напр. один "
+        "«клиент согласился», другой «отказался»).\n"
+        "• outflow_worked=нет — только при РЕАЛЬНОМ оттоке, который банк мог удержать и "
+        "не удержал. Если отток объективный (отпуска, сезон, сокращение штата) — ставь «—».\n"
+        "• attract_real — реально ли привлечение/расширение по смыслу текста и потенциалу. "
+        "Отсутствие сделки само по себе НЕ делает привлечение нереальным.\n"
+        "В reason и action НЕ употребляй слово «ИНН» — пиши «организация».\n"
+        f"Пар на входе: {len(chunk)} — верни столько же строк ответа.\n\n"
+        + "\n\n".join(blocks)
     )
 
 
-def _ask(ctx, chunk: list[dict], label: str) -> dict:
+def _ask(ctx, chunk: list[dict], label: str, ref_label: str = "") -> dict:
     """Один вызов LLM по чанку. Возвращает {(gosb_id, inn): insight}."""
-    prompt = _prompt(chunk)
+    prompt = _prompt(chunk, ref_label)
     progress.llm_request(label, prompt, note=f"орг {len(chunk)}")
     llm_mod.LAST_META = {}
     raw, meta = "", {}
@@ -154,15 +288,57 @@ def _ask(ctx, chunk: list[dict], label: str) -> dict:
             key = (int(r["gosb_id"]), int(r["inn"]))
         except (KeyError, ValueError, TypeError):
             continue
-        worth = str(r.get("worth", "")).strip().lower()
         result[key] = {
             "reason": str(r.get("reason", ""))[:80],
             "action": str(r.get("action", ""))[:100],
-            "worth": worth,
-            "verdict": "no_point" if worth.startswith("нет") else "work",
+            "verdict": _norm_verdict(r.get("verdict")),
+            "can_influence": _yn(r.get("can_influence")),
+            "quality": _norm_quality(r.get("quality")),
+            "contradiction": _yn(r.get("contradiction")),
+            "outflow_worked": _yn(r.get("outflow_worked")),
+            "attract_real": _yn(r.get("attract_real")),
             "source": "LLM",
         }
     return result
+
+
+# Явные словари вместо startswith("нет"): «нет данных» не должно давать no_point.
+_VERDICT_MAP = (
+    ("no_point", "no_point"), ("нет смысл", "no_point"), ("бесперспектив", "no_point"),
+    ("ликвидац", "no_point"), ("monitor", "no_point"), ("мониторинг", "no_point"),
+    ("влиять неч", "no_point"),
+    ("in_progress", "in_progress"), ("в процесс", "in_progress"), ("в работе", "in_progress"),
+    ("ждать", "in_progress"), ("wait", "in_progress"),
+    ("work", "work"), ("работать", "work"), ("да", "work"),
+)
+
+
+def _norm_verdict(raw) -> str:
+    r = str(raw or "").strip().lower()
+    for pref, val in _VERDICT_MAP:
+        if r.startswith(pref):
+            return val
+    return "work"      # безопасный дефолт: не «прибиваем» потенциал из-за неясности
+
+
+def _norm_quality(raw) -> str:
+    r = str(raw or "").strip().lower()
+    if r.startswith("формал"):
+        return "формально"
+    if r.startswith("не отраб"):
+        return "не отработана"
+    if r.startswith("качеств"):
+        return "качественно"
+    return "—"
+
+
+def _yn(raw) -> str:
+    r = str(raw or "").strip().lower()
+    if r.startswith("да"):
+        return "да"
+    if r.startswith("нет"):
+        return "нет"
+    return "—"
 
 
 def _split(chunk: list[dict], size: int) -> list[list[dict]]:
@@ -177,20 +353,32 @@ def _next_size(n: int) -> int:
     return max(1, n // 2)
 
 
-def _fits(chunk: list[dict]) -> bool:
-    return len(_prompt(chunk)) <= PROMPT_CHAR_LIMIT
+def _fits(chunk: list[dict], ref_label: str = "") -> bool:
+    return len(_prompt(chunk, ref_label)) <= PROMPT_CHAR_LIMIT
 
 
 # --------------------------------------------------------------------------- #
 def text_insights(ctx, items: list[dict], batch: int = 30,
-                  max_calls: int | None = None) -> tuple[dict, int]:
+                  max_calls: int | None = None,
+                  ref_label: str = "") -> tuple[dict, int]:
     """Анализ свободного текста по парам (ГОСБ, ИНН).
 
-    items: [{gosb_id, inn, gosb, company, segment, notes:[{text,...}]}, ...]
-    Возврат: ({(gosb_id, inn): {reason, action, worth, verdict, source}}, n_вызовов)
+    items: [{gosb_id, inn, segment, lever, facts:{...}, notes:[{text,date,author,…}]}, …]
+    ref_label: опорный месяц «MM.YYYY» — без него модель не может отличить «срок ещё
+    не наступил» от «просрочено» и требует результата по будущим датам.
+    Возврат: ({(gosb_id, inn): {reason, action, verdict, can_influence, quality,
+              contradiction, outflow_worked, attract_real, source}}, n_вызовов)
     """
+    global _GATEWAY_DOWN
     result: dict = {}
     if not items:
+        return result, 0
+    # Отчёт по всей сети — это 12 прогонов подряд. Если шлюз лежит, каждый ТБ честно
+    # потратит свои три вызова с таймаутом, и на пустую работу уйдут десятки минут.
+    # Защёлка про ОТКАЗ, а не про бюджет: потолок вызовов остаётся у каждого ТБ свой.
+    if _GATEWAY_DOWN:
+        progress.llm_error("текст", "шлюз LLM уже не ответил на предыдущем ТБ — "
+                                    "аудит пропущен, всё уходит в фолбэк на правила")
         return result, 0
 
     if max_calls is None:
@@ -203,10 +391,10 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
     while queue:
         chunk = queue.pop(0)
         # слишком объёмный промпт делим, не тратя вызов
-        while len(chunk) > 1 and not _fits(chunk):
+        while len(chunk) > 1 and not _fits(chunk, ref_label):
             size = _next_size(len(chunk))
             parts = _split(chunk, size)
-            progress.done(f"промпт великоват ({len(_prompt(chunk))} симв.) → "
+            progress.done(f"промпт великоват ({len(_prompt(chunk, ref_label))} симв.) → "
                           f"дроблю на {len(parts)} по {size}")
             chunk = parts[0]
             queue = parts[1:] + queue
@@ -217,7 +405,7 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
             break
 
         label = f"батч {calls + 1} · {len(chunk)} орг из {total}"
-        got = _ask(ctx, chunk, label)
+        got = _ask(ctx, chunk, label, ref_label)
         calls += 1
         result.update(got)
 
@@ -226,9 +414,14 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
         zero_streak = 0 if got else zero_streak + 1
         if zero_streak >= ZERO_STREAK_ABORT:
             left = sum(len(c) for c in queue) + len(chunk)
+            # ни одного разобранного объекта за весь проход — это отказ шлюза,
+            # а не свойство данных этого ТБ: следующим ТБ пробовать незачем
+            _GATEWAY_DOWN = not result
             progress.llm_error("текст", f"{zero_streak} вызова подряд без единого ответа — "
                                         f"дальнейшие попытки прекращены, остаток {left} орг "
-                                        f"уйдёт в фолбэк на правила")
+                                        f"уйдёт в фолбэк на правила"
+                                        + (" · аудит следующих ТБ будет пропущен"
+                                           if _GATEWAY_DOWN else ""))
             break
 
         missing = [o for o in chunk if (o["gosb_id"], o["inn"]) not in got]
@@ -247,23 +440,36 @@ def text_insights(ctx, items: list[dict], batch: int = 30,
 
 
 # --------------------------------------------------------------------------- #
-def narrative(ctx, a) -> str:
-    """Исполнительный нарратив «что плохо и что делать» для управляющего ТБ.
+def section_narratives(ctx, a) -> dict:
+    """Выводы LLM по разделам отчёта: {forecast, matrix, gosb, orgs}.
+
+    ОДИН вызов на все четыре блока: так дешевле и, главное, выводы не противоречат
+    друг другу — модель видит всю картину сразу. При сбое или неполном ответе
+    недостающие блоки заменяются своим текстом (`_fallback_blocks`), чтобы раздел
+    не остался без вывода.
 
     Названия ГОСБ и компаний уходят в LLM только как псевдонимы («ГОСБ-01»);
     настоящие имена подставляются обратно в ответ модели (Aliases.restore).
     """
     v = a.verdict
     al = Aliases()
+    # единица разбора зависит от уровня отчёта: ГОСБ внутри ТБ, ТБ внутри СБ
+    unit = getattr(a, "unit_label", "ГОСБ")
+    # Псевдонимы заводятся на ВСЕ единицы уровня заранее, а не только на попавшие
+    # в промпт. Модель охотно называет соседние номера («ГОСБ-04 и ГОСБ-05», хотя
+    # в тексте было три), и без полного словаря такой токен вернуть неоткуда —
+    # он утекал в отчёт как есть.
+    for c in getattr(a, "gosb_cards", []):
+        al.alias(unit, c["gosb_name"])
     cells = "; ".join(
-        f"{al.alias('ГОСБ', r.gosb_name)}/{r.seg_name} "
+        f"{al.alias(unit, r.unit_name)}/{r.seg_name} "
         f"({r.execution_percent*100:.0f}%, −{r.nedobor:.0f})"
         for r in a.top_cells.head(5).itertuples()
     )
     sel = (a.to_work[(a.to_work.need_k > 0) & (a.to_work.need_k <= 1.0)]
            if "need_k" in a.to_work else a.to_work)
     bad_segs = "; ".join(
-        f'{al.alias("ГОСБ", c["gosb_name"])}: ' + ", ".join(
+        f'{al.alias(unit, c["gosb_name"])}: ' + ", ".join(
             f'{s["seg"]} ({s["exec"]*100:.0f}%, −{s["nedobor"]:.0f})' for s in c["segs"][:3])
         for c in getattr(a, "gosb_cards", [])[:6] if c["segs"])
     top_orgs = "; ".join(
@@ -271,12 +477,26 @@ def narrative(ctx, a) -> str:
         f'[{al.alias("ГОСБ", r.gosb_name)}] ({r.lever}, +{r.impact_fl:.0f} чел)'
         for r in sel.head(6).itertuples()
     )
+    pf = getattr(a, "pf", {}) or {}
+    d = getattr(a, "dates", {}) or {}
+    cl = (getattr(a, "closed", {}) or {}).get("rcp", {})
     ctx_txt = (
-        f"ТБ: {a.tb_full}. Опорный месяц: {a.ref_date}.\n"
-        f"Получатели: факт {v['rcp']['fact']:.0f} из плана {v['rcp']['plan']:.0f} "
-        f"({v['rcp']['exec']*100:.0f}%, ранг {v['rcp']['rank']}/{v['rcp']['n_tb']}), "
-        f"недобор {a.gap_rcp:.0f} чел.\n"
-        f"ФОТ: {v['fot']['exec']*100:.0f}% плана, недобор {a.gap_fot_mln:.0f} млн ₽.\n"
+        f"ТБ: {a.tb_full}. Месяц ещё НЕ ЗАКРЫТ: это {d.get('label', a.ref_date)}. "
+        f"Цифры по получателям — ПРОГНОЗ ВИТРИНЫ, а не факт и не наш расчёт.\n"
+        f"Получатели: прогноз {v['rcp']['fact']:.0f} из плана {v['rcp']['plan']:.0f} "
+        f"({(v['rcp']['exec'] or 0)*100:.0f}%), недобор {a.gap_rcp:.0f} чел. "
+        f"Ранг {v['rcp']['rank']}/{v['rcp']['n_tb']} — за ЗАКРЫТЫЙ месяц "
+        f"{d.get('closed_label', '')} (тогда выполнение было "
+        f"{(cl.get('exec') or 0)*100:.0f}%).\n"
+        f"Прогноз берётся ГОТОВЫМ из витрины метрик — банк его не пересчитывает.\n"
+        f"Управление портфелем (три НЕЗАВИСИМЫХ факта, они НЕ складываются в прогноз): "
+        f"портфель закрытого месяца {pf.get('base', 0):.0f}; "
+        f"фактический отток за {d.get('out_label', '3 закрытых месяца')}, который не "
+        f"вернулся — {pf.get('out_kept', 0):.0f} чел; "
+        f"пайплайн на месяц {pf.get('pipe', 0):.0f} фл "
+        f"(заявлено {pf.get('pipe_raw', 0):.0f}, остальное срезано поправкой на "
+        f"историческую реализуемость сделок).\n"
+        f"ФОТ: {(v['fot']['exec'] or 0)*100:.0f}% плана, недобор {a.gap_fot_mln:.0f} млн ₽.\n"
         f"Провальные ГОСБ×сегмент: {cells}.\n"
         f"Активности за 3 мес: {a.activity.get('n',0)} задач по "
         f"{a.activity.get('orgs',0)} орг, успех {a.activity.get('success_rate',0)*100:.0f}%, "
@@ -286,6 +506,10 @@ def narrative(ctx, a) -> str:
         f"Организации к отработке подбираются ВНУТРИ западающих сегментов; там, где "
         f"своих организаций не хватает, добираем из других сегментов ГОСБ "
         f"(таких добров: {a.sim.get('filler_n', 0)}).\n"
+        f"Рычага два: «Привлечь» (новые получатели из потенциала) и «Вернуть» — "
+        f"люди, которые за три закрытых месяца ушли и НЕ вернулись. Прогноз считает "
+        f"витрина, и список организаций показывает, чем его можно улучшить: приход "
+        f"из пайплайна в прогнозе уже учтён, потенциал и возврат — нет.\n"
         f"Для выполнения плана нужно отработать {a.sim['k']} организаций (ГОСБ×организация) "
         f"с суммарным эффектом +{a.sim['closable']:.0f} чел и ФОТ ~{a.sim['fot_mln']:.0f} млн ₽ "
         f"(привлечение {a.sim['attract']:.0f}, возврат {a.sim['retention']:.0f}); "
@@ -294,45 +518,114 @@ def narrative(ctx, a) -> str:
         f"Приоритетные: {top_orgs}."
     )
     prompt = (
-        "Ты — руководитель по продажам зарплатных проектов. На основе данных ниже "
-        "напиши управляющему ТБ краткое резюме на русском в деловом тоне, без воды, "
-        "тремя частями с подзаголовками:\n"
-        "**Диагноз** — 2–3 предложения: что именно не выполняется и где.\n"
-        "**Что сделать** — 3–5 конкретных действий (какие ГОСБ, сегменты, организации, "
-        "привлечение vs возврат).\n"
-        "**Ожидаемый эффект** — 1–2 предложения с числами.\n"
-        "Не употребляй слово «ИНН» — пиши «организация».\n"
-        "Обозначения вида ГОСБ-01 пиши ПОЛНОСТЬЮ при каждом упоминании "
-        "(«ГОСБ-01, ГОСБ-02»), не сокращай перечисления до «ГОСБ-01, 02».\n\n"
+        "Ты — руководитель по продажам зарплатных проектов. По данным ниже напиши "
+        "управляющему ТБ ЧЕТЫРЕ коротких вывода на русском, в деловом тоне, без воды. "
+        "Каждый вывод — 2–4 предложения и относится к своему разделу отчёта.\n\n"
+        "Формат ответа СТРОГО такой, каждый блок начинается со своей метки на отдельной "
+        "строке (без markdown-заголовков, без ```):\n"
+        "[[forecast]]\n<вывод>\n[[matrix]]\n<вывод>\n[[gosb]]\n<вывод>\n[[orgs]]\n<вывод>\n\n"
+        "Что писать в каждом блоке:\n"
+        "• forecast — раздел «Управление портфелем». Выполняется ли план текущего "
+        "месяца по прогнозу витрины и что с этим делать: сколько людей уже потеряли "
+        "(ушли и не вернулись) и что даст пайплайн. ВАЖНО: портфель, отток и пайплайн "
+        "НЕ складываются в прогноз — это независимые факты, не выводи прогноз из них "
+        "арифметически. Назови главные числа.\n"
+        "• matrix — раздел «Где провал: ГОСБ × сегмент». Где именно концентрируется "
+        "недобор и есть ли общий для ТБ провальный сегмент.\n"
+        "• gosb — раздел с карточками ГОСБ. На каких ГОСБ сосредоточиться и почему; "
+        "если у ГОСБ не хватает своих организаций — сказать об этом.\n"
+        "• orgs — раздел «Организации к работе». Что делать в первую очередь: "
+        "удержание тех, кто оттекает сейчас, привлечение, возврат. С числами.\n\n"
+        "Правила: пиши «прогноз», а не «факт» — месяц не закрыт. Не употребляй слово "
+        "«ИНН», пиши «организация». Обозначения вида ГОСБ-01 пиши ПОЛНОСТЬЮ при каждом "
+        "упоминании («ГОСБ-01, ГОСБ-02»), не сокращай перечисления до «ГОСБ-01, 02». "
+        "Не повторяй один и тот же вывод в разных блоках.\n\n"
         + ctx_txt
     )
-    progress.llm_request("нарратив", prompt, note=f"псевдонимов {len(al)}")
+    progress.llm_request("выводы", prompt, note=f"псевдонимов {len(al)}")
     llm_mod.LAST_META = {}
+    fb = _fallback_blocks(a)
     try:
         resp = ctx.llm(prompt, temperature=0.2)
         meta = dict(llm_mod.LAST_META)
-        progress.llm_response("нарратив", resp, meta, ok=bool(resp and resp.strip()))
-        progress.llm_dump("нарратив", prompt, resp, meta)
-        if not resp or not resp.strip():
-            progress.llm_error("нарратив", "пустой ответ LLM — использую фолбэк")
-            return _fallback(a) + "\n\n_(LLM вернул пустой ответ)_"
-        return al.restore(resp)      # вернуть настоящие названия ГОСБ/организаций
+        progress.llm_response("выводы", resp, meta, ok=bool(resp and resp.strip()))
+        progress.llm_dump("выводы", prompt, resp, meta)
+        got = _parse_blocks(resp)
+        if not got:
+            progress.llm_error("выводы", "не разобрано ни одного блока — фолбэк на все")
+            return fb
+        miss = [k for k in NARRATIVE_BLOCKS if k not in got]
+        if miss:
+            progress.llm_error("выводы", f"не вернулись блоки: {', '.join(miss)} — "
+                                         f"по ним фолбэк")
+        # каждый блок восстанавливаем отдельно: сбой одного не рушит остальные
+        out, leaked = {}, 0
+        for k in NARRATIVE_BLOCKS:
+            out[k] = al.restore(got[k]) if k in got else fb[k]
+            leaked += al.leaked
+        # молча обезличивать нельзя: это значит, что модель назвала единицу, которой
+        # в промпте не было, и вместо имени в отчёте стоит общая формулировка
+        if leaked:
+            progress.llm_error("выводы", f"модель назвала {leaked} несуществующих "
+                                         f"псевдонимов — заменены общей формулировкой")
+        return out
     except Exception as ex:
-        meta = dict(llm_mod.LAST_META)
-        progress.llm_error("нарратив", f"{type(ex).__name__}: {ex}")
-        progress.llm_dump("нарратив", prompt, f"<ошибка> {ex}", meta)
-        return _fallback(a) + f"\n\n_(LLM недоступен: {type(ex).__name__}: {ex})_"
+        progress.llm_error("выводы", f"{type(ex).__name__}: {ex}")
+        progress.llm_dump("выводы", prompt, f"<ошибка> {ex}", dict(llm_mod.LAST_META))
+        return fb
 
 
-def _fallback(a) -> str:
+# Метки блоков = разделы отчёта, после которых печатается вывод
+NARRATIVE_BLOCKS = ("forecast", "matrix", "gosb", "orgs")
+_BLOCK_RE = re.compile(r"\[\[\s*(forecast|matrix|gosb|orgs)\s*\]\]", re.I)
+
+
+def _parse_blocks(raw: str) -> dict:
+    """Разобрать ответ на блоки по меткам [[имя]].
+
+    Разметка вместо JSON выбрана намеренно: при обрыве ответа уцелевшие блоки всё
+    равно разбираются, а модель реже ломает её, чем структуру объекта.
+    """
+    if not raw or not raw.strip():
+        return {}
+    parts = _BLOCK_RE.split(raw)
+    out: dict = {}
+    # split даёт [мусор, имя1, текст1, имя2, текст2, …]
+    for i in range(1, len(parts) - 1, 2):
+        key = parts[i].strip().lower()
+        text = parts[i + 1].strip()
+        if text:
+            out[key] = text
+    return out
+
+
+def _fallback_blocks(a) -> dict:
+    """Свой текст на каждый раздел — чтобы при сбое LLM ни один не остался пустым."""
     v = a.verdict
-    return (
-        f"**Диагноз.** {a.tb_full}: получатели {v['rcp']['exec']*100:.0f}% плана "
-        f"(недобор {a.gap_rcp:.0f} чел, ранг {v['rcp']['rank']}/{v['rcp']['n_tb']}). "
-        f"Основной провал — в сегментах с наибольшим недобором.\n\n"
-        f"**Что сделать.** Отработать {a.sim.get('k', 0)} организаций из списка — именно "
-        f"столько закрывает план (отбор по величине эффекта внутри каждого ГОСБ); "
-        f"частые причины: {a.themes}; закрыть недоработки по сделкам.\n\n"
-        f"**Ожидаемый эффект.** +{a.sim.get('closable', 0):.0f} получателей при недоборе "
-        f"{a.gap_rcp:.0f}, эффект ФОТ ~{a.sim.get('fot_mln', 0):.0f} млн ₽."
-    )
+    pf = getattr(a, "pf", {}) or {}
+    d = getattr(a, "dates", {}) or {}
+    cells = ", ".join(f'{r.unit_name}/{r.seg_name} ({r.execution_percent*100:.0f}%)'
+                      for r in a.top_cells.head(3).itertuples()) or "—"
+    return {
+        "forecast": (
+            f"Прогноз витрины на {d.get('label', a.ref_date)}: "
+            f"{(v['rcp']['exec'] or 0)*100:.0f}% плана, недобор {a.gap_rcp:.0f} чел. "
+            f"Портфель закрытого месяца {pf.get('base', 0):.0f}; за "
+            f"{d.get('out_label', '3 закрытых месяца')} не вернулись "
+            f"{pf.get('out_kept', 0):.0f} чел; пайплайн даст "
+            f"{pf.get('pipe', 0):.0f} фл."),
+        "matrix": (
+            f"Наибольший вклад в недобор дают: {cells}. "
+            f"Всего западающих зон — {len(a.top_cells)} из показанных в матрице."),
+        "gosb": (
+            f"Карточек ГОСБ: {len(getattr(a, 'gosb_cards', []))}. "
+            f"Потенциал западающих сегментов покрывает разрыв на "
+            f"{a.sim.get('coverage', 0)*100:.0f}%; добор из других сегментов — "
+            f"{a.sim.get('filler_n', 0)} организаций."),
+        "orgs": (
+            f"Под план нужно отработать {a.sim.get('k', 0)} организаций с эффектом "
+            f"+{a.sim.get('closable', 0):.0f} чел и ФОТ ~{a.sim.get('fot_mln', 0):.0f} млн ₽. "
+            f"Возврат ушедших — {a.sim.get('retention', 0):.0f} чел, "
+            f"привлечение — {a.sim.get('attract', 0):.0f}. "
+            f"Частые причины из комментариев: {a.themes}."),
+    }

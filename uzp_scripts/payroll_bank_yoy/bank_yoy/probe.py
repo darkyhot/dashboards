@@ -1,0 +1,77 @@
+"""Разведка: что лежит в витринах, ДО первого тяжёлого запроса.
+
+Каждый пункт — ошибка, которая иначе обнаружилась бы через полчаса прогона или
+не обнаружилась бы вовсе:
+* имя колонки кода (`enrollment_type` против `enrollment_type_id`) — неверное
+  роняет КАЖДЫЙ запрос;
+* есть ли справочники отбора: виды зачислений (`is_portfolio_enrollment`) и
+  образовательные организации — без них отбор заказчика не посчитать;
+* разрешены ли временные таблицы — без них разбор банка не выполним;
+* срез справочника ЕПК.
+
+Ведомости разведка НЕ читает: единственное обращение к ним — копия `t_raw`, и
+какие месяцы загружены, видно по ней (месяц без строк — месяца нет в витрине).
+"""
+from __future__ import annotations
+
+from . import config, db, progress
+from . import queries as Q
+
+
+class ProbeError(RuntimeError):
+    pass
+
+
+def _cols(conn, table: str, schema: str | None = None) -> set:
+    schema = schema or config.SCHEMA
+    cols = db.read_sql(conn, Q.PROBE_COLUMNS, {"schema": schema, "table": table})
+    if cols.empty:
+        raise ProbeError(f"таблица {schema}.{table} не найдена")
+    return set(cols["column_name"])
+
+
+def run(conn) -> dict:
+    progress.step("Разведка витрин")
+    out: dict = {"schema": config.SCHEMA}
+
+    names = _cols(conn, "mis_data_payroll_m")
+    code_col = next((c for c in ("enrollment_type", "enrollment_type_id") if c in names), None)
+    if code_col is None:
+        raise ProbeError("в mis_data_payroll_m нет колонки кода зачисления "
+                         "(ни enrollment_type, ни enrollment_type_id)")
+    for need in ("sys_gosb_id", "sys_tb_id", "epk_id", "inn", "amt", "report_dt",
+                 "segment_name", "enrollment_kind_descr", "market_share_flag_name"):
+        if need not in names:
+            raise ProbeError(f"в mis_data_payroll_m нет колонки {need}")
+    dim = _cols(conn, "uzp_dim_enrollment_type")
+    for need in ("enrollment_type_id", "is_portfolio_enrollment"):
+        if need not in dim:
+            raise ProbeError(f"в uzp_dim_enrollment_type нет колонки {need}")
+    _cols(conn, "uzp_dim_education_organization")
+    # Список исключаемых ТИК/ЦИК: без него отчёт молча посчитал бы их — лучше упасть.
+    tik = _cols(conn, "yva_tik_cik", config.SCHEMA_T)
+    for need in ("inn", "is_tik_cik"):
+        if need not in tik:
+            raise ProbeError(f"в {config.SCHEMA_T}.yva_tik_cik нет колонки {need}")
+    progress.done("справочники отбора на месте: виды зачислений, образовательные организации")
+    db.CODE_COL = code_col
+    out["code_col"] = code_col
+    progress.done(f"колонка кода зачисления: {code_col}")
+
+    epk = db.read_sql(conn, Q.PROBE_EPK).iloc[0].to_dict()
+    out["epk"] = {k: (str(v) if v is not None else None) for k, v in epk.items()}
+    progress.done(f"справочник ЕПК: {int(epk['n_inn']):,} id орг, "
+                  f"без сегмента {int(epk['n_no_seg']):,} строк")
+
+    try:
+        db.execute(conn, Q.PROBE_TEMP)
+        db.execute(conn, Q.DROP_PROBE_TEMP)
+        out["temp_ok"] = True
+    except Exception as ex:                                      # noqa: BLE001
+        db.rollback(conn)
+        raise ProbeError(
+            "временные таблицы запрещены в этой сессии "
+            f"({type(ex).__name__}: {str(ex)[:160]}). Разбор всего банка без них "
+            "невыполним: каждый запрос пересчитывал бы тройки за все месяцы.") from ex
+    progress.done("временные таблицы разрешены")
+    return out

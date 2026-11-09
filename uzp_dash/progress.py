@@ -91,10 +91,11 @@ def llm_dump(label: str, prompt: str, response: str, meta: dict | None = None) -
         return None
     global _seq
     _seq += 1
+    seq = _seq
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r"[^\w.-]+", "_", label)[:60]
-        path = LOG_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{_seq:03d}_{slug}.txt"
+        path = LOG_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{seq:03d}_{slug}.txt"
         path.write_text(
             f"=== META ===\n{meta}\n\n"
             f"=== REQUEST ({len(prompt or '')} симв.) ===\n{prompt}\n\n"

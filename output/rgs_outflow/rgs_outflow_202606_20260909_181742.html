@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Отток бюджетной сферы · 06.2026</title>
+<style>
+:root {
+  --bg: #f5f5f7;
+  --surface: rgba(255,255,255,0.72);
+  --surface-solid: #ffffff;
+  --elevated: rgba(255,255,255,0.85);
+  --text: #1d1d1f;
+  --text-2: #6e6e73;
+  --separator: rgba(0,0,0,0.08);
+  --accent: #0071e3;
+  --good: #34c759;
+  --warn: #ff9f0a;
+  --bad: #ff3b30;
+  --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
+  --radius: 18px;
+  --spring: 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --surface: rgba(28,28,30,0.72);
+    --surface-solid: #1c1c1e;
+    --elevated: rgba(44,44,46,0.85);
+    --text: #f5f5f7;
+    --text-2: #98989d;
+    --separator: rgba(255,255,255,0.10);
+    --accent: #0a84ff;
+    --good: #30d158;
+    --warn: #ff9f0a;
+    --bad: #ff453a;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 30px rgba(0,0,0,0.5);
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  /* 18px, а не 17: отчёт читают с проектора и с ноутбука люди, которым мелкий
+     текст неудобен. Ниже по файлу нет ни одного видимого текста меньше 15px. */
+  font: 400 18px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+  letter-spacing: 0;
+}
+
+.wrap { max-width: 1180px; margin: 0 auto; padding: 28px 24px 120px; }
+
+/* Заголовки: отрицательный трекинг тем сильнее, чем крупнее текст */
+h1 { font-size: clamp(30px, 4vw, 44px); line-height: 1.06; letter-spacing: -0.022em; font-weight: 700; margin: 0 0 6px; }
+h2 { font-size: clamp(26px, 3vw, 36px); line-height: 1.14; letter-spacing: -0.018em; font-weight: 680; margin: 0 0 10px; }
+h3 { font-size: 21px; line-height: 1.25; letter-spacing: -0.01em; font-weight: 620; margin: 0 0 12px; }
+.sub { color: var(--text-2); font-size: 19px; letter-spacing: -0.004em; margin: 0 0 8px; }
+.eyebrow { color: var(--accent); font-weight: 600; font-size: 15px; letter-spacing: 0.02em; text-transform: uppercase; }
+
+/* Карточка-материал */
+.card {
+  background: var(--surface);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid var(--separator);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 22px 24px;
+}
+
+.grid { display: grid; gap: 18px; }
+.grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
+.grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.grid.cols-4 { grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 820px) { .grid.cols-2, .grid.cols-3, .grid.cols-4 { grid-template-columns: 1fr; } }
+
+/* Бэйдж статуса */
+.badge { display: inline-flex; align-items: center; gap: 6px; font-size: 15px; font-weight: 600; letter-spacing: -0.003em; padding: 4px 11px; border-radius: 980px; }
+.badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; }
+.badge.good { color: var(--good); background: color-mix(in srgb, var(--good) 14%, transparent); }
+.badge.good::before { background: var(--good); }
+.badge.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.badge.warn::before { background: var(--warn); }
+.badge.bad  { color: var(--bad);  background: color-mix(in srgb, var(--bad) 14%, transparent); }
+.badge.bad::before  { background: var(--bad); }
+
+/* Прогресс выполнения плана */
+.meter { height: 8px; border-radius: 980px; background: var(--separator); overflow: hidden; margin-top: 12px; }
+.meter > span { display: block; height: 100%; border-radius: 980px; transition: width var(--spring); }
+
+/* Таблица */
+table { width: 100%; border-collapse: collapse; font-size: 16px; }
+th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--separator); letter-spacing: -0.004em; }
+th { color: var(--text-2); font-weight: 560; font-size: 15px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr:last-child td { border-bottom: none; }
+
+.footer { margin-top: 64px; color: var(--text-2); font-size: 15px; letter-spacing: -0.003em; }
+
+/* Тепловая карта */
+table.matrix { font-size: 15px; }
+table.matrix th, table.matrix td { padding: 8px 11px; white-space: nowrap; }
+td.heat { font-weight: 600; font-variant-numeric: tabular-nums; border-radius: 6px; }
+
+/* Строки блоков и таблицы живут и на слайде уровня, и в разборе отделения —
+   поэтому не привязаны ни к какому контейнеру. */
+.g-seg { font-size: 17px; line-height: 1.6; letter-spacing: -0.004em; margin: 5px 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
+.g-seg b { font-variant-numeric: tabular-nums; }
+.g-hint { color: var(--text-2); font-size: 15px; letter-spacing: -0.003em; }
+/* Вывод LLM в конце своего раздела — тише данных, но с явной пометкой авторства */
+.ai { margin-top: 14px; border-left: 3px solid var(--accent); }
+.ai-head { font-size: 15px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+           color: var(--accent); margin-bottom: 6px; }
+/* Таблица «прогноз / план / недобор / орг»: строка «Всего» по ГОСБ и строки сегментов
+   в одних колонках — выравнивание делает сравнение за читателя. */
+.g-tbl { margin: 12px 0 0; overflow-x: auto; }
+/* первая колонка вмещает бейдж целиком («КСБ 99.9%»), числовые — своё значение;
+   minmax(0,...) для чисел не годится: ячейка сжалась бы уже содержимого */
+.g-tbl .g-row { display: grid; grid-template-columns: minmax(104px, 1.25fr) repeat(4, minmax(46px, 1fr));
+                gap: 8px; align-items: baseline; font-size: 16px; line-height: 1.6;
+                letter-spacing: -0.004em; padding: 5px 0; }
+.g-tbl .g-row > span:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+/* nowrap ТОЛЬКО у бейджей таблицы: «КСБ» и «104%» всегда в одной строке.
+   Глобально нельзя — длинные бейджи («план выполняется, но западает …») должны переноситься. */
+.g-tbl .badge { white-space: nowrap; }
+/* в оверлее к таблице добавляются отток и пайплайн — разбор на грейне (ГОСБ, сегмент) */
+.g-tbl.wide .g-row { grid-template-columns: minmax(104px, 1.25fr) repeat(6, minmax(46px, 1fr)); }
+.g-tbl .g-row.head { color: var(--text-2); font-size: 15px; letter-spacing: 0; padding-bottom: 2px; }
+.g-tbl .g-row.total { font-weight: 620; border-bottom: 1px solid var(--separator); padding-bottom: 6px; margin-bottom: 2px; }
+.g-tbl .g-row.rest, .g-tbl .g-row.ok { color: var(--text-2); }
+
+/* Разбор отделения — раскрывается прямо в ленте, без модального окна */
+.gd-block { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--separator); }
+.gd-block:first-child { border-top: 0; padding-top: 6px; }
+.gd-block h4 { margin: 0 0 12px; font-size: 19px; font-weight: 640; letter-spacing: -0.012em; }
+.gd-note { font-size: 15px; color: var(--text-2); line-height: 1.5; margin: 8px 0 0; }
+/* строка организации: имя · сколько человек · что произошло */
+.gd-row { display: grid; grid-template-columns: 1fr 90px 1.35fr; gap: 14px;
+          align-items: baseline; font-size: 16px; line-height: 1.5; padding: 8px 0;
+          border-top: 1px solid var(--separator); }
+.gd-row:first-of-type { border-top: 0; }
+.gd-row > span:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums;
+                              font-weight: 640; }
+.gd-row .gd-why { color: var(--text-2); font-size: 15px; }
+/* закреплённый сотрудник — подпись под названием организации */
+.gd-row .gd-emp { display: block; color: var(--text-2); font-size: 15px; margin-top: 2px; }
+@media (max-width: 720px) {
+  .gd-row { grid-template-columns: 1fr 80px; }
+  .gd-row .gd-why { grid-column: 1 / -1; }
+}
+
+/* Группы оттока по причине: нативный <details>, шапка в колонках строки организации */
+.gd-grp { border-top: 1px solid var(--separator); }
+.gd-grp:first-of-type { border-top: 0; }
+.gd-grp > summary { display: grid; grid-template-columns: 1fr 90px 1.35fr; gap: 14px;
+                    align-items: baseline; font-size: 16px; line-height: 1.5;
+                    padding: 11px 10px; margin: 0 -10px; cursor: pointer; border-radius: 10px;
+                    list-style: none;
+                    /* полоска доли блока — фон под шапкой, ширина из --share */
+                    background: linear-gradient(to right, var(--separator) var(--share),
+                                                transparent var(--share)); }
+.gd-grp > summary::-webkit-details-marker { display: none; }
+/* подсветка через inset-тень, а не background: иначе она стёрла бы полоску доли */
+.gd-grp > summary:hover { box-shadow: inset 0 0 0 999px rgba(127, 127, 127, 0.09); }
+.gd-grp > summary > span:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums;
+                                        font-weight: 620; }
+.gd-gt { font-weight: 620; letter-spacing: -0.006em; }
+.gd-gt::before { content: "›"; display: inline-block; width: 12px; color: var(--text-2);
+                 transition: transform 0.18s ease; }
+.gd-grp[open] > summary .gd-gt::before { transform: rotate(90deg); }
+.gd-gt i { font-style: normal; font-weight: 400; color: var(--text-2); margin-left: 8px;
+           font-variant-numeric: tabular-nums; }
+.gd-sub { color: var(--text-2); font-size: 15px; }
+.gd-rows { padding: 2px 0 8px 20px; }
+.g-do { font-size: 17px; line-height: 1.5; letter-spacing: -0.004em; margin: 16px 0 0; padding-top: 14px; border-top: 1px solid var(--separator); }
+.g-do b { font-variant-numeric: tabular-nums; }
+.g-act { font-size: 15px; color: var(--text-2); margin-top: 10px; line-height: 1.5; }
+
+/* Фильтры и пагинация интерактивной таблицы */
+.filters { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+.filters input, .filters select {
+  font: inherit; font-size: 16px; padding: 9px 13px; border-radius: 11px;
+  border: 1px solid var(--separator); background: var(--surface-solid); color: var(--text);
+  letter-spacing: -0.003em; outline: none;
+}
+.filters input { flex: 1; min-width: 190px; }
+.filters input:focus, .filters select:focus { border-color: var(--accent); }
+.tbl-scroll { overflow-x: auto; }
+.pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; }
+.pager .btns { display: flex; gap: 8px; }
+.pager button {
+  font: inherit; font-size: 16px; padding: 8px 15px; border-radius: 11px;
+  border: 1px solid var(--separator); background: var(--surface-solid); color: var(--text); cursor: pointer;
+  transition: transform 100ms ease-out;
+}
+.pager button:active { transform: scale(0.97); }
+.pager button:disabled { opacity: 0.4; cursor: default; }
+.pager .info { font-size: 15px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+
+/* ============ Презентация: экран = слайд, скролл защёлкивается ============= */
+/* Листание на уровне документа: видимый уровень — единственный в потоке, поэтому
+   снап работает по странице целиком. scroll-padding — под закреплённой полосой
+   крошек, иначе верх слайда уезжал бы под неё. */
+html { scroll-snap-type: y mandatory; scroll-behavior: smooth; scroll-padding-top: 0; }
+body { overflow-x: hidden; }
+.wrap { max-width: none; margin: 0; padding: 0; }
+
+/* Закреплённая полоса: где читатель и как перейти к другому банку */
+.topbar { position: fixed; top: 0; left: 0; right: 0; z-index: 20; height: 56px;
+          display: flex; align-items: center; gap: 20px; padding: 0 28px;
+          background: var(--elevated); border-bottom: 1px solid var(--separator);
+          backdrop-filter: saturate(180%) blur(20px);
+          -webkit-backdrop-filter: saturate(180%) blur(20px); }
+.crumbs { display: flex; align-items: center; gap: 8px; }
+.crumb { border: 0; background: none; color: var(--accent); cursor: pointer;
+         font: inherit; font-size: 16px; font-weight: 600; padding: 4px 2px;
+         border-radius: 8px; }
+.crumb:hover { text-decoration: underline; }
+.crumb.on { color: var(--text); font-weight: 700; }
+.crumb-sep { color: var(--text-2); font-size: 16px; }
+.topbar-name { font-size: 17px; font-weight: 650; letter-spacing: -0.01em;
+               white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topbar-when { font-size: 15px; color: var(--text-2); white-space: nowrap; }
+@media (max-width: 900px) { .topbar-when, .topbar-name { display: none; } }
+.picker { display: flex; align-items: center; gap: 10px; margin-left: auto;
+          font-size: 15px; color: var(--text-2); }
+.picker select { font: inherit; font-size: 15px; padding: 6px 12px; border-radius: 10px;
+                 border: 1px solid var(--separator); background: var(--surface-solid);
+                 color: var(--text); }
+
+/* СЛАЙД = ровно одно окно. Тело прокручивается внутри, шапка и подвал закреплены —
+   иначе длинный разбор отделения растянул бы слайд и листание сломалось бы. */
+.slide {
+  height: 100vh; height: 100svh;
+  scroll-snap-align: start; scroll-snap-stop: always;
+  display: flex; flex-direction: column;
+  padding: 76px 28px 20px; max-width: 1320px; margin: 0 auto;
+  border-top: 1px solid var(--separator);
+}
+.slide:first-of-type { border-top: 0; }
+.slide-head { flex: none; }
+.slide-q { margin: 0 0 6px; }
+.slide-hint { color: var(--text-2); font-size: 16px; line-height: 1.45;
+              max-width: 1000px; margin: 0 0 14px; }
+.slide-body { flex: 1; min-height: 0; overflow-y: auto; padding-right: 4px; }
+.slide-foot { flex: none; display: flex; gap: 12px; align-items: center;
+              padding-top: 14px; margin-top: 10px;
+              border-top: 1px solid var(--separator); }
+
+/* Точки-индикатор: сколько слайдов и где мы сейчас */
+.dots { position: fixed; right: 14px; top: 50%; transform: translateY(-50%);
+        z-index: 15; display: flex; flex-direction: column; gap: 10px; }
+.dots .dot { border: 0; background: none; padding: 4px; cursor: pointer; line-height: 0; }
+.dots .dot i { display: block; width: 10px; height: 10px; border-radius: 50%;
+               background: var(--separator); border: 1px solid var(--text-2);
+               transition: background var(--spring), transform var(--spring); }
+.dots .dot.on i { background: var(--accent); border-color: var(--accent);
+                  transform: scale(1.35); }
+@media (max-width: 900px) { .dots { display: none; } }
+
+/* Два главных числа одного кегля: процент плана и сколько людей не хватает */
+.hero2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+         gap: 22px; margin: 0 0 22px; }
+.hero-one { background: var(--surface); border: 1px solid var(--separator);
+            border-radius: var(--radius); box-shadow: var(--shadow); padding: 22px 26px; }
+.hero-v { font-size: clamp(44px, 5.5vw, 68px); line-height: 1.0; font-weight: 700;
+          letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+.hero-c { font-size: 20px; font-weight: 600; line-height: 1.35; margin-top: 8px; }
+.hero-sub { font-size: 16px; color: var(--text-2); margin-top: 6px; line-height: 1.45; }
+
+/* Три числа портфеля */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+         gap: 16px; margin: 0 0 18px; }
+.stat { background: var(--surface); border: 1px solid var(--separator);
+        border-radius: var(--radius); padding: 16px 20px; }
+.stat-v { font-size: 34px; line-height: 1.05; font-weight: 680;
+          letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.stat-c { font-size: 17px; line-height: 1.4; margin-top: 6px; }
+.stat-sub { font-size: 15px; color: var(--text-2); margin-top: 4px; }
+
+/* Твёрдые факты и легенда цветов */
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+         gap: 8px 26px; margin: 0 0 16px; }
+.fact { font-size: 16px; color: var(--text-2); line-height: 1.45; }
+.fact b { color: var(--text); }
+.legend { display: flex; flex-wrap: wrap; gap: 18px; font-size: 15px; }
+.legend .lg { display: inline-flex; align-items: center; gap: 8px; color: var(--text-2); }
+.legend .lg::before { content: ""; width: 12px; height: 12px; border-radius: 4px; }
+.legend .lg.good::before { background: var(--good); }
+.legend .lg.warn::before { background: var(--warn); }
+.legend .lg.bad::before { background: var(--bad); }
+
+.note { font-size: 17px; line-height: 1.5; max-width: 1000px; margin: 14px 0 0; }
+.note.dim { color: var(--text-2); font-size: 16px; }
+.card-sub { color: var(--text-2); font-size: 15px; margin: -6px 0 12px; }
+.matrix-pair { margin-top: 22px; }
+
+/* ==================== Рейтинг единиц ==================== */
+.rk { margin-top: 2px; }
+.rk-row {
+  display: grid; align-items: center; gap: 16px;
+  grid-template-columns: minmax(150px, 1.1fr) minmax(90px, 0.9fr) 76px minmax(180px, 1.3fr) auto;
+  padding: 12px 16px; border-radius: 12px; border: 1px solid var(--separator);
+  background: var(--surface); margin-bottom: 8px; border-left: 5px solid var(--text-2);
+}
+.rk-row.good { border-left-color: var(--good); }
+.rk-row.warn { border-left-color: var(--warn); }
+.rk-row.bad  { border-left-color: var(--bad); }
+.rk-name { font-size: 18px; font-weight: 620; letter-spacing: -0.008em; }
+.rk-sub { display: block; font-size: 15px; color: var(--text-2); font-weight: 400; }
+.rk-bar { height: 10px; border-radius: 980px; background: var(--separator); overflow: hidden; }
+.rk-bar > span { display: block; height: 100%; border-radius: 980px;
+                 transition: width var(--spring); }
+.rk-pct { font-size: 24px; font-weight: 700; text-align: right;
+          font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+.rk-right { font-size: 16px; color: var(--text-2); }
+.rk-right b { color: var(--text); font-variant-numeric: tabular-nums; }
+.ok-txt { color: var(--good); font-weight: 600; }
+.rk-act { text-align: right; }
+.go { font: inherit; font-size: 15px; font-weight: 620; padding: 9px 16px;
+      border-radius: 980px; border: 0; cursor: pointer;
+      background: var(--accent); color: #fff; white-space: nowrap;
+      transition: filter var(--spring); }
+.go:hover { filter: brightness(1.08); }
+.go.ghost { background: var(--separator); color: var(--text); }
+@media (max-width: 860px) {
+  .rk-row { grid-template-columns: 1fr auto; }
+  .rk-bar { display: none; }
+  .rk-right, .rk-act { grid-column: 1 / -1; text-align: left; }
+}
+
+/* Слайд разбора отделения: цветная полоса статуса слева */
+.slide.unit { border-left: 6px solid var(--text-2); }
+.slide.unit.good { border-left-color: var(--good); }
+.slide.unit.warn { border-left-color: var(--warn); }
+.slide.unit.bad  { border-left-color: var(--bad); }
+
+/* Печать: слайды становятся обычными страницами, снап не нужен */
+@media print {
+  html { scroll-snap-type: none; }
+  .slide { height: auto; page-break-after: always; }
+  .slide-body { overflow: visible; }
+  .dots, .topbar { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .meter > span, .rk-bar > span, .dots .dot i { transition: none; }
+  .pager button, .crumb, .go { transition: none; }
+  .gd-gt::before { transition: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header><div class="eyebrow">УЗП · Дэшборд</div><h1>Отток бюджетной сферы · 06.2026</h1><p class="sub">Ведомства, территории, причины и прогноз численности</p></header>
+
+<style>
+.spark-ax{display:flex;justify-content:space-between;font-size:12px;color:var(--text-2);margin-top:2px}
+.sbar{display:flex;height:16px;border-radius:8px;overflow:hidden;margin:10px 0 8px}
+.sbar span{display:block;height:100%}
+.lgs{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--text-2)}
+.lg{display:flex;align-items:center;gap:6px}
+.lg i{width:10px;height:10px;border-radius:3px;display:inline-block}
+.muted{color:var(--text-2);font-size:13px}
+.note{border-left:3px solid var(--warn);padding:8px 12px;margin:12px 0;
+      color:var(--text-2);font-size:13px;background:color-mix(in srgb,var(--warn) 7%,transparent)}
+.src{font-size:12px;color:var(--text-2);margin-top:8px}
+.fb{font-size:12px;color:var(--warn);margin-bottom:6px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:820px){.grid2{grid-template-columns:1fr}}
+</style>
+<div class="stats"><div class="stat"><div class="stat-v" style="color:var(--text)">57 165</div><div class="stat-c">получателей в бюджетной сфере</div><div class="stat-sub">402 организаций</div></div><div class="stat"><div class="stat-v" style="color:var(--bad)">3 959</div><div class="stat-c">ушло за месяц</div></div><div class="stat"><div class="stat-v" style="color:var(--good)">582</div><div class="stat-c">вернулось</div></div><div class="stat"><div class="stat-v" style="color:var(--warn)">3 377</div><div class="stat-c">ушло и не вернулось</div><div class="stat-sub">5,9% численности</div></div></div><section><div class="eyebrow">Отчётный месяц</div><h2>Где основной отток: ведомства</h2><div class="fb">Вывод собран расчётом по правилам: модель не ответила или её ответ не разобрался.</div><p style="margin:0 0 10px;color:var(--text-2);font-size:16px">За 06.2026 из бюджетной сферы ушло и не вернулось 3,377 человек при численности 57,165 (5.9%); вернулось 582. Больше всего потерь в ведомстве «Образование» — 952 человек, это 28% всего оттока сегмента. Самая высокая доля оттока — в ведомстве «Налоги и казначейство»: 13.0% численности. За последние 3 мес. отток растёт на 370% относительно предыдущих 3.</p><div class="card "><table><thead><tr><th class="">Ведомство</th><th class="num">Ушло и не вернулось</th><th class="">Доля от численности</th><th class="num">Вклад в отток</th><th class="num">Организаций</th><th class="num">Возвращено</th></tr></thead><tbody><tr><td class="">Образование</td><td class="num">952</td><td class=""><div class="meter"><span style="width:108.9%;background:var(--good)"></span></div> <span>6,5%</span></td><td class="num">28%</td><td class="num">116</td><td class="num">17%</td></tr><tr><td class="">Здравоохранение</td><td class="num">722</td><td class=""><div class="meter"><span style="width:120.0%;background:var(--good)"></span></div> <span>7,7%</span></td><td class="num">21%</td><td class="num">84</td><td class="num">10%</td></tr><tr><td class="">Органы власти</td><td class="num">603</td><td class=""><div class="meter"><span style="width:120.0%;background:var(--good)"></span></div> <span>9,2%</span></td><td class="num">18%</td><td class="num">50</td><td class="num">14%</td></tr><tr><td class="">Культура</td><td class="num">222</td><td class=""><div class="meter"><span style="width:109.9%;background:var(--good)"></span></div> <span>6,6%</span></td><td class="num">7%</td><td class="num">27</td><td class="num">23%</td></tr><tr><td class="">Силовые ведомства</td><td class="num">221</td><td class=""><div class="meter"><span style="width:120.0%;background:var(--good)"></span></div> <span>8,3%</span></td><td class="num">7%</td><td class="num">20</td><td class="num">5%</td></tr><tr><td class="">Спорт</td><td class="num">208</td><td class=""><div class="meter"><span style="width:120.0%;background:var(--good)"></span></div> <span>9,1%</span></td><td class="num">6%</td><td class="num">16</td><td class="num">19%</td></tr><tr><td class="">Социальная защита</td><td class="num">124</td><td class=""><div class="meter"><span style="width:62.6%;background:var(--bad)"></span></div> <span>3,8%</span></td><td class="num">4%</td><td class="num">25</td><td class="num">14%</td></tr><tr><td class="">Налоги и казначейство</td><td class="num">105</td><td class=""><div class="meter"><span style="width:120.0%;background:var(--good)"></span></div> <span>13,0%</span></td><td class="num">3%</td><td class="num">5</td><td class="num">3%</td></tr><tr><td class="">Суды и юстиция</td><td class="num">101</td><td class=""><div class="meter"><span style="width:87.7%;background:var(--bad)"></span></div> <span>5,3%</span></td><td class="num">3%</td><td class="num">16</td><td class="num">21%</td></tr><tr><td class="">Не классифицировано</td><td class="num">68</td><td class=""><div class="meter"><span style="width:50.0%;background:var(--bad)"></span></div> <span>3,0%</span></td><td class="num">2%</td><td class="num">24</td><td class="num">25%</td></tr><tr><td class="">ЖКХ и благоустройство</td><td class="num">51</td><td class=""><div class="meter"><span style="width:69.0%;background:var(--bad)"></span></div> <span>4,1%</span></td><td class="num">2%</td><td class="num">19</td><td class="num">19%</td></tr></tbody></table></div></section><section><div class="eyebrow">12 мес. истории</div><h2>Тенденции</h2><div class="card "><p>За последние 3 мес. невозвращённый отток растёт на 370% относительно предыдущих 3.</p><svg viewBox="0 0 100 120" preserveAspectRatio="none" style="width:100%;height:120px;display:block"><path d="M0.00,39.12 L9.09,43.19 L18.18,39.19 L27.27,111.99 L36.36,111.45 L45.45,112.45 L54.55,112.60 L63.64,112.45 L72.73,114.00 L81.82,90.26 L90.91,82.68 L100.00,6.00 L100.00,120 L0,120 Z" fill="color-mix(in srgb, var(--accent) 12%, transparent)"/><path d="M0.00,39.12 L9.09,43.19 L18.18,39.19 L27.27,111.99 L36.36,111.45 L45.45,112.45 L54.55,112.60 L63.64,112.45 L72.73,114.00 L81.82,90.26 L90.91,82.68 L100.00,6.00" fill="none" stroke="var(--accent)" stroke-width="0.8" vector-effect="non-scaling-stroke"/><circle cx="0.00" cy="39.12" r="1.1" fill="var(--accent)"/><circle cx="9.09" cy="43.19" r="1.1" fill="var(--accent)"/><circle cx="18.18" cy="39.19" r="1.1" fill="var(--accent)"/><circle cx="27.27" cy="111.99" r="1.1" fill="var(--accent)"/><circle cx="36.36" cy="111.45" r="1.1" fill="var(--accent)"/><circle cx="45.45" cy="112.45" r="1.1" fill="var(--accent)"/><circle cx="54.55" cy="112.60" r="1.1" fill="var(--accent)"/><circle cx="63.64" cy="112.45" r="1.1" fill="var(--accent)"/><circle cx="72.73" cy="114.00" r="1.1" fill="var(--accent)"/><circle cx="81.82" cy="90.26" r="1.1" fill="var(--accent)"/><circle cx="90.91" cy="82.68" r="1.1" fill="var(--accent)"/><circle cx="100.00" cy="6.00" r="1.1" fill="var(--accent)"/></svg><div class="spark-ax"><span>07.25</span><span>06.26</span></div><div class="muted" style="margin-top:4px">невозвращённый отток по месяцам</div></div><div class="card "><table><thead><tr><th class="">Ведомство</th><th class="num">Ушло и не вернулось</th><th class="">Направление</th><th class="num">Изменение</th></tr></thead><tbody><tr><td class="">Образование</td><td class="num">952</td><td class="">растёт</td><td class="num">415%</td></tr><tr><td class="">Здравоохранение</td><td class="num">722</td><td class="">растёт</td><td class="num">373%</td></tr><tr><td class="">Органы власти</td><td class="num">603</td><td class="">растёт</td><td class="num">452%</td></tr><tr><td class="">Культура</td><td class="num">222</td><td class="">растёт</td><td class="num">241%</td></tr><tr><td class="">Силовые ведомства</td><td class="num">221</td><td class="">растёт</td><td class="num">445%</td></tr><tr><td class="">Спорт</td><td class="num">208</td><td class="">растёт</td><td class="num">517%</td></tr><tr><td class="">Социальная защита</td><td class="num">124</td><td class="">растёт</td><td class="num">145%</td></tr><tr><td class="">Налоги и казначейство</td><td class="num">105</td><td class="">растёт</td><td class="num">490%</td></tr><tr><td class="">Суды и юстиция</td><td class="num">101</td><td class="">растёт</td><td class="num">324%</td></tr><tr><td class="">Не классифицировано</td><td class="num">68</td><td class="">растёт</td><td class="num">168%</td></tr><tr><td class="">ЖКХ и благоустройство</td><td class="num">51</td><td class="">растёт</td><td class="num">313%</td></tr></tbody></table></div><div class="src">Источник ряда: витрина фактического оттока</div></section><section><div class="eyebrow">Отчётный месяц</div><h2>Территории и регионы</h2><div class="fb">Вывод собран расчётом по правилам: модель не ответила или её ответ не разобрался.</div><p style="margin:0 0 10px;color:var(--text-2);font-size:16px">Основной объём оттока даёт ЮЗБ — 1,990 человек (59% сегмента) при доле оттока 23.5%. Самая высокая доля оттока по регионам — Республика Дагестан: 100.0% численности при 2 организациях.</p><div class="grid2"><div class="card "><h3>Территориальные банки</h3><table><thead><tr><th class=""></th><th class="num">Ушло</th><th class="num">Доля</th><th class="num">Орг.</th></tr></thead><tbody><tr><td class="">ЮЗБ</td><td class="num">1 990</td><td class="num">23,5%</td><td class="num">65</td></tr><tr><td class="">СРБ</td><td class="num">285</td><td class="num">3,6%</td><td class="num">73</td></tr><tr><td class="">СЗБ</td><td class="num">221</td><td class="num">5,0%</td><td class="num">40</td></tr><tr><td class="">ПБ</td><td class="num">185</td><td class="num">4,6%</td><td class="num">33</td></tr><tr><td class="">СибБ</td><td class="num">168</td><td class="num">2,6%</td><td class="num">46</td></tr><tr><td class="">ББ</td><td class="num">128</td><td class="num">4,2%</td><td class="num">29</td></tr><tr><td class="">УБ</td><td class="num">108</td><td class="num">3,3%</td><td class="num">33</td></tr><tr><td class="">ЦЧБ</td><td class="num">104</td><td class="num">2,9%</td><td class="num">33</td></tr><tr><td class="">ВВБ</td><td class="num">100</td><td class="num">3,2%</td><td class="num">25</td></tr><tr><td class="">ДВБ</td><td class="num">86</td><td class="num">3,3%</td><td class="num">24</td></tr></tbody></table></div><div class="card "><h3>Регионы</h3><table><thead><tr><th class=""></th><th class="num">Ушло</th><th class="num">Доля</th><th class="num">Орг.</th></tr></thead><tbody><tr><td class="">Республика Калмыкия</td><td class="num">707</td><td class="num">41,7%</td><td class="num">12</td></tr><tr><td class="">Карачаево-Черкесская Республика</td><td class="num">370</td><td class="num">83,6%</td><td class="num">5</td></tr><tr><td class="">Регион не указан</td><td class="num">336</td><td class="num">3,6%</td><td class="num">87</td></tr><tr><td class="">Краснодарский край</td><td class="num">275</td><td class="num">45,2%</td><td class="num">5</td></tr><tr><td class="">Республика Ингушетия</td><td class="num">165</td><td class="num">38,6%</td><td class="num">7</td></tr><tr><td class="">Чеченская Республика</td><td class="num">135</td><td class="num">100,0%</td><td class="num">4</td></tr><tr><td class="">Республика Дагестан</td><td class="num">114</td><td class="num">100,0%</td><td class="num">2</td></tr><tr><td class="">Мурманская область</td><td class="num">92</td><td class="num">7,6%</td><td class="num">9</td></tr><tr><td class="">Донецкая Народная Республика</td><td class="num">59</td><td class="num">36,4%</td><td class="num">1</td></tr><tr><td class="">Кабардино-Балкарская Республика</td><td class="num">57</td><td class="num">3,3%</td><td class="num">9</td></tr></tbody></table></div></div><div class="card "><h3>Субъекты РФ по ОКТМО</h3><table><thead><tr><th class=""></th><th class="num">Ушло</th><th class="num">Доля</th><th class="num">Орг.</th></tr></thead><tbody><tr><td class="">36</td><td class="num">660</td><td class="num">25,6%</td><td class="num">19</td></tr><tr><td class="">42</td><td class="num">299</td><td class="num">83,6%</td><td class="num">4</td></tr><tr><td class="">69</td><td class="num">282</td><td class="num">33,1%</td><td class="num">8</td></tr><tr><td class="">11</td><td class="num">169</td><td class="num">24,0%</td><td class="num">10</td></tr><tr><td class="">01</td><td class="num">153</td><td class="num">35,0%</td><td class="num">7</td></tr><tr><td class="">47</td><td class="num">133</td><td class="num">31,1%</td><td class="num">5</td></tr><tr><td class="">65</td><td class="num">77</td><td class="num">6,8%</td><td class="num">9</td></tr><tr><td class="">84</td><td class="num">77</td><td class="num">7,2%</td><td class="num">8</td></tr><tr><td class="">61</td><td class="num">66</td><td class="num">3,8%</td><td class="num">18</td></tr><tr><td class="">50</td><td class="num">56</td><td class="num">3,2%</td><td class="num">15</td></tr></tbody></table></div><div class="note">Субъект РФ известен по 88% строк витрины: код берётся из полного ОКТМО. Колонка oktmo_subject_code для этого непригодна — в ней встречаются значения длиной ноль-два символа и нечисловой мусор. Организации без ОКТМО в этот разрез не попали.</div></section><section><div class="eyebrow">окно 6 мес.</div><h2>Причины: сокращение штата или уход к конкуренту</h2><div class="fb">Вывод собран расчётом по правилам: модель не ответила или её ответ не разобрался.</div><p style="margin:0 0 10px;color:var(--text-2);font-size:16px">За 6 мес. численность упала на 2,213 человек: 1,502 объясняется сокращением штата, 711 — уходом к конкуренту; преобладает сокращение штата в самих организациях. Больше всего уходов к конкурентам в регионе Забайкальский край — 62 человек из 62 падения.</p><div class="card "><p>За 6 мес. численность упала на <b>2 213</b> человек.</p><div class="sbar"><span style="width:67.87%;background:var(--warn)" title="Сокращение штата"></span><span style="width:32.13%;background:var(--bad)" title="Уход к конкуренту"></span></div><div class="lgs"><div class="lg"><i style="background:var(--warn)"></i>Сокращение штата — <b>1 502</b> <span class="muted">(68%)</span></div><div class="lg"><i style="background:var(--bad)"></i>Уход к конкуренту — <b>711</b> <span class="muted">(32%)</span></div></div></div><div class="card "><table><thead><tr><th class="">Ведомство</th><th class="num">Падение</th><th class="num">Сокращение штата</th><th class="num">Уход к конкуренту</th><th class="num">Доля сокращения</th></tr></thead><tbody><tr><td class="">Образование</td><td class="num">1 030</td><td class="num">693</td><td class="num">337</td><td class="num">67%</td></tr><tr><td class="">Здравоохранение</td><td class="num">292</td><td class="num">207</td><td class="num">85</td><td class="num">71%</td></tr><tr><td class="">Органы власти</td><td class="num">244</td><td class="num">122</td><td class="num">122</td><td class="num">50%</td></tr><tr><td class="">Спорт</td><td class="num">126</td><td class="num">88</td><td class="num">38</td><td class="num">70%</td></tr><tr><td class="">Суды и юстиция</td><td class="num">116</td><td class="num">103</td><td class="num">13</td><td class="num">89%</td></tr><tr><td class="">Культура</td><td class="num">97</td><td class="num">73</td><td class="num">24</td><td class="num">75%</td></tr><tr><td class="">Силовые ведомства</td><td class="num">90</td><td class="num">71</td><td class="num">19</td><td class="num">79%</td></tr><tr><td class="">Социальная защита</td><td class="num">77</td><td class="num">58</td><td class="num">19</td><td class="num">75%</td></tr><tr><td class="">ЖКХ и благоустройство</td><td class="num">66</td><td class="num">36</td><td class="num">30</td><td class="num">55%</td></tr><tr><td class="">Не классифицировано</td><td class="num">62</td><td class="num">46</td><td class="num">16</td><td class="num">74%</td></tr><tr><td class="">Налоги и казначейство</td><td class="num">13</td><td class="num">5</td><td class="num">8</td><td class="num">38%</td></tr></tbody></table></div><details class="disc "><summary>Разрез по регионам<span class="disc-tog" data-open="Скрыть разбор">Показать регионы</span></summary><div class="disc-body"><table><thead><tr><th class="">Регион</th><th class="num">Падение</th><th class="num">Сокращение штата</th><th class="num">Уход к конкуренту</th><th class="num">Доля сокращения</th></tr></thead><tbody><tr><td class="">Регион не указан</td><td class="num">361</td><td class="num">326</td><td class="num">35</td><td class="num">90%</td></tr><tr><td class="">Кабардино-Балкарская Республика</td><td class="num">127</td><td class="num">121</td><td class="num">6</td><td class="num">95%</td></tr><tr><td class="">Калужская область</td><td class="num">93</td><td class="num">91</td><td class="num">2</td><td class="num">98%</td></tr><tr><td class="">Мурманская область</td><td class="num">81</td><td class="num">65</td><td class="num">16</td><td class="num">80%</td></tr><tr><td class="">Ярославская область</td><td class="num">65</td><td class="num">65</td><td class="num">0</td><td class="num">100%</td></tr><tr><td class="">Забайкальский край</td><td class="num">62</td><td class="num">0</td><td class="num">62</td><td class="num">0%</td></tr><tr><td class="">Республика Алтай</td><td class="num">53</td><td class="num">0</td><td class="num">53</td><td class="num">0%</td></tr><tr><td class="">Республика Калмыкия</td><td class="num">53</td><td class="num">0</td><td class="num">53</td><td class="num">0%</td></tr><tr><td class="">Чукотский АО</td><td class="num">52</td><td class="num">52</td><td class="num">0</td><td class="num">100%</td></tr><tr><td class="">Курганская область</td><td class="num">52</td><td class="num">0</td><td class="num">52</td><td class="num">0%</td></tr><tr><td class="">Воронежская область</td><td class="num">52</td><td class="num">52</td><td class="num">0</td><td class="num">100%</td></tr><tr><td class="">Тверская область</td><td class="num">51</td><td class="num">46</td><td class="num">5</td><td class="num">90%</td></tr></tbody></table></div></details><div class="src">Падение численности получателей за окно раскладывается на две части. Если вместе с получателями уменьшился и штат организации — людей стало меньше, и банк на это не влияет. Если штат на месте, а получателей стало меньше — те же люди получают зарплату в другом банке. Сумма частей равна падению по построению, поэтому разрезы сходятся с итогом.</div></section><section><div class="eyebrow">внутренние прокси</div><h2>Зарплатные проекты в регионах</h2><div class="card "><table><thead><tr><th class="">Регион</th><th class="num">Получателей</th><th class="num">Штат</th><th class="num">Проникновение</th><th class="num">Средняя ЗП</th><th class="num">ФЛ год к году</th><th class="num">Исполнение плана</th></tr></thead><tbody><tr><td class="">Регион не указан</td><td class="num">9 712</td><td class="num">17 780</td><td class="num">54,6%</td><td class="num">69 593</td><td class="num">147</td><td class="num">—</td></tr><tr><td class="">Республика Калмыкия</td><td class="num">1 815</td><td class="num">3 049</td><td class="num">59,5%</td><td class="num">51 855</td><td class="num">50</td><td class="num">86,2%</td></tr><tr><td class="">Кабардино-Балкарская Республика</td><td class="num">1 588</td><td class="num">3 370</td><td class="num">47,1%</td><td class="num">80 977</td><td class="num">-37</td><td class="num">109,8%</td></tr><tr><td class="">Калужская область</td><td class="num">1 570</td><td class="num">2 786</td><td class="num">56,4%</td><td class="num">55 858</td><td class="num">1</td><td class="num">101,5%</td></tr><tr><td class="">Кемеровская область</td><td class="num">1 502</td><td class="num">2 470</td><td class="num">60,8%</td><td class="num">70 605</td><td class="num">62</td><td class="num">98,4%</td></tr><tr><td class="">Мурманская область</td><td class="num">1 490</td><td class="num">2 498</td><td class="num">59,6%</td><td class="num">60 247</td><td class="num">-16</td><td class="num">97,5%</td></tr><tr><td class="">Ростовская область</td><td class="num">1 455</td><td class="num">2 419</td><td class="num">60,1%</td><td class="num">75 054</td><td class="num">56</td><td class="num">—</td></tr><tr><td class="">Ханты-Мансийский АО - Югра</td><td class="num">1 218</td><td class="num">2 269</td><td class="num">53,7%</td><td class="num">52 788</td><td class="num">67</td><td class="num">—</td></tr><tr><td class="">Ставропольский край</td><td class="num">1 215</td><td class="num">2 298</td><td class="num">52,9%</td><td class="num">58 181</td><td class="num">16</td><td class="num">—</td></tr><tr><td class="">Ярославская область</td><td class="num">1 212</td><td class="num">2 449</td><td class="num">49,5%</td><td class="num">62 130</td><td class="num">19</td><td class="num">107,5%</td></tr><tr><td class="">Тульская область</td><td class="num">1 136</td><td class="num">2 081</td><td class="num">54,6%</td><td class="num">75 787</td><td class="num">12</td><td class="num">104,2%</td></tr><tr><td class="">Тамбовская область</td><td class="num">1 036</td><td class="num">1 792</td><td class="num">57,8%</td><td class="num">76 224</td><td class="num">20</td><td class="num">106,5%</td></tr><tr><td class="">Пермский край</td><td class="num">944</td><td class="num">1 894</td><td class="num">49,8%</td><td class="num">64 369</td><td class="num">6</td><td class="num">106,3%</td></tr><tr><td class="">Омская область</td><td class="num">936</td><td class="num">1 566</td><td class="num">59,8%</td><td class="num">82 199</td><td class="num">-8</td><td class="num">104,3%</td></tr><tr><td class="">Волгоградская область</td><td class="num">928</td><td class="num">1 441</td><td class="num">64,4%</td><td class="num">50 653</td><td class="num">-21</td><td class="num">106,4%</td></tr></tbody></table></div><div class="note">Это показатели витрин банка, а не государственная статистика. «Штат» — численность сотрудников организаций-клиентов по данным банка; «проникновение» — доля из них, получающая зарплату у нас. Занятость и сокращения по региону в целом здесь не измеряются.</div></section><section><div class="eyebrow">ключевые клиенты</div><h2>Активность банков-конкурентов</h2><div class="fb">Вывод собран расчётом по правилам: модель не ответила или её ответ не разобрался.</div><p style="margin:0 0 10px;color:var(--text-2);font-size:16px">Чаще других конкурентом назван Банк В: 22 организаций, 351 человек оттока. Оценка неполная: банк-конкурент известен только по ключевым клиентам, это 42% организаций сегмента.</p><div class="card "><table><thead><tr><th class="">Банк</th><th class="num">Ушло и не вернулось</th><th class="num">Организаций</th></tr></thead><tbody><tr><td class="">Банк В</td><td class="num">351</td><td class="num">22</td></tr><tr><td class="">Банк Г</td><td class="num">316</td><td class="num">24</td></tr><tr><td class="">Банк А</td><td class="num">206</td><td class="num">20</td></tr><tr><td class="">Банк Д</td><td class="num">157</td><td class="num">18</td></tr><tr><td class="">Банк Б</td><td class="num">103</td><td class="num">19</td></tr></tbody></table></div><div class="card "><h3>Стратегия по клиенту</h3><table><thead><tr><th class="">Стратегия</th><th class="num">Ушло</th><th class="num">Организаций</th></tr></thead><tbody><tr><td class="">отток</td><td class="num">1 727</td><td class="num">131</td></tr><tr><td class="">привлечение</td><td class="num">56</td><td class="num">19</td></tr><tr><td class="">удержание</td><td class="num">24</td><td class="num">18</td></tr></tbody></table></div><div class="note">Банк-конкурент известен только по ключевым клиентам — это 42% организаций сегмента (103 из 402 с оттоком). Отсутствие банка в списке не означает, что конкурента нет: про остальных не спрашивали.</div></section><section><div class="eyebrow">горизонт 6 мес.</div><h2>Прогноз численности до конца года</h2><div class="fb">Вывод собран расчётом по правилам: модель не ответила или её ответ не разобрался.</div><p style="margin:0 0 10px;color:var(--text-2);font-size:16px">При сохранении текущих темпов численность к 12.2026 составит 54,657 человек против 57,165 сейчас (-4.4% за 6 мес.). Восстановление до 65,280 возможно, если приход выйдет на уровень лучшего месяца окна. При повторении худшего месяца по оттоку численность падает до 38,687 (-32.3%).</p><div class="stats"><div class="stat"><div class="stat-v" style="color:var(--warn)">54 657</div><div class="stat-c">Сохранение</div><div class="stat-sub">-2 508 чел. · -4.4%</div></div><div class="stat"><div class="stat-v" style="color:var(--good)">65 280</div><div class="stat-c">Восстановление</div><div class="stat-sub">+8 115 чел. · +14.2%</div></div><div class="stat"><div class="stat-v" style="color:var(--bad)">38 687</div><div class="stat-c">Риск</div><div class="stat-sub">-18 478 чел. · -32.3%</div></div></div><div class="card "><svg viewBox="0 0 100 160" preserveAspectRatio="none" style="width:100%;height:160px;display:block"><path d="M0.00,51.94 L16.67,49.09 L33.33,45.68 L50.00,42.82 L66.67,31.21 L83.33,19.61 L100.00,8.00" fill="none" stroke="var(--good)" stroke-width="1" vector-effect="non-scaling-stroke"/><path d="M0.00,51.94 L16.67,81.81 L33.33,110.07 L50.00,139.91 L66.67,143.94 L83.33,147.97 L100.00,152.00" fill="none" stroke="var(--bad)" stroke-width="1" vector-effect="non-scaling-stroke"/><path d="M0.00,51.94 L16.67,58.67 L33.33,64.86 L50.00,71.58 L66.67,69.56 L83.33,67.54 L100.00,65.52" fill="none" stroke="var(--accent)" stroke-width="1" vector-effect="non-scaling-stroke"/></svg><div class="spark-ax"><span>06.2026</span><span>12.2026</span></div><div class="lgs"><div class="lg"><i style="background:var(--good)"></i>Восстановление</div><div class="lg"><i style="background:var(--bad)"></i>Риск</div><div class="lg"><i style="background:var(--accent)"></i>Сохранение</div></div></div><div class="src">«Сохранение» — отток и приход по среднему за окно; «Восстановление» — отток по среднему, приход по лучшему месяцу окна; «Риск» — отток по худшему месяцу окна, приход по среднему. Приход выведен из динамики численности, а не взят колонкой витрины.</div></section><section><div class="eyebrow">читать до выводов</div><h2>Ограничения и проверки</h2><div class="card "><ul><li>other_inn_emp_perc пуст во всей витрине — доля сотрудников, ушедших в другой Орг., не измеряется; признак в отчёте не показывается</li><li>prev_m_overflow_qty пуст во всей витрине — переток внутри Сбера (смена работодателя без ухода из банка) не измеряется</li><li>витринный приход (new_fl_cnt + np_cnt) отличается от расчётного в 7.2 раза — в прогнозе он не используется; приход выведен из динамики численности</li></ul><p>Ведомство определено у 378 из 402 организаций (94%). Остальные показаны отдельной строкой «Не классифицировано» и по ведомствам не распределены.</p><p>Все проверки сходимости пройдены: суммы частей совпадают с итогами.</p></div></section>
+<div class="footer">Сформировано 09.09.2026 18:17 · контур open · модель deepseek-v4-flash · источники: витрина оттока, возвраты, витрина организаций, справочник компаний, ключевые клиенты, справочник ГОСБ</div>
+</div>
+</body>
+</html>

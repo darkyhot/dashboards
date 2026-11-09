@@ -16,7 +16,16 @@ def sanitize(text: str) -> str:
     return _INN_WORD.sub("Орг.", text or "")
 
 
-def page(title: str, subtitle: str, body: str, footer: str = "") -> str:
+def page(title: str, subtitle: str, body: str, footer: str = "",
+         css: str | None = None, tail: str = "") -> str:
+    """Каркас страницы.
+
+    `css` — свой стиль вместо общего `BASE_CSS`: у tb_health он свой, собранный
+    пользователем, а общий нужен и другим отчётам (rgs_outflow) — трогать его нельзя.
+    `tail` — разметка ПОСЛЕ `.wrap`, прямо перед `</body>`. Туда встаёт скрипт, который
+    перестраивает страницу (он двигает содержимое `.wrap` и сам в нём жить не должен),
+    и всплывающая памятка.
+    """
     footer_html = f'<div class="footer">{footer}</div>' if footer else ""
     html = f"""<!doctype html>
 <html lang="ru">
@@ -24,7 +33,7 @@ def page(title: str, subtitle: str, body: str, footer: str = "") -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
-<style>{BASE_CSS}</style>
+<style>{BASE_CSS if css is None else css}</style>
 </head>
 <body>
 <div class="wrap">
@@ -36,6 +45,7 @@ def page(title: str, subtitle: str, body: str, footer: str = "") -> str:
 {body}
 {footer_html}
 </div>
+{tail}
 </body>
 </html>"""
     return sanitize(html)

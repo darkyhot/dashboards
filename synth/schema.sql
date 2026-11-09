@@ -1,8 +1,11 @@
 -- DDL открытого контура: повторяет пром ТОЧЬ-В-ТОЧЬ (та же схема и имена),
 -- чтобы SQL дэшей был идентичен в обоих контурах.
--- __SCHEMA__ заменяется на имя схемы при применении (reference.py / setup-ноутбук).
+-- __SCHEMA__ / __SCHEMA_T__ заменяются на имена схем при применении
+-- (reference.py / setup-ноутбук). Схем две, как на проме: основная витринная и
+-- __SCHEMA_T__ — там лежит пайплайн (yva_pl_task_deal_code).
 
 CREATE SCHEMA IF NOT EXISTS __SCHEMA__;
+CREATE SCHEMA IF NOT EXISTS __SCHEMA_T__;
 SET search_path TO __SCHEMA__;
 
 DROP TABLE IF EXISTS uzp_dim_gosb CASCADE;
@@ -12,6 +15,16 @@ DROP TABLE IF EXISTS uzp_dwh_company_holding_metric CASCADE;
 DROP TABLE IF EXISTS uzp_dwh_sale_funnel_task CASCADE;
 DROP TABLE IF EXISTS uzp_dim_company CASCADE;
 DROP TABLE IF EXISTS uzp_dim_mzp_reference_base CASCADE;
+DROP TABLE IF EXISTS uzp_dwh_day_outflow CASCADE;
+DROP TABLE IF EXISTS uzp_dwh_fact_outflow CASCADE;
+DROP TABLE IF EXISTS uzp_data_outflow_return_detail CASCADE;
+DROP TABLE IF EXISTS uzp_data_key_client_info_add_attr CASCADE;
+DROP TABLE IF EXISTS uzp_data_emp_epk_assignment CASCADE;
+DROP TABLE IF EXISTS uzp_data_epk_consolidation CASCADE;
+DROP TABLE IF EXISTS uzp_data_payroll_m CASCADE;
+DROP TABLE IF EXISTS uzp_dwh_sap_staff_emp CASCADE;
+DROP TABLE IF EXISTS uzp_data_mzp_motivation_detail_corr CASCADE;
+DROP TABLE IF EXISTS __SCHEMA_T__.yva_pl_task_deal_code CASCADE;
 
 -- ============ Справочники (грузятся из CSV как есть) ============
 
@@ -125,10 +138,12 @@ CREATE TABLE uzp_dwh_sale_funnel_task (
   task_category          varchar,
   task_code              varchar,
   task_create_dt         date,
+  fact_close_task_dttm   timestamp,   -- факт. закрытие задачи (для «закрыто в день создания»)
   is_task_closed         boolean,
   is_task_closed_success boolean,
   is_task_in_progress    boolean,
   task_text_status       varchar,
+  isu_struct_saphr_id    bigint,      -- табельный автора (для различения сотрудников)
   role_code              varchar,     -- МЗП / СЗП / МКК
   last_active_type       varchar,     -- Звонок / Встреча
   last_active_status     varchar,
@@ -185,9 +200,328 @@ CREATE TABLE uzp_dim_mzp_reference_base (
   author_login   text
 );
 
+
+-- ============ Месячный факт оттока (отдельная витрина) ============
+-- Дэш tb_health её не использует: модель оттока он строит по
+-- uzp_dwh_company_holding_metric. Синтетика её всё равно наполняет, потому что
+-- forecast_lab перебирает и варианты модели ПО ЭТОЙ витрине, а непроверенных
+-- веток алгоритма быть не должно.
+-- Ключевая особенность прома, которую воспроизводим: здесь отток заполнен ГУЩЕ,
+-- чем fl_outflow_qty в company_holding_metric.
+
+CREATE TABLE uzp_dwh_fact_outflow (
+  report_dt            date,
+  tb_id                integer,
+  gosb_id              integer,
+  inn                  bigint,
+  segment_name         varchar,
+  is_force             boolean,
+  mzp_fio              varchar,
+  saphr_id             bigint,
+  calc_fl_qty          integer,   -- расчётная численность за период
+  prev_m_overflow_qty  integer,
+  plan_payee_qty       integer,   -- плановое количество получателей
+  fact_payee_qty       integer,   -- фактическое количество получателей
+  outflow_qty          integer,   -- перестали быть ЗП-клиентами
+  outflow_perc         numeric,
+  other_inn_emp_perc   numeric,
+  m_avg_salary_amt     numeric,
+  prev_m_avg_salary_amt numeric,
+  next_m_avg_salary_amt numeric,   -- смотрит ВПЕРЁД: forecast_lab её не читает
+  prev_m_fl_val        integer,
+  next_m_fl_val        integer,    -- смотрит ВПЕРЁД: forecast_lab её не читает
+  is_task              boolean,
+  -- Территориальная привязка по ОКТМО. Разрезы «по территориям» строятся отсюда.
+  -- На проме oktmo_subject_code НЕГОДЕН: длина 0-2, среди значений «"0», «М»,
+  -- «П», «tr» — это мусор загрузки, а не код субъекта. Синтетика воспроизводит
+  -- его таким же намеренно: ветка «код субъекта негоден, берём substr(oktmo,1,2)»
+  -- обязана проверяться снаружи, а не открыться на проме.
+  is_oktmo             boolean,
+  oktmo_subject_code   varchar,
+  oktmo_subject_district_code      varchar,
+  oktmo_subject_district_city_code varchar,
+  oktmo                varchar,
+  client_communication_infopovod   varchar,
+  inserted_dttm        timestamp,
+  author_login         text
+);
+
+-- ============ Возвраты оттока ============
+-- Кто из ушедших вернулся. Грейн тот же, что у uzp_dwh_fact_outflow, связь —
+-- (report_dt, gosb_id, inn). Дэш считает «отток, который НЕ вернулся»:
+--     outflow_qty − COALESCE(return_qty, 0)
+-- Поэтому строки здесь обязаны ссылаться на реально существующие строки оттока;
+-- сгенерированные независимо, они дали бы пустой join и молча нулевой блок.
+
+CREATE TABLE uzp_data_outflow_return_detail (
+  report_dt                 date,
+  tb_id                     integer,
+  gosb_id                   integer,
+  inn                       bigint,
+  segment_name              varchar,
+  is_outflow_task           boolean,
+  outflow_qty               integer,   -- сколько ушло (копия строки оттока)
+  is_outflow_return_success boolean,
+  return_qty                integer,   -- сколько из них вернулось, <= outflow_qty
+  inserted_dttm             timestamp
+);
+
+-- ============ Доп. атрибуты по ключевым клиентам ============
+-- Единственный источник в витринах, где названы БАНКИ-КОНКУРЕНТЫ и кэптивный банк.
+-- Ключевая особенность прома, которую воспроизводим: витрина покрывает ТОЛЬКО
+-- ключевых клиентов (на проме ~16.7 тыс. ИНН против ~88 тыс. в витрине оттока).
+-- Код обязан считать и показывать это покрытие: без него блок конкурентов
+-- выглядит как «конкурентов почти нет», хотя на самом деле их просто не спросили.
+-- Колонок на проме под сотню; здесь заведены те, которые реально читаются.
+
+CREATE TABLE uzp_data_key_client_info_add_attr (
+  report_dt              date,
+  inn                    bigint,
+  tb_id                  integer,
+  gosb_id                integer,
+  segment_name           varchar,   -- БОЛЬШОЕ имя сегмента («Рег. госсектор»)
+  industry_name          varchar,
+  company_name           varchar,
+  holding_name           varchar,
+  holding_strategy_name  varchar,   -- отток | привлечение | удержание
+  bank_competitor        varchar,   -- основные банки-конкуренты
+  captive_bank_name      varchar,
+  is_key_client          boolean,
+  inn_current_fl_qty     bigint,
+  inn_emp_potential_qty  numeric,
+  modified_dttm          timestamp
+);
+
+-- ============ Справочники сотрудников и ЕПК ============
+-- Дэшем пока НЕ используются: заведены под будущие разрезы (закрепление
+-- сотрудника за клиентом, консолидированная карточка ЕПК, штатное расписание).
+-- Наполняются минимально-правдоподобно, чтобы схема открытого контура совпадала
+-- с промом и запросы к ним не падали на «нет такой таблицы».
+
+CREATE TABLE uzp_data_emp_epk_assignment (
+  epk_id            bigint,
+  saphr_id          bigint,
+  post_id           bigint,
+  pos_id            bigint,
+  role_id           integer,
+  start_dttm        timestamp,
+  end_dttm          timestamp,
+  balance_unit_code varchar,
+  tb_id             integer,
+  gosb_id           integer,
+  gosb_code         varchar,
+  sap_gosb_code     varchar,
+  vsp_code          varchar,
+  modified_dttm     timestamp
+);
+
+-- Атрибуты ЕПК организаций. ТЕКУЩИЙ срез, отчётной даты здесь нет вовсе —
+-- поэтому сегмент организации известен только «на сегодня», а не на дату.
+--
+-- Колонки приведены к пром-профилю (data/profiles/...uzp_data_epk_consolidation).
+-- Прежняя версия таблицы в синтетике была короче прома (не было company_name,
+-- holding_name, industry_name, status_name, is_educational, is_military), и
+-- разбор численности РГС отладить снаружи было нельзя вовсе.
+--
+-- ЛИКВИДАЦИЯ определяется по ОТСУТСТВИЮ активной записи у ИНН, а не по одной
+-- строке: у одного ИНН может быть несколько ЕПК, и «Ликвидирована» на одной из
+-- них ничего не значит, пока жива другая.
+CREATE TABLE uzp_data_epk_consolidation (
+  epk_id                      bigint,
+  epk_create_dttm             timestamp,
+  client_type_id              smallint,
+  client_type_name            varchar,
+  industry_id                 smallint,
+  industry_name               varchar,
+  inn                         bigint,
+  kpp                         bigint,
+  ogrn                        bigint,
+  okato                       bigint,
+  oktmo                       bigint,
+  old_epk_id                  varchar,
+  segment_id                  smallint,
+  segment_name                varchar,
+  priority_id                 smallint,
+  priority_name               varchar,
+  company_name                varchar,
+  holding_epk_id              bigint,
+  holding_name                varchar,
+  reference_holding_name      varchar,
+  head_holding_epk_id         bigint,
+  head_holding_name           varchar,
+  reference_head_holding_name varchar,
+  is_parent                   boolean,
+  is_key_client               boolean,
+  importance_lvl_id           smallint,
+  tb_id                       smallint,
+  gosb_id                     integer,
+  oktmo_gosb_id               integer,
+  okato_gosb_id               integer,
+  epk_gosb_id                 integer,
+  payroll_gosb_id             integer,
+  km_gosb_id                  integer,
+  last_mzp_activity_gosb_id   integer,
+  last_deal_gosb_id           integer,
+  kpp_gosb_id                 integer,
+  gosb_method_id              smallint,
+  status_id                   smallint,
+  status_name                 varchar,
+  is_educational              boolean,
+  is_military                 boolean,
+  report_id                   bigint,
+  modified_dttm               timestamp
+);
+
+-- ============ ЗП-ведомости, помесячно ============
+-- Самая большая таблица прома. Партиционирована по report_dt — КАЖДЫЙ запрос к ней
+-- обязан иметь report_dt в WHERE, иначе читается вся история.
+--
+-- Три вещи, из-за которых разбор по этой таблице ломается молча:
+--
+-- 1. Колонка кода зачисления называется `enrollment_type`, а НЕ
+--    `enrollment_type_id`. Имя проверяется разведкой по information_schema.
+-- 2. `inn` здесь TEXT длиной 1-12, а в uzp_data_epk_consolidation — bigint.
+--    Прямой CAST(inn AS bigint) на нечисловом значении роняет запрос. Синтетика
+--    намеренно содержит нечисловые ИНН и ИНН с ведущим нулём.
+-- 3. `segment_name` на проме ПУСТА (заполненность 0%), поэтому сегмент берётся
+--    только из uzp_data_epk_consolidation по ИНН. Колонка оставлена пустой и
+--    здесь: код, который на неё обопрётся, обязан сломаться и снаружи тоже.
+--
+-- Грейн: (report_dt, acc_num, inn, enrollment_type). Один человек в одном ИНН за
+-- месяц даёт НЕСКОЛЬКО строк — по строке на вид зачисления; получатель считается
+-- по СУММЕ этих строк.
+CREATE TABLE uzp_data_payroll_m (
+  acc_num                 text,
+  acc_open_dt             date,
+  acc_subtype             smallint,
+  acc_type                smallint,
+  actual_client_tid       bigint,
+  amt                     numeric,
+  client_category         smallint,
+  company_name            text,
+  document_info_sha1      bigint,
+  agrmnt_dt               date,
+  agrmnt_num              text,
+  enrollment_transcription text,
+  enrollment_type         smallint,
+  epk_id                  bigint,
+  gosb_id                 integer,
+  sys_gosb_id             integer,
+  inn                     text,
+  inn_parsing             text,
+  ipt_name                text,
+  sys_osb_id              integer,
+  card_type               text,
+  modified_dttm           timestamp,
+  report_dt               date,
+  tb_id                   smallint,
+  sys_tb_id               smallint,
+  transaction_qty         smallint,
+  untb                    bigint,
+  vsp_id                  integer,
+  sys_vsp_id              integer,
+  report_id               bigint,
+  is_security_force       boolean,
+  segment_name            text,
+  enrollment_kind_descr   text,
+  market_share_flag_name  text,
+  src_system_name         text
+);
+
+-- Партиции на проме нет — здесь её заменяет индекс: без него разбор за 25 месяцев
+-- на локальной синтетике идёт минутами вместо секунд.
+CREATE INDEX ix_payroll_m_dt ON uzp_data_payroll_m (report_dt);
+CREATE INDEX ix_payroll_m_dt_inn ON uzp_data_payroll_m (report_dt, inn);
+CREATE INDEX ix_payroll_m_dt_epk ON uzp_data_payroll_m (report_dt, epk_id);
+
+CREATE TABLE uzp_dwh_sap_staff_emp (
+  report_dt               date,
+  saphr_id                bigint,
+  fio                     varchar,
+  post_id                 bigint,
+  post_name               varchar,
+  pos_id                  bigint,
+  pos_name                varchar,
+  tb_code                 varchar,
+  tb_id                   integer,
+  gosb_code               varchar,
+  sap_gosb_code           varchar,
+  gosb_id                 integer,
+  city                    varchar,
+  post_total_experience_ym numeric,
+  is_actual               boolean,
+  inserted_dttm           timestamp
+);
+
+-- ============ Пайплайн: помесячная раскладка плана привлечения ============
+-- Схема ОТДЕЛЬНАЯ (__SCHEMA_T__), как на проме.
+-- В uzp_dwh_sale_funnel_task.plan_staff_deal_qty план размазан на все 3 месяца
+-- жизни сделки; помесячная разбивка есть только здесь. Ключ связи —
+-- coalesce(funnel.deal_code, funnel.task_code) = pl_task_deal_code.
+
+CREATE TABLE __SCHEMA_T__.yva_pl_task_deal_code (
+  pl_task_deal_code text,        -- код оффера или сделки в пайплайне
+  pl_month_num      integer,     -- номер месяца (1..12), когда зайдут ФЛ и ФОТ
+  pl_plan_fot_amt   bigint,      -- сколько ФОТа зайдёт за этот месяц
+  pl_plan_np_amt    bigint,      -- сколько ФЛ зайдёт за этот месяц
+  PRIMARY KEY (pl_task_deal_code, pl_month_num)
+);
+
+-- ============ Факт привлечения по сделкам, помесячно ============
+-- Витрина премирования МЗП. Для дэша важны четыре вещи:
+--   report_dt  — МЕСЯЦ ИЗ ПАЙПЛАЙНА, на который сделка обещала привлечение;
+--   sales_amt  — сколько НП по ней реально пришло (факт продаж, количество);
+--   (gosb_id, inn, saphr_id) — грейн сравнения плана с фактом.
+-- Сравнивать надо АГРЕГАТ: сотрудник мог завести две сделки по одной организации и
+-- обе запланировать на один месяц — факт месяца относится к их сумме, а не к каждой.
+-- metric_id = 1000636 («Новые получатели b2b»), учитываются строки product_cmnt='учтено'.
+
+CREATE TABLE uzp_data_mzp_motivation_detail_corr (
+  report_dt                date,        -- отчётный месяц (месяц из пайплайна)
+  tb_id                    smallint,
+  gosb_id                  integer,
+  inn                      bigint,
+  company_name             text,
+  segment_name             text,
+  agrmnt_num               integer,
+  saphr_id                 bigint,      -- табельный сотрудника (= isu_struct_saphr_id)
+  position_name            text,
+  metric_id                bigint,
+  product_group_name       text,
+  product_id               bigint,
+  product_name             text,
+  sales_amt                numeric,     -- ФАКТ продаж, количество
+  up_weight                numeric,
+  sales_prediction_percent numeric,
+  up_sales_amt             numeric,
+  consultation_start_dt    date,
+  consultation_success_dt  date,
+  product_cmnt             text,        -- 'учтено' | 'не соответствует критериям учета' | …
+  is_motiv                 boolean,
+  is_fraud                 boolean,
+  metric_name              varchar,
+  sale_plan_amt            numeric,
+  sale_prediction_amt      numeric,
+  up_sale_prediction_amt   numeric,
+  kpp                      varchar,
+  deal_code                varchar,
+  offer_code               varchar,
+  task_code                varchar,
+  ul_epk_id                bigint,
+  fl_epk_id                bigint,
+  sale_approve_dt          timestamp,
+  calc_dttm                timestamp,
+  inserted_dttm            timestamp,
+  author_login             text
+);
+
 -- Индексы под запросы дэшей
 CREATE INDEX ix_metrics_lookup ON uzp_dwh_metrics (metric_id, level_name, period_type, end_dt);
 CREATE INDEX ix_chm_gosb ON uzp_dwh_company_holding_metric (level_id, report_dt);
 CREATE INDEX ix_funnel_inn ON uzp_dwh_sale_funnel_task (inn);
 CREATE INDEX ix_gosb_tb ON uzp_dim_gosb (tb_id);
 CREATE INDEX ix_ref_base ON uzp_dim_mzp_reference_base (gosb_id, inn);
+CREATE INDEX ix_chm_hist ON uzp_dwh_company_holding_metric (org_id, level_id, report_dt);
+CREATE INDEX ix_motiv ON uzp_data_mzp_motivation_detail_corr (tb_id, metric_id, report_dt);
+CREATE INDEX ix_fact_outflow ON uzp_dwh_fact_outflow (report_dt, gosb_id, inn);
+CREATE INDEX ix_outflow_return ON uzp_data_outflow_return_detail (report_dt, gosb_id, inn);

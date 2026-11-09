@@ -75,7 +75,10 @@ def generate_dashboard(name: str, conn: str | None = None, params: dict | None =
     progress.enable(verbose=verbose, show_sql=show_sql, show_llm=show_llm)
     config.set_contour(contour)
     opts = llm.configure(**(llm_opts or {}))
-    progress.done(f"LLM: max_tokens={opts['max_tokens']} · extra={opts['extra']} · "
+    model = llm._model_for(config.CONTOUR, None)
+    progress.done(f"LLM: модель {model}"
+                  + ("" if opts.get("model") else " (из .env, llm_opts['model'] не задан)")
+                  + f" · max_tokens={opts['max_tokens']} · extra={opts['extra']} · "
                   f"timeout={opts['timeout']} · логи → {progress.LOG_DIR}")
     progress.step(f"Дэш «{name}» · контур {config.CONTOUR} · подключение к БД")
     engine = get_engine(config.db_url(conn))

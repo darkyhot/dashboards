@@ -13,8 +13,10 @@ SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
 def apply_schema(engine: Engine) -> None:
-    """Создать схему и таблицы (DROP+CREATE)."""
-    sql = SCHEMA_SQL.read_text(encoding="utf-8").replace("__SCHEMA__", config.SCHEMA)
+    """Создать схемы и таблицы (DROP+CREATE). Схем две: витринная и пайплайна."""
+    sql = (SCHEMA_SQL.read_text(encoding="utf-8")
+           .replace("__SCHEMA_T__", config.SCHEMA_T)
+           .replace("__SCHEMA__", config.SCHEMA))
     with engine.begin() as conn:
         for stmt in _split_statements(sql):
             conn.execute(text(stmt))
@@ -68,8 +70,8 @@ def load_reference_csvs(engine: Engine) -> dict[str, int]:
     return counts
 
 
-def _bulk(engine: Engine, df: pd.DataFrame, table: str) -> int:
+def _bulk(engine: Engine, df: pd.DataFrame, table: str, schema: str | None = None) -> int:
     df = df.where(pd.notnull(df), None)
-    df.to_sql(table, engine, schema=config.SCHEMA, if_exists="append",
+    df.to_sql(table, engine, schema=schema or config.SCHEMA, if_exists="append",
               index=False, method="multi", chunksize=500)
     return len(df)

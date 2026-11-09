@@ -13,6 +13,14 @@ import re
 # Разделители, которыми модель может «переписать» токен: «ГОСБ-01», «ГОСБ 1», «ГОСБ—01»
 _SEP = r"[\s\-–—_]*"
 
+# Чем заменить токен, которому не нашлось имени. Ключи — те же `kind`, что уходят
+# в `alias()`; вид, которого здесь нет, получит формулировку по умолчанию.
+UNKNOWN = {
+    "ГОСБ": "другие подразделения",
+    "ТБ": "другие территориальные банки",
+    "Организация": "другие организации",
+}
+
 
 class Aliases:
     """Двусторонний словарь «настоящее имя ↔ токен» на один вызов LLM."""
@@ -21,6 +29,7 @@ class Aliases:
         self._by_name: dict[tuple[str, str], str] = {}
         self._by_token: dict[str, str] = {}
         self._counters: dict[str, int] = {}
+        self.leaked = 0          # сколько выдуманных токенов пришлось обезличить
 
     def alias(self, kind: str, name) -> str:
         """Токен для имени. Повторный вызов даёт тот же токен."""
@@ -59,17 +68,45 @@ class Aliases:
         return text
 
     def restore(self, text: str) -> str:
-        """Вернуть настоящие имена в текст ответа LLM."""
-        if not text or not self._by_token:
+        """Вернуть настоящие имена в текст ответа LLM.
+
+        Последним шагом — страховка от НЕИЗВЕСТНЫХ токенов. Модель называет и то,
+        чего в промпте не было: пишет «ГОСБ-04 и ГОСБ-05», хотя псевдонимов завели
+        три. Вернуть такое имя неоткуда, а оставить токен в отчёте нельзя — читатель
+        видит «ГОСБ-05» и не понимает, о ком речь. Заменяем нейтральной формулировкой
+        и считаем, сколько раз это понадобилось (`leaked`): если счётчик не ноль,
+        промпту не хватило псевдонимов, и это видно в прогрессе.
+        """
+        self.leaked = 0
+        if not text:
             return text
-        text = self._expand_lists(text)
-        # от длинных номеров к коротким: иначе «ГОСБ-1» съест начало «ГОСБ-12»
-        for token in sorted(self._by_token, key=len, reverse=True):
-            kind, _, num = token.rpartition("-")
-            pattern = re.compile(rf"{re.escape(kind)}{_SEP}0*{int(num)}(?!\d)")
-            name = self._by_token[token]
-            text = pattern.sub(lambda _m, n=name: n, text)   # без спецсимволов замены
+        if self._by_token:
+            text = self._expand_lists(text)
+            # от длинных номеров к коротким: иначе «ГОСБ-1» съест начало «ГОСБ-12»
+            for token in sorted(self._by_token, key=len, reverse=True):
+                kind, _, num = token.rpartition("-")
+                pattern = re.compile(rf"{re.escape(kind)}{_SEP}0*{int(num)}(?!\d)")
+                name = self._by_token[token]
+                text = pattern.sub(lambda _m, n=name: n, text)  # без спецсимволов замены
+        return self._drop_unknown(text)
+
+    def _drop_unknown(self, text: str) -> str:
+        """Убрать токены, которых нет в словаре, — модель их выдумала."""
+        for kind in self._kinds():
+            repl = UNKNOWN.get(kind, f"другие {kind}")
+            pattern = re.compile(rf"{re.escape(kind)}{_SEP}0*\d+(?!\d)")
+            text, n = pattern.subn(repl, text)
+            self.leaked += n
+            if n > 1:
+                # «ГОСБ-04 и ГОСБ-05» превратилось бы в «другие подразделения и
+                # другие подразделения» — схлопываем повтор в одну формулировку
+                dup = re.compile(rf"{re.escape(repl)}(?:\s*(?:,|и)\s*{re.escape(repl)})+")
+                text = dup.sub(repl, text)
         return text
+
+    def _kinds(self) -> set:
+        """Все виды токенов: и заведённые, и те, что модель могла выдумать сама."""
+        return set(self._counters) | set(UNKNOWN)
 
     def __len__(self) -> int:
         return len(self._by_token)

@@ -1,0 +1,25 @@
+
+/* ============================================================
+   ПРАВКИ ПОВЕРХ ДИЗАЙНА (ux.css остаётся копией макета байт в байт)
+   ============================================================ */
+
+/* --- «Разделы страницы» в боковой колонке должны влезать без ползунка ---
+   Причина ползунка: кнопки разделов не переносят текст (white-space: nowrap у
+   .qn-pill), а самое длинное название — «Матрица выполнения ГОСБ/сегмент» —
+   шире колонки в 250px. У колонки overflow-y: auto, поэтому по второй оси
+   браузер тоже включает прокрутку, и снизу появляется горизонтальный ползунок.
+   Лечим переносом названия внутри кнопки и запретом горизонтальной прокрутки;
+   заодно чуть уплотняем кнопки, чтобы колонка и по высоте влезала на ноутбук. */
+.app-sidebar { overflow-x: hidden; gap: 6px; }
+.app-sidebar .quicknav { padding: 8px; gap: 6px; }
+.app-sidebar .qn-pill {
+  white-space: normal; line-height: 1.3; text-align: left;
+  align-items: center; padding: 8px 12px;
+}
+.app-sidebar .qn-pill > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.app-sidebar .read-progress { margin-top: 8px; padding-top: 10px; }
+.app-sidebar .rp-hint { margin-top: 6px; }
+/* на низком экране подсказку под счётчиком прячем: счётчик и полоса говорят то же */
+@media (max-height: 720px) {
+  .app-sidebar .rp-hint { display: none; }
+}
