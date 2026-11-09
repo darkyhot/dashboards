@@ -307,6 +307,39 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
                          if source.get("model") == "positive_count" else
                          "Первые три строки хвоста и строка, определяющая исторический порог.")
         notes.append("Условные коды строк не содержат исходных номеров организаций.")
+    elif section == "год к году":
+        from .business import compact
+
+        report = data["business_yoy"]
+        pages = 7
+        title = f"Год к году: {report['this_label']} против {report['last_label']}"
+        notes = [report["selection"], report["calendar"]]
+        if page == 1:
+            blocks = [("Изменение банка", _frame(report["summary"])),
+                      ("Из чего сложилось отличие от прошлого года (тройки)", _frame(report["flows"]))]
+            notes.append("Сверх прошлого года = изменение этого месяца − изменение того же месяца год назад.")
+        elif page == 2:
+            blocks = [("Причины ухода и признаки календаря (тройки)", _frame(report["reasons"]))]
+            notes += ["Причины ухода — часть строки «Ушли из банка»; «вернулись через месяц» с ними пересекается.",
+                      "Это наблюдаемые признаки, а не доказанная причина отличия."]
+        elif page in (3, 4, 5):
+            key, label = {3: ("segments", "Сегменты"), 4: ("tb", "ТБ"), 5: ("gosb", "ГОСБ")}[page]
+            frame = _frame(report["slices"][key])
+            blocks = [(label, compact(frame, value="Сверх прошлого года"))]
+            notes.append(f"Крупнейшие отличия и весь остаток; всего срезов {len(frame)}.")
+        elif page == 6:
+            blocks = [("Крупные организации", compact(_frame(report["organizations"]),
+                                                      value="Сверх прошлого года", total=report["excess"]))]
+            notes.append("«Остальные» включает все непоказанные организации и малые, до итога банка.")
+        else:
+            history = _frame(report["history"])
+            history = history.loc[history["Сверх прошлого года"].abs().sort_values(ascending=False).index].head(8)
+            blocks = [("Месяцы с наибольшим отличием от прошлого года", history[
+                ["Месяц", "Этот год", "Прошлый год", "Сверх прошлого года", "Объём отличий", "Проверено"]])]
+            notes.append("Объём отличий — справочно: половина суммы модулей отличий атомов или организаций.")
+            if report["issues"]:
+                blocks.append(("Ограничения", pd.DataFrame({"Сообщение": report["issues"][:8]})))
+        notes = [n for n in notes if n]
     elif section == "хвосты":
         shape = data.get("tail_shape")
         if not shape:
@@ -326,7 +359,7 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         pages = max(1, (len(frame) + 7) // 8)
         blocks = [("Разметка причин: последние шесть месяцев", frame.iloc[(page - 1) * 8:page * 8])]
     else:
-        raise ValueError("Раздел: бизнес, итог, карточки, пропуски, слабые, хвосты, календарь, кейс-август, пороги или качество")
+        raise ValueError("Раздел: бизнес, год к году, итог, карточки, пропуски, слабые, хвосты, календарь, кейс-август, пороги или качество")
     if page > pages:
         raise ValueError(f"Страница должна быть от 1 до {pages}")
     return {"title": title, "page": page, "pages": pages, "blocks": blocks, "notes": notes}

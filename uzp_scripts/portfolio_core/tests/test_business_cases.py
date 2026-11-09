@@ -302,8 +302,9 @@ class BusinessReportTests(unittest.TestCase):
                 self.assertEqual(load.call_count, 0 if have_panel else 1)
                 self.assertEqual(engine.call_count, 0 if have_panel else 1)
                 self.assertEqual(scope["business_report"]["month"][:7], "2026-08")
-                self.assertTrue((Path(tmp) / "business" / "report.html").exists())
-                self.assertEqual(len(shown), 2)
+                self.assertEqual(scope["business_report"]["excess"], -1.)
+                self.assertTrue((Path(tmp) / "business" / "yoy.html").exists())
+                self.assertGreaterEqual(len(shown), 6)
 
 
 if __name__ == "__main__":
