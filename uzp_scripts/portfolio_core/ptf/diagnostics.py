@@ -168,7 +168,7 @@ def recode_report(p: Panel, event=None, before=None, after=None, **params) -> di
         ("портфель организации в прошлом месяце", p.x["pf_recip"][r, t - 1]),
         ("портфель атома-источника в прошлом месяце", p.x["pf_recip"][src, t - 1]),
         ("портфель атома-источника после закладки", q.x["pf_recip"][src, t]),
-        ("минимум портфеля источника с месяца закладки", float(np.nanmin(q.x["pf_recip"][src, t:]))),
+        ("минимум портфеля источника с месяца закладки", float(bench.quiet_nan(np.nanmin, q.x["pf_recip"][src, t:]))),
         ("ГОСБ источника и приёмника совпадают", bool(
             p.meta.at[src, "sys_gosb_id"] == p.meta.at[ev.row2, "sys_gosb_id"])),
         ("строк детализации потоков организации", len(q.org_flows.xs((r, t), level=("row", "t")))
@@ -211,3 +211,57 @@ def recode_report(p: Panel, event=None, before=None, after=None, **params) -> di
         "3. Итоговая карточка организации": watch.cards_frame(q, org_cards, t),
         "4. Лишние карточки по правилу стенда": extra_frame,
     }
+
+
+def tail_shape(p: Panel, months_back: int = 6) -> dict:
+    """Форма хвостов реальных потоков: логарифмическая или аддитивная мерка шума.
+
+    Для тех же рядов и месяцев, что проверяет стенд, считаются стандартизованные
+    отклонения в двух мерках одной модели: z_log = (log(1+факт) − центр)/σ и
+    z_add = (факт − E)/s. Если шум мультипликативный, у z_add раздут верхний хвост
+    и сжат нижний, а z_log близок к нормальному; если аддитивный — наоборот.
+    Реальные события попадают в обе мерки одинаково, поэтому сравнение честное,
+    но частоты выше нормальных сами по себе не означают ложных тревог.
+
+    «Лишних отборов» — ряды в месяц, которые прошли бы первичный отбор вверх при
+    границе min(лог, E + z·s), но не проходят при принятой лог-границе (цена гибрида
+    до слияния карточек). Расчёт по панели в памяти; стенд и БД не нужны.
+    """
+    from . import count_model
+
+    ts = list(range(max(13, len(p.months) - months_back), len(p.months)))
+    acc: dict = {}
+    for level, rows in (("org", p.orgs), ("atom", p.atoms)):
+        if not len(rows):
+            continue
+        for t in ts:
+            obs = {f: watch.flow_obs(p, f) for f in watch.FLOWS}
+            scans = watch.scan_rows(p, rows, t, obs)
+            for flow, s in scans.items():
+                ok = np.isfinite(s["z"]) & np.isfinite(s["s"]) & (s["s"] > 0)
+                z_log = s["z"][ok]
+                z_add = (s["obs"][ok] - s["E"][ok]) / s["s"][ok]
+                floor = watch.floor_of(s["base"])
+                upper_log = np.maximum(count_model.positive_exp(s["center"] + s["zs"] * s["log_s"]), s["E"])
+                upper_hyb = np.maximum(np.fmin(upper_log, s["E"] + s["zs"] * s["s"]), s["E"])
+                extra = ((s["obs"] - upper_hyb >= floor) & ~(s["obs"] - upper_log >= floor) & ok).sum()
+                a = acc.setdefault((level, flow), {"z_log": [], "z_add": [], "extra": 0})
+                a["z_log"].append(z_log)
+                a["z_add"].append(z_add)
+                a["extra"] += int(extra)
+    rows_out = []
+    for (level, flow), a in acc.items():
+        zl, za = np.concatenate(a["z_log"]), np.concatenate(a["z_add"])
+        n = len(zl)
+
+        def share(x, cond):
+            return round(100. * float(cond(x).mean()), 2) if n else np.nan
+
+        rows_out.append({
+            "уровень": "орг." if level == "org" else "атом", "поток": flow, "точек": n,
+            "лог >3, %": share(zl, lambda x: x > 3), "лог <−3, %": share(zl, lambda x: x < -3),
+            "адд >3, %": share(za, lambda x: x > 3), "адд <−3, %": share(za, lambda x: x < -3),
+            "лог >2, %": share(zl, lambda x: x > 2), "адд >2, %": share(za, lambda x: x > 2),
+            "лишних отборов/мес": round(a["extra"] / len(ts), 1)})
+    return {"months": [p.months[t] for t in ts], "table": pd.DataFrame(rows_out),
+            "normal": {"> 3": 0.13, "> 2": 2.28}}

@@ -28,7 +28,7 @@ from statistics import NormalDist
 import numpy as np
 import pandas as pd
 
-from .bench import Card
+from .bench import Card, quiet_nan
 from .inputs import Panel, residual_panel
 from .presentation import org_code
 
@@ -699,8 +699,8 @@ def _temporal(p: Panel, atoms: np.ndarray, obs: dict, t: int) -> list[Card]:
             def pred(h):
                 if h < 16:
                     return np.nan
-                lvl_now = np.nanmean(rate[h - 3:h])
-                lvl_ago = np.nanmean(rate[h - 15:h - 12])
+                lvl_now = quiet_nan(np.nanmean, rate[h - 3:h])
+                lvl_ago = quiet_nan(np.nanmean, rate[h - 15:h - 12])
                 return rate[h - 12] * (lvl_now / lvl_ago if lvl_ago > 0 else 1.0)
 
             errs = [rate[h] - pred(h) for h in range(16, t)]

@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -21,6 +22,19 @@ import pandas as pd
 
 from . import months as M
 from .inputs import CELL_MEAS, IN_M, MEAS, OUT_M, Panel
+
+def quiet_nan(fn, *args, **kwargs):
+    """NaN-свёртка NumPy без предупреждений о пустом срезе.
+
+    Ряд без данных законно даёт NaN («неизвестно»): значение не меняется и нулём
+    не подменяется, но тетрадка не засыпается красными RuntimeWarning.
+    Глушатся только эти два сообщения; любые другие предупреждения остаются.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", r"All-NaN (slice|axis) encountered", RuntimeWarning)
+        warnings.filterwarnings("ignore", r"Mean of empty slice", RuntimeWarning)
+        return fn(*args, **kwargs)
+
 
 # --------------------------------------------------------------------------- #
 # Карточка и событие
@@ -219,7 +233,7 @@ def vary_departure_reasons(p: Panel, seed: int = 41) -> Panel:
     for m in ("m_out_left_bank", "m_lb_seasonal", "m_lb_org_stopped"):
         parts[m] = p.x[m][rows].copy()
         np.subtract.at(parts[m], destination, p.x[m][orgs])
-        if np.nanmin(parts[m]) < -1e-6:
+        if quiet_nan(np.nanmin, parts[m]) < -1e-6:
             raise ValueError("Организации превышают итог атома")
     rng = np.random.default_rng(seed)
     mean = rng.uniform(.75, .97, len(rows))
@@ -623,7 +637,7 @@ def inject(p: Panel, ev: Event) -> Panel:
         if invalid.any():
             raise ValueError(f"Закладка создала {count} больше портфеля")
     gap = q.identity_gap(ev.t) - p.identity_gap(ev.t)
-    if np.nanmax(np.abs(gap)) > 1e-5:
+    if quiet_nan(np.nanmax, np.abs(gap)) > 1e-5:
         raise ValueError("Закладка нарушила тождество движений")
     return q
 
@@ -817,7 +831,7 @@ def pick_events(p: Panel, rng, kind: str, k: float, t: int, n_ev: int,
                 continue
             ev.row2 = int(rng.choice(others))
         if kind == "conc":
-            cap = np.nanmin(_atom_stocks(p, "multi_recip")[:, t:], axis=1)
+            cap = quiet_nan(np.nanmin, _atom_stocks(p, "multi_recip")[:, t:], axis=1)
             available = p.atoms[(cap >= n) & (p.atoms != p.meta.at[r, "atom"])]
             if not len(available):
                 continue

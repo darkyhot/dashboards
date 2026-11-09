@@ -14,6 +14,13 @@ import numpy as np
 NORMAL_MEDIAN = .6744897501960817
 MAD_SCALE = 1. / NORMAL_MEDIAN
 
+# Верхняя граница ряда:
+#   "log"    — E·exp(z·σ) в логарифмах (принятая версия протокола 3);
+#   "hybrid" — не дальше аддитивной E + z·s при том же z (эксперимент 09.11.2026).
+# Аддитивное событие (+N человек) при лог-границе должно быть (e^{zσ}−1)/σ шумов модели:
+# 4,1 при σ=0,1; 7,0 при σ=0,36. Нижняя граница не меняется (лог-нижняя ближе к E).
+UPPER_BOUND = "log"
+
 
 def positive_exp(a):
     with np.errstate(over="ignore", invalid="ignore"):
@@ -174,7 +181,10 @@ def scan_rows(p, rows, t, obs_all, details=False):
         # В физических единицах: запас относительно прогнозной границы,
         # а не log-z, ошибочно умноженный на счётчиковый шум.
         current["zs"] *= critical / normal
-        current["upper"] = np.maximum(positive_exp(current["center"] + current["zs"] * current["log_s"]), current["E"])
+        upper = positive_exp(current["center"] + current["zs"] * current["log_s"])
+        if UPPER_BOUND == "hybrid":
+            upper = np.fmin(upper, current["E"] + current["zs"] * current["s"])
+        current["upper"] = np.maximum(upper, current["E"])
         current["lower"] = np.minimum(positive_exp(current["center"] - current["zs"] * current["log_s"]), current["E"])
         if details:
             current["calibration"].update(critical_z=critical, empirical_z=current["zs"],

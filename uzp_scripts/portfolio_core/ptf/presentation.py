@@ -307,6 +307,18 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
                          if source.get("model") == "positive_count" else
                          "Первые три строки хвоста и строка, определяющая исторический порог.")
         notes.append("Условные коды строк не содержат исходных номеров организаций.")
+    elif section == "хвосты":
+        shape = data.get("tail_shape")
+        if not shape:
+            raise ValueError('Разбор хвостов не рассчитан: запустите ячейку с PHOTO_SECTION = "хвосты"')
+        frame = _frame(shape["table"])
+        pages = max(1, (len(frame) + 11) // 12)
+        title = f"Форма хвостов: {shape['months'][0][:7]} — {shape['months'][-1][:7]}"
+        blocks = [("Доля отклонений за ±3 и +2 шума, %", frame.iloc[(page - 1) * 12:page * 12])]
+        notes += ["Норма для гауссова шума: >3 — 0,13%; >2 — 2,28%; <−3 — 0,13%.",
+                  "Мультипликативный шум: у «адд» раздут верх и сжат низ, «лог» близок к норме.",
+                  "Аддитивный шум: наоборот. Реальные события завышают обе мерки одинаково.",
+                  "Лишних отборов — цена границы min(лог, E + z·s) до слияния карточек."]
     elif section == "качество":
         frame = _frame(data["reason_partition"])
         if not frame.empty:
@@ -314,7 +326,7 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         pages = max(1, (len(frame) + 7) // 8)
         blocks = [("Разметка причин: последние шесть месяцев", frame.iloc[(page - 1) * 8:page * 8])]
     else:
-        raise ValueError("Раздел: бизнес, итог, карточки, пропуски, слабые, календарь, кейс-август, пороги или качество")
+        raise ValueError("Раздел: бизнес, итог, карточки, пропуски, слабые, хвосты, календарь, кейс-август, пороги или качество")
     if page > pages:
         raise ValueError(f"Страница должна быть от 1 до {pages}")
     return {"title": title, "page": page, "pages": pages, "blocks": blocks, "notes": notes}
