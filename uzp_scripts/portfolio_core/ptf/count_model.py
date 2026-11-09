@@ -104,6 +104,8 @@ def score(obs, expected, base, groups, t):
             "s": np.where(supported, sd, np.nan), "d": np.where(supported, delta, np.nan),
             "z": np.where(supported, z, np.nan), "base": base[:, t], "R": residuals,
             "center": center, "log_s": sigma, "n_history": n_history,
+            # Для диагностики: из чего взят разброс (σ = max(групповой, собственный)).
+            "own_log_s": own, "pooled_log_s": pooled,
             "eligible": supported & (median >= watch.MIN_NULL_MEAN),
             "unsupported_material": ~supported & (np.abs(obs[:, t] - raw[:, t]) >= watch.floor_of(base[:, t]))}
 

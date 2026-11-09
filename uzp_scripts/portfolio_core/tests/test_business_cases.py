@@ -1,5 +1,6 @@
 """C01: единицы, неполные меры и просмотр без повторного стенда."""
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -122,7 +123,9 @@ class BusinessReportTests(unittest.TestCase):
         notebook = json.loads((Path(__file__).resolve().parents[1] / "portfolio_core.ipynb").read_text())
         source = next("".join(c["source"]) for c in notebook["cells"]
                       if "СТОРОЖ: РЕЗУЛЬТАТЫ ДЛЯ ФОТОГРАФИРОВАНИЯ" in "".join(c["source"]))
-        source = source.replace('PHOTO_SECTION = "итог"', 'PHOTO_SECTION = "пороги"')
+        # Раздел и страницы ячейки меняются от запуска к запуску — подставляем свои.
+        source = re.sub(r'(?m)^PHOTO_SECTION = .*$', 'PHOTO_SECTION = "пороги"', source)
+        source = re.sub(r'(?m)^PHOTO_PAGE = .*$', 'PHOTO_PAGE = 1', source)
         p = secondary_job_gap()
         del p.x["m_in_temp_outside"]
         del p.x["m_out_temp_left"]

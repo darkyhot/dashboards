@@ -184,7 +184,10 @@ def _target_scan(p, ev, target, cache):
             records.append({"когда": when, "поток": f, "факт": s["obs"][i], "ожидание": s["E"][i],
                             "граница": s["upper"][i] if "upper" in s else np.nan,
                             "шум": s["s"][i], "порог z": s["zs"], "сверх шума": watch.excess(s)[i],
-                            "минимум": watch.floor_of(s["base"][i]), "выбран": picked == f})
+                            "минимум": watch.floor_of(s["base"][i]), "выбран": picked == f,
+                            "σ своя": s["own_log_s"][i] if "own_log_s" in s else np.nan,
+                            "σ группы": s["pooled_log_s"][i] if "pooled_log_s" in s else np.nan,
+                            "история": s["n_history"][i] if "n_history" in s else np.nan})
     return {"table": pd.DataFrame(records).round(2),
             "calibration": {f: s["calibration"] for f, s in after.items()},
             "where": watch.where(p, bench.Card(lvl, target, "net", 0))}
@@ -259,6 +262,10 @@ def weak_misses(p, res, progress=print) -> dict:
             "№": number, "тип": row["kind"], "месяц": p.months[int(row["t"])][:7],
             "ряд": "орг." if p.meta.at[target, "lvl"] == "org" else "атом",
             "людей": int(row["n"]), "шумов стенда": round(float(row["effective_k"]), 2),
+            "шум стенда": round(float(row["n"]) / float(row["effective_k"]), 1),
+            "шум модели": after["шум"],
+            "шумов модели": round(float(row["n"]) / after["шум"], 2) if after["шум"] > 0 else np.nan,
+            "σ своя": after["σ своя"], "σ группы": after["σ группы"], "история": after["история"],
             "найдено": level if found else ("нет" if level is None or pd.isna(level) else f"нет ({level})"),
             "факт": after["факт"], "ожидание": after["ожидание"], "граница": after["граница"],
             "запас": after["сверх шума"], "минимум": after["минимум"],

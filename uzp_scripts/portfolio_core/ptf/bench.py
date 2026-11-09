@@ -783,8 +783,11 @@ def row_noise(p: Panel, t: int, rows: np.ndarray, hist: int = 12,
     lo = max(0, t - hist)
     h = (p.x[measure][rows, lo:t] if measure else
          np.stack([net(p, s)[rows] for s in range(lo, t)], axis=1))
-    med = np.nanmedian(h, axis=1, keepdims=True)
-    return np.maximum(1.4826 * np.nanmedian(np.abs(h - med), axis=1), 1.0)
+    from .watch import _nanmedian  # ленивый импорт: watch сам импортирует bench
+
+    # Ряд без истории даёт NaN (шум неизвестен) — без предупреждений NumPy в тетрадке.
+    med = _nanmedian(h, axis=1, keepdims=True)
+    return np.maximum(1.4826 * _nanmedian(np.abs(h - med), axis=1), 1.0)
 
 
 def pick_events(p: Panel, rng, kind: str, k: float, t: int, n_ev: int,
@@ -849,6 +852,8 @@ def pick_recode(p: Panel, rng, t: int) -> Event | None:
 # --------------------------------------------------------------------------- #
 def baseline(p: Panel, t: int, z_min: float = 4.0, min_people: int = 100,
              top: int = 25) -> list[Card]:
+    from .watch import _nanmedian  # ленивый импорт: watch сам импортирует bench
+
     rows = np.arange(len(p.meta))
     best: dict[int, Card] = {}
     series = {"net": lambda s: net(p, s)}
@@ -857,8 +862,8 @@ def baseline(p: Panel, t: int, z_min: float = 4.0, min_people: int = 100,
     for name, f in series.items():
         cur = f(t)
         h = np.stack([f(s) for s in range(max(0, t - 12), t)], axis=1)
-        med = np.nanmedian(h, axis=1)
-        mad = 1.4826 * np.nanmedian(np.abs(h - med[:, None]), axis=1) + 1
+        med = _nanmedian(h, axis=1)
+        mad = 1.4826 * _nanmedian(np.abs(h - med[:, None]), axis=1) + 1
         dev = cur - med
         z = np.abs(dev) / mad
         for r in rows[(z >= z_min) & (np.abs(dev) >= min_people)]:
