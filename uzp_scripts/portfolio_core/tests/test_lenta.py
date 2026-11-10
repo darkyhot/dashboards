@@ -192,3 +192,31 @@ class Sql(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoadErrors(unittest.TestCase):
+    def test_failed_slice_type_is_one_line_and_others_load(self):
+        from unittest.mock import patch
+
+        from ptf import db
+
+        months, meas = seasonal(n=3)
+        good = frame_of({("Банк", "банк"): meas}, months)
+
+        class Orig(Exception):
+            pass
+
+        def fake_read(connection, sql, params=None):
+            if "Отрасль" in sql:
+                err = Exception("SELECT ... длинный запрос")
+                err.orig = Orig("column \"ind\" does not exist\nLINE 1: ...")
+                raise err
+            return good.copy()
+
+        logs = []
+        with patch.object(db, "is_greenplum", return_value=True), patch.object(db, "execute", return_value=5), \
+             patch.object(db, "read_sql", side_effect=fake_read), patch.object(db, "rollback"):
+            frame = lenta.load(object(), progress=logs.append)
+        self.assertEqual(frame.attrs["failed"], [("Отрасль", 'Orig: column "ind" does not exist')])
+        self.assertTrue(any("пропущен — Orig: column" in s for s in logs))
+        self.assertNotIn("SELECT", " ".join(logs))

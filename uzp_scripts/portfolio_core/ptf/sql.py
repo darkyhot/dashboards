@@ -1074,11 +1074,11 @@ LENTA_SLICES = [("Банк", "CAST('банк' AS text)"),
                 ("Сегмент × отрасль", "seg_rep || ' / ' || ind")]
 
 
-def _lenta_part(kind: str, key: str) -> str:
+def lenta_part(kind: str, key: str) -> str:
     cols = ",\n       ".join([f"sum({c}) AS {c}" for c in LENTA_MEAS]
                              + [f"sum(nn_{c}) AS nn_{c}" for c in LENTA_MEAS])
     return (f"SELECT CAST('{kind}' AS text) AS slice_type, CAST({key} AS text) AS slice_key, report_dt,\n"
             f"       {cols}\nFROM t_lenta\nWHERE {key} IS NOT NULL\nGROUP BY 1, 2, 3")
 
 
-LENTA_SERIES = "\nUNION ALL\n".join(_lenta_part(k, v) for k, v in LENTA_SLICES)
+LENTA_SERIES = "\nUNION ALL\n".join(lenta_part(k, v) for k, v in LENTA_SLICES)

@@ -377,6 +377,7 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         if 3 <= page <= 6:
             name, table, n = rep["pages"][page - 3]
             blocks = [(f"{name}: сюжетов {n}, показано {min(n, 10)}", _frame(table))]
+            notes += [f"Пропущен вид среза «{k}»: {r}" for k, r in rep.get("failed", [])]
             notes += [f"Срезов {rep['n_slices']:,}; значимых сравнений {rep['n_found']:,} → сюжетов "
                       f"{rep['n_stories']:,}. Отбор — от 4 шумов своего сравнения; эхо окон склеено.",
                       "Реальное — ушли из банка насовсем и пришли извне; учёт и календарь — временный "

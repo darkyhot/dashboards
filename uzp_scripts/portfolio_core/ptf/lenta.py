@@ -81,10 +81,32 @@ def load(connection, hold_min: int = 1000, org_min: int = 1000, progress=print) 
     ddl = "CREATE TEMP TABLE t_lenta AS\n" + Q.T_LENTA + ("\nDISTRIBUTED RANDOMLY" if gp else "")
     n = db.execute(connection, ddl, {"hold_min": hold_min, "org_min": org_min})
     progress(f"Лента: сводка свёрнута до {n:,} строк, {time.time() - t0:.0f} с")
-    frame = db.read_sql(connection, Q.LENTA_SERIES)
-    progress(f"Лента: {frame[['slice_type', 'slice_key']].drop_duplicates().shape[0]:,} срезов, "
-             f"{time.time() - t0:.0f} с")
+    # Вид среза — отдельный запрос: ошибка одного вида видна одной строкой и не губит остальные.
+    parts, failed = [], []
+    for kind, key in Q.LENTA_SLICES:
+        t1 = time.time()
+        try:
+            part = db.read_sql(connection, Q.lenta_part(kind, key))
+        except Exception as ex:                                     # noqa: BLE001
+            db.rollback(connection)
+            reason = _db_reason(ex)
+            failed.append((kind, reason))
+            progress(f"Лента: срез «{kind}» пропущен — {reason}")
+            continue
+        parts.append(part)
+        progress(f"Лента: {kind} — {part['slice_key'].nunique():,} срезов, {time.time() - t1:.0f} с")
+    if not parts or "Банк" in [k for k, _ in failed]:
+        raise RuntimeError("Лента: ряды срезов не получены — " + "; ".join(f"{k}: {r}" for k, r in failed))
+    frame = pd.concat(parts, ignore_index=True)
+    frame.attrs["failed"] = failed
     return frame
+
+
+def _db_reason(ex: Exception) -> str:
+    """Первая строка сообщения БД без текста запроса (он длинный и закрывает причину)."""
+    orig = getattr(ex, "orig", None)
+    msg = str(orig if orig is not None else ex).strip().splitlines()
+    return f"{type(orig if orig is not None else ex).__name__}: {msg[0][:300] if msg else ''}"
 
 
 class Series:
@@ -416,6 +438,7 @@ def run(connection, months_back: int = 12, month: str | None = None, checks: lis
     t0 = time.time()
     frame = load(connection, hold_min, org_min, progress)
     rep = report(frame, months_back, month, checks)
+    rep["failed"] = list(frame.attrs.get("failed", []))
     rep["duration_min"] = (time.time() - t0) / 60.
     progress(f"Лента: {rep['n_found']:,} значимых сравнений → {rep['n_stories']:,} сюжетов, "
              f"{rep['duration_min']:.1f} мин")
