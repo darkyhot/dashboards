@@ -369,12 +369,13 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         rep = data.get("lenta")
         if not rep:
             raise ValueError("Лента не рассчитана: ячейка «ЛЕНТА»")
-        cards = [*rep["pulse"], None, None, None, None, *rep["cards"], *rep["checks"]]
+        n_tab = len(rep["pages"])
+        cards = [*rep["pulse"], *([None] * n_tab), *rep["cards"], *rep["checks"]]
         pages = len(cards)
         page = min(max(1, int(page)), pages)
         title = (f"Лента портфеля {rep['report_months'][0][:7]} — {rep['report_months'][-1][:7]}: "
                  f"отклонения и реальное изменение")
-        if 3 <= page <= 6:
+        if 3 <= page < 3 + n_tab:
             name, table, n = rep["pages"][page - 3]
             blocks = [(f"{name}: сюжетов {n}, показано {min(n, 10)}", _frame(table))]
             notes += [f"Пропущен вид среза «{k}»: {r}" for k, r in rep.get("failed", [])]
@@ -385,7 +386,9 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         else:
             c = cards[page - 1]
             notes += [c["title"], c["text"]]
-            blocks = [("Составляющие, тройки", _frame(c["table"]).round(0))]
+            blocks = [("Составляющие, тройки", _frame(c["table"]).round(0).head(12))]
+            if len(c["table"]) > 12:
+                blocks.append(("Остаток к году назад по меткам y_", _frame(c["table"]).round(0).iloc[12:]))
             if page <= 2:
                 notes.append("Месяц — последний, где временный отток уже виден (нужен следующий месяц).")
     elif section == "граница месяца":

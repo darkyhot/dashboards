@@ -60,6 +60,9 @@ def check_dialect() -> list[str]:
         for w in ("GROUPING SETS", "ON CONFLICT", "MAKE_INTERVAL", "COUNT(DISTINCT", "FILTER (WHERE"):
             if w in u:
                 bad.append(f"{n}: «{w}» — нет в Greenplum 9.4 или запрещено правилами")
+        # До 9.5 IS [NOT] NULL связывает сильнее ||: «a || b IS NULL» = «a || (b IS NULL)».
+        if re.search(r"\|\|[^()\n,]*\bIS\s+(NOT\s+)?NULL", s, re.IGNORECASE):
+            bad.append(f"{n}: «|| … IS NULL» без скобок — в 9.4 другой порядок операций")
     return bad
 
 

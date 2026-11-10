@@ -242,51 +242,46 @@ def _group_sums(d: dict, idx=None) -> dict[str, np.ndarray]:
 # Поиск отклонений
 # --------------------------------------------------------------------------- #
 def scan(s: Series, comp: dict, report_months: list[str]) -> pd.DataFrame:
-    """Все значимые отклонения (срез × месяц × окно × база) в месяцах отчёта."""
+    """Все значимые отклонения (срез × месяц × окно × база) в месяцах отчёта.
+
+    Значимо, если отчётное отклонение или его реальная часть — от Z_MIN шумов своего
+    сравнения и не меньше порога существенности. «Без базы» — только остаток к году назад
+    (окно 12 мес.) или срез без прошлого года: месячное изменение без базы несёт сезон.
+    Сравнение с неизвестной составляющей (нет истории для разложения) — не сюжет.
+    """
     cols = [s.months.index(m) for m in report_months if m in s.months]
     level = s.x["pf_recip"]
-    yoy_z = {}
     rows = []
     for L in WINDOWS:
+        has_y1 = np.isfinite(base_of(window(comp["reported"], L), "y1"))
         for base in BASES:
             d = compare(comp, L, base)
             e = d["reported"]
-            sig = _noise(e)
-            lvl = _shift(level, L)
-            floor = np.maximum(MAT_ABS, MAT_REL * np.nan_to_num(lvl))
-            with np.errstate(all="ignore"):
-                z = e / np.maximum(sig[:, None], floor)
-            if base == "y1":
-                yoy_z[L] = z
             g = _group_sums(d)
+            floor = np.maximum(MAT_ABS, MAT_REL * np.nan_to_num(_shift(level, L)))
+            with np.errstate(all="ignore"):
+                z = e / np.maximum(_noise(e)[:, None], floor)
+                zr = g["real"] / np.maximum(_noise(g["real"])[:, None], floor)
+            complete = np.isfinite(e) & np.all([np.isfinite(v) for v in g.values()], axis=0)
+            if base == "none" and L != 12:
+                complete &= ~has_y1
+            sig = (np.abs(np.nan_to_num(z)) >= Z_MIN) & (np.abs(np.nan_to_num(e)) >= floor)
+            sig_r = (np.abs(np.nan_to_num(zr)) >= Z_MIN) & (np.abs(np.nan_to_num(g["real"])) >= floor)
             for t in cols:
-                zt = z[:, t]
-                hit = np.flatnonzero(np.isfinite(zt) & (np.abs(zt) >= Z_MIN) & (np.abs(e[:, t]) >= floor[:, t]))
-                for i in hit:
-                    rows.append({"row": int(i), "t": t, "L": L, "base": base, "z": float(zt[i]),
+                for i in np.flatnonzero(complete[:, t] & (sig[:, t] | sig_r[:, t])):
+                    rows.append({"row": int(i), "t": t, "L": L, "base": base, "z": float(z[i, t]),
+                                 "z_real": float(zr[i, t]), "real_sig": bool(sig_r[i, t]),
                                  "excess": float(e[i, t]), "this": float(d["_this"][i, t]),
                                  "base_value": float(d["_base"][i, t]),
                                  **{f"g_{k}": float(v[i, t]) for k, v in g.items()}})
-    found = pd.DataFrame(rows)
-    if found.empty:
-        return found
-    # «Без базы» при обычном отличии от прошлого года — известный сезон, не отклонение.
-    keep = []
-    for r in found.itertuples():
-        if r.base == "none" and r.L in yoy_z:
-            zy = yoy_z[r.L][r.row, r.t]
-            if np.isfinite(zy) and abs(zy) < Z_SEASON:
-                keep.append(False)
-                continue
-        keep.append(True)
-    return found[keep].reset_index(drop=True)
+    return pd.DataFrame(rows)
 
 
 def stories(s: Series, found: pd.DataFrame) -> pd.DataFrame:
     """Один сюжет на срез × месяц: сравнение с наибольшим превышением шума; прочие — «видно также»."""
     if found.empty:
         return pd.DataFrame()
-    found = found.assign(az=found["z"].abs()).sort_values("az", ascending=False)
+    found = found.assign(az=np.maximum(found["z"].abs(), found["z_real"].abs())).sort_values("az", ascending=False)
     best = found.groupby(["row", "t"], sort=False).head(1).copy()
     also: dict = {}
     for r in found.itertuples():           # уже по убыванию превышения: первое — лучшее
@@ -332,13 +327,14 @@ def _short(base: str) -> str:
 def _table(st: pd.DataFrame) -> pd.DataFrame:
     if st.empty:
         return pd.DataFrame({"Сообщение": ["Значимых отклонений нет"]})
+    st = st.copy()
     return pd.DataFrame({
         "Срез": st["slice_key"], "Месяц": [m[:7] for m in st["month"]],
         "Сравнение": [f"{WIN_LABEL[a]} {_short(b)}" for a, b in zip(st["L"], st["base"])],
         "Отклонение": st["excess"].round(), "Реальное": st["g_real"].round(),
         "Внутри банка": st["g_inside"].round(), "Учёт и календарь": st["g_account"].round(),
         "Спорное": st["g_disputed"].round(), "Неизвестно": st["g_unknown"].round(),
-        "Шумов": st["z"].round(1)})
+        "Шумов": st["z"].round(1), "Шумов реальн.": st["z_real"].round(1)})
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +354,18 @@ def card(s: Series, comp: dict, slice_type: str, key: str, month: str, L: int, b
         w = window(comp[k], L)[i, t]
         b = base_of(window(comp[k], L), base)[i, t]
         rows.append({"Составляющая": label, "Группа": "", "Окно": w, "База": b, "Отклонение": d[k][i, t]})
+    if L == 12 and base == "none":
+        # Остаток к тому же месяцу год назад по меткам y_: люди без портфеля в банке год назад
+        # или сейчас, и всё прочее (совместительство, переходы, переводы между срезами).
+        x = s.x
+        rep12 = window(comp["reported"], 12)[i, t]
+        fl_in, fl_out = x["y_fl_in"][i, t], x["y_fl_out"][i, t]
+        rows += [{"Составляющая": "к году назад: люди пришли в банк", "Группа": "", "Окно": fl_in,
+                  "База": 0., "Отклонение": fl_in},
+                 {"Составляющая": "к году назад: люди ушли из банка", "Группа": "", "Окно": -fl_out,
+                  "База": 0., "Отклонение": -fl_out},
+                 {"Составляющая": "к году назад: прочее (совместительство, переходы, сегмент)", "Группа": "",
+                  "Окно": rep12 - fl_in + fl_out, "База": 0., "Отклонение": rep12 - fl_in + fl_out}]
     table = pd.DataFrame(rows)
     g = {k: float(v[i, t]) for k, v in _group_sums(d).items()}
     rep = float(d["reported"][i, t])
@@ -414,12 +422,21 @@ def report(frame: pd.DataFrame, months_back: int = 12, month: str | None = None,
              and np.isfinite(s.x["m_out_temp_left"][bank, s.months.index(m)])]
     month = M.iso(month) if month else (known[-1] if known else report_months[-1])
     pulse = [card(s, comp, "Банк", "банк", month, 1, b) for b in ("none", "y1")]
-    pages = []
+    real = st[st["real_sig"]].sort_values("g_real", key=np.abs, ascending=False) if not st.empty else st
+    pages = [("Главное реальное изменение (люди ушли / пришли), все срезы",
+              _table(real.head(TOP) if not real.empty else real), len(real))]
     for title, types in PAGE_GROUPS:
         part = st[st["slice_type"].isin(types)] if not st.empty else st
         pages.append((title, _table(part.head(TOP) if not part.empty else part), len(part)))
-    top_cards = [card(s, comp, r.slice_type, r.slice_key, r.month, r.L, r.base)
-                 for r in st.head(cards).itertuples()] if not st.empty else []
+    picked = []
+    if not st.empty:                       # половина — главное реальное, половина — крупнейшее
+        for r in [*real.head(cards // 2).itertuples(), *st.itertuples()]:
+            key = (r.slice_type, r.slice_key, r.month, r.L, r.base)
+            if key not in picked:
+                picked.append(key)
+            if len(picked) >= cards:
+                break
+    top_cards = [card(s, comp, *k) for k in picked]
     check_cards = []
     for c in checks or []:
         try:

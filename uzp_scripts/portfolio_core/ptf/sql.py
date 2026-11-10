@@ -1019,7 +1019,8 @@ LENTA_MEAS = ["pf_recip", "pf_fl", "m_base_pf", "m_in_from_outside", "m_in_temp_
               "m_out_left_bank", "m_out_temp_left", "m_out_to_other_org", "m_out_to_nonzp",
               "m_out_zp_out", "m_lb_seasonal", "m_lb_org_stopped", "m_lb_one_time", "m_lb_unknown",
               "m_fl_in", "m_fl_out", "ten_lt3", "ten_3_12", "ten_12p",
-              "m_out_ten_lt3", "m_out_ten_3_12", "m_out_ten_12p", "single_pay_recip", "multi_recip"]
+              "m_out_ten_lt3", "m_out_ten_3_12", "m_out_ten_12p", "single_pay_recip", "multi_recip",
+              "y_base_pf", "y_fl_in", "y_fl_out"]
 LENTA_SIZE = ("CASE WHEN om.pf_max >= 10000 THEN '1) от 10 тыс.' WHEN om.pf_max >= 1000 THEN '2) 1–10 тыс.' "
               "WHEN om.pf_max >= 100 THEN '3) 100–1 000' ELSE '4) до 100' END")
 _ACTIVE = "(COALESCE(m.pf_recip, 0) > 0 OR COALESCE(m.m_base_pf, 0) > 0)"
@@ -1078,7 +1079,7 @@ def lenta_part(kind: str, key: str) -> str:
     cols = ",\n       ".join([f"sum({c}) AS {c}" for c in LENTA_MEAS]
                              + [f"sum(nn_{c}) AS nn_{c}" for c in LENTA_MEAS])
     return (f"SELECT CAST('{kind}' AS text) AS slice_type, CAST({key} AS text) AS slice_key, report_dt,\n"
-            f"       {cols}\nFROM t_lenta\nWHERE {key} IS NOT NULL\nGROUP BY 1, 2, 3")
+            f"       {cols}\nFROM t_lenta\nWHERE ({key}) IS NOT NULL\nGROUP BY 1, 2, 3")
 
 
 LENTA_SERIES = "\nUNION ALL\n".join(lenta_part(k, v) for k, v in LENTA_SLICES)

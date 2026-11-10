@@ -129,7 +129,7 @@ class Scan(unittest.TestCase):
         c = rep["checks"][0]
         self.assertAlmostEqual(sum(c["groups"].values()), c["reported"])
         self.assertIn("Нет данных", rep["checks"][1]["text"])
-        n = 6 + len(rep["cards"]) + len(rep["checks"])
+        n = 2 + len(rep["pages"]) + len(rep["cards"]) + len(rep["checks"])
         for page in range(1, n + 1):
             view = presentation.photo_page({"lenta": rep}, "лента", page)
             for _, frame in view["blocks"]:
@@ -187,7 +187,7 @@ class Sql(unittest.TestCase):
         rep = scope["lenta_report"]
         self.assertEqual(len(rep["checks"]), 3)
         self.assertTrue(Path(scope["lenta_path"]).exists())
-        self.assertGreaterEqual(len(shown), 6 + len(rep["cards"]) + 3)
+        self.assertGreaterEqual(len(shown), 2 + len(rep["pages"]) + len(rep["cards"]) + 3)
 
 
 if __name__ == "__main__":
@@ -220,3 +220,33 @@ class LoadErrors(unittest.TestCase):
         self.assertEqual(frame.attrs["failed"], [("Отрасль", 'Orig: column "ind" does not exist')])
         self.assertTrue(any("пропущен — Orig: column" in s for s in logs))
         self.assertNotIn("SELECT", " ".join(logs))
+
+
+class Rules(unittest.TestCase):
+    def test_monthly_change_without_base_is_not_a_story_when_year_ago_exists(self):
+        months, meas = seasonal()
+        rep = lenta.report(frame_of({("Банк", "банк"): meas}, months), months_back=12)
+        st = rep["stories"]
+        self.assertFalse(((st["base"] == "none") & (st["L"] < 12)).any(), st[["month", "L", "base"]])
+
+    def test_real_page_holds_departure_not_calendar(self):
+        months, meas = seasonal()
+        rep = lenta.report(frame_of({("Банк", "банк"): meas}, months), months_back=12)
+        name, table, n = rep["pages"][0]
+        self.assertTrue(name.startswith("Главное реальное"))
+        self.assertIn("2026-05", set(table["Месяц"]))
+        self.assertNotIn("2026-01", set(table["Месяц"]))
+
+    def test_year_ago_stock_card_has_people_rows(self):
+        months, meas = seasonal()
+        meas = {**meas, "y_fl_in": np.full(len(months), 3000.), "y_fl_out": np.full(len(months), 2500.)}
+        rep = lenta.report(frame_of({("Банк", "банк"): meas}, months), months_back=12,
+                           checks=[("Банк", "банк", "2026-08", 12, "none")])
+        t = rep["checks"][0]["table"].set_index("Составляющая")
+        self.assertEqual(t.loc["к году назад: люди пришли в банк", "Окно"], 3000.)
+        self.assertEqual(t.loc["к году назад: люди ушли из банка", "Окно"], -2500.)
+        total = t.loc["Итого отчётное", "Окно"]
+        self.assertAlmostEqual(t.loc["к году назад: прочее (совместительство, переходы, сегмент)", "Окно"],
+                               total - 500.)
+        view = presentation.photo_page({"lenta": rep}, "лента", 2 + len(rep["pages"]) + len(rep["cards"]) + 1)
+        self.assertEqual(len(view["blocks"]), 2)
