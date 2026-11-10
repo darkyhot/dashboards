@@ -265,3 +265,40 @@ def tail_shape(p: Panel, months_back: int = 6) -> dict:
             "лишних отборов/мес": round(a["extra"] / len(ts), 1)})
     return {"months": [p.months[t] for t in ts], "table": pd.DataFrame(rows_out),
             "normal": {"> 3": 0.13, "> 2": 2.28}}
+
+
+def slice_sources(connection) -> dict:
+    """Готовность срезов шага 2 по последнему месяцу сводки: покрытие ЕПК, отрасли, холдинги.
+
+    Холдинг и отрасль — текущий срез ЕПК, история принадлежности не хранится. Наружу
+    уходят только счётчики, доли и названия отраслей; номера организаций и названия
+    холдингов не выводятся. Полный запрос — агрегаты в БД, в pandas — десятки строк.
+    """
+    from . import db, sql as Q
+
+    coverage = db.read_sql(connection, Q.SLICE_COVERAGE)
+    industry = db.read_sql(connection, Q.SLICE_INDUSTRY)
+    holding = db.read_sql(connection, Q.SLICE_HOLDING_SIZE)
+    c = coverage.iloc[0]
+    pf = float(c["pf"]) if c["pf"] else np.nan
+
+    def share(v):
+        return round(100. * float(v) / pf, 1) if pf and np.isfinite(pf) else np.nan
+
+    summary = pd.DataFrame([
+        {"Показатель": "Месяц", "Значение": str(c["report_dt"])[:7]},
+        {"Показатель": "Организаций с портфелем", "Значение": int(c["n_org"])},
+        {"Показатель": "Получателей (тройки)", "Значение": int(c["pf"])},
+        {"Показатель": "Получатели у организаций, найденных в ЕПК, %", "Значение": share(c["pf_in_epk"])},
+        {"Показатель": "Получатели с указанной отраслью, %", "Значение": share(c["pf_with_ind"])},
+        {"Показатель": "Получатели с указанным холдингом, %", "Значение": share(c["pf_with_hold"])},
+        {"Показатель": "Организаций с холдингом", "Значение": int(c["n_org_with_hold"])},
+        {"Показатель": "Отраслей", "Значение": int(c["n_ind"])},
+        {"Показатель": "Холдингов", "Значение": int(c["n_hold"])}])
+    industry = industry.rename(columns={"industry": "Отрасль", "n_org": "Организаций", "pf": "Получателей"})
+    industry["Доля, %"] = [share(v) for v in industry["Получателей"]]
+    holding = holding.rename(columns={"size_class": "Размер холдинга", "n_hold": "Холдингов",
+                                      "n_org": "Организаций", "n_hold_multi_org": "Из них ≥2 организаций",
+                                      "pf": "Получателей"})
+    holding["Доля, %"] = [share(v) for v in holding["Получателей"]]
+    return {"summary": summary, "industry": industry, "holding": holding}

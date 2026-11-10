@@ -13,6 +13,7 @@ SYNTH_SCHEMA = "synth_ptf"                                # открытый к�
 SCHEMA = PROM_SCHEMA
 SCHEMA_T = PROM_SCHEMA_T
 PAYROLL = "mis_data_payroll_m"                            # ведомости
+PAYROLL_D = "mis_data_payroll_d"                          # ведомости по дням (та же схема витрин)
 SEG_HIST = "uzp_data_payroll_segment_month_2021"          # исторический сегмент
 
 OUTPUT_DIR = REPORT_DIR / "output"
@@ -37,12 +38,14 @@ _load_dotenv()
 
 
 def setup(schema: str | None = None, schema_t: str | None = None,
-          payroll: str | None = None, seg_hist: str | None = None) -> None:
-    global SCHEMA, SCHEMA_T, PAYROLL, SEG_HIST
+          payroll: str | None = None, seg_hist: str | None = None,
+          payroll_d: str | None = None) -> None:
+    global SCHEMA, SCHEMA_T, PAYROLL, SEG_HIST, PAYROLL_D
     SCHEMA = (schema or SCHEMA).strip()
     SCHEMA_T = (schema_t or SCHEMA_T).strip()
     PAYROLL = (payroll or PAYROLL).strip()
     SEG_HIST = (seg_hist or SEG_HIST).strip()
+    PAYROLL_D = (payroll_d or PAYROLL_D).strip()
 
 
 def db_url(override: str | None = None) -> str:

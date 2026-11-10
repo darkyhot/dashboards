@@ -6,6 +6,8 @@ from dataclasses import asdict, is_dataclass
 
 import pandas as pd
 
+from . import months as M
+
 
 def org_code(row) -> str:
     """Код строки панели; исходный номер организации в него не входит."""
@@ -311,26 +313,35 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         from .business import compact
 
         report = data["business_yoy"]
-        pages = 7
+        pages = 8
         title = f"Год к году: {report['this_label']} против {report['last_label']}"
         notes = [report["selection"], report["calendar"]]
         if page == 1:
+            notes = [report["selection"], report["calendar"], *report.get("verdict", [])]
+            blocks = [("Объяснение отличия от прошлого года (тройки)", _frame(report["explanation"]))]
+            notes.append("Строки не пересекаются и складываются в отличие банка.")
+        elif page == 2:
             blocks = [("Изменение банка", _frame(report["summary"])),
                       ("Из чего сложилось отличие от прошлого года (тройки)", _frame(report["flows"]))]
             notes.append("Сверх прошлого года = изменение этого месяца − изменение того же месяца год назад.")
-        elif page == 2:
-            blocks = [("Причины ухода и признаки календаря (тройки)", _frame(report["reasons"]))]
-            notes += ["Причины ухода — часть строки «Ушли из банка»; «вернулись через месяц» с ними пересекается.",
+        elif page == 3:
+            blocks = [("Причины ухода и временный отток (тройки)", _frame(report["reasons"]))]
+            notes += ["Причины ухода — часть строки «Ушли из банка»; временный отток с ними пересекается.",
                       "Это наблюдаемые признаки, а не доказанная причина отличия."]
-        elif page in (3, 4, 5):
-            key, label = {3: ("segments", "Сегменты"), 4: ("tb", "ТБ"), 5: ("gosb", "ГОСБ")}[page]
+        elif page in (4, 5, 6):
+            key, label = {4: ("segments", "Сегменты"), 5: ("tb", "ТБ"), 6: ("gosb", "ГОСБ")}[page]
             frame = _frame(report["slices"][key])
             blocks = [(label, compact(frame, value="Сверх прошлого года"))]
             notes.append(f"Крупнейшие отличия и весь остаток; всего срезов {len(frame)}.")
-        elif page == 6:
-            blocks = [("Крупные организации", compact(_frame(report["organizations"]),
-                                                      value="Сверх прошлого года", total=report["excess"]))]
-            notes.append("«Остальные» включает все непоказанные организации и малые, до итога банка.")
+        elif page == 7:
+            orgs = _frame(report["organizations"])
+            note = orgs.pop("Примечание") if "Примечание" in orgs else None
+            shown = compact(orgs, value="Сверх прошлого года", total=report["excess"])
+            if note is not None:
+                shown["Примечание"] = list(note.iloc[:len(shown) - 1].fillna("")) + [""]
+            blocks = [("Крупные организации", shown)]
+            notes += ["«Остальные» включает все непоказанные организации и малые, до итога банка.",
+                      "«нет в этом году / не было в прошлом году» — отличие из-за отсутствия, а не изменения."]
         else:
             history = _frame(report["history"])
             history = history.loc[history["Сверх прошлого года"].abs().sort_values(ascending=False).index].head(8)
@@ -340,6 +351,43 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
             if report["issues"]:
                 blocks.append(("Ограничения", pd.DataFrame({"Сообщение": report["issues"][:8]})))
         notes = [n for n in notes if n]
+    elif section == "источники срезов":
+        sources = data["slice_sources"]
+        pages = 2
+        title = "Источники срезов шага 2: ЕПК, текущий срез"
+        if page == 1:
+            blocks = [("Покрытие", _frame(sources["summary"])),
+                      ("Холдинги по размеру (без названий)", _frame(sources["holding"]))]
+        else:
+            industry = _frame(sources["industry"])
+            blocks = [("Отрасли по получателям", industry.head(12))]
+            notes.append(f"Показано {min(12, len(industry))} из {len(industry)} строк.")
+        notes += ["Холдинг и отрасль — текущий срез ЕПК; история принадлежности не хранится.",
+                  "Номера организаций и названия холдингов не выводятся."]
+    elif section == "граница месяца":
+        cal = data.get("calendar")
+        if not cal:
+            raise ValueError("Граница месяца не рассчитана: ячейка бизнес-разбора, CALENDAR = True")
+        details = cal["details"]
+        pages = 1 + 2 * len(details)
+        page = min(max(1, int(page)), pages)
+        title = "Календарь выплат: месяц с 16-го по 15-е против календарного (дневная витрина)"
+        if page == 1:
+            blocks = [("Сверх прошлого года по банку, тройки", _frame(cal["bank"]))]
+            notes += cal["verdicts"]
+            notes += ["Граница месяца = «Календарный (дни)» − «С 16-го по 15-е»; доля — от календарного.",
+                      "Сверка: календарный месяц дневной витрины против месячной сводки, худший из 4 месяцев, %."]
+        else:
+            d = details[(page - 2) // 2]
+            notes.append(d["verdict"])
+            if page % 2 == 0:
+                blocks = [(f"{M.long(d['month'])}: из чего отличие", _frame(d["components"]))]
+                if d["days"] is not None:
+                    blocks.append(("Строки выплат у границы месяца (зп-виды, сумма > 0)", _frame(d["days"])))
+            else:
+                blocks = [(f"{M.long(d['month'])}: сегменты", _frame(d["segments"])),
+                          (f"{M.long(d['month'])}: ТБ", _frame(d["tb"]))]
+                notes.append("Порядок — по модулю вклада границы месяца; «Остальные» — сумма прочих.")
     elif section == "хвосты":
         shape = data.get("tail_shape")
         if not shape:
@@ -359,7 +407,7 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         pages = max(1, (len(frame) + 7) // 8)
         blocks = [("Разметка причин: последние шесть месяцев", frame.iloc[(page - 1) * 8:page * 8])]
     else:
-        raise ValueError("Раздел: бизнес, год к году, итог, карточки, пропуски, слабые, хвосты, календарь, кейс-август, пороги или качество")
+        raise ValueError("Раздел: бизнес, год к году, итог, карточки, пропуски, слабые, хвосты, календарь, граница месяца, источники срезов, кейс-август, пороги или качество")
     if page > pages:
         raise ValueError(f"Страница должна быть от 1 до {pages}")
     return {"title": title, "page": page, "pages": pages, "blocks": blocks, "notes": notes}

@@ -223,8 +223,8 @@ REASONS = [("m_lb_one_time", -1, "Ушли из банка: были разов�
            ("m_lb_seasonal", -1, "Ушли из банка: сезонно, как год назад"),
            ("m_lb_org_stopped", -1, "Ушли из банка: организация перестала платить"),
            ("m_lb_unknown", -1, "Ушли из банка: причина не размечена")]
-MARKERS = [("m_out_temp_left", -1, "Ушли из банка и вернулись через месяц"),
-           ("m_in_temp_outside", 1, "Пришли извне после месячного пропуска")]
+MARKERS = [("m_out_temp_left", -1, "Временный отток: ушли из банка, вернулись в следующем месяце"),
+           ("m_in_temp_outside", 1, "Вернулись после временного оттока прошлого месяца")]
 STOCK_MARKERS = [("single_pay_recip", "Одна выплата за месяц"),
                  ("one_time_pf", "Разовые в портфеле"), ("multi_recip", "Совместители (тройки)")]
 WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
@@ -360,6 +360,17 @@ def yoy(p: Panel, month: str | None = None) -> dict:
         organizations = organizations.sort_values("Сверх прошлого года", key=lambda s: s.abs(),
                                                   ascending=False).reset_index(drop=True)
 
+    explanation, verdict = _explain(p, x, comparisons, t0, t12, summary, reasons)
+    if ox is not None and len(organizations):
+        def absent(a, b):
+            v = np.nan_to_num(ox["pf_recip"][:, [a, b]])
+            return (np.abs(v) <= TOL).all(axis=1)
+        status = pd.Series("", index=range(len(p.orgs)))
+        status[absent(t0, t1)] = "нет в этом году"
+        status[absent(t12, t13)] = "не было в прошлом году"
+        codes = pd.Series([org_code(r) for r in p.orgs])
+        organizations["Примечание"] = organizations["Организация"].map(dict(zip(codes, status)))
+
     issues = []
     for t, name in ((t0, "этого года"), (t12, "прошлого года")):
         if not hist.at[p.months[t], "Тройки проверены"]:
@@ -378,6 +389,7 @@ def yoy(p: Panel, month: str | None = None) -> dict:
         "month": month, "previous_month": p.months[t1], "last_year_month": p.months[t12],
         "run_id": p.run_id, "selection": selection, "this_label": this_label, "last_label": last_label,
         "calendar": calendar, "summary": summary, "flows": flows, "reasons": reasons,
+        "explanation": explanation, "verdict": verdict,
         "slices": slices, "organizations": organizations, "history": comparisons,
         "excess": float(summary.at[0, "Сверх прошлого года"]),
         "flows_total": float(explained.sum(skipna=False)), "issues": issues,
@@ -385,6 +397,59 @@ def yoy(p: Panel, month: str | None = None) -> dict:
                   "Повторяющийся каждый год сезон взаимно сокращается; остаётся то, что изменилось.",
                   "Причины ухода и календарные признаки — наблюдения, а не доказанная причина.",
                   "Тройки и доли ФЛ — разные единицы. Суммируются только атомы."]})
+
+
+def _explain(p, x, comparisons, t0, t12, summary, reasons):
+    """Непересекающееся разложение отличия от прошлого года и проверка соседними месяцами.
+
+    Временный отток — часть «ушли из банка» (вернулись в M+1); возврат после временного
+    оттока — часть «пришли извне». Строки складываются в отличие банка (тройки).
+    """
+    def excess(m, t_this, t_last, sign=1):
+        return sign * (_known_total(p, m, t_this) - _known_total(p, m, t_last))
+
+    temp = excess("m_out_temp_left", t0, t12, -1)
+    back = excess("m_in_temp_outside", t0, t12)
+    left = excess("m_out_left_bank", t0, t12, -1)
+    outside = excess("m_in_from_outside", t0, t12)
+    internal = excess("m_in_from_other_org", t0, t12) - excess("m_out_to_other_org", t0, t12)
+    codes = excess("m_in_codes", t0, t12) - excess("m_out_codes", t0, t12)
+    total = float(summary.at[0, "Сверх прошлого года"])
+    rows = [("Временный отток: ушли и вернулись в следующем месяце", temp),
+            ("Возврат после временного оттока прошлого месяца", back),
+            ("Постоянный уход из банка", left - temp),
+            ("Приход извне, кроме возвратов", outside - back),
+            ("Переходы между организациями, сальдо", internal),
+            ("Смена кодов, сальдо", codes)]
+    rows.append(("Невязка расчёта", total - sum(v for _, v in rows)))
+    frame = pd.DataFrame(rows, columns=["Составляющая", "Сверх прошлого года"])
+    frame["Доля, %"] = (100. * frame["Сверх прошлого года"] / total).round(0) if total else np.nan
+
+    by_month = comparisons.set_index("Месяц")["Сверх прошлого года"]
+    months = p.months
+    nxt = by_month.get(months[t0 + 1]) if t0 + 1 < len(months) else None
+    prv = by_month.get(months[t0 - 1])
+    multi = (_known_total(p, "multi_recip", t0) - _known_total(p, "multi_recip", t0 - 1)
+             - _known_total(p, "multi_recip", t12) + _known_total(p, "multi_recip", t12 - 1))
+
+    def num(v):
+        return "неизвестно" if v is None or not np.isfinite(v) else f"{v:+,.0f}".replace(",", " ")
+
+    lines = [f"Сверх прошлого года: {num(total)} троек; ФЛ (доли): {num(summary.at[1, 'Сверх прошлого года'])}."]
+    if np.isfinite(temp) and total:
+        lines.append(f"Временный отток: {num(temp)} ({temp / total:.0%} отличия).")
+    elif not np.isfinite(temp):
+        lines.append("Временный отток неизвестен: следующий месяц ещё не наблюдался.")
+    if np.isfinite(back) and abs(back) >= .1 * abs(total):
+        lines.append(f"Возврат после временного оттока прошлого месяца: {num(back)}.")
+    lines.append(f"Следующий месяц сверх прошлого года: {num(nxt)}; предыдущий: {num(prv)}.")
+    if (np.isfinite(temp) and temp < 0 and nxt is not None and np.isfinite(nxt) and nxt > 0
+            and abs(temp) >= .5 * abs(total)):
+        lines.append(f"Признак сдвига выплат: временный отток вернулся в следующем месяце "
+                     f"({num(nxt)} сверх прошлого года ≈ {min(nxt / -temp, 9.99):.0%} оттока).")
+    lines.append(f"Постоянный уход из банка сверх прошлого года: {num(left - temp)}.")
+    lines.append(f"Совместители (тройки), изменение сверх прошлого года: {num(multi)}.")
+    return frame, lines
 
 
 def write_yoy_html(report: dict, path) -> Path:
@@ -400,7 +465,9 @@ def write_yoy_html(report: dict, path) -> Path:
             f"<p>{html.escape(report['calendar'])}</p>"]
     for note in [*report["issues"], *report["notes"]]:
         body.append(f"<p>{html.escape(note)}</p>")
-    frames = [("Изменение банка", report["summary"]), ("Движения", report["flows"]),
+    body += [f"<p><b>{html.escape(line)}</b></p>" for line in report["verdict"]]
+    frames = [("Объяснение отличия", report["explanation"]),
+              ("Изменение банка", report["summary"]), ("Движения", report["flows"]),
               ("Причины ухода и признаки", report["reasons"]), ("Сегменты", report["slices"]["segments"]),
               ("ТБ", report["slices"]["tb"]), ("ГОСБ", report["slices"]["gosb"]),
               ("Крупные организации", report["organizations"]), ("Все месяцы", report["history"])]

@@ -27,6 +27,11 @@ def seasonal_panel(extra_month="2026-05", extra=30.):
         x[name] = np.maximum(diff, 0.)
     for name in ("m_out_left_bank", "m_lb_unknown", "m_fl_out"):
         x[name] = np.maximum(-diff, 0.)
+    # Каждый провал возвращается в следующем месяце: временный отток и возврат после него.
+    x["m_out_temp_left"] = x["m_out_left_bank"].copy()
+    x["m_out_temp_left"][:, -1] = np.nan
+    x["m_in_temp_outside"] = x["m_in_from_outside"].copy()
+    x["m_in_temp_outside"][:, :2] = np.nan
     p = inputs.Panel(months, meta, x)
     for t in range(len(months)):
         np.testing.assert_allclose(p.identity_gap(t), 0.)
@@ -69,9 +74,40 @@ class YearOverYearTests(unittest.TestCase):
 
     def test_photo_pages_fit(self):
         report = business.yoy(seasonal_panel())
-        for page in range(1, 8):
+        for page in range(1, 9):
             view = presentation.photo_page({"business_yoy": report}, "год к году", page)
             self.assertTrue(all(len(frame) <= 12 for _, frame in view["blocks"]))
+
+    def test_explanation_adds_up_and_names_temporary_outflow(self):
+        report = business.yoy(seasonal_panel(), "2026-05")
+        frame = report["explanation"].set_index("Составляющая")["Сверх прошлого года"]
+        self.assertAlmostEqual(frame.sum(), report["excess"])
+        self.assertEqual(frame["Временный отток: ушли и вернулись в следующем месяце"], -30.)
+        self.assertEqual(frame["Постоянный уход из банка"], 0.)
+        self.assertEqual(frame["Невязка расчёта"], 0.)
+        self.assertTrue(any("Признак сдвига выплат" in line for line in report["verdict"]))
+        back = business.yoy(seasonal_panel(), "2026-06")
+        self.assertEqual(back["explanation"].set_index("Составляющая")["Сверх прошлого года"][
+            "Возврат после временного оттока прошлого месяца"], 30.)
+
+    def test_last_month_temporary_outflow_is_unknown_not_zero(self):
+        p = seasonal_panel("2026-09")
+        report = business.yoy(p, "2026-09")
+        frame = report["explanation"].set_index("Составляющая")["Сверх прошлого года"]
+        self.assertTrue(np.isnan(frame["Временный отток: ушли и вернулись в следующем месяце"]))
+        self.assertTrue(any("неизвестен" in line for line in report["verdict"]))
+
+    def test_absent_organization_is_marked(self):
+        p = seasonal_panel()
+        meta = pd.concat([p.meta, pd.DataFrame({"lvl": ["org"], "org_id": [1_000_000_001], "seg_rep": ["A"],
+                          "sys_tb_id": [1], "sys_gosb_id": [100], "atom": [0]})], ignore_index=True)
+        x = {k: np.vstack([v, v[:1]]) for k, v in p.x.items()}
+        t = p.months.index("2026-01-31")
+        x["pf_recip"][2, t - 1:] = 0.
+        q = inputs.Panel(p.months, meta, x)
+        orgs = business.yoy(q, "2026-01")["organizations"].set_index("Организация")
+        self.assertEqual(orgs["Примечание"].iloc[0], "нет в этом году")
+        self.assertEqual(orgs["Сверх прошлого года"].iloc[0], 100.)
 
 
 if __name__ == "__main__":

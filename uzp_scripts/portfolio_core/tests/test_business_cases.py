@@ -286,6 +286,11 @@ class BusinessReportTests(unittest.TestCase):
         cells = [c for c in notebook["cells"] if "БИЗНЕС-РАЗБОР ПОРТФЕЛЯ" in "".join(c["source"])]
         self.assertEqual(len(cells), 1)
         source = "".join(cells[0]["source"])
+        # Параметры ячейки меняются от запуска к запуску — подставляем полный разбор.
+        source = re.sub(r"(?m)^BUSINESS_PAGE = .*$", "BUSINESS_PAGE = [1, 2, 3, 4, 5, 6, 7, 8]", source)
+        source = re.sub(r"(?m)^BUSINESS_EXTRA_MONTHS = .*$", 'BUSINESS_EXTRA_MONTHS = ["2025-11"]', source)
+        source = re.sub(r"(?m)^SLICE_SOURCES = .*$", "SLICE_SOURCES = False", source)
+        source = re.sub(r"(?m)^CALENDAR = .*$", "CALENDAR = False", source)
         for have_panel in (True, False):
             p = secondary_job_gap()
             shown = []
@@ -305,6 +310,36 @@ class BusinessReportTests(unittest.TestCase):
                 self.assertEqual(scope["business_report"]["excess"], -1.)
                 self.assertTrue((Path(tmp) / "business" / "yoy.html").exists())
                 self.assertGreaterEqual(len(shown), 6)
+
+    def test_slice_sources_run_without_generation(self):
+        notebook = json.loads((Path(__file__).resolve().parents[1] / "portfolio_core.ipynb").read_text())
+        source = next("".join(c["source"]) for c in notebook["cells"]
+                      if "БИЗНЕС-РАЗБОР ПОРТФЕЛЯ" in "".join(c["source"]))
+        source = re.sub(r"(?m)^BUSINESS_PAGE = .*$", "BUSINESS_PAGE = []", source)
+        source = re.sub(r"(?m)^BUSINESS_EXTRA_MONTHS = .*$", "BUSINESS_EXTRA_MONTHS = []", source)
+        source = re.sub(r"(?m)^SLICE_SOURCES = .*$", "SLICE_SOURCES = True", source)
+        source = re.sub(r"(?m)^CALENDAR = .*$", "CALENDAR = False", source)
+        frames = {"SLICE_COVERAGE": pd.DataFrame([{"report_dt": "2026-09-30", "n_org": 2, "pf": 100,
+                      "pf_in_epk": 90, "pf_with_ind": 80, "pf_with_hold": 0, "n_org_with_hold": 0,
+                      "n_ind": 1, "n_hold": 0}]),
+                  "SLICE_INDUSTRY": pd.DataFrame([{"industry": "Отрасль", "n_org": 2, "pf": 100}]),
+                  "SLICE_HOLDING_SIZE": pd.DataFrame(columns=["size_class", "n_hold", "n_org",
+                                                               "n_hold_multi_org", "pf"])}
+        from ptf import sql as Q
+
+        def fake_read(connection, text, params=None):
+            return next(frame.copy() for name, frame in frames.items() if getattr(Q, name) == text)
+
+        shown = []
+        scope = {"display": shown.append, "CONN": "postgresql://example/example"}
+        with patch.object(db, "get_engine"), patch.object(db, "session"), \
+             patch.object(db, "read_sql", side_effect=fake_read), \
+             patch.object(inputs, "load", side_effect=AssertionError("Поколение")):
+            exec(compile(source, "notebook_business", "exec"), scope)
+        self.assertNotIn("panel", scope)
+        summary = scope["slice_report"]["summary"].set_index("Показатель")["Значение"]
+        self.assertEqual(summary["Получатели с указанным холдингом, %"], 0.)
+        self.assertEqual(len(shown), 3)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,14 @@
 """Весь SQL прогона. Ни одной строки SQL за пределами этого файла.
 
-Плейсхолдеры `{schema}`, `{schema_t}`, `{payroll}`, `{seg_hist}`, `{code_col}`
+Плейсхолдеры `{schema}`, `{schema_t}`, `{payroll}`, `{payroll_d}`, `{seg_hist}`, `{code_col}`
 подставляет `db.render`; значения — именованными параметрами `:name`.
 
 Ловушки, на которых такой расчёт ломается тихо
 -----------------------------------------------
 1. **Партиция.** Ведомости партиционированы по `report_dt`; каждое обращение к ним
-   ограничено ОДНИМ месяцем (`= CAST(:m AS date)`) — проверяет самопроверка.
+   ограничено ОДНИМ месяцем (`= CAST(:m AS date)`) — проверяет самопроверка. Дневная
+   витрина `{payroll_d}` — диапазоном дат не длиннее двух соседних партиций
+   (`:s_from` … `:c_to`), тоже проверяется.
 2. **Номер организации** в ведомостях — текст («ID123» бывает). В число — только
    под маской `MASK`, внутри `CASE`.
 3. **Диалект 9.4.** Нет `GROUPING SETS`, `ON CONFLICT`, `make_interval`. Сдвиги
@@ -789,3 +791,199 @@ DIST = {"t_months": "mi", "t_tik": "inn", "t_exc": "inn_exc", "t_org": "org_id",
         "t_kseg": "org_id", "t_pslice": "epk_id", "t_jpers": "mi", "t_jrows": "report_dt",
         **{f"t_{d}_{b}_part": "epk_id" for d in ("in", "out") for b in BASES},
         **{f"t_{d}_{b}": "org_id" for d in ("in", "out") for b in BASES}}
+
+
+# --------------------------------------------------------------------------- #
+# Источники срезов шага 2: холдинг и отрасль — текущий срез ЕПК (в сводке не хранятся).
+# Только агрегаты; номера организаций и названия холдингов не выводятся.
+# Greenplum 9.4: без FILTER и count(DISTINCT) — CASE и подзапросы.
+# --------------------------------------------------------------------------- #
+_SLICE_BASE = """
+WITH last AS (SELECT max(report_dt) AS dt FROM {schema_t}.yva_ptf_month_org),
+o AS (
+  SELECT m.org_id, sum(m.pf_recip) AS pf
+  FROM {schema_t}.yva_ptf_month_org m
+  JOIN last l ON m.report_dt = l.dt
+  GROUP BY m.org_id
+  HAVING sum(m.pf_recip) > 0
+),
+e AS (
+  SELECT c.inn AS org_id,
+         min(NULLIF(btrim(c.holding_name), ''))  AS hold,
+         min(NULLIF(btrim(c.industry_name), '')) AS ind
+  FROM {schema}.uzp_data_epk_consolidation c
+  WHERE c.inn IS NOT NULL
+  GROUP BY c.inn
+),
+j AS (
+  SELECT o.org_id, o.pf, CASE WHEN e.org_id IS NULL THEN 0 ELSE 1 END AS in_epk, e.hold, e.ind
+  FROM o LEFT JOIN e ON e.org_id = o.org_id
+)
+"""
+
+SLICE_COVERAGE = _SLICE_BASE + """
+SELECT (SELECT dt FROM last)                                  AS report_dt,
+       count(*)                                               AS n_org,
+       sum(pf)                                                AS pf,
+       sum(CASE WHEN in_epk = 1 THEN pf ELSE 0 END)           AS pf_in_epk,
+       sum(CASE WHEN ind IS NOT NULL THEN pf ELSE 0 END)      AS pf_with_ind,
+       sum(CASE WHEN hold IS NOT NULL THEN pf ELSE 0 END)     AS pf_with_hold,
+       sum(CASE WHEN hold IS NOT NULL THEN 1 ELSE 0 END)      AS n_org_with_hold,
+       (SELECT count(*) FROM (SELECT ind FROM j WHERE ind IS NOT NULL GROUP BY ind) a)   AS n_ind,
+       (SELECT count(*) FROM (SELECT hold FROM j WHERE hold IS NOT NULL GROUP BY hold) b) AS n_hold
+FROM j
+"""
+
+SLICE_INDUSTRY = _SLICE_BASE + """
+SELECT COALESCE(ind, '(нет в ЕПК или не указана)') AS industry, count(*) AS n_org, sum(pf) AS pf
+FROM j
+GROUP BY COALESCE(ind, '(нет в ЕПК или не указана)')
+ORDER BY sum(pf) DESC
+"""
+
+# Размер холдингов без названий: сколько холдингов и получателей в классах размера.
+SLICE_HOLDING_SIZE = _SLICE_BASE + """
+SELECT CASE WHEN h.pf >= 100000 THEN '1) от 100 тыс.'
+            WHEN h.pf >= 10000 THEN '2) 10–100 тыс.'
+            WHEN h.pf >= 1000 THEN '3) 1–10 тыс.'
+            ELSE '4) до 1 тыс.' END                          AS size_class,
+       count(*)                                           AS n_hold,
+       sum(h.n_org)                                       AS n_org,
+       sum(CASE WHEN h.n_org >= 2 THEN 1 ELSE 0 END)      AS n_hold_multi_org,
+       sum(h.pf)                                          AS pf
+FROM (SELECT hold, count(*) AS n_org, sum(pf) AS pf FROM j WHERE hold IS NOT NULL GROUP BY hold) h
+GROUP BY 1
+ORDER BY 1
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Календарь выплат по дневной витрине (шаг 2: подпись «календарь»).
+# Тот же отбор строк и порог, что в T_TR_MONTH, но тройка считается дважды:
+#   календарный месяц M   — даты :c_from … :c_to (1-е … последнее число M);
+#   сдвинутый месяц M     — даты :s_from … :s_to (16-е M−1 … 15-е M).
+# Выплата, переехавшая через 1-е число (выходной, праздник, ранняя выплата), остаётся
+# в том же сдвинутом месяце. Читаются даты :s_from … :c_to — две соседние партиции.
+# Наружу — только счётчики троек по организации × ГОСБ (агрегат yva_).
+# --------------------------------------------------------------------------- #
+CREATE_CALENDAR = """
+CREATE TABLE IF NOT EXISTS {schema_t}.yva_ptf_calendar (
+  report_dt date, org_id bigint, sys_gosb_id integer, sys_tb_id integer,
+  n_cal bigint, n_sh bigint, n_both bigint,
+  amt_min numeric, def_ver integer, created_at timestamp
+)"""
+
+CALENDAR_DELETE = """
+DELETE FROM {schema_t}.yva_ptf_calendar
+WHERE report_dt = CAST(:m AS date) AND amt_min = :amt_min AND def_ver = :def_ver
+"""
+
+CALENDAR_INSERT = """
+INSERT INTO {schema_t}.yva_ptf_calendar
+  (report_dt, org_id, sys_gosb_id, sys_tb_id, n_cal, n_sh, n_both, amt_min, def_ver, created_at)
+SELECT CAST(:m AS date), x.org_id, x.gosb_id, x.tb_id,
+       sum(CASE WHEN x.in_c THEN 1 ELSE 0 END),
+       sum(CASE WHEN x.in_s THEN 1 ELSE 0 END),
+       sum(CASE WHEN x.in_c AND x.in_s THEN 1 ELSE 0 END),
+       :amt_min, :def_ver, CAST(:created_at AS timestamp)
+FROM (
+  SELECT a.org_id, a.gosb_id, a.tb_id,
+         (a.t2_c OR (a.pf_c AND (e.inn_exc IS NOT NULL OR a.sum_c > :amt_min))) AS in_c,
+         (a.t2_s OR (a.pf_s AND (e.inn_exc IS NOT NULL OR a.sum_s > :amt_min))) AS in_s
+  FROM (
+    SELECT p.epk_id,
+           """ + org_num("p.inn") + """ AS org_id,
+           COALESCE(""" + gosb_fix("p.sys_gosb_id", "p.sys_tb_id", "p.segment_name") + """, -1) AS gosb_id,
+           min(p.sys_tb_id)                                                     AS tb_id,
+           sum(CASE WHEN p.report_dt >= CAST(:c_from AS date)
+                     AND COALESCE(d.is_portfolio_enrollment, false) THEN p.amt ELSE 0 END) AS sum_c,
+           sum(CASE WHEN p.report_dt <= CAST(:s_to AS date)
+                     AND COALESCE(d.is_portfolio_enrollment, false) THEN p.amt ELSE 0 END) AS sum_s,
+           bool_or(p.report_dt >= CAST(:c_from AS date)
+                   AND COALESCE(d.is_portfolio_enrollment, false) AND p.amt > 0)         AS pf_c,
+           bool_or(p.report_dt <= CAST(:s_to AS date)
+                   AND COALESCE(d.is_portfolio_enrollment, false) AND p.amt > 0)         AS pf_s,
+           bool_or(p.report_dt >= CAST(:c_from AS date)
+                   AND COALESCE(d.enrollment_type_id = 2, false) AND p.amt > 0)          AS t2_c,
+           bool_or(p.report_dt <= CAST(:s_to AS date)
+                   AND COALESCE(d.enrollment_type_id = 2, false) AND p.amt > 0)          AS t2_s
+    FROM {schema}.{payroll_d} p
+    LEFT JOIN {schema}.uzp_dim_enrollment_type d ON d.enrollment_type_id = p.{code_col}
+    LEFT JOIN t_tik k ON k.inn = """ + org_num("p.inn") + """
+    WHERE p.report_dt >= CAST(:s_from AS date) AND p.report_dt <= CAST(:c_to AS date)
+      AND k.inn IS NULL
+      AND p.epk_id IS NOT NULL
+      AND p.inn ~ """ + MASK + """
+      AND """ + RELEV + """
+    GROUP BY 1, 2, 3
+  ) a
+  LEFT JOIN t_exc e ON e.inn_exc = a.org_id
+) x
+WHERE x.in_c OR x.in_s
+GROUP BY x.org_id, x.gosb_id, x.tb_id
+"""
+
+CALENDAR_DONE = """
+SELECT report_dt, count(*) AS n_rows, sum(n_cal) AS n_cal, max(created_at) AS created_at
+FROM {schema_t}.yva_ptf_calendar
+WHERE amt_min = :amt_min AND def_ver = :def_ver
+GROUP BY report_dt
+"""
+
+# Сегмент — отчётный сегмент сводки за тот же месяц; если пары «орг × ГОСБ» в этом месяце
+# в сводке нет (выплата только во «сдвинутой» части) — её сегмент в ближайших месяцах.
+CALENDAR_SUMMARY = """
+SELECT c.report_dt, COALESCE(s.seg, s2.seg, '(нет в сводке)') AS seg, c.sys_tb_id,
+       sum(c.n_cal) AS n_cal, sum(c.n_sh) AS n_sh, sum(c.n_both) AS n_both
+FROM {schema_t}.yva_ptf_calendar c
+LEFT JOIN (
+  SELECT report_dt, org_id, sys_gosb_id, min(seg_rep) AS seg
+  FROM {schema_t}.yva_ptf_month_org
+  WHERE report_dt >= CAST(:d_from AS date) AND report_dt <= CAST(:d_to AS date)
+  GROUP BY report_dt, org_id, sys_gosb_id
+) s ON s.report_dt = c.report_dt AND s.org_id = c.org_id AND s.sys_gosb_id = c.sys_gosb_id
+LEFT JOIN (
+  SELECT org_id, sys_gosb_id, min(seg_rep) AS seg
+  FROM {schema_t}.yva_ptf_month_org
+  WHERE report_dt >= CAST(:d_from AS date) - interval '2 month'
+    AND report_dt <= CAST(:d_to AS date) + interval '2 month'
+  GROUP BY org_id, sys_gosb_id
+) s2 ON s2.org_id = c.org_id AND s2.sys_gosb_id = c.sys_gosb_id
+WHERE c.amt_min = :amt_min AND c.def_ver = :def_ver
+  AND c.report_dt >= CAST(:d_from AS date) AND c.report_dt <= CAST(:d_to AS date)
+GROUP BY 1, 2, 3
+"""
+
+# Месячная сводка в тех же срезах — сверка: календарный месяц из дневной витрины обязан
+# совпасть с месячной (тот же отбор и порог).
+CALENDAR_MONTHLY = """
+SELECT report_dt, COALESCE(seg_rep, '(нет в сводке)') AS seg, sys_tb_id, sum(pf_recip) AS pf
+FROM {schema_t}.yva_ptf_month_org
+WHERE report_dt >= CAST(:d_from AS date) AND report_dt <= CAST(:d_to AS date)
+GROUP BY 1, 2, 3
+"""
+
+# Отличие банка от прошлого года по месяцам сводки — для автоматического выбора месяцев.
+CALENDAR_BANK = """
+SELECT report_dt, sum(pf_recip) AS pf
+FROM {schema_t}.yva_ptf_month_org
+GROUP BY report_dt
+ORDER BY report_dt
+"""
+
+# Выплаты по дням у границы месяца: последние дни M−1 и первые дни M (строки зп-видов > 0,
+# без ТИК/ЦИК — их выплаты к выборам дали бы ложный всплеск).
+CALENDAR_DAYS = """
+SELECT p.report_dt AS pay_dt, count(*) AS n_rows
+FROM {schema}.{payroll_d} p
+JOIN {schema}.uzp_dim_enrollment_type d ON d.enrollment_type_id = p.{code_col}
+LEFT JOIN (SELECT inn FROM {schema_t}.yva_tik_cik WHERE is_tik_cik IS TRUE GROUP BY inn) k
+       ON k.inn = """ + org_num("p.inn") + """
+WHERE p.report_dt >= CAST(:s_from AS date) AND p.report_dt <= CAST(:c_to AS date)
+  AND k.inn IS NULL
+  AND d.is_portfolio_enrollment AND p.amt > 0
+  AND p.epk_id IS NOT NULL
+  AND p.inn ~ """ + MASK + """
+  AND """ + RELEV + """
+GROUP BY p.report_dt
+"""

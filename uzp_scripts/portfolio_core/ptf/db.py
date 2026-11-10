@@ -1,6 +1,6 @@
 """Доступ к БД: локальный Postgres и Greenplum на ядре 9.4 — различается только URL.
 
-Плейсхолдеры `{schema}`, `{schema_t}`, `{payroll}`, `{seg_hist}`, `{code_col}`
+Плейсхолдеры `{schema}`, `{schema_t}`, `{payroll}`, `{payroll_d}`, `{seg_hist}`, `{code_col}`
 подставляются заменой по имени (не `str.format`): квантификатор `{1,12}` в
 регулярках не нужно экранировать.
 """
@@ -54,7 +54,7 @@ def session(engine: Engine):
 
 def render(sql: str) -> str:
     return (sql.replace("{schema}", config.SCHEMA).replace("{schema_t}", config.SCHEMA_T)
-            .replace("{payroll}", config.PAYROLL).replace("{seg_hist}", config.SEG_HIST)
+            .replace("{payroll_d}", config.PAYROLL_D).replace("{payroll}", config.PAYROLL).replace("{seg_hist}", config.SEG_HIST)
             .replace("{code_col}", CODE_COL))
 
 

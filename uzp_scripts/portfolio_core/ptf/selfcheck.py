@@ -42,9 +42,15 @@ def check_self_contained() -> list[str]:
 
 
 def check_partition_filter() -> list[str]:
-    return [f"{n}: обращение к ведомостям без фильтра одного месяца"
+    bad = [f"{n}: обращение к ведомостям без фильтра одного месяца"
+           for n, s in _sql_texts()
+           if "{payroll}" in s and "report_dt = CAST(:m AS date)" not in s]
+    # Дневная витрина: диапазон дат двух соседних партиций (:s_from … :c_to), не больше.
+    bad += [f"{n}: обращение к дневной витрине без диапазона :s_from … :c_to"
             for n, s in _sql_texts()
-            if "{payroll}" in s and "report_dt = CAST(:m AS date)" not in s]
+            if "{payroll_d}" in s and not ("report_dt >= CAST(:s_from AS date)" in s
+                                          and "report_dt <= CAST(:c_to AS date)" in s)]
+    return bad
 
 
 def check_dialect() -> list[str]:
