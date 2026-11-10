@@ -379,6 +379,14 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
             name, table, n = rep["pages"][page - 3]
             blocks = [(f"{name}: сюжетов {n}, показано {min(n, 10)}", _frame(table))]
             notes += [f"Пропущен вид среза «{k}»: {r}" for k, r in rep.get("failed", [])]
+            if name.startswith("Пересегментация"):
+                notes.append("Сегмент один на организацию по всем ГОСБ: «Сегмент» — текущий по ЕПК, "
+                             "«на дату выплаты» — история сегментов в месяце выплаты.")
+                conf = rep.get("seg_conflicts")
+                if conf is not None:
+                    n, pf = conf.get(rep["month"], (0, 0.))
+                    notes.append(f"Ошибка данных: организаций с разным сегментом по ГОСБ в одном месяце — {n:,}, "
+                                 f"получателей у них {pf:,.0f} (взят сегмент ГОСБ с наибольшим числом получателей).")
             notes += [f"Срезов {rep['n_slices']:,}; значимых сравнений {rep['n_found']:,} → сюжетов "
                       f"{rep['n_stories']:,}. Отбор — от 4 шумов своего сравнения; эхо окон склеено.",
                       "Реальное — ушли из банка насовсем и пришли извне; учёт и календарь — временный "
@@ -386,9 +394,13 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         else:
             c = cards[page - 1]
             notes += [c["title"], c["text"]]
-            blocks = [("Составляющие, тройки", _frame(c["table"]).round(0).head(12))]
-            if len(c["table"]) > 12:
-                blocks.append(("Остаток к году назад по меткам y_", _frame(c["table"]).round(0).iloc[12:]))
+            from .lenta import _unknown
+            blocks = [("Составляющие, тройки", _unknown(_frame(c["table"]).round(0)))]
+            if c.get("people") is not None:
+                blocks.append(("Люди и совместительство (присутствие в портфеле банка)",
+                               _unknown(_frame(c["people"]).round(0))))
+            if c.get("year") is not None:
+                blocks.append(("То же к тому же месяцу год назад (метки y_)", _unknown(_frame(c["year"]).round(0))))
             if page <= 2:
                 notes.append("Месяц — последний, где временный отток уже виден (нужен следующий месяц).")
     elif section == "граница месяца":

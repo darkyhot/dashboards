@@ -68,7 +68,7 @@ def base_cols(b: str) -> list[str]:
             "out_left_bank", "out_to_other_org", "out_to_nonzp", "out_zp_out",
             "out_oth_same_org", "out_oth_same_hold", "out_oth_other",
             "lb_seasonal", "lb_org_stopped", "lb_one_time", "lb_unknown",
-            "fl_in", "fl_out", "fl_conc"]
+            "fl_in", "fl_out", "fl_conc", "in_person_new", "out_person_gone"]
     return [c for c in cols if not (b == "y" and c == "lb_seasonal")]
 
 
@@ -317,6 +317,7 @@ SELECT c.mi, c.epk_id, c.org_id, c.gosb_id,
             WHEN """ + rng("pr.b_p", "c.mi - :k - 12", "c.mi - :k - 1") + """ <> 0 THEN 'in_returned'
             ELSE 'in_new_bank' END                                         AS lab,
        CASE WHEN pb.k_pf IS NULL THEN CAST(1.0 / pc.k_pf AS float8) ELSE 0 END AS fl,
+       CASE WHEN pb.k_pf IS NULL THEN 1 ELSE 0 END                       AS in_new,
        CASE WHEN :k = 1 AND """ + bit("th.b_p", "c.mi - 2") + """ = 1
             THEN 1 ELSE 0 END AS in_temp
 FROM t_tr c
@@ -353,6 +354,7 @@ SELECT b.mi + :k AS mi, b.epk_id, b.org_id, b.gosb_id,
             WHEN """ + _one_time("th.b_any", "b.mi") + """ THEN 'lb_one_time'
             ELSE 'lb_unknown' END                                          AS lab,
        CASE WHEN pc.k_pf IS NULL THEN CAST(1.0 / pb.k_pf AS float8) ELSE 0 END AS fl,
+       CASE WHEN pc.k_pf IS NULL THEN 1 ELSE 0 END                       AS out_gone,
        """ + bit("th.b_p", "b.mi + :k + 1") + """                          AS out_temp,
        """ + _ten("th.b_p", "b.mi") + """                                   AS ten
 FROM t_tr b
@@ -376,7 +378,7 @@ def _count_cols(col: str, labels: list[str], prefix: str = "") -> str:
 
 def agg_in(part: str) -> str:
     return (f"SELECT mi, org_id, gosb_id,\n       {_count_cols('lab', IN_LABELS)},\n"
-            f"       sum(fl) AS fl_in,\n"
+            f"       sum(fl) AS fl_in, sum(in_new) AS in_person_new,\n"
             f"       sum(CASE WHEN lab IN ('in_new_bank', 'in_returned') THEN in_temp ELSE 0 END) "
             f"AS in_temp_outside\nFROM {part}\nGROUP BY mi, org_id, gosb_id")
 
@@ -384,7 +386,7 @@ def agg_in(part: str) -> str:
 def agg_out(part: str) -> str:
     return (f"SELECT mi, org_id, gosb_id,\n       {_count_cols('lab', OUT_LABELS)},\n"
             f"       {_count_cols('ten', TEN, 'out_ten_')},\n"
-            f"       sum(fl) AS fl_out, sum(out_temp) AS out_temp,\n"
+            f"       sum(fl) AS fl_out, sum(out_gone) AS out_person_gone, sum(out_temp) AS out_temp,\n"
             f"       sum(CASE WHEN lab LIKE 'lb_%' THEN out_temp ELSE 0 END) "
             f"AS out_temp_left\nFROM {part}\nGROUP BY mi, org_id, gosb_id")
 
@@ -442,8 +444,8 @@ def regroup(part: str, sums: list[str], extra: str = "") -> str:
     return f"SELECT mi, org_id, gosb_id{extra},\n       {cols}\nFROM {part}\nGROUP BY mi, org_id, gosb_id"
 
 
-IN_SUMS = IN_LABELS + ["fl_in"]
-OUT_SUMS = OUT_LABELS + [f"out_ten_{t}" for t in TEN] + ["fl_out", "out_temp"]
+IN_SUMS = IN_LABELS + ["fl_in", "in_person_new"]
+OUT_SUMS = OUT_LABELS + [f"out_ten_{t}" for t in TEN] + ["fl_out", "out_person_gone", "out_temp"]
 
 # Ключи сводки: пары с тройками в M и пары, у которых был портфель в одной из баз.
 T_KEYS = """
@@ -528,6 +530,8 @@ def final_select() -> str:
             "out_to_other_org": " + ".join(outs[x] for x in OUT_LABELS if x.startswith("out_oth_")),
             "fl_in": fl_in, "fl_out": fl_out,
             "fl_conc": f"(COALESCE(s.pf_fl, 0) - COALESCE(s_{b}.pf_fl, 0)) - {fl_in} + {fl_out}",
+            "in_person_new": f"COALESCE(i_{b}.in_person_new, 0)",
+            "out_person_gone": f"COALESCE(o_{b}.out_person_gone, 0)",
             **ins, **outs,
         }
         for c in base_cols(b):
@@ -1018,18 +1022,38 @@ LENTA_MEAS = ["pf_recip", "pf_fl", "m_base_pf", "m_in_from_outside", "m_in_temp_
               "m_in_from_other_org", "m_in_from_nonzp", "m_in_from_zp_out",
               "m_out_left_bank", "m_out_temp_left", "m_out_to_other_org", "m_out_to_nonzp",
               "m_out_zp_out", "m_lb_seasonal", "m_lb_org_stopped", "m_lb_one_time", "m_lb_unknown",
-              "m_fl_in", "m_fl_out", "ten_lt3", "ten_3_12", "ten_12p",
+              "m_fl_in", "m_fl_out", "m_in_person_new", "m_out_person_gone",
+              "ten_lt3", "ten_3_12", "ten_12p",
               "m_out_ten_lt3", "m_out_ten_3_12", "m_out_ten_12p", "single_pay_recip", "multi_recip",
-              "y_base_pf", "y_fl_in", "y_fl_out"]
+              "y_base_pf", "y_fl_in", "y_fl_out", "y_in_person_new", "y_out_person_gone"]
 LENTA_SIZE = ("CASE WHEN om.pf_max >= 10000 THEN '1) от 10 тыс.' WHEN om.pf_max >= 1000 THEN '2) 1–10 тыс.' "
               "WHEN om.pf_max >= 100 THEN '3) 100–1 000' ELSE '4) до 100' END")
 _ACTIVE = "(COALESCE(m.pf_recip, 0) > 0 OR COALESCE(m.m_base_pf, 0) > 0)"
 
-T_LENTA = """
+MONTH_ORG_COLS = """
+SELECT column_name FROM information_schema.columns
+WHERE table_schema = :schema AND table_name = 'yva_ptf_month_org'
+"""
+
+
+def t_lenta(have: set | None = None) -> str:
+    """Свёртка сводки для ленты. Столбца нет в сводке (собрана до его добавления) —
+    мера «неизвестна» у всех активных строк, а не 0."""
+    have = set(LENTA_MEAS) if have is None else set(have)
+    sums, nns = [], []
+    for c in LENTA_MEAS:
+        if c in have:
+            sums.append(f"sum(m.{c}) AS {c}")
+            nns.append(f"sum(CASE WHEN m.{c} IS NULL AND {_ACTIVE} THEN 1 ELSE 0 END) AS nn_{c}")
+        else:
+            sums.append(f"sum(CAST(NULL AS float8)) AS {c}")
+            nns.append(f"sum(CASE WHEN {_ACTIVE} THEN 1 ELSE 0 END) AS nn_{c}")
+    return """
 WITH e AS (
   SELECT c.inn AS org_id,
          min(NULLIF(btrim(c.holding_name), ''))  AS hold,
-         min(NULLIF(btrim(c.industry_name), '')) AS ind
+         min(NULLIF(btrim(c.industry_name), '')) AS ind,
+         min(""" + S.seg_case_epk("c.segment_name") + """) AS seg_epk
   FROM {schema}.uzp_data_epk_consolidation c
   WHERE c.inn IS NOT NULL
   GROUP BY c.inn
@@ -1046,33 +1070,66 @@ hs AS (
   WHERE e.hold IS NOT NULL
   GROUP BY e.hold
   HAVING count(*) >= 2 AND sum(om.pf_max) >= :hold_min
+),
+os AS (
+  -- Сегмент один на организацию по всем ГОСБ: на дату выплаты — сегмент её ГОСБ с наибольшим
+  -- числом получателей (расхождение ГОСБ внутри организации считает LENTA_SEG_CONFLICTS).
+  SELECT report_dt, org_id, seg_rep
+  FROM (SELECT report_dt, org_id, seg_rep,
+               row_number() OVER (PARTITION BY report_dt, org_id
+                                  ORDER BY sum(pf_recip) DESC, seg_rep) AS rn
+        FROM {schema_t}.yva_ptf_month_org
+        GROUP BY report_dt, org_id, seg_rep) a
+  WHERE rn = 1
 )
-SELECT m.report_dt, COALESCE(m.seg_rep, '(нет)') AS seg_rep, m.sys_tb_id, m.sys_gosb_id,
+SELECT m.report_dt, COALESCE(os.seg_rep, '(нет)') AS seg_rep,
+       COALESCE(e.seg_epk, '(нет в ЕПК)') AS seg_epk,
+       m.sys_tb_id, m.sys_gosb_id,
        COALESCE(e.ind, '(нет в ЕПК или не указана)')                          AS ind,
        CASE WHEN hs.hold IS NOT NULL THEN 'Холдинг ' || substr(md5(hs.hold), 1, 8) END AS hold_code,
        """ + LENTA_SIZE + """                                                 AS size_class,
        CASE WHEN om.pf_max >= :org_min
             THEN 'Орг. ' || substr(md5(CAST(m.org_id AS text)), 1, 8) END     AS org_code,
-       """ + ",\n       ".join(f"sum(m.{c}) AS {c}" for c in LENTA_MEAS) + """,
-       """ + ",\n       ".join(f"sum(CASE WHEN m.{c} IS NULL AND {_ACTIVE} THEN 1 ELSE 0 END) AS nn_{c}"
-                                for c in LENTA_MEAS) + """
+       """ + ",\n       ".join(sums) + """,
+       """ + ",\n       ".join(nns) + """
 FROM {schema_t}.yva_ptf_month_org m
 LEFT JOIN e  ON e.org_id = m.org_id
 LEFT JOIN om ON om.org_id = m.org_id
 LEFT JOIN hs ON hs.hold = e.hold
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+LEFT JOIN os ON os.report_dt = m.report_dt AND os.org_id = m.org_id
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
 """
 
+
+T_LENTA = t_lenta()
+
+# Сегмент — один на организацию по всем ГОСБ, в двух видах: текущий по ЕПК («Сегмент»,
+# основные цифры) и на дату выплаты (история сегментов). Их расхождение — пересегментация.
 LENTA_SLICES = [("Банк", "CAST('банк' AS text)"),
-                ("Сегмент", "seg_rep"),
+                ("Сегмент", "seg_epk"),
+                ("Сегмент на дату выплаты", "seg_rep"),
                 ("ТБ", "'ТБ ' || CAST(sys_tb_id AS text)"),
                 ("ГОСБ", "'ГОСБ ' || CAST(sys_gosb_id AS text)"),
                 ("Отрасль", "ind"),
                 ("Размер организации", "size_class"),
                 ("Холдинг", "hold_code"),
                 ("Организация", "org_code"),
-                ("Сегмент × ТБ", "seg_rep || ' / ТБ ' || CAST(sys_tb_id AS text)"),
-                ("Сегмент × отрасль", "seg_rep || ' / ' || ind")]
+                ("Сегмент × ТБ", "seg_epk || ' / ТБ ' || CAST(sys_tb_id AS text)"),
+                ("Сегмент × отрасль", "seg_epk || ' / ' || ind"),
+                ("Сегмент на дату выплаты × ТБ", "seg_rep || ' / ТБ ' || CAST(sys_tb_id AS text)"),
+                ("Сегмент на дату выплаты × отрасль", "seg_rep || ' / ' || ind")]
+SEGMENT_VIEWS = ["Сегмент", "Сегмент на дату выплаты"]
+
+# Организации, у которых в одном месяце разные ГОСБ имеют разный сегмент на дату выплаты
+# (по правилу сегмент один на организацию — это ошибка данных истории сегментов).
+LENTA_SEG_CONFLICTS = """
+SELECT a.report_dt, count(*) AS n_org, sum(a.pf) AS pf
+FROM (SELECT report_dt, org_id, sum(pf_recip) AS pf
+      FROM {schema_t}.yva_ptf_month_org
+      GROUP BY report_dt, org_id
+      HAVING min(seg_rep) <> max(seg_rep)) a
+GROUP BY a.report_dt
+"""
 
 
 def lenta_part(kind: str, key: str) -> str:

@@ -1,8 +1,11 @@
 """Лента шага 2: отклонения на любом срезе и сравнении, их разложение и реальное изменение.
 
-Срезы — вся сводка `yva_ptf_month_org` (все организации): банк, сегмент, ТБ, ГОСБ, отрасль,
-класс размера, холдинг (от 2 организаций), крупная организация, сегмент × ТБ, сегмент ×
-отрасль. Холдинг и отрасль — текущий срез ЕПК.
+Срезы — вся сводка `yva_ptf_month_org` (все организации): банк, сегмент (один на организацию
+по всем ГОСБ) в двух видах — текущий по ЕПК («Сегмент», основные цифры) и на дату выплаты
+(история сегментов), ТБ, ГОСБ, отрасль, класс размера, холдинг (от 2 организаций), крупная
+организация, оба сегмента × ТБ и × отрасль. Холдинг, отрасль и сегмент — текущий срез ЕПК.
+Расхождение видов сегмента — пересегментация (страница «Пересегментация»; у сегмента на дату
+выплаты переводы видны строкой «учёта»).
 
 Изменение среза за месяц точно раскладывается на составляющие (сумма = изменению):
 
@@ -64,9 +67,9 @@ MIN_HISTORY = 6         # точек истории сравнения для о
 MAT_ABS = 500           # существенность: не меньше стольких троек
 MAT_REL = 0.002         # и не меньше такой доли уровня среза
 TOP = 10                # сюжетов на странице
-PAGE_GROUPS = [("Банк, сегменты, размер организаций", ["Банк", "Сегмент", "Размер организации"]),
-               ("Территории", ["ТБ", "ГОСБ", "Сегмент × ТБ"]),
-               ("Отрасли", ["Отрасль", "Сегмент × отрасль"]),
+PAGE_GROUPS = [("Банк, сегменты, размер организаций", ["Банк", *Q.SEGMENT_VIEWS, "Размер организации"]),
+               ("Территории", ["ТБ", "ГОСБ", "Сегмент × ТБ", "Сегмент на дату выплаты × ТБ"]),
+               ("Отрасли", ["Отрасль", "Сегмент × отрасль", "Сегмент на дату выплаты × отрасль"]),
                ("Холдинги и организации", ["Холдинг", "Организация"])]
 
 
@@ -77,8 +80,13 @@ def load(connection, hold_min: int = 1000, org_min: int = 1000, progress=print) 
     """Ряды срезов из сводки: длинная таблица slice_type, slice_key, report_dt, меры, nn_*."""
     t0 = time.time()
     gp = db.is_greenplum(connection)
+    from . import config
+    have = set(db.read_sql(connection, Q.MONTH_ORG_COLS, {"schema": config.SCHEMA_T})["column_name"])
+    missing = [c for c in Q.LENTA_MEAS if c not in have]
+    if missing:
+        progress(f"Лента: в сводке нет столбцов {', '.join(missing)} — они «неизвестны» до новой сборки")
     db.execute(connection, "DROP TABLE IF EXISTS t_lenta")
-    ddl = "CREATE TEMP TABLE t_lenta AS\n" + Q.T_LENTA + ("\nDISTRIBUTED RANDOMLY" if gp else "")
+    ddl = "CREATE TEMP TABLE t_lenta AS\n" + Q.t_lenta(have) + ("\nDISTRIBUTED RANDOMLY" if gp else "")
     n = db.execute(connection, ddl, {"hold_min": hold_min, "org_min": org_min})
     progress(f"Лента: сводка свёрнута до {n:,} строк, {time.time() - t0:.0f} с")
     # Вид среза — отдельный запрос: ошибка одного вида видна одной строкой и не губит остальные.
@@ -99,6 +107,13 @@ def load(connection, hold_min: int = 1000, org_min: int = 1000, progress=print) 
         raise RuntimeError("Лента: ряды срезов не получены — " + "; ".join(f"{k}: {r}" for k, r in failed))
     frame = pd.concat(parts, ignore_index=True)
     frame.attrs["failed"] = failed
+    try:
+        conf = db.read_sql(connection, Q.LENTA_SEG_CONFLICTS)
+        frame.attrs["seg_conflicts"] = {M.iso(d): (int(n), float(p))
+                                        for d, n, p in zip(conf["report_dt"], conf["n_org"], conf["pf"])}
+    except Exception as ex:                                         # noqa: BLE001
+        db.rollback(connection)
+        progress(f"Лента: проверка сегмента по ГОСБ не выполнена — {_db_reason(ex)}")
     return frame
 
 
@@ -168,6 +183,9 @@ def components(s: Series) -> dict[str, np.ndarray]:
     }
     flows = sum(c.values())
     c["gap"] = reported - flows
+    # Пока не виден следующий месяц, неизвестно, кто ушёл насовсем: реальная часть
+    # неизвестна целиком (иначе «реальное» = один приход), уход — в «неизвестно».
+    c["left"] = np.where(temp_known, c["left"], np.nan)
     # Без базы (нет m_base_pf) все составляющие неизвестны.
     unknown = ~np.isfinite(x["m_base_pf"]) | ~np.isfinite(prev)
     for k in c:
@@ -176,7 +194,27 @@ def components(s: Series) -> dict[str, np.ndarray]:
     fl_prev = np.full_like(pf, np.nan)
     fl_prev[:, 1:] = x["pf_fl"][:, :-1]
     c["people"] = np.where(unknown, np.nan, x["pf_fl"] - fl_prev)
+    # Люди и совместительство (по присутствию в портфеле банка): человек ушёл целиком —
+    # у него не осталось ни одной тройки; «другие работы» — его тройки сверх одного человека.
+    for k, v in person_parts(x["m_fl_in"], x["m_fl_out"], x["m_in_person_new"],
+                             x["m_out_person_gone"], c["reported"]).items():
+        c[k] = np.where(unknown, np.nan, v)
     return c
+
+
+PERSON = {"p_out": "Люди ушли из портфеля банка целиком (ФЛ)",
+          "p_out_extra": "  их другие работы (совместители ушли целиком)",
+          "p_in": "Люди пришли в портфель банка (ФЛ)",
+          "p_in_extra": "  их другие работы (совместители пришли)",
+          "p_stay": "Оставшиеся: больше/меньше работ, переходы, сегмент"}
+
+
+def person_parts(fl_in, fl_out, in_new, out_gone, reported) -> dict:
+    """Изменение троек = люди ушли/пришли целиком + их другие работы + оставшиеся.
+    Сумма частей = изменению; нет счётчика троек людей (старая сводка) — неизвестно."""
+    return {"p_out": -fl_out, "p_out_extra": -(out_gone - fl_out),
+            "p_in": fl_in, "p_in_extra": in_new - fl_in,
+            "p_stay": reported - (in_new - out_gone)}
 
 
 def window(a: np.ndarray, L: int) -> np.ndarray:
@@ -262,7 +300,8 @@ def scan(s: Series, comp: dict, report_months: list[str]) -> pd.DataFrame:
             with np.errstate(all="ignore"):
                 z = e / np.maximum(_noise(e)[:, None], floor)
                 zr = g["real"] / np.maximum(_noise(g["real"])[:, None], floor)
-            complete = np.isfinite(e) & np.all([np.isfinite(v) for v in g.values()], axis=0)
+            # Реальная часть может быть неизвестна (последний месяц) — тогда сюжет только по отчётному.
+            complete = np.isfinite(e) & np.all([np.isfinite(v) for k, v in g.items() if k != "real"], axis=0)
             if base == "none" and L != 12:
                 complete &= ~has_y1
             sig = (np.abs(np.nan_to_num(z)) >= Z_MIN) & (np.abs(np.nan_to_num(e)) >= floor)
@@ -328,45 +367,46 @@ def _table(st: pd.DataFrame) -> pd.DataFrame:
     if st.empty:
         return pd.DataFrame({"Сообщение": ["Значимых отклонений нет"]})
     st = st.copy()
-    return pd.DataFrame({
+    return _unknown(pd.DataFrame({
         "Срез": st["slice_key"], "Месяц": [m[:7] for m in st["month"]],
         "Сравнение": [f"{WIN_LABEL[a]} {_short(b)}" for a, b in zip(st["L"], st["base"])],
         "Отклонение": st["excess"].round(), "Реальное": st["g_real"].round(),
         "Внутри банка": st["g_inside"].round(), "Учёт и календарь": st["g_account"].round(),
         "Спорное": st["g_disputed"].round(), "Неизвестно": st["g_unknown"].round(),
-        "Шумов": st["z"].round(1), "Шумов реальн.": st["z_real"].round(1)})
+        "Шумов": st["z"].round(1), "Шумов реальн.": st["z_real"].round(1)}))
+
+
+def _unknown(frame: pd.DataFrame) -> pd.DataFrame:
+    """Пустое значение на странице — словом «неизв.», не NaN и не 0."""
+    out = frame.astype(object)
+    return out.where(frame.notna(), "неизв.")
 
 
 # --------------------------------------------------------------------------- #
 # Карточка
 # --------------------------------------------------------------------------- #
 def card(s: Series, comp: dict, slice_type: str, key: str, month: str, L: int, base: str) -> dict:
-    """Разложение одного сравнения: составляющие за окно, база, отклонение."""
+    """Разложение одного сравнения: составляющие за окно, база, отклонение; люди и
+    совместительство; для остатка к году назад — то же по меткам y_."""
     i, t = s.index(slice_type, key), s.months.index(M.iso(month))
     d = compare(comp, L, base)
-    rows = []
-    for k, (label, grp) in COMPONENTS.items():
+
+    def row(k, label, grp=""):
         w = window(comp[k], L)[i, t]
-        b = base_of(window(comp[k], L), base)[i, t]
-        rows.append({"Составляющая": label, "Группа": GROUPS[grp].split(":")[0],
-                     "Окно": w, "База": b, "Отклонение": d[k][i, t]})
-    for k, label in (("people", "в т. ч. люди (ФЛ, доли)"), ("reported", "Итого отчётное")):
-        w = window(comp[k], L)[i, t]
-        b = base_of(window(comp[k], L), base)[i, t]
-        rows.append({"Составляющая": label, "Группа": "", "Окно": w, "База": b, "Отклонение": d[k][i, t]})
+        return {"Составляющая": label, "Группа": grp, "Окно": w,
+                "База": base_of(window(comp[k], L), base)[i, t], "Отклонение": d[k][i, t]}
+
+    table = pd.DataFrame([row(k, label, GROUPS[grp].split(":")[0]) for k, (label, grp) in COMPONENTS.items()]
+                         + [row("reported", "Итого отчётное")])
+    people = pd.DataFrame([row(k, label) for k, label in PERSON.items()] + [row("reported", "Итого отчётное")])
+    year = None
     if L == 12 and base == "none":
-        # Остаток к тому же месяцу год назад по меткам y_: люди без портфеля в банке год назад
-        # или сейчас, и всё прочее (совместительство, переходы, переводы между срезами).
         x = s.x
         rep12 = window(comp["reported"], 12)[i, t]
-        fl_in, fl_out = x["y_fl_in"][i, t], x["y_fl_out"][i, t]
-        rows += [{"Составляющая": "к году назад: люди пришли в банк", "Группа": "", "Окно": fl_in,
-                  "База": 0., "Отклонение": fl_in},
-                 {"Составляющая": "к году назад: люди ушли из банка", "Группа": "", "Окно": -fl_out,
-                  "База": 0., "Отклонение": -fl_out},
-                 {"Составляющая": "к году назад: прочее (совместительство, переходы, сегмент)", "Группа": "",
-                  "Окно": rep12 - fl_in + fl_out, "База": 0., "Отклонение": rep12 - fl_in + fl_out}]
-    table = pd.DataFrame(rows)
+        parts = person_parts(x["y_fl_in"][i, t], x["y_fl_out"][i, t], x["y_in_person_new"][i, t],
+                             x["y_out_person_gone"][i, t], rep12)
+        year = pd.DataFrame([{"Составляющая": PERSON[k], "К году назад": v} for k, v in parts.items()]
+                            + [{"Составляющая": "Итого отчётное", "К году назад": rep12}])
     g = {k: float(v[i, t]) for k, v in _group_sums(d).items()}
     rep = float(d["reported"][i, t])
     start = M.iso(M.shift(month, -(L - 1)))
@@ -377,8 +417,12 @@ def card(s: Series, comp: dict, slice_type: str, key: str, month: str, L: int, b
             f"+ неизвестно {_fmt(g['unknown'])}.")
     if np.isfinite(rep) and np.isfinite(g["real"]) and rep:
         text += f" Реальное изменение — {abs(g['real']) / abs(rep) * 100:.0f}% отчётного."
-    return {"title": title, "text": text, "table": table, "groups": g, "reported": rep,
-            "sql": check_sql(slice_type, key, start, month)}
+    pe = {k: float(d[k][i, t]) for k in PERSON}
+    if all(np.isfinite(v) for v in pe.values()):
+        text += (f" Люди: ушли целиком {_fmt(pe['p_out'])} (и их другие работы {_fmt(pe['p_out_extra'])}), "
+                 f"пришли {_fmt(pe['p_in'])} ({_fmt(pe['p_in_extra'])}); у оставшихся {_fmt(pe['p_stay'])}.")
+    return {"title": title, "text": text, "table": table, "people": people, "year": year,
+            "groups": g, "reported": rep, "sql": check_sql(slice_type, key, start, month)}
 
 
 def _fmt(v: float) -> str:
@@ -390,7 +434,7 @@ def check_sql(slice_type: str, key: str, first: str, last: str) -> str:
     first, last = M.iso(M.shift(first, -1)), M.iso(last)
     where = {
         "Банк": "TRUE",
-        "Сегмент": f"m.seg_rep = '{key}'",
+        "Сегмент на дату выплаты": f"m.seg_rep = '{key}'  /* сегмент ГОСБ с наибольшим числом получателей */",
         "ТБ": f"m.sys_tb_id = {key.split()[-1]}",
         "ГОСБ": f"m.sys_gosb_id = {key.split()[-1]}",
         "Организация": f"substr(md5(CAST(m.org_id AS text)), 1, 8) = '{key.split()[-1]}'",
@@ -403,6 +447,37 @@ def check_sql(slice_type: str, key: str, first: str, last: str) -> str:
             "FROM s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.yva_ptf_month_org m\n"
             f"WHERE {where}\n  AND m.report_dt BETWEEN DATE '{first}' AND DATE '{last}'\n"
             "GROUP BY m.report_dt ORDER BY 1;")
+
+
+# --------------------------------------------------------------------------- #
+# Пересегментация
+# --------------------------------------------------------------------------- #
+def resegmentation(s: Series, comp: dict, month: str) -> pd.DataFrame:
+    """Получатели сегмента в двух видах в месяце и переводы за 12 месяцев.
+
+    Текущий − на дату выплаты: сколько получателей сегмент «получил» пересегментацией (по ЕПК
+    организация уже в сегменте, по истории на дату выплаты — ещё нет, или наоборот). Переводы за 12 мес. —
+    составляющая «переводы между срезами» сегмента на дату выплаты: сколько ушло / пришло
+    сменой сегмента без движения людей."""
+    t = s.months.index(M.iso(month))
+    pf = s.x["pf_recip"][:, t]
+    moved = window(comp["reclass"], 12)[:, t]
+    views = {}
+    for kind in Q.SEGMENT_VIEWS:
+        sel = np.flatnonzero(s.meta["slice_type"].to_numpy() == kind)
+        views[kind] = {s.meta.at[i, "slice_key"]: i for i in sel}
+    keys = sorted(set().union(*[set(v) for v in views.values()]))
+    rows = []
+    for k in keys:
+        get = lambda kind, a: a[views[kind][k]] if k in views[kind] else np.nan   # noqa: E731
+        cur, rep = (get(v, pf) for v in Q.SEGMENT_VIEWS)
+        rows.append({"Сегмент": k, "Текущий (ЕПК)": cur, "На дату выплаты": rep,
+                     "Текущий − на дату выплаты": cur - rep,
+                     "Переводы за 12 мес.": get("Сегмент на дату выплаты", moved)})
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.reindex(out["Текущий (ЕПК)"].fillna(0).abs().sort_values(ascending=False).index)
+    return out.reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -437,6 +512,9 @@ def report(frame: pd.DataFrame, months_back: int = 12, month: str | None = None,
             if len(picked) >= cards:
                 break
     top_cards = [card(s, comp, *k) for k in picked]
+    reseg = resegmentation(s, comp, month)
+    pages.append((f"Пересегментация, {M.label(month)}: получатели по двум видам сегмента",
+                  _unknown(reseg.round(0).head(TOP)), len(reseg)))
     check_cards = []
     for c in checks or []:
         try:
@@ -456,6 +534,7 @@ def run(connection, months_back: int = 12, month: str | None = None, checks: lis
     frame = load(connection, hold_min, org_min, progress)
     rep = report(frame, months_back, month, checks)
     rep["failed"] = list(frame.attrs.get("failed", []))
+    rep["seg_conflicts"] = frame.attrs.get("seg_conflicts")
     rep["duration_min"] = (time.time() - t0) / 60.
     progress(f"Лента: {rep['n_found']:,} значимых сравнений → {rep['n_stories']:,} сюжетов, "
              f"{rep['duration_min']:.1f} мин")
@@ -474,9 +553,11 @@ def write_html(rep: dict, path) -> Path:
             f"<p>Срезов: {rep['n_slices']:,}; значимых сравнений: {rep['n_found']:,}; "
             f"сюжетов: {rep['n_stories']:,}.</p>"]
     for c in [*rep["pulse"], *rep["cards"], *rep["checks"]]:
-        body += [f"<h2>{html.escape(c['title'])}</h2>", f"<p><b>{html.escape(c['text'])}</b></p>",
-                 c["table"].round(0).to_html(index=False, border=0, na_rep="неизвестно"),
-                 f"<pre>{html.escape(c['sql'])}</pre>"]
+        body += [f"<h2>{html.escape(c['title'])}</h2>", f"<p><b>{html.escape(c['text'])}</b></p>"]
+        for part in (c["table"], c.get("people"), c.get("year")):
+            if part is not None and not part.empty:
+                body.append(part.round(0).to_html(index=False, border=0, na_rep="неизвестно"))
+        body.append(f"<pre>{html.escape(c['sql'])}</pre>")
     st = rep["stories"]
     if not st.empty:
         body += ["<h2>Все сюжеты</h2>", _table(st).to_html(index=False, border=0, na_rep="неизвестно")]

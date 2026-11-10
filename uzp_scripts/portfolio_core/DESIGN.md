@@ -66,6 +66,10 @@
 
 **Люди:** `fl_in` / `fl_out` — пришли / ушли люди, у которых портфеля нет нигде в B / M;
 `fl_conc` = Δ`pf_fl` − `fl_in` + `fl_out` — изменение от совместительства (по банку 0).
+`in_person_new` / `out_person_gone` — те же люди в тройках (сколько троек у пришедших / ушедших
+целиком). Разность с `fl_in` / `fl_out` — «другие работы» совместителей, пришедших или ушедших
+целиком (было 3 тройки — стало 0: −1 человек и −2 работы); остальное изменение — у оставшихся
+(стало меньше / больше работ, переходы). Добавлены 10.11.2026 по просьбе аналитика.
 
 **Тождество** (каждая строка, каждый прогон): `pf_recip − base_pf = Σ in − Σ out`,
 части = целому.
@@ -80,7 +84,7 @@
 | `m_out_temp` | нет базы или следующего месяца |
 | `m_out_ten_*` | нет базы или 12 месяцев истории до неё |
 
-## 4. Сводка `yva_ptf_month_org` (82 столбца)
+## 4. Сводка `yva_ptf_month_org` (86 столбцов)
 
 Строка = (месяц, id орг, ГОСБ), если у пары были тройки в M или портфель в одной из баз.
 
@@ -93,7 +97,7 @@
 | коды | `flapping_recip` — ≥ 3 смен зп ↔ не зп за 12 мес. |
 | разовые | `one_time_pf`, `one_time_person` (человек разовый во всём банке), `prelim` |
 | стаж | `ten_lt3`, `ten_3_12`, `ten_12p` |
-| движения × {m, y} | `base_pf`, `base_seg`, `in_from_outside`, `in_new_bank`, `in_returned`, `in_from_other_org`, `in_from_nonzp`, `in_from_zp_out`, 3 `in_oth_*`, `out_left_bank`, `out_to_other_org`, `out_to_nonzp`, `out_zp_out`, 3 `out_oth_*`, `lb_*`, `fl_in`, `fl_out`, `fl_conc` |
+| движения × {m, y} | `base_pf`, `base_seg`, `in_from_outside`, `in_new_bank`, `in_returned`, `in_from_other_org`, `in_from_nonzp`, `in_from_zp_out`, 3 `in_oth_*`, `out_left_bank`, `out_to_other_org`, `out_to_nonzp`, `out_zp_out`, 3 `out_oth_*`, `lb_*`, `fl_in`, `fl_out`, `fl_conc`, `in_person_new`, `out_person_gone` |
 | только m | `m_out_temp` (вернулись в M+1), `m_out_ten_lt3/3_12/12p` (ушедшие по стажу — вместе со стажем дают таблицу дожития на любом срезе) |
 
 ## 5. Остальные таблицы

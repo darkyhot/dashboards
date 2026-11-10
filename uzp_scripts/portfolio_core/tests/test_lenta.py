@@ -66,7 +66,7 @@ class Decomposition(unittest.TestCase):
         self.c = lenta.components(self.s)
 
     def test_parts_sum_to_reported_exactly(self):
-        parts = sum(self.c[k] for k in lenta.COMPONENTS)
+        parts = sum(np.nan_to_num(self.c[k]) for k in lenta.COMPONENTS)
         ok = np.isfinite(self.c["reported"])
         np.testing.assert_allclose(parts[ok], self.c["reported"][ok])
         self.assertTrue(np.allclose(np.nan_to_num(self.c["gap"]), 0))
@@ -78,7 +78,7 @@ class Decomposition(unittest.TestCase):
         self.assertLess(abs(self.c["left"][0, t]), 400)
 
     def test_last_month_departures_are_unknown_not_real(self):
-        self.assertEqual(self.c["left"][0, -1], 0.)
+        self.assertTrue(np.isnan(self.c["left"][0, -1]))
         self.assertLess(self.c["left_unk"][0, -1], 0.)
         self.assertEqual(self.c["temp_out"][0, -1], 0.)
 
@@ -168,7 +168,7 @@ class Sql(unittest.TestCase):
         bank = frame[frame["slice_type"] == "Банк"].set_index("report_dt")
         total = total.set_index("report_dt")
         np.testing.assert_allclose(bank.loc[total.index, "pf_recip"].astype(float), total["pf"].astype(float))
-        for kind in ("Сегмент", "ТБ", "Размер организации"):
+        for kind in ("Сегмент", "Сегмент на дату выплаты", "ТБ", "Размер организации"):
             part = frame[frame["slice_type"] == kind].groupby("report_dt")["pf_recip"].sum()
             np.testing.assert_allclose(part.loc[total.index].astype(float), total["pf"].astype(float))
         self.assertFalse(frame["slice_key"].str.contains(r"\d{9,}").any(), "номера организаций не выводятся")
@@ -185,9 +185,9 @@ class Sql(unittest.TestCase):
         scope = {"display": shown.append, "CONN": PG_URL, "SCHEMA": self.SCHEMA, "SCHEMA_T": self.SCHEMA}
         exec(compile(source, "notebook_lenta", "exec"), scope)
         rep = scope["lenta_report"]
-        self.assertEqual(len(rep["checks"]), 3)
+        self.assertEqual(len(rep["checks"]), 4)
         self.assertTrue(Path(scope["lenta_path"]).exists())
-        self.assertGreaterEqual(len(shown), 2 + len(rep["pages"]) + len(rep["cards"]) + 3)
+        self.assertGreaterEqual(len(shown), 2 + len(rep["pages"]) + len(rep["cards"]) + 4)
 
 
 if __name__ == "__main__":
@@ -207,6 +207,8 @@ class LoadErrors(unittest.TestCase):
             pass
 
         def fake_read(connection, sql, params=None):
+            if sql == Q.MONTH_ORG_COLS:
+                return pd.DataFrame({"column_name": Q.LENTA_MEAS})
             if "Отрасль" in sql:
                 err = Exception("SELECT ... длинный запрос")
                 err.orig = Orig("column \"ind\" does not exist\nLINE 1: ...")
@@ -238,15 +240,87 @@ class Rules(unittest.TestCase):
         self.assertNotIn("2026-01", set(table["Месяц"]))
 
     def test_year_ago_stock_card_has_people_rows(self):
+        """Ушёл совместитель с 3 работами: −1 человек и −2 «другие работы»."""
         months, meas = seasonal()
-        meas = {**meas, "y_fl_in": np.full(len(months), 3000.), "y_fl_out": np.full(len(months), 2500.)}
+        n = len(months)
+        meas = {**meas, "y_fl_in": np.full(n, 3000.), "y_fl_out": np.full(n, 2500.),
+                "y_in_person_new": np.full(n, 3100.), "y_out_person_gone": np.full(n, 2900.),
+                "m_fl_in": meas["m_in_from_outside"], "m_in_person_new": meas["m_in_from_outside"],
+                "m_fl_out": meas["m_out_left_bank"] - 2., "m_out_person_gone": meas["m_out_left_bank"]}
         rep = lenta.report(frame_of({("Банк", "банк"): meas}, months), months_back=12,
-                           checks=[("Банк", "банк", "2026-08", 12, "none")])
-        t = rep["checks"][0]["table"].set_index("Составляющая")
-        self.assertEqual(t.loc["к году назад: люди пришли в банк", "Окно"], 3000.)
-        self.assertEqual(t.loc["к году назад: люди ушли из банка", "Окно"], -2500.)
-        total = t.loc["Итого отчётное", "Окно"]
-        self.assertAlmostEqual(t.loc["к году назад: прочее (совместительство, переходы, сегмент)", "Окно"],
-                               total - 500.)
+                           checks=[("Банк", "банк", "2026-08", 12, "none"), ("Банк", "банк", "2026-05", 1, "y1")])
+        y = rep["checks"][0]["year"].set_index("Составляющая")["К году назад"]
+        self.assertEqual(y[lenta.PERSON["p_out"]], -2500.)
+        self.assertEqual(y[lenta.PERSON["p_out_extra"]], -400.)
+        self.assertEqual(y[lenta.PERSON["p_in_extra"]], 100.)
+        self.assertAlmostEqual(y.drop("Итого отчётное").sum(), y["Итого отчётное"])
+        p = rep["checks"][1]["people"].set_index("Составляющая")
+        self.assertAlmostEqual(p.drop("Итого отчётное")["Окно"].sum(), p.loc["Итого отчётное", "Окно"])
+        self.assertEqual(p.loc[lenta.PERSON["p_out_extra"], "Окно"], -2.)
+        self.assertIn("Люди: ушли целиком", rep["checks"][1]["text"])
         view = presentation.photo_page({"lenta": rep}, "лента", 2 + len(rep["pages"]) + len(rep["cards"]) + 1)
-        self.assertEqual(len(view["blocks"]), 2)
+        self.assertEqual(len(view["blocks"]), 3)
+
+    def test_old_summary_without_person_counts_is_unknown(self):
+        months, meas = seasonal()
+        meas = {**meas, "m_in_person_new": np.full(len(months), np.nan),
+                "m_out_person_gone": np.full(len(months), np.nan)}
+        rep = lenta.report(frame_of({("Банк", "банк"): meas}, months), months_back=12,
+                           checks=[("Банк", "банк", "2026-05", 1, "y1")])
+        p = rep["checks"][0]["people"].set_index("Составляющая")
+        self.assertTrue(np.isnan(p.loc[lenta.PERSON["p_out_extra"], "Окно"]))
+        self.assertNotIn("Люди: ушли целиком", rep["checks"][0]["text"])
+
+
+class LastMonth(unittest.TestCase):
+    def test_last_month_has_no_real_story_and_real_is_unknown(self):
+        months, meas = seasonal()
+        meas = {**meas, "m_in_from_outside": meas["m_in_from_outside"].copy()}
+        meas["m_in_from_outside"][-1] += 50_000.          # большой приход в последнем месяце
+        meas["pf_recip"] = meas["pf_recip"].copy()
+        meas["pf_recip"][-1] += 50_000.
+        meas["pf_fl"] = meas["pf_recip"]
+        rep = lenta.report(frame_of({("Банк", "банк"): meas}, months), months_back=12)
+        st = rep["stories"]
+        last = st[st["month"] == months[-1]]
+        self.assertFalse(last.empty, "отчётное отклонение последнего месяца видно")
+        self.assertTrue(last["g_real"].isna().all())
+        self.assertFalse(last["real_sig"].any())
+        name, table, n = rep["pages"][0]
+        self.assertNotIn(months[-1][:7], set(table.get("Месяц", [])))
+
+
+class Resegmentation(unittest.TestCase):
+    def test_two_segment_views_and_moves(self):
+        """Организацию на 500 получателей в мае 2026 перевели из ММБ в КСБ: на дату выплаты
+        это перевод между сегментами, по текущему ЕПК она в КСБ всегда."""
+        months, meas = seasonal()
+        n = len(months)
+        t = months.index("2026-05-31")
+
+        def part(level, move):
+            pf = np.full(n, float(level))
+            pf[t:] += move
+            base = np.r_[np.nan, pf[:-1]]
+            base[t] += move                      # база строк месяца — уже в новом сегменте
+            return {"pf_recip": pf, "pf_fl": pf, "m_base_pf": base,
+                    "m_in_from_outside": np.zeros(n), "m_out_left_bank": np.zeros(n),
+                    "m_in_temp_outside": np.zeros(n), "m_out_temp_left": np.zeros(n)}
+        series = {("Банк", "банк"): meas,
+                  ("Сегмент", "КСБ"): part(1500, 0), ("Сегмент", "ММБ"): part(1000, 0),
+                  ("Сегмент на дату выплаты", "КСБ"): part(1000, 500),
+                  ("Сегмент на дату выплаты", "ММБ"): part(1500, -500)}
+        frame = frame_of(series, months)
+        frame.attrs["seg_conflicts"] = {"2026-08-31": (3, 120.)}
+        rep = lenta.report(frame, months_back=12, month="2026-08")
+        rep["seg_conflicts"] = frame.attrs["seg_conflicts"]
+        name, table, n_rows = rep["pages"][-1]
+        self.assertTrue(name.startswith("Пересегментация"))
+        r = table.set_index("Сегмент")
+        self.assertEqual(r.loc["КСБ", "Текущий (ЕПК)"], 1500)
+        self.assertEqual(r.loc["КСБ", "На дату выплаты"], 1500)
+        self.assertEqual(r.loc["КСБ", "Переводы за 12 мес."], 500)
+        self.assertEqual(r.loc["ММБ", "Переводы за 12 мес."], -500)
+        view = presentation.photo_page({"lenta": rep}, "лента", 2 + len(rep["pages"]))
+        self.assertTrue(any("Ошибка данных: организаций с разным сегментом по ГОСБ" in x and "3" in x
+                            for x in view["notes"]))

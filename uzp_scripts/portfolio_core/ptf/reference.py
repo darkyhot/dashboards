@@ -250,6 +250,7 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
                     L[(mi, o, g)]["in_temp_outside"] += 1
                 if not p_by_pm.get((B, e)):
                     L[(mi, o, g)]["fl_in"] += 1.0 / len(p_by_pm[(mi, e)])
+                    L[(mi, o, g)]["in_person_new"] += 1
                 if kk == 1 and x.startswith("in_oth_"):
                     moves_in[(mi, e)].append((o, g))
             # ушёл в m2 (mi — база)
@@ -274,6 +275,7 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
                 L[(m2, o, g)][x] += 1
                 if not p_by_pm.get((m2, e)):
                     L[(m2, o, g)]["fl_out"] += 1.0 / len(p_by_pm[(mi, e)])
+                    L[(m2, o, g)]["out_person_gone"] += 1
                 L[(m2, o, g)]["out_temp"] += (m2 + 1) in p
                 if x.startswith("lb_") and (m2 + 1) in p:
                     L[(m2, o, g)]["out_temp_left"] += 1
@@ -358,6 +360,7 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
                 "out_left_bank": sum(get(x) for x in Q.OUT_LABELS if x.startswith("lb_")),
                 "fl_in": get("fl_in"), "fl_out": get("fl_out"),
                 "fl_conc": (sv(key, "pf_fl") - sv(bk, "pf_fl")) - get("fl_in") + get("fl_out"),
+                "in_person_new": get("in_person_new"), "out_person_gone": get("out_person_gone"),
             }
             for x in Q.IN_LABELS + Q.OUT_LABELS:
                 val[x] = get(x)
