@@ -89,10 +89,22 @@ class Report(unittest.TestCase):
         """1 августа 2026 — суббота: выплата B ушла на 31 июля; в 2025 году 1-е — пятница."""
         rep = daily.report(frame_from(self.ref), ["2026-08"])
         row = rep["bank"].iloc[0]
-        self.assertEqual(row["Календарный (дни)"], -50)
-        self.assertEqual(row["С 16-го по 15-е"], 0)
+        self.assertEqual(row["Месячная сводка"], -50)
+        self.assertEqual(row["Остаток (16-е – 15-е)"], 0)
         self.assertEqual(row["Граница месяца"], -50)
+        self.assertEqual(row["Расхождение витрин"], 0)
+        comp = rep["details"][0]["components"].set_index("Счёт")
+        self.assertEqual(comp.loc["Календарный месяц (дни)", "Сверх прошлого года"], -50)
         self.assertIn("календарь, а не потеря людей", rep["verdicts"][0])
+
+    def test_source_gap_is_visible(self):
+        """Уровни сходятся в допуске, но отличие месячной сводки иное — разница видна строкой."""
+        rep = daily.report(frame_from(self.ref, {"2026-08-31": -0.2}), ["2026-08"])
+        row = rep["bank"].iloc[0]
+        self.assertAlmostEqual(row["Расхождение витрин"], -0.2)
+        self.assertAlmostEqual(row["Месячная сводка"],
+                               row["Граница месяца"] + row["Остаток (16-е – 15-е)"] + row["Расхождение витрин"])
+        self.assertIn("расхождение витрин", rep["verdicts"][0])
 
     def test_monthly_mismatch_blocks_conclusion(self):
         rep = daily.report(frame_from(self.ref, {"2026-07-31": 10.}), ["2026-08"])
@@ -181,8 +193,8 @@ class Sql(unittest.TestCase):
             self.assertEqual(row["pf"], row["n_cal"], m)
         bank = rep["bank"].set_index("Месяц")
         self.assertEqual(bank.loc["2026-08", "Граница месяца"], -50)
-        self.assertEqual(bank.loc["2026-08", "С 16-го по 15-е"], 0)
-        self.assertEqual(bank.loc["2026-08", "Сверка, %"], 0)
+        self.assertEqual(bank.loc["2026-08", "Остаток (16-е – 15-е)"], 0)
+        self.assertEqual(bank.loc["2026-08", "Сверка уровней, %"], 0)
         self.assertTrue(any("уже посчитаны" in s for s in logs))
         pd.testing.assert_frame_equal(rep["bank"], again["bank"])
         days = rep["details"][0]["days"]

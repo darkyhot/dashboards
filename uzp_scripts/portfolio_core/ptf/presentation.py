@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import textwrap
 from dataclasses import asdict, is_dataclass
 
 import pandas as pd
@@ -364,6 +365,28 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
             notes.append(f"Показано {min(12, len(industry))} из {len(industry)} строк.")
         notes += ["Холдинг и отрасль — текущий срез ЕПК; история принадлежности не хранится.",
                   "Номера организаций и названия холдингов не выводятся."]
+    elif section == "лента":
+        rep = data.get("lenta")
+        if not rep:
+            raise ValueError("Лента не рассчитана: ячейка «ЛЕНТА»")
+        cards = [*rep["pulse"], None, None, None, None, *rep["cards"], *rep["checks"]]
+        pages = len(cards)
+        page = min(max(1, int(page)), pages)
+        title = (f"Лента портфеля {rep['report_months'][0][:7]} — {rep['report_months'][-1][:7]}: "
+                 f"отклонения и реальное изменение")
+        if 3 <= page <= 6:
+            name, table, n = rep["pages"][page - 3]
+            blocks = [(f"{name}: сюжетов {n}, показано {min(n, 10)}", _frame(table))]
+            notes += [f"Срезов {rep['n_slices']:,}; значимых сравнений {rep['n_found']:,} → сюжетов "
+                      f"{rep['n_stories']:,}. Отбор — от 4 шумов своего сравнения; эхо окон склеено.",
+                      "Реальное — ушли из банка насовсем и пришли извне; учёт и календарь — временный "
+                      "отток, возврат, переводы; спорное — коды и порог 2 500 ₽."]
+        else:
+            c = cards[page - 1]
+            notes += [c["title"], c["text"]]
+            blocks = [("Составляющие, тройки", _frame(c["table"]).round(0))]
+            if page <= 2:
+                notes.append("Месяц — последний, где временный отток уже виден (нужен следующий месяц).")
     elif section == "граница месяца":
         cal = data.get("calendar")
         if not cal:
@@ -407,7 +430,7 @@ def photo_page(data, section="итог", page=1, month=None, panel=None):
         pages = max(1, (len(frame) + 7) // 8)
         blocks = [("Разметка причин: последние шесть месяцев", frame.iloc[(page - 1) * 8:page * 8])]
     else:
-        raise ValueError("Раздел: бизнес, год к году, итог, карточки, пропуски, слабые, хвосты, календарь, граница месяца, источники срезов, кейс-август, пороги или качество")
+        raise ValueError("Раздел: бизнес, год к году, итог, карточки, пропуски, слабые, хвосты, календарь, граница месяца, лента, источники срезов, кейс-август, пороги или качество")
     if page > pages:
         raise ValueError(f"Страница должна быть от 1 до {pages}")
     return {"title": title, "page": page, "pages": pages, "blocks": blocks, "notes": notes}
@@ -417,7 +440,7 @@ def show(data, display, section="итог", page=1, month=None, panel=None):
     view = photo_page(data, section, page, month, panel)
     print(f"{view['title']} — страница {view['page']}/{view['pages']}")
     for note in view["notes"]:
-        print(note)
+        print(textwrap.fill(str(note), width=110, break_on_hyphens=False))
     with pd.option_context("display.max_rows", 12, "display.max_columns", None, "display.max_colwidth", 100):
         for title, frame in view["blocks"]:
             print(title)

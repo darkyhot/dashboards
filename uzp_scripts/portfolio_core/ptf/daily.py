@@ -118,12 +118,21 @@ def load(connection, months: list[str], amt_min: float = Q.AMT_MIN) -> pd.DataFr
     return frame.reset_index(drop=True)
 
 
-def days(connection, month) -> pd.DataFrame:
-    """Строки выплат по дням у границы месяца: с 16-го M−1 по последнее число M."""
+def days(connection, month, refresh: bool = False) -> pd.DataFrame:
+    """Строки выплат по дням у границы месяца: с 16-го M−1 по последнее число M.
+    Посчитанное окно хранится в `yva_ptf_calendar_days` и витрину повторно не читает."""
     w = windows(month)
-    f = db.read_sql(connection, Q.CALENDAR_DAYS, {"s_from": w["s_from"], "c_to": w["c_to"]})
+    p = {"m": w["m"], "s_from": w["s_from"], "c_to": w["c_to"], "def_ver": Q.DEF_VER}
+    db.execute(connection, Q.CREATE_CALENDAR_DAYS + ("\nDISTRIBUTED BY (report_dt)"
+                                                     if db.is_greenplum(connection) else ""))
+    f = db.read_sql(connection, Q.CALENDAR_DAYS_CACHED, p)
+    if refresh or f.empty:
+        stamp = datetime.now().replace(microsecond=0).isoformat(sep=" ")
+        db.execute_tx(connection, [Q.CALENDAR_DAYS_DELETE, Q.CALENDAR_DAYS_INSERT],
+                      {**p, "created_at": stamp})
+        f = db.read_sql(connection, Q.CALENDAR_DAYS_CACHED, p)
     f["pay_dt"] = pd.to_datetime(f["pay_dt"]).dt.date
-    return f.sort_values("pay_dt").reset_index(drop=True)
+    return f[["pay_dt", "n_rows"]].sort_values("pay_dt").reset_index(drop=True)
 
 
 def _totals(frame: pd.DataFrame, col: str, by: str | None = None) -> pd.DataFrame | pd.Series:
@@ -212,9 +221,11 @@ def report(frame: pd.DataFrame, months_of_interest: list[str], day_frames: dict 
         sync = _sync(frame, m)
         effect = c - s
         share = effect / c * 100. if c and np.isfinite(c) and np.isfinite(effect) else np.nan
-        bank_rows.append({"Месяц": m[:7], "Месячная сводка": p, "Календарный (дни)": c,
-                          "С 16-го по 15-е": s, "Граница месяца": effect, "Доля, %": share,
-                          "Сверка, %": sync})
+        gap = p - c          # расхождение источников: месячная сводка − дневная витрина
+        bank_rows.append({"Месяц": m[:7], "Месячная сводка": p, "Граница месяца": effect,
+                          "Остаток (16-е – 15-е)": s, "Расхождение витрин": gap,
+                          "Доля границы, %": effect / p * 100. if p and np.isfinite(p) else np.nan,
+                          "Сверка уровней, %": sync})
         if np.isnan(sync):
             text = (f"{M.long(m)}: сверить дневную витрину с месячной нельзя (нет месяца в одной "
                     f"из них) — вывод о календаре не делается.")
@@ -224,15 +235,19 @@ def report(frame: pd.DataFrame, months_of_interest: list[str], day_frames: dict 
         elif not np.isfinite(c) or not np.isfinite(s):
             text = f"{M.long(m)}: неизвестно — нет нужных месяцев в дневной витрине."
         else:
-            text = (f"{M.long(m)}: сверх прошлого года {c:+,.0f} по календарному месяцу и "
-                    f"{s:+,.0f} по месяцу с 16-го по 15-е. Граница месяца (перенос выплат через "
-                    f"1-е число) — {effect:+,.0f}" + (f" ({share:.0f}% отличия)." if np.isfinite(share) else "."))
+            base = p if np.isfinite(p) else c
+            text = (f"{M.long(m)}: сверх прошлого года {base:+,.0f} = граница месяца {effect:+,.0f} "
+                    f"(перенос выплат через 1-е число) + остаток {s:+,.0f} (есть и при счёте "
+                    f"с 16-го по 15-е)")
+            text += (f" + расхождение витрин {gap:+,.0f}." if np.isfinite(gap) else ".")
             if abs(s) < VANISH * abs(c):
-                text += " На сдвинутом месяце отличие почти исчезает: это календарь, а не потеря людей."
+                text += " Без границы месяца отличие почти исчезает: это календарь, а не потеря людей."
             else:
-                text += f" Остаётся {s:+,.0f} — его объясняют другие механизмы, не граница месяца."
+                text += " Остаток объясняют другие механизмы."
         verdicts.append(text)
         comp = pd.DataFrame([
+            {"Счёт": "Месячная сводка", "Этот год": _yoy_at(mon, m)[0], "Прошлый год": _yoy_at(mon, m)[1],
+             "Сверх прошлого года": p},
             {"Счёт": "Календарный месяц (дни)", "Этот год": tc, "Прошлый год": lc, "Сверх прошлого года": c},
             {"Счёт": "С 16-го по 15-е", "Этот год": ts, "Прошлый год": ls, "Сверх прошлого года": s},
             {"Счёт": "Граница месяца", "Этот год": tc - ts, "Прошлый год": lc - ls,
@@ -266,7 +281,8 @@ def run(connection, months: list[str] | None = None, top: int = 4, amt_min: floa
     if with_days:
         for m in interest:
             tt = time.time()
-            day_frames[m] = {"this": days(connection, m), "last": days(connection, M.shift(m, -12))}
+            day_frames[m] = {"this": days(connection, m, refresh),
+                             "last": days(connection, M.shift(m, -12), refresh)}
             progress(f"Выплаты по дням {M.label(m)} и год назад: {time.time() - tt:.0f} с")
     rep = report(frame, interest, day_frames)
     rep["duration_min"] = (time.time() - t0) / 60.

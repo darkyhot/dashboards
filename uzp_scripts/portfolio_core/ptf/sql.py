@@ -972,9 +972,26 @@ ORDER BY report_dt
 """
 
 # Выплаты по дням у границы месяца: последние дни M−1 и первые дни M (строки зп-видов > 0,
-# без ТИК/ЦИК — их выплаты к выборам дали бы ложный всплеск).
-CALENDAR_DAYS = """
-SELECT p.report_dt AS pay_dt, count(*) AS n_rows
+# без ТИК/ЦИК — их выплаты к выборам дали бы ложный всплеск). Окно месяца M хранится
+# в yva_ptf_calendar_days (дата × число строк) и повторно не читается.
+CREATE_CALENDAR_DAYS = """
+CREATE TABLE IF NOT EXISTS {schema_t}.yva_ptf_calendar_days (
+  report_dt date, pay_dt date, n_rows bigint, def_ver integer, created_at timestamp
+)"""
+
+CALENDAR_DAYS_CACHED = """
+SELECT pay_dt, n_rows FROM {schema_t}.yva_ptf_calendar_days
+WHERE report_dt = CAST(:m AS date) AND def_ver = :def_ver
+"""
+
+CALENDAR_DAYS_DELETE = """
+DELETE FROM {schema_t}.yva_ptf_calendar_days
+WHERE report_dt = CAST(:m AS date) AND def_ver = :def_ver
+"""
+
+CALENDAR_DAYS_INSERT = """
+INSERT INTO {schema_t}.yva_ptf_calendar_days (report_dt, pay_dt, n_rows, def_ver, created_at)
+SELECT CAST(:m AS date), p.report_dt, count(*), :def_ver, CAST(:created_at AS timestamp)
 FROM {schema}.{payroll_d} p
 JOIN {schema}.uzp_dim_enrollment_type d ON d.enrollment_type_id = p.{code_col}
 LEFT JOIN (SELECT inn FROM {schema_t}.yva_tik_cik WHERE is_tik_cik IS TRUE GROUP BY inn) k
@@ -987,3 +1004,81 @@ WHERE p.report_dt >= CAST(:s_from AS date) AND p.report_dt <= CAST(:c_to AS date
   AND """ + RELEV + """
 GROUP BY p.report_dt
 """
+
+
+# --------------------------------------------------------------------------- #
+# Лента шага 2: ряды «срез × месяц» по всей сводке (все организации).
+# Шаг 1 — временная t_lenta: строки сводки свёрнуты до атома × отрасль × холдинг ×
+# класс размера × крупная организация (мелкие сливаются). Шаг 2 — ряды срезов.
+# Холдинг и отрасль — текущий срез ЕПК. Наружу номера организаций и названия холдингов
+# не уходят: код — первые 8 знаков md5 (по нему же SQL проверки находит строку).
+# Пустая мера у активной строки (есть портфель или база) — счётчик nn_*: «неизвестно».
+# --------------------------------------------------------------------------- #
+LENTA_MEAS = ["pf_recip", "pf_fl", "m_base_pf", "m_in_from_outside", "m_in_temp_outside",
+              "m_in_from_other_org", "m_in_from_nonzp", "m_in_from_zp_out",
+              "m_out_left_bank", "m_out_temp_left", "m_out_to_other_org", "m_out_to_nonzp",
+              "m_out_zp_out", "m_lb_seasonal", "m_lb_org_stopped", "m_lb_one_time", "m_lb_unknown",
+              "m_fl_in", "m_fl_out", "ten_lt3", "ten_3_12", "ten_12p",
+              "m_out_ten_lt3", "m_out_ten_3_12", "m_out_ten_12p", "single_pay_recip", "multi_recip"]
+LENTA_SIZE = ("CASE WHEN om.pf_max >= 10000 THEN '1) от 10 тыс.' WHEN om.pf_max >= 1000 THEN '2) 1–10 тыс.' "
+              "WHEN om.pf_max >= 100 THEN '3) 100–1 000' ELSE '4) до 100' END")
+_ACTIVE = "(COALESCE(m.pf_recip, 0) > 0 OR COALESCE(m.m_base_pf, 0) > 0)"
+
+T_LENTA = """
+WITH e AS (
+  SELECT c.inn AS org_id,
+         min(NULLIF(btrim(c.holding_name), ''))  AS hold,
+         min(NULLIF(btrim(c.industry_name), '')) AS ind
+  FROM {schema}.uzp_data_epk_consolidation c
+  WHERE c.inn IS NOT NULL
+  GROUP BY c.inn
+),
+om AS (
+  SELECT org_id, max(pf) AS pf_max
+  FROM (SELECT report_dt, org_id, sum(pf_recip) AS pf
+        FROM {schema_t}.yva_ptf_month_org GROUP BY report_dt, org_id) a
+  GROUP BY org_id
+),
+hs AS (
+  SELECT e.hold
+  FROM e JOIN om ON om.org_id = e.org_id
+  WHERE e.hold IS NOT NULL
+  GROUP BY e.hold
+  HAVING count(*) >= 2 AND sum(om.pf_max) >= :hold_min
+)
+SELECT m.report_dt, COALESCE(m.seg_rep, '(нет)') AS seg_rep, m.sys_tb_id, m.sys_gosb_id,
+       COALESCE(e.ind, '(нет в ЕПК или не указана)')                          AS ind,
+       CASE WHEN hs.hold IS NOT NULL THEN 'Холдинг ' || substr(md5(hs.hold), 1, 8) END AS hold_code,
+       """ + LENTA_SIZE + """                                                 AS size_class,
+       CASE WHEN om.pf_max >= :org_min
+            THEN 'Орг. ' || substr(md5(CAST(m.org_id AS text)), 1, 8) END     AS org_code,
+       """ + ",\n       ".join(f"sum(m.{c}) AS {c}" for c in LENTA_MEAS) + """,
+       """ + ",\n       ".join(f"sum(CASE WHEN m.{c} IS NULL AND {_ACTIVE} THEN 1 ELSE 0 END) AS nn_{c}"
+                                for c in LENTA_MEAS) + """
+FROM {schema_t}.yva_ptf_month_org m
+LEFT JOIN e  ON e.org_id = m.org_id
+LEFT JOIN om ON om.org_id = m.org_id
+LEFT JOIN hs ON hs.hold = e.hold
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+"""
+
+LENTA_SLICES = [("Банк", "CAST('банк' AS text)"),
+                ("Сегмент", "seg_rep"),
+                ("ТБ", "'ТБ ' || CAST(sys_tb_id AS text)"),
+                ("ГОСБ", "'ГОСБ ' || CAST(sys_gosb_id AS text)"),
+                ("Отрасль", "ind"),
+                ("Размер организации", "size_class"),
+                ("Холдинг", "hold_code"),
+                ("Организация", "org_code"),
+                ("Сегмент × ТБ", "seg_rep || ' / ТБ ' || CAST(sys_tb_id AS text)"),
+                ("Сегмент × отрасль", "seg_rep || ' / ' || ind")]
+
+
+def _lenta_part(kind: str, key: str) -> str:
+    cols = ",\n       ".join([f"sum({c}) AS {c}" for c in LENTA_MEAS]
+                             + [f"sum(nn_{c}) AS nn_{c}" for c in LENTA_MEAS])
+    return (f"SELECT CAST('{kind}' AS text) AS slice_type, CAST({key} AS text) AS slice_key, report_dt,\n"
+            f"       {cols}\nFROM t_lenta\nWHERE {key} IS NOT NULL\nGROUP BY 1, 2, 3")
+
+
+LENTA_SERIES = "\nUNION ALL\n".join(_lenta_part(k, v) for k, v in LENTA_SLICES)
