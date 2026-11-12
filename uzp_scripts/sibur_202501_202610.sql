@@ -289,29 +289,28 @@ CROSS JOIN tmp_sibur_epk e
 LEFT JOIN payments p ON p.report_dt = m.report_dt AND p.epk_id = e.epk_id
 ORDER BY e.epk_id, m.report_dt;
 
--- 4. Количество ФЛ по месяцу и ИНН; каждый ФЛ учитывается один раз внутри ИНН.
--- Частота ЗП/аванса: SUM(transaction_qty), коды 1/16, объединяем все ГОСБ.
--- Считаем до отсечки 2500, чтобы не потерять вторую небольшую выплату.
--- Неизвестная частота исключается из счётчиков: NULL -> 1 не доказывает одну выплату.
--- Две выплаты — ровно две транзакции ЗП/аванса от данного ИНН за месяц.
+-- 4. ФЛ из «Учтенные ФЛ» запроса 1 по коду 1 с единственной выплатой ЗП.
+-- База получателей берётся из той же tmp-таблицы, что и в запросе 1.
+-- Частоту проверяем до отсечки по всем ГОСБ данного ИНН:
+-- ровно одна транзакция кода 1, без аванса (код 16).
+-- Вторую выплату менее 2500 не отбрасываем при подсчёте частоты.
+-- Неизвестное количество транзакций исключается из счётчика.
 WITH persons AS (
-    SELECT report_dt, inn, epk_id,
-           sum(n_pay) AS pay_qty,
-           sum(CASE WHEN code = 16 THEN n_pay ELSE 0 END) AS advance_qty,
-           sum(CASE WHEN code = 1 THEN n_pay ELSE 0 END) AS salary_qty
-    FROM tmp_sibur_raw
-    WHERE in_holding AND relev AND amt_pos > 0 AND code IN (1, 16)
-    GROUP BY report_dt, inn, epk_id
-    HAVING sum(n_unknown_qty) = 0
+    SELECT r.report_dt, r.inn, r.epk_id
+    FROM tmp_sibur_person_kind k
+    JOIN tmp_sibur_raw r ON r.report_dt = k.report_dt
+                        AND r.inn = k.inn AND r.epk_id = k.epk_id
+    WHERE k.code = 1 AND k.counted_fl
+      AND r.in_holding AND r.relev AND r.amt_pos > 0 AND r.code IN (1, 16)
+    GROUP BY r.report_dt, r.inn, r.epk_id
+    HAVING sum(r.n_pay) = 1
+       AND sum(CASE WHEN r.code = 1 THEN r.n_pay ELSE 0 END) = 1
+       AND sum(r.n_unknown_qty) = 0
 )
 SELECT
     m.report_dt AS "Дата",
     i.inn AS "ИНН",
-    sum(CASE WHEN p.pay_qty = 1 AND p.advance_qty = 1
-             THEN 1 ELSE 0 END) AS "ФЛ с одной выплатой аванса",
-    sum(CASE WHEN p.pay_qty = 1 AND p.salary_qty = 1
-             THEN 1 ELSE 0 END) AS "ФЛ с одной выплатой ЗП",
-    sum(CASE WHEN p.pay_qty = 2 THEN 1 ELSE 0 END) AS "ФЛ с двумя выплатами"
+    count(p.epk_id) AS "ФЛ с одной выплатой ЗП"
 FROM tmp_sibur_months m
 CROSS JOIN tmp_sibur_inn i
 LEFT JOIN persons p ON p.report_dt = m.report_dt AND p.inn = i.inn
