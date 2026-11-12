@@ -227,6 +227,7 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
     moves_out, moves_in = defaultdict(list), defaultdict(list)   # (mi, e) -> [(o, g)] для k=1
     for b, kk in Q.BASES.items():
         L = lab[b]
+        ev_in, ev_out = defaultdict(list), defaultdict(list)    # (месяц, человек) -> [(o, g)]
         for (mi, e, o, g), st in ST.items():
             trip = (e, o, g)
             if st != "P":
@@ -251,6 +252,7 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
                 if not p_by_pm.get((B, e)):
                     L[(mi, o, g)]["fl_in"] += 1.0 / len(p_by_pm[(mi, e)])
                     L[(mi, o, g)]["in_person_new"] += 1
+                ev_in[(mi, e)].append((o, g))
                 if kk == 1 and x.startswith("in_oth_"):
                     moves_in[(mi, e)].append((o, g))
             # ушёл в m2 (mi — база)
@@ -276,12 +278,22 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
                 if not p_by_pm.get((m2, e)):
                     L[(m2, o, g)]["fl_out"] += 1.0 / len(p_by_pm[(mi, e)])
                     L[(m2, o, g)]["out_person_gone"] += 1
+                ev_out[(m2, e)].append((o, g))
                 L[(m2, o, g)]["out_temp"] += (m2 + 1) in p
                 if x.startswith("lb_") and (m2 + 1) in p:
                     L[(m2, o, g)]["out_temp_left"] += 1
                 L[(m2, o, g)]["out_ten_" + _ten(p, mi)] += 1
                 if kk == 1 and x.startswith("out_oth_"):
                     moves_out[(m2, e)].append((o, g))
+        # Совместительство оставшихся: человек есть в обоих месяцах, число его троек
+        # изменилось — разница делится поровну между его пришедшими (ушедшими) тройками.
+        for ev, col, sign in ((ev_in, "in_conc", 1), (ev_out, "out_conc", -1)):
+            for (m, e), trips in ev.items():
+                kb, kc = len(p_by_pm.get((m - kk, e), ())), len(p_by_pm.get((m, e), ()))
+                d = sign * (kc - kb)
+                if kb and kc and d > 0:
+                    for o, g in trips:
+                        L[(m, o, g)][col] += d / len(trips)
 
     pairs = Counter()
     for (mi, e), outs in moves_out.items():
@@ -314,10 +326,16 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
     for (o, g), s in cur_pair.items():
         cur_org[o] = min(cur_org.get(o, s), s)
 
+    hist_org = {}
+    for (mi, o, g), sg in hist.items():
+        hist_org[(mi, o)] = min(hist_org.get((mi, o), sg), sg)
+
     def seg_of(key):
         mi, o, g = key
         if key in hist:
             return hist[key], "история"
+        if (mi, o) in hist_org:
+            return hist_org[(mi, o)], "история орг."
         if o in org_seg:
             return org_seg[o], "ЕПК"
         return S.NOT_FOUND, "нет"
@@ -361,6 +379,7 @@ def compute(t: dict, report_month: str, n_months: int = 36, amt_min: float = Q.A
                 "fl_in": get("fl_in"), "fl_out": get("fl_out"),
                 "fl_conc": (sv(key, "pf_fl") - sv(bk, "pf_fl")) - get("fl_in") + get("fl_out"),
                 "in_person_new": get("in_person_new"), "out_person_gone": get("out_person_gone"),
+                "in_conc": get("in_conc"), "out_conc": get("out_conc"),
             }
             for x in Q.IN_LABELS + Q.OUT_LABELS:
                 val[x] = get(x)

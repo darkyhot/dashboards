@@ -68,7 +68,7 @@ def base_cols(b: str) -> list[str]:
             "out_left_bank", "out_to_other_org", "out_to_nonzp", "out_zp_out",
             "out_oth_same_org", "out_oth_same_hold", "out_oth_other",
             "lb_seasonal", "lb_org_stopped", "lb_one_time", "lb_unknown",
-            "fl_in", "fl_out", "fl_conc", "in_person_new", "out_person_gone"]
+            "fl_in", "fl_out", "fl_conc", "in_person_new", "out_person_gone", "in_conc", "out_conc"]
     return [c for c in cols if not (b == "y" and c == "lb_seasonal")]
 
 
@@ -318,6 +318,9 @@ SELECT c.mi, c.epk_id, c.org_id, c.gosb_id,
             ELSE 'in_new_bank' END                                         AS lab,
        CASE WHEN pb.k_pf IS NULL THEN CAST(1.0 / pc.k_pf AS float8) ELSE 0 END AS fl,
        CASE WHEN pb.k_pf IS NULL THEN 1 ELSE 0 END                       AS in_new,
+       CASE WHEN pb.k_pf IS NOT NULL AND pc.k_pf > pb.k_pf
+            THEN CAST(pc.k_pf - pb.k_pf AS float8) / count(*) OVER (PARTITION BY c.mi, c.epk_id)
+            ELSE 0 END                                                    AS in_conc,
        CASE WHEN :k = 1 AND """ + bit("th.b_p", "c.mi - 2") + """ = 1
             THEN 1 ELSE 0 END AS in_temp
 FROM t_tr c
@@ -355,6 +358,9 @@ SELECT b.mi + :k AS mi, b.epk_id, b.org_id, b.gosb_id,
             ELSE 'lb_unknown' END                                          AS lab,
        CASE WHEN pc.k_pf IS NULL THEN CAST(1.0 / pb.k_pf AS float8) ELSE 0 END AS fl,
        CASE WHEN pc.k_pf IS NULL THEN 1 ELSE 0 END                       AS out_gone,
+       CASE WHEN pc.k_pf IS NOT NULL AND pb.k_pf > pc.k_pf
+            THEN CAST(pb.k_pf - pc.k_pf AS float8) / count(*) OVER (PARTITION BY b.mi, b.epk_id)
+            ELSE 0 END                                                    AS out_conc,
        """ + bit("th.b_p", "b.mi + :k + 1") + """                          AS out_temp,
        """ + _ten("th.b_p", "b.mi") + """                                   AS ten
 FROM t_tr b
@@ -378,7 +384,7 @@ def _count_cols(col: str, labels: list[str], prefix: str = "") -> str:
 
 def agg_in(part: str) -> str:
     return (f"SELECT mi, org_id, gosb_id,\n       {_count_cols('lab', IN_LABELS)},\n"
-            f"       sum(fl) AS fl_in, sum(in_new) AS in_person_new,\n"
+            f"       sum(fl) AS fl_in, sum(in_new) AS in_person_new, sum(in_conc) AS in_conc,\n"
             f"       sum(CASE WHEN lab IN ('in_new_bank', 'in_returned') THEN in_temp ELSE 0 END) "
             f"AS in_temp_outside\nFROM {part}\nGROUP BY mi, org_id, gosb_id")
 
@@ -386,7 +392,8 @@ def agg_in(part: str) -> str:
 def agg_out(part: str) -> str:
     return (f"SELECT mi, org_id, gosb_id,\n       {_count_cols('lab', OUT_LABELS)},\n"
             f"       {_count_cols('ten', TEN, 'out_ten_')},\n"
-            f"       sum(fl) AS fl_out, sum(out_gone) AS out_person_gone, sum(out_temp) AS out_temp,\n"
+            f"       sum(fl) AS fl_out, sum(out_gone) AS out_person_gone, sum(out_conc) AS out_conc,\n"
+            f"       sum(out_temp) AS out_temp,\n"
             f"       sum(CASE WHEN lab LIKE 'lb_%' THEN out_temp ELSE 0 END) "
             f"AS out_temp_left\nFROM {part}\nGROUP BY mi, org_id, gosb_id")
 
@@ -444,8 +451,8 @@ def regroup(part: str, sums: list[str], extra: str = "") -> str:
     return f"SELECT mi, org_id, gosb_id{extra},\n       {cols}\nFROM {part}\nGROUP BY mi, org_id, gosb_id"
 
 
-IN_SUMS = IN_LABELS + ["fl_in", "in_person_new"]
-OUT_SUMS = OUT_LABELS + [f"out_ten_{t}" for t in TEN] + ["fl_out", "out_person_gone", "out_temp"]
+IN_SUMS = IN_LABELS + ["fl_in", "in_person_new", "in_conc"]
+OUT_SUMS = OUT_LABELS + [f"out_ten_{t}" for t in TEN] + ["fl_out", "out_person_gone", "out_conc", "out_temp"]
 
 # Ключи сводки: пары с тройками в M и пары, у которых был портфель в одной из баз.
 T_KEYS = """
@@ -474,18 +481,23 @@ WHERE mi = :cur_mi
 """
 
 # Два сегмента каждого ключа (одним словарём заказчика):
-#   seg — сегмент отчётного месяца: история за этот месяц, иначе ЕПК;
+#   seg — сегмент отчётного месяца: история пары за этот месяц, иначе история той же
+#         организации в другом ГОСБ (сегмент один на организацию — правило аналитика),
+#         иначе ЕПК;
 #   seg_cur — текущий: история за последний полный месяц по паре, иначе по
 #   организации в тот же месяц, иначе ЕПК.
 T_KSEG = """
 SELECT k.mi, k.org_id, k.gosb_id,
-       COALESCE(h.seg, o.seg, '""" + S.NOT_FOUND + """')           AS seg,
+       COALESCE(h.seg, ho.seg, o.seg, '""" + S.NOT_FOUND + """')   AS seg,
        COALESCE(cp.seg, co.seg, o.seg, '""" + S.NOT_FOUND + """')  AS seg_cur,
        CASE WHEN h.seg IS NOT NULL THEN 'история'
+            WHEN ho.seg IS NOT NULL THEN 'история орг.'
             WHEN o.seg IS NOT NULL THEN 'ЕПК'
             ELSE 'нет' END                     AS seg_src
 FROM t_keys k
 LEFT JOIN t_seg h ON h.mi = k.mi AND h.org_id = k.org_id AND h.gosb_id = k.gosb_id
+LEFT JOIN (SELECT mi, org_id, min(seg) AS seg FROM t_seg GROUP BY mi, org_id) ho
+       ON ho.mi = k.mi AND ho.org_id = k.org_id
 LEFT JOIN t_seg_cur cp ON cp.org_id = k.org_id AND cp.gosb_id = k.gosb_id
 LEFT JOIN (SELECT org_id, min(seg) AS seg FROM t_seg_cur GROUP BY org_id) co ON co.org_id = k.org_id
 LEFT JOIN t_org o ON o.org_id = k.org_id
@@ -532,6 +544,8 @@ def final_select() -> str:
             "fl_conc": f"(COALESCE(s.pf_fl, 0) - COALESCE(s_{b}.pf_fl, 0)) - {fl_in} + {fl_out}",
             "in_person_new": f"COALESCE(i_{b}.in_person_new, 0)",
             "out_person_gone": f"COALESCE(o_{b}.out_person_gone, 0)",
+            "in_conc": f"COALESCE(i_{b}.in_conc, 0)",
+            "out_conc": f"COALESCE(o_{b}.out_conc, 0)",
             **ins, **outs,
         }
         for c in base_cols(b):
@@ -561,7 +575,7 @@ _NOT_COUNT = {"report_dt", "org_id", "sys_gosb_id", "sys_tb_id", "seg_rep", "seg
 
 def _typed(item: str) -> str:
     expr, _, name = item.rpartition(" AS ")
-    if not expr or name in _NOT_COUNT or name.endswith(("_base_seg", "_fl_in", "_fl_out", "_fl_conc")):
+    if not expr or name in _NOT_COUNT or name.endswith(("_base_seg", "_fl_in", "_fl_out", "_fl_conc", "_in_conc", "_out_conc")):
         return item
     return f"CAST({expr} AS bigint) AS {name}"
 
@@ -1022,13 +1036,17 @@ LENTA_MEAS = ["pf_recip", "pf_fl", "m_base_pf", "m_in_from_outside", "m_in_temp_
               "m_in_from_other_org", "m_in_from_nonzp", "m_in_from_zp_out",
               "m_out_left_bank", "m_out_temp_left", "m_out_to_other_org", "m_out_to_nonzp",
               "m_out_zp_out", "m_lb_seasonal", "m_lb_org_stopped", "m_lb_one_time", "m_lb_unknown",
-              "m_fl_in", "m_fl_out", "m_in_person_new", "m_out_person_gone",
+              "m_fl_in", "m_fl_out", "m_in_person_new", "m_out_person_gone", "m_in_conc", "m_out_conc",
               "ten_lt3", "ten_3_12", "ten_12p",
               "m_out_ten_lt3", "m_out_ten_3_12", "m_out_ten_12p", "single_pay_recip", "multi_recip",
-              "y_base_pf", "y_fl_in", "y_fl_out", "y_in_person_new", "y_out_person_gone"]
+              "y_base_pf", "y_fl_in", "y_fl_out", "y_in_person_new", "y_out_person_gone",
+              "y_in_conc", "y_out_conc"]
 LENTA_SIZE = ("CASE WHEN om.pf_max >= 10000 THEN '1) от 10 тыс.' WHEN om.pf_max >= 1000 THEN '2) 1–10 тыс.' "
               "WHEN om.pf_max >= 100 THEN '3) 100–1 000' ELSE '4) до 100' END")
 _ACTIVE = "(COALESCE(m.pf_recip, 0) > 0 OR COALESCE(m.m_base_pf, 0) > 0)"
+
+# Источник сегмента строки: история пары или организации — раньше ЕПК.
+_SRC_RANK = "CASE WHEN seg_src LIKE 'история%' THEN 0 ELSE 1 END"
 
 MONTH_ORG_COLS = """
 SELECT column_name FROM information_schema.columns
@@ -1077,7 +1095,7 @@ os AS (
   SELECT report_dt, org_id, seg_rep
   FROM (SELECT report_dt, org_id, seg_rep,
                row_number() OVER (PARTITION BY report_dt, org_id
-                                  ORDER BY sum(pf_recip) DESC, seg_rep) AS rn
+                                  ORDER BY min(""" + _SRC_RANK + """), sum(pf_recip) DESC, seg_rep) AS rn
         FROM {schema_t}.yva_ptf_month_org
         GROUP BY report_dt, org_id, seg_rep) a
   WHERE rn = 1
@@ -1122,12 +1140,20 @@ SEGMENT_VIEWS = ["Сегмент", "Сегмент на дату выплаты"
 
 # Организации, у которых в одном месяце разные ГОСБ имеют разный сегмент на дату выплаты
 # (по правилу сегмент один на организацию — это ошибка данных истории сегментов).
+# Сегмент организации по ГОСБ: n_org/pf — история разных ГОСБ расходится (ошибка данных);
+# n_mix/pf_mix — у части ГОСБ истории нет, сегмент взят из ЕПК и отличается от истории.
 LENTA_SEG_CONFLICTS = """
-SELECT a.report_dt, count(*) AS n_org, sum(a.pf) AS pf
-FROM (SELECT report_dt, org_id, sum(pf_recip) AS pf
+SELECT a.report_dt,
+       sum(CASE WHEN a.h_min <> a.h_max THEN 1 ELSE 0 END)   AS n_org,
+       sum(CASE WHEN a.h_min <> a.h_max THEN a.pf ELSE 0 END) AS pf,
+       sum(CASE WHEN a.h_min = a.h_max AND a.e_dif = 1 THEN 1 ELSE 0 END)   AS n_mix,
+       sum(CASE WHEN a.h_min = a.h_max AND a.e_dif = 1 THEN a.pf ELSE 0 END) AS pf_mix
+FROM (SELECT report_dt, org_id, sum(pf_recip) AS pf,
+             min(CASE WHEN seg_src LIKE 'история%' THEN seg_rep END) AS h_min,
+             max(CASE WHEN seg_src LIKE 'история%' THEN seg_rep END) AS h_max,
+             CASE WHEN min(seg_rep) <> max(seg_rep) THEN 1 ELSE 0 END AS e_dif
       FROM {schema_t}.yva_ptf_month_org
-      GROUP BY report_dt, org_id
-      HAVING min(seg_rep) <> max(seg_rep)) a
+      GROUP BY report_dt, org_id) a
 GROUP BY a.report_dt
 """
 

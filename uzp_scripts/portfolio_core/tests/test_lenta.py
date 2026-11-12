@@ -246,7 +246,9 @@ class Rules(unittest.TestCase):
         meas = {**meas, "y_fl_in": np.full(n, 3000.), "y_fl_out": np.full(n, 2500.),
                 "y_in_person_new": np.full(n, 3100.), "y_out_person_gone": np.full(n, 2900.),
                 "m_fl_in": meas["m_in_from_outside"], "m_in_person_new": meas["m_in_from_outside"],
-                "m_fl_out": meas["m_out_left_bank"] - 2., "m_out_person_gone": meas["m_out_left_bank"]}
+                "m_fl_out": meas["m_out_left_bank"] - 2., "m_out_person_gone": meas["m_out_left_bank"],
+                "y_in_conc": np.full(n, 50.), "y_out_conc": np.full(n, 120.),
+                "m_in_conc": np.full(n, 3.), "m_out_conc": np.full(n, 5.)}
         rep = lenta.report(frame_of({("Банк", "банк"): meas}, months), months_back=12,
                            checks=[("Банк", "банк", "2026-08", 12, "none"), ("Банк", "банк", "2026-05", 1, "y1")])
         y = rep["checks"][0]["year"].set_index("Составляющая")["К году назад"]
@@ -257,7 +259,10 @@ class Rules(unittest.TestCase):
         p = rep["checks"][1]["people"].set_index("Составляющая")
         self.assertAlmostEqual(p.drop("Итого отчётное")["Окно"].sum(), p.loc["Итого отчётное", "Окно"])
         self.assertEqual(p.loc[lenta.PERSON["p_out_extra"], "Окно"], -2.)
+        self.assertEqual(p.loc[lenta.PERSON["p_conc"], "Окно"], -2.)
+        self.assertEqual(y[lenta.PERSON["p_conc"]], -70.)
         self.assertIn("Люди: ушли целиком", rep["checks"][1]["text"])
+        self.assertIn("у оставшихся +0: совместительство +0, переходы +0", rep["checks"][1]["text"])
         view = presentation.photo_page({"lenta": rep}, "лента", 2 + len(rep["pages"]) + len(rep["cards"]) + 1)
         self.assertEqual(len(view["blocks"]), 3)
 
@@ -311,7 +316,7 @@ class Resegmentation(unittest.TestCase):
                   ("Сегмент на дату выплаты", "КСБ"): part(1000, 500),
                   ("Сегмент на дату выплаты", "ММБ"): part(1500, -500)}
         frame = frame_of(series, months)
-        frame.attrs["seg_conflicts"] = {"2026-08-31": (3, 120.)}
+        frame.attrs["seg_conflicts"] = {"2026-08-31": {"n_org": 3, "pf": 120., "n_mix": 7, "pf_mix": 900.}}
         rep = lenta.report(frame, months_back=12, month="2026-08")
         rep["seg_conflicts"] = frame.attrs["seg_conflicts"]
         name, table, n_rows = rep["pages"][-1]
@@ -322,5 +327,44 @@ class Resegmentation(unittest.TestCase):
         self.assertEqual(r.loc["КСБ", "Переводы за 12 мес."], 500)
         self.assertEqual(r.loc["ММБ", "Переводы за 12 мес."], -500)
         view = presentation.photo_page({"lenta": rep}, "лента", 2 + len(rep["pages"]))
-        self.assertTrue(any("Ошибка данных: организаций с разным сегментом по ГОСБ" in x and "3" in x
+        self.assertTrue(any("Ошибка данных: история сегментов разных ГОСБ" in x and "организаций 3" in x
                             for x in view["notes"]))
+        self.assertTrue(any("организаций 7" in x and "получателей 900" in x for x in view["notes"]))
+
+    def test_same_story_in_two_segment_views_shown_once(self):
+        """РГС одинаково просел в обоих видах — один сюжет (текущий); КСБ на дату выплаты
+        расходится с текущим — остаётся с пометкой «на дату выпл.»."""
+        months, meas = seasonal()
+        n = len(months)
+        t = months.index("2026-05-31")
+
+        def part(level, drop):
+            pf = np.full(n, float(level))
+            pf[t:] -= drop
+            base = np.r_[np.nan, pf[:-1]]
+            out = np.zeros(n)
+            out[t] = drop
+            return {"pf_recip": pf, "pf_fl": pf, "m_base_pf": base,
+                    "m_in_from_outside": np.zeros(n), "m_out_left_bank": out,
+                    "m_in_temp_outside": np.zeros(n), "m_out_temp_left": np.zeros(n)}
+        series = {("Банк", "банк"): meas,
+                  ("Сегмент", "РГС"): part(100_000, 20_000),
+                  ("Сегмент на дату выплаты", "РГС"): part(100_500, 19_800),
+                  ("Сегмент", "КСБ"): part(80_000, 10_000),
+                  ("Сегмент на дату выплаты", "КСБ"): part(80_000, 30_000)}
+        rep = lenta.report(frame_of(series, months), months_back=12)
+        st = rep["stories"]
+        self.assertEqual(set(st.loc[st["slice_key"] == "РГС", "slice_type"]), {"Сегмент"})
+        self.assertEqual(set(st.loc[st["slice_key"] == "КСБ", "slice_type"]),
+                         {"Сегмент", "Сегмент на дату выплаты"})
+        table = rep["pages"][1][1]
+        self.assertIn("КСБ (на дату выпл.)", set(table["Срез"]))
+
+
+class SegmentDictionaries(unittest.TestCase):
+    def test_largest_is_kfi_in_both_dictionaries(self):
+        """Решение аналитика 11.11.2026: крупнейшие — КФИ и по ЕПК, и по ведомостям."""
+        from ptf import segments as S
+        self.assertEqual(S.epk_to_short("Крупнейшие"), "КФИ")
+        self.assertEqual(S.pay_to_short("Крупнейший бизнес"), "КФИ")
+        self.assertEqual(S.pay_to_short("CIB"), "КФИ")

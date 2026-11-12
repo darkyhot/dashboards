@@ -67,6 +67,11 @@ MIN_HISTORY = 6         # точек истории сравнения для о
 MAT_ABS = 500           # существенность: не меньше стольких троек
 MAT_REL = 0.002         # и не меньше такой доли уровня среза
 TOP = 10                # сюжетов на странице
+# Срез «на дату выплаты» → тот же срез по текущему сегменту (основные цифры).
+PAY_VIEW = {"Сегмент на дату выплаты": "Сегмент",
+            "Сегмент на дату выплаты × ТБ": "Сегмент × ТБ",
+            "Сегмент на дату выплаты × отрасль": "Сегмент × отрасль"}
+SAME_STORY = 0.10       # сюжеты двух видов сегмента совпадают, если отклонения ближе 10%
 PAGE_GROUPS = [("Банк, сегменты, размер организаций", ["Банк", *Q.SEGMENT_VIEWS, "Размер организации"]),
                ("Территории", ["ТБ", "ГОСБ", "Сегмент × ТБ", "Сегмент на дату выплаты × ТБ"]),
                ("Отрасли", ["Отрасль", "Сегмент × отрасль", "Сегмент на дату выплаты × отрасль"]),
@@ -109,8 +114,10 @@ def load(connection, hold_min: int = 1000, org_min: int = 1000, progress=print) 
     frame.attrs["failed"] = failed
     try:
         conf = db.read_sql(connection, Q.LENTA_SEG_CONFLICTS)
-        frame.attrs["seg_conflicts"] = {M.iso(d): (int(n), float(p))
-                                        for d, n, p in zip(conf["report_dt"], conf["n_org"], conf["pf"])}
+        frame.attrs["seg_conflicts"] = {
+            M.iso(r.report_dt): {"n_org": int(r.n_org), "pf": float(r.pf),
+                                 "n_mix": int(r.n_mix), "pf_mix": float(r.pf_mix)}
+            for r in conf.itertuples()}
     except Exception as ex:                                         # noqa: BLE001
         db.rollback(connection)
         progress(f"Лента: проверка сегмента по ГОСБ не выполнена — {_db_reason(ex)}")
@@ -197,24 +204,32 @@ def components(s: Series) -> dict[str, np.ndarray]:
     # Люди и совместительство (по присутствию в портфеле банка): человек ушёл целиком —
     # у него не осталось ни одной тройки; «другие работы» — его тройки сверх одного человека.
     for k, v in person_parts(x["m_fl_in"], x["m_fl_out"], x["m_in_person_new"],
-                             x["m_out_person_gone"], c["reported"]).items():
+                             x["m_out_person_gone"], c["reported"],
+                             x["m_in_conc"], x["m_out_conc"]).items():
         c[k] = np.where(unknown, np.nan, v)
     return c
 
 
-PERSON = {"p_out": "Люди ушли из портфеля банка целиком (ФЛ)",
-          "p_out_extra": "  их другие работы (совместители ушли целиком)",
-          "p_in": "Люди пришли в портфель банка (ФЛ)",
+PERSON = {"p_out": "Люди ушли из портфеля банка целиком (ФЛ; вкл. временный отток)",
+          "p_out_extra": "  их другие работы (совместители ушли целиком: было 3 — стало 0)",
+          "p_in": "Люди пришли в портфель банка (ФЛ; вкл. возврат)",
           "p_in_extra": "  их другие работы (совместители пришли)",
-          "p_stay": "Оставшиеся: больше/меньше работ, переходы, сегмент"}
+          "p_conc": "Остались в банке: стало больше/меньше работ (было 2 — стало 1)",
+          "p_move": "Остались в банке: перешли между организациями / срезами"}
+# Строки таблицы «Люди»; p_stay = p_conc + p_move — итог оставшихся (в тексте).
+PERSON_ROWS = ["p_out", "p_out_extra", "p_in", "p_in_extra", "p_conc", "p_move"]
 
 
-def person_parts(fl_in, fl_out, in_new, out_gone, reported) -> dict:
+def person_parts(fl_in, fl_out, in_new, out_gone, reported, in_conc=None, out_conc=None) -> dict:
     """Изменение троек = люди ушли/пришли целиком + их другие работы + оставшиеся.
-    Сумма частей = изменению; нет счётчика троек людей (старая сводка) — неизвестно."""
+    Оставшиеся (человек в портфеле банка в обоих месяцах) = совместительство (у него
+    стало больше/меньше троек) + переходы (то же число троек, другая организация/срез).
+    Сумма частей = изменению; нет счётчика (старая сводка) — неизвестно, не 0."""
+    stay = reported - (in_new - out_gone)
+    conc = np.nan * stay if in_conc is None else in_conc - out_conc
     return {"p_out": -fl_out, "p_out_extra": -(out_gone - fl_out),
             "p_in": fl_in, "p_in_extra": in_new - fl_in,
-            "p_stay": reported - (in_new - out_gone)}
+            "p_conc": conc, "p_move": stay - conc, "p_stay": stay}
 
 
 def window(a: np.ndarray, L: int) -> np.ndarray:
@@ -343,7 +358,22 @@ def stories(s: Series, found: pd.DataFrame) -> pd.DataFrame:
     best["slice_type"] = s.meta["slice_type"].to_numpy()[best["row"]]
     best["slice_key"] = s.meta["slice_key"].to_numpy()[best["row"]]
     best["month"] = [s.months[t] for t in best["t"]]
+    best = _drop_same_segment_story(best, found, s)
     return best.sort_values("excess", key=np.abs, ascending=False).reset_index(drop=True)
+
+
+def _drop_same_segment_story(best: pd.DataFrame, found: pd.DataFrame, s: Series) -> pd.DataFrame:
+    """Сюжет «на дату выплаты», который повторяет текущий сегмент (то же сравнение того же
+    ключа там тоже значимо, отклонения ближе SAME_STORY), — тот же сюжет: остаётся текущий.
+    Расходящиеся остаются: их разница и есть пересегментация."""
+    types, keys = s.meta["slice_type"].to_numpy(), s.meta["slice_key"].to_numpy()
+    cur = {(types[r.row], keys[r.row], r.t, r.L, r.base): r.excess
+           for r in found.itertuples() if types[r.row] in PAY_VIEW.values()}
+    keep = []
+    for r in best.itertuples():
+        twin = cur.get((PAY_VIEW.get(r.slice_type), r.slice_key, r.t, r.L, r.base))
+        keep.append(twin is None or abs(r.excess - twin) > max(MAT_ABS, SAME_STORY * abs(twin)))
+    return best[np.array(keep, dtype=bool)]
 
 
 def _duplicate_rows(s: Series) -> set[int]:
@@ -368,7 +398,9 @@ def _table(st: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame({"Сообщение": ["Значимых отклонений нет"]})
     st = st.copy()
     return _unknown(pd.DataFrame({
-        "Срез": st["slice_key"], "Месяц": [m[:7] for m in st["month"]],
+        "Срез": [f"{k} (на дату выпл.)" if t in PAY_VIEW else k
+                 for t, k in zip(st["slice_type"], st["slice_key"])],
+        "Месяц": [m[:7] for m in st["month"]],
         "Сравнение": [f"{WIN_LABEL[a]} {_short(b)}" for a, b in zip(st["L"], st["base"])],
         "Отклонение": st["excess"].round(), "Реальное": st["g_real"].round(),
         "Внутри банка": st["g_inside"].round(), "Учёт и календарь": st["g_account"].round(),
@@ -398,14 +430,14 @@ def card(s: Series, comp: dict, slice_type: str, key: str, month: str, L: int, b
 
     table = pd.DataFrame([row(k, label, GROUPS[grp].split(":")[0]) for k, (label, grp) in COMPONENTS.items()]
                          + [row("reported", "Итого отчётное")])
-    people = pd.DataFrame([row(k, label) for k, label in PERSON.items()] + [row("reported", "Итого отчётное")])
+    people = pd.DataFrame([row(k, PERSON[k]) for k in PERSON_ROWS] + [row("reported", "Итого отчётное")])
     year = None
     if L == 12 and base == "none":
         x = s.x
         rep12 = window(comp["reported"], 12)[i, t]
         parts = person_parts(x["y_fl_in"][i, t], x["y_fl_out"][i, t], x["y_in_person_new"][i, t],
-                             x["y_out_person_gone"][i, t], rep12)
-        year = pd.DataFrame([{"Составляющая": PERSON[k], "К году назад": v} for k, v in parts.items()]
+                             x["y_out_person_gone"][i, t], rep12, x["y_in_conc"][i, t], x["y_out_conc"][i, t])
+        year = pd.DataFrame([{"Составляющая": PERSON[k], "К году назад": parts[k]} for k in PERSON_ROWS]
                             + [{"Составляющая": "Итого отчётное", "К году назад": rep12}])
     g = {k: float(v[i, t]) for k, v in _group_sums(d).items()}
     rep = float(d["reported"][i, t])
@@ -417,10 +449,12 @@ def card(s: Series, comp: dict, slice_type: str, key: str, month: str, L: int, b
             f"+ неизвестно {_fmt(g['unknown'])}.")
     if np.isfinite(rep) and np.isfinite(g["real"]) and rep:
         text += f" Реальное изменение — {abs(g['real']) / abs(rep) * 100:.0f}% отчётного."
-    pe = {k: float(d[k][i, t]) for k in PERSON}
-    if all(np.isfinite(v) for v in pe.values()):
+    pe = {k: float(d[k][i, t]) for k in [*PERSON_ROWS, "p_stay"]}
+    if all(np.isfinite(pe[k]) for k in ("p_out", "p_out_extra", "p_in", "p_in_extra", "p_stay")):
         text += (f" Люди: ушли целиком {_fmt(pe['p_out'])} (и их другие работы {_fmt(pe['p_out_extra'])}), "
-                 f"пришли {_fmt(pe['p_in'])} ({_fmt(pe['p_in_extra'])}); у оставшихся {_fmt(pe['p_stay'])}.")
+                 f"пришли {_fmt(pe['p_in'])} ({_fmt(pe['p_in_extra'])}); у оставшихся {_fmt(pe['p_stay'])}")
+        text += (f": совместительство {_fmt(pe['p_conc'])}, переходы {_fmt(pe['p_move'])}."
+                 if np.isfinite(pe["p_conc"]) else ".")
     return {"title": title, "text": text, "table": table, "people": people, "year": year,
             "groups": g, "reported": rep, "sql": check_sql(slice_type, key, start, month)}
 
@@ -475,7 +509,8 @@ def resegmentation(s: Series, comp: dict, month: str) -> pd.DataFrame:
                      "Текущий − на дату выплаты": cur - rep,
                      "Переводы за 12 мес.": get("Сегмент на дату выплаты", moved)})
     out = pd.DataFrame(rows)
-    if not out.empty:
+    if not out.empty:                      # строки без получателей в обоих видах — не показывать
+        out = out[out[["Текущий (ЕПК)", "На дату выплаты"]].fillna(0).abs().sum(axis=1) > 0]
         out = out.reindex(out["Текущий (ЕПК)"].fillna(0).abs().sort_values(ascending=False).index)
     return out.reset_index(drop=True)
 
