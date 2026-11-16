@@ -1,6 +1,6 @@
 -- Шаблон DDL целевой витрины УЗП.
--- Структура повторяет блок storage паспорта витрины: marts/<домен>/<витрина>/contract.yaml.
--- Имя объекта и полей — etl/naming.md, требования к целевым таблицам — etl/target-tables.md.
+-- Структура повторяет спеку витрины: marts/<витрина>/openspec/specs/.
+-- Имя объекта и полей — knowledge/codestyle/naming.md, требования к целевым таблицам — knowledge/codestyle/target-tables.md.
 
 create table s_grnplm_ld_salesntwrk_pcap_sn_uzp.<витрина> (
 	report_dt date not null,

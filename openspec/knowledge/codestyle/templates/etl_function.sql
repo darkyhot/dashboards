@@ -1,8 +1,8 @@
 -- Шаблон управляющей ETL-функции расчётной витрины УЗП.
 -- Скопируй, подставь имя витрины и шаги расчёта.
--- Имена объектов и полей — etl/naming.md, оформление SQL — etl/sql-style.md,
--- требования к целевой и временным таблицам — etl/target-tables.md.
--- Формулы метрик бери из processes/<процесс>/SKILL.md, не переписывай их здесь.
+-- Имена объектов и полей — knowledge/codestyle/naming.md, оформление SQL — knowledge/codestyle/sql-style.md,
+-- требования к целевой и временным таблицам — knowledge/codestyle/target-tables.md.
+-- Формулы метрик бери из спеки витрины marts/<витрина>/openspec/specs/, не придумывай их здесь.
 
 create or replace function s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.<витрина>_<глагол>(
         p_etl_load_id int8,
