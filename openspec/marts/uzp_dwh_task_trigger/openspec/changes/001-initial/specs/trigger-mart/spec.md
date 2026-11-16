@@ -25,6 +25,18 @@
 - **WHEN** витрина создана
 - **THEN** поля, типы и not null — как в таблице, у полей есть описание
 
+### Requirement: Объекты и функции расчёта
+Витрина SHALL называться `uzp_dwh_task_trigger`. Расчёт SHALL выполнять 2 функции с параметрами `p_etl_load_id int8, p_start_dttm timestamp, p_end_dttm timestamp`:
+
+| Функция | Период | Поток информатики |
+| --- | --- | --- |
+| `uzp_dwh_task_trigger_month_calc` | месяц | ежемесячный |
+| `uzp_dwh_task_trigger_week_calc` | неделя | еженедельный |
+
+#### Scenario: Вызов функции
+- **WHEN** поток вызывает `uzp_dwh_task_trigger_month_calc(p_etl_load_id, p_start_dttm, p_end_dttm)`
+- **THEN** функция считает ежемесячные триггеры за месяц `p_end_dttm`
+
 ### Requirement: Зерно и ключ
 Строка SHALL означать один сработавший триггер по паре за период. Ключ — `inn`, `gosb_id`, `trigger_name`, `start_dt`, `end_dt`.
 
