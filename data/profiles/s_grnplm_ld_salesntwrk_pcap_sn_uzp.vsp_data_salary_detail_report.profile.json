@@ -1518,7 +1518,7 @@
       ]
     },
     {
-      "name": "gu_abc",
+      "name": "gu_inn",
       "dtype": "bigint",
       "is_nullable": true,
       "description": "Код организации, которая найдена на ГосУлугах",
@@ -1674,7 +1674,7 @@
       ]
     },
     {
-      "name": "search_abc_flag",
+      "name": "search_inn_flag",
       "dtype": "smallint",
       "is_nullable": true,
       "description": "Флаг поиска по коду организации",
@@ -1906,7 +1906,7 @@
       ]
     },
     {
-      "name": "search_abc",
+      "name": "search_inn",
       "dtype": "character varying",
       "is_nullable": true,
       "description": "Ввод кода организации при поиске",
@@ -1926,7 +1926,7 @@
       "sample_values": []
     },
     {
-      "name": "incorrect_abc_flag",
+      "name": "incorrect_inn_flag",
       "dtype": "smallint",
       "is_nullable": true,
       "description": "Флаг некорректного ввода кода организации при поиске",
@@ -1946,7 +1946,7 @@
       "sample_values": []
     },
     {
-      "name": "fact_abc",
+      "name": "fact_inn",
       "dtype": "bigint",
       "is_nullable": true,
       "description": "Код выбранной организации из списка",
@@ -3319,7 +3319,7 @@
       "sample_values": []
     },
     {
-      "name": "pay_abc",
+      "name": "pay_inn",
       "dtype": "bigint",
       "is_nullable": true,
       "description": "Код организации зачисления",

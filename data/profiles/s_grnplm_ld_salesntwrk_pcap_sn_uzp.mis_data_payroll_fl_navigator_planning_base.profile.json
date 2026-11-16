@@ -7,7 +7,7 @@
   "sample_rows": 100000,
   "sample_fraction": 1.0,
   "pk": [
-    "abc",
+    "inn",
     "gosb_id",
     "sales_flag"
   ],
@@ -717,7 +717,7 @@
       ]
     },
     {
-      "name": "abc",
+      "name": "inn",
       "dtype": "character varying",
       "is_nullable": true,
       "description": "abc",
