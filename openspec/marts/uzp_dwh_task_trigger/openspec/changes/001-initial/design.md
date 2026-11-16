@@ -14,7 +14,7 @@ Greenplum (ядро 9.4), plpgsql-функции, запуск — потоки 
 | `vsp_data_salary_detail_report` | `fact_inn`, `gu_inn` — bigint; `urf_code` = '<ТБ>_<ГОСБ>_<ВСП>' |
 | `uzp_dim_gosb` | `tb_id` + `old_gosb_id` → один `new_gosb_id` |
 | `uzp_data_epk_consolidation` | несколько ЕПК на ИНН; `status_name`, `is_parent` бывают null |
-| `mis_data_payroll_d` | схема `s_grnplm_as_salesntwrk_pcap_sn_data`, партиции по `report_dt` помесячно |
+| `mis_data_payroll_d` | партиции по `report_dt` помесячно |
 | `jupiter_data_agrmnt_num` | `inn`, `start_dt`, `end_dt` |
 
 ## Goals / Non-Goals
@@ -34,7 +34,8 @@ Greenplum (ядро 9.4), plpgsql-функции, запуск — потоки 
 есть в `modified_dttm`. Хранение:
 - `appendonly=true, compresstype=zstd, compresslevel=1`;
 - `partition by range(start_dt)` помесячно, 2026-01-01…2031-01-01, без default;
-- `distributed by (inn)`: по ИНН идут соединения, строк меньше 10 млн.
+- `distributed by (inn)`: по ИНН идут соединения, строк меньше 10 млн;
+- `distributed by` стоит перед `partition by` — так требует Greenplum.
 
 Партиция по `start_dt`: неделя целиком попадает в партицию понедельника.
 
@@ -45,14 +46,18 @@ Greenplum (ядро 9.4), plpgsql-функции, запуск — потоки 
 
 Дата не в конце месяца или не в воскресенье не даёт ошибку: период строится сам.
 
+**Даты месяца.** Помощники `last_day`, `trunc` (`sql-style.md`) и `interval`. Переменные —
+только для фильтров по источникам: T, 1-е число T, T-2, T-23. В `tmp_hm` и `tmp_app` колонка
+`month_ago` — месяцев от T (0 — месяц T); триггеры сравнивают с ней.
+
 **Шаги функции:**
 
 | Шаг | Действие |
 | --- | --- |
 | `01` | старт, статус 1 |
 | `02` | наличие данных источников за период; нет — `98`, статус 98, `return` |
-| `10.NN` | `tmp_hm`, `tmp_industry`, `tmp_agrmnt`, `tmp_app`, `tmp_enrl`, `tmp_trg_<триггер>` |
-| `20` | `tmp_stg_uzp_dwh_task_trigger` = объединение `tmp_trg_*` |
+| `10.NN` | `tmp_hm`, `tmp_industry`, `tmp_agrmnt`, `tmp_app`, `tmp_enrl`, `tmp_app_pair` |
+| `20.NN` | вставка каждого триггера в `tmp_stg_uzp_dwh_task_trigger` |
 | `21` | уникальность ключа стейджинга; дубль — `97`, статус 97, `return` |
 | `30` | `delete` за период по `trigger_name` своей функции, `insert` из стейджинга |
 | `40` | `sys_table_analyze` |
@@ -60,7 +65,7 @@ Greenplum (ядро 9.4), plpgsql-функции, запуск — потоки 
 
 Проверка шага `02`:
 - месяц: hm за T; навигатор за `report_dt` = T и `version_plan_dt` = T; заявления за
-  `report_m_dt` = T; `fact_outflow` за T; `payroll_d` с начала месяца T-2; остальные
+  `report_m_dt` = T; `fact_outflow` за T; `payroll_d` за месяц T; остальные
   источники не пусты;
 - неделя: заявления за неделю; `payroll_d` с `start_dt`; справочники и договоры не пусты.
 

@@ -41,15 +41,14 @@
 | `jupiter_data_agrmnt_num` | действующий договор |
 | `uzp_dwh_sale_funnel_task` | закрытые задачи МЗП |
 | `vsp_data_salary_detail_report` | заявления ВСП / МП СБОЛ |
-| `s_grnplm_as_salesntwrk_pcap_sn_data.mis_data_payroll_d` | зачисления по человеку |
+| `mis_data_payroll_d` | зачисления по человеку |
 | `uzp_dim_enrollment_type` | ЗП-коды |
 | `uzp_dim_gosb` | ГОСБ заявления |
 | `uzp_dwh_fact_outflow` | отток |
 
 ## Открытые вопросы
 
-1. «Есть договор нет зачисления»: что передавать в `portf_cur_6m`?
-2. «Доля по клиенту больше 90%»: что передавать в `fl_cnt` и `fl_dolay`?
+1. «Доля по клиенту больше 90%»: что передавать в `fl_cnt` и `fl_dolay`?
 
 ## Impact
 

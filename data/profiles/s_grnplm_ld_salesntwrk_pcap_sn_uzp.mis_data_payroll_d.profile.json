@@ -1,9 +1,9 @@
 {
-  "schema": "s_grnplm_as_salesntwrk_pcap_sn_data",
+  "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
   "table": "mis_data_payroll_d",
-  "fqn": "s_grnplm_as_salesntwrk_pcap_sn_data.mis_data_payroll_d",
+  "fqn": "s_grnplm_ld_salesntwrk_pcap_sn_uzp.mis_data_payroll_d",
   "description": "ЗП ведомости (день)",
-  "profile_source": "Только DDL (фото 16.11.2026), статистики нет. Структура и смысл полей как у uzp_data_payroll_m; report_dt — дата выплаты. Партиции по report_dt помесячно (2017-04-01…2030-12-31), DISTRIBUTED RANDOMLY, appendonly column zstd 3.",
+  "profile_source": "Только DDL (фото 16.11.2026; схема на фото указана неверно, верная — s_grnplm_ld_salesntwrk_pcap_sn_uzp), статистики нет. Структура и смысл полей как у uzp_data_payroll_m; report_dt — дата выплаты. Партиции по report_dt помесячно (2017-04-01…2030-12-31), DISTRIBUTED RANDOMLY, appendonly column zstd 3.",
   "est_rows": null,
   "sample_rows": 0,
   "sample_fraction": null,

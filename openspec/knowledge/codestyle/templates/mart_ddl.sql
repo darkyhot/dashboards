@@ -16,17 +16,18 @@ with (
 	compresstype=zstd,
 	compresslevel=1
 )
+-- Ключ дистрибуции не может быть типа date или timestamp.
+-- distributed randomly допустим только при объёме от 10 млн строк.
+distributed by (<ключ распределения>)
+-- Greenplum требует distributed by до partition by.
 -- Месячные витрины партиционят по отчётной дате. Небольшой справочник можно оставить
--- без партиционирования, тогда секцию partition by не пишут. Default-партиции избегают:
--- границы партиций задают явно с запасом вперёд.
+-- без партиционирования, тогда секцию partition by не пишут, а «;» ставят после distributed by.
+-- Default-партиции избегают: границы партиций задают явно с запасом вперёд.
 partition by range(report_dt) (
 	start (date '<первая отчётная дата>')
 	end (date '<последняя отчётная дата>')
 	every (interval '1 month')
-)
--- Ключ дистрибуции не может быть типа date или timestamp.
--- distributed randomly допустим только при объёме от 10 млн строк.
-distributed by (<ключ распределения>);
+);
 
 comment on table s_grnplm_ld_salesntwrk_pcap_sn_uzp.<витрина>
 	is 'Расчетные данные <содержание витрины> — <бизнес-процесс>';

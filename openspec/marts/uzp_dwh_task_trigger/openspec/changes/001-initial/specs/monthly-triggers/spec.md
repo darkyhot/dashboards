@@ -4,7 +4,7 @@
 
 Правила и JSON ежемесячных триггеров витрины `uzp_dwh_task_trigger`. T — конец месяца `end_dt`,
 T-k — конец месяца на k раньше. hm — `uzp_dwh_company_holding_metric` (пара — `org_id` + `level_id`).
-В JSON всегда есть `month` = T, ниже — остальные ключи.
+Ключ JSON `month` = T, если он есть в интенте.
 
 ## ADDED Requirements
 
@@ -93,7 +93,7 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** действующего договора нет
 
 ### Requirement: Есть договор нет зачисления
-'есть договор нет зачисления' SHALL срабатывать по паре hm за T, если у ИНН действующий договор с `start_dt <= current_date - 6 мес` и `current_fot_amt = 0` за каждый месяц T-5…T. JSON: `portf_cur_6m` (открытый вопрос 1).
+'есть договор нет зачисления' SHALL срабатывать по паре hm за T, если у ИНН действующий договор с `start_dt <= current_date - 6 мес` и `current_fot_amt = 0` за каждый месяц T-5…T. JSON: только `month`.
 
 #### Scenario: Полгода без зачислений
 - **WHEN** договор с `start_dt` год назад, ФОТ = 0 за T-5…T
@@ -184,14 +184,14 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 
 #### Scenario: Три месяца подряд
 - **WHEN** условие выполнено за T-2…T, 430 → 388
-- **THEN** `churn_pct_3m` ≈ 0.098
+- **THEN** `churn_pct_3m` = 0.1 (42 / 430, округлено до 2 знаков)
 
 #### Scenario: Перерыв
 - **WHEN** условие не выполнено за T-1
 - **THEN** строки нет
 
 ### Requirement: Доля по клиенту больше 90%
-'Доля по клиенту больше 90%' SHALL срабатывать, если в hm за T `zp_fl_perc > 0,9`. JSON: `fl_cnt`, `fl_dolay` (открытый вопрос 2).
+'Доля по клиенту больше 90%' SHALL срабатывать, если в hm за T `zp_fl_perc > 0,9`. JSON: `fl_cnt`, `fl_dolay` (открытый вопрос 1).
 
 #### Scenario: 93%
 - **WHEN** `zp_fl_perc` = 0.93
