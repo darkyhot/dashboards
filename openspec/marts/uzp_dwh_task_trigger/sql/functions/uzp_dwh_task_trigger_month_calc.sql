@@ -47,17 +47,17 @@ declare
 	-- Триггеры этой функции: только их строки заменяются при перерасчёте.
 	v_trigger_names text[] := array[
 		'ЕПП флаг',
-		'ср чек ниже среднего',
-		'отрицательный потенциал',
-		'кп первое зачисление',
-		'сезонный тип деятельности',
-		'высокая текучка',
-		'есть договор нет зачисления',
-		'контактная политика 4 месяца',
-		'Подано заявлений в ВСП или МП СБОЛ за прошлый месяц',
-		'Заявлений с зачислениями из ВСП или МП СБОЛ за прошлый месяц',
-		'Подано заявлений в ВСП или МП СБОЛ за последние три месяца',
-		'Заявлений с зачислениями из ВСП или МП СБОЛ за последние три месяца',
+		'Ср чек ниже среднего',
+		'Отрицательный потенциал',
+		'Кп первое зачисление',
+		'Сезонный тип деятельности',
+		'Высокая текучка',
+		'Есть договор нет зачисления',
+		'Контактная политика 4 месяца',
+		'Бумажные заявления из ВСП или МП СБОЛ за прошлый месяц',
+		'Электронные заявления из ВСП или МП СБОЛ за прошлый месяц',
+		'Бумажные заявления из ВСП или МП СБОЛ за последние три месяца',
+		'Электронные заявления из ВСП или МП СБОЛ за последние три месяца',
 		'По клиенту был отток в прошлом месяце, численность',
 		'По клиенту был отток в последние три месяца',
 		'Доля по клиенту больше 90%'
@@ -457,6 +457,7 @@ begin
 
 		-- 10.04. Заявления ВСП / МП СБОЛ за T-2…T. ГОСБ — по ТБ и номеру ГОСБ из urf_code:
 		-- по номеру без ТБ справочник неоднозначен. Заявление без ГОСБ не берётся.
+		-- Электронное — реквизиты переданы (credential_transferred_flag = 1), иначе бумажное.
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
 			p_function_name := v_function_name,
@@ -469,7 +470,8 @@ begin
 			inn int8,
 			epk_id int8,
 			app_dt date,
-			month_ago int4
+			month_ago int4,
+			is_electronic bool
 		)
 		with (
 			appendonly=true,
@@ -482,7 +484,8 @@ begin
 			inn,
 			epk_id,
 			app_dt,
-			month_ago
+			month_ago,
+			is_electronic
 		)
 		select
 			gosb.new_gosb_id,
@@ -490,7 +493,8 @@ begin
 			vsp.epk_id,
 			vsp.report_dt,
 			((date_part('year', v_end_dt) - date_part('year', vsp.report_m_dt)) * 12
-				+ date_part('month', v_end_dt) - date_part('month', vsp.report_m_dt))::int4
+				+ date_part('month', v_end_dt) - date_part('month', vsp.report_m_dt))::int4,
+			coalesce(vsp.credential_transferred_flag, 0) = 1
 		from
 			s_grnplm_ld_salesntwrk_pcap_sn_uzp.vsp_data_salary_detail_report vsp
 		inner join
@@ -570,7 +574,7 @@ begin
 			p_log_message := '10.05 - Вставлено строк в tmp_enrl: ' || v_row_count::text
 		);
 
-		-- 10.06. Заявления по паре: за месяц T и за T-2…T, всего и с зачислением.
+		-- 10.06. Заявления по паре и типу: за месяц T и за T-2…T, всего и с зачислением.
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
 			p_function_name := v_function_name,
@@ -581,6 +585,7 @@ begin
 		create temp table tmp_app_pair (
 			gosb_id int4,
 			inn int8,
+			is_electronic bool,
 			app_cnt_1m int8,
 			first_app_dt_1m date,
 			app_with_enrl_cnt_1m int8,
@@ -597,6 +602,7 @@ begin
 		insert into tmp_app_pair (
 			gosb_id,
 			inn,
+			is_electronic,
 			app_cnt_1m,
 			first_app_dt_1m,
 			app_with_enrl_cnt_1m,
@@ -607,6 +613,7 @@ begin
 		select
 			app.gosb_id,
 			app.inn,
+			app.is_electronic,
 			sum(case when app.month_ago = 0 then 1 else 0 end),
 			min(case when app.month_ago = 0 then app.app_dt end),
 			sum(
@@ -628,7 +635,8 @@ begin
 				on enrl.epk_id = app.epk_id
 		group by
 			app.gosb_id,
-			app.inn;
+			app.inn,
+			app.is_electronic;
 
 		get diagnostics v_row_count = row_count;
 		analyze tmp_app_pair;
@@ -761,7 +769,7 @@ begin
 		select
 			chk.gosb_id,
 			chk.inn,
-			'ср чек ниже среднего',
+			'Ср чек ниже среднего',
 			'Вспомогательный',
 			json_build_object(
 				'month', v_month_txt,
@@ -818,7 +826,7 @@ begin
 		select
 			hm.gosb_id,
 			hm.inn,
-			'отрицательный потенциал',
+			'Отрицательный потенциал',
 			'Основной',
 			json_build_object(
 				'month', v_month_txt,
@@ -849,7 +857,7 @@ begin
 		select
 			kp.gosb_id,
 			kp.inn,
-			'кп первое зачисление',
+			'Кп первое зачисление',
 			'Основной',
 			json_build_object(
 				'month', v_month_txt,
@@ -902,7 +910,7 @@ begin
 		select
 			ss.gosb_id,
 			ss.inn,
-			'сезонный тип деятельности',
+			'Сезонный тип деятельности',
 			'Основной',
 			json_build_object(
 				'month', v_month_txt,
@@ -951,7 +959,7 @@ begin
 		select
 			cur.gosb_id,
 			cur.inn,
-			'высокая текучка',
+			'Высокая текучка',
 			'Основной',
 			json_build_object(
 				'month', v_month_txt,
@@ -992,7 +1000,7 @@ begin
 		select
 			nz.gosb_id,
 			nz.inn,
-			'есть договор нет зачисления',
+			'Есть договор нет зачисления',
 			'Вспомогательный',
 			json_build_object(
 				'month', v_month_txt
@@ -1038,7 +1046,7 @@ begin
 		select
 			hm.gosb_id,
 			hm.inn,
-			'контактная политика 4 месяца',
+			'Контактная политика 4 месяца',
 			'Основной',
 			json_build_object(
 				'task_close_date', to_char(tsk.last_close_dttm, 'YYYY-MM-DD')
@@ -1077,7 +1085,7 @@ begin
 			p_log_message := '20.08 - контактная политика 4 месяца: ' || v_row_count::text
 		);
 
-		-- 20.09. Подано заявлений за прошлый месяц.
+		-- 20.09. Заявления за прошлый месяц по типу: всего и с зачислением (может быть 0).
 		insert into tmp_stg_uzp_dwh_task_trigger (
 			gosb_id,
 			inn,
@@ -1088,11 +1096,16 @@ begin
 		select
 			ap.gosb_id,
 			ap.inn,
-			'Подано заявлений в ВСП или МП СБОЛ за прошлый месяц',
+			case
+				when ap.is_electronic
+					then 'Электронные заявления из ВСП или МП СБОЛ за прошлый месяц'
+				else 'Бумажные заявления из ВСП или МП СБОЛ за прошлый месяц'
+			end,
 			'Вспомогательный',
 			json_build_object(
 				'month', v_month_txt,
 				'app_cnt', ap.app_cnt_1m,
+				'app_with_zachisl_cnt', ap.app_with_enrl_cnt_1m,
 				'first_app_date', to_char(ap.first_app_dt_1m, 'YYYY-MM-DD')
 			)
 		from
@@ -1104,10 +1117,10 @@ begin
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
 			p_function_name := v_function_name,
-			p_log_message := '20.09 - подано заявлений за месяц: ' || v_row_count::text
+			p_log_message := '20.09 - заявления за месяц: ' || v_row_count::text
 		);
 
-		-- 20.10. Заявлений с зачислениями за прошлый месяц: пишется и при 0.
+		-- 20.10. Заявления за последние три месяца по типу: всего и с зачислением (может быть 0).
 		insert into tmp_stg_uzp_dwh_task_trigger (
 			gosb_id,
 			inn,
@@ -1118,40 +1131,16 @@ begin
 		select
 			ap.gosb_id,
 			ap.inn,
-			'Заявлений с зачислениями из ВСП или МП СБОЛ за прошлый месяц',
-			'Вспомогательный',
-			json_build_object(
-				'month', v_month_txt,
-				'app_with_zachisl_cnt', ap.app_with_enrl_cnt_1m
-			)
-		from
-			tmp_app_pair ap
-		where
-			ap.app_cnt_1m > 0;
-
-		get diagnostics v_row_count = row_count;
-		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
-			p_etl_load_id := v_etl_load_id,
-			p_function_name := v_function_name,
-			p_log_message := '20.10 - заявлений с зачислениями за месяц: ' || v_row_count::text
-		);
-
-		-- 20.11. Подано заявлений за последние три месяца.
-		insert into tmp_stg_uzp_dwh_task_trigger (
-			gosb_id,
-			inn,
-			trigger_name,
-			trigger_type,
-			attributes_json
-		)
-		select
-			ap.gosb_id,
-			ap.inn,
-			'Подано заявлений в ВСП или МП СБОЛ за последние три месяца',
+			case
+				when ap.is_electronic
+					then 'Электронные заявления из ВСП или МП СБОЛ за последние три месяца'
+				else 'Бумажные заявления из ВСП или МП СБОЛ за последние три месяца'
+			end,
 			'Вспомогательный',
 			json_build_object(
 				'month', v_month_txt,
 				'app_cnt_3m', ap.app_cnt_3m,
+				'app_with_zachisl_cnt_3m', ap.app_with_enrl_cnt_3m,
 				'first_app_date', to_char(ap.first_app_dt_3m, 'YYYY-MM-DD')
 			)
 		from
@@ -1161,37 +1150,10 @@ begin
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
 			p_function_name := v_function_name,
-			p_log_message := '20.11 - подано заявлений за три месяца: ' || v_row_count::text
+			p_log_message := '20.10 - заявления за три месяца: ' || v_row_count::text
 		);
 
-		-- 20.12. Заявлений с зачислениями за последние три месяца: пишется и при 0.
-		insert into tmp_stg_uzp_dwh_task_trigger (
-			gosb_id,
-			inn,
-			trigger_name,
-			trigger_type,
-			attributes_json
-		)
-		select
-			ap.gosb_id,
-			ap.inn,
-			'Заявлений с зачислениями из ВСП или МП СБОЛ за последние три месяца',
-			'Вспомогательный',
-			json_build_object(
-				'month', v_month_txt,
-				'app_with_zachisl_cnt_3m', ap.app_with_enrl_cnt_3m
-			)
-		from
-			tmp_app_pair ap;
-
-		get diagnostics v_row_count = row_count;
-		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
-			p_etl_load_id := v_etl_load_id,
-			p_function_name := v_function_name,
-			p_log_message := '20.12 - заявлений с зачислениями за три месяца: ' || v_row_count::text
-		);
-
-		-- 20.13. Отток за месяц: отток 3+ и численность снизилась.
+		-- 20.11. Отток за месяц: отток 3+ и численность снизилась.
 		insert into tmp_stg_uzp_dwh_task_trigger (
 			gosb_id,
 			inn,
@@ -1222,10 +1184,10 @@ begin
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
 			p_function_name := v_function_name,
-			p_log_message := '20.13 - отток за месяц: ' || v_row_count::text
+			p_log_message := '20.11 - отток за месяц: ' || v_row_count::text
 		);
 
-		-- 20.14. Отток за три месяца: условие оттока за месяц выполнено в T-2, T-1 и T.
+		-- 20.12. Отток за три месяца: условие оттока за месяц выполнено в T-2, T-1 и T.
 		insert into tmp_stg_uzp_dwh_task_trigger (
 			gosb_id,
 			inn,
@@ -1268,10 +1230,10 @@ begin
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
 			p_function_name := v_function_name,
-			p_log_message := '20.14 - отток за три месяца: ' || v_row_count::text
+			p_log_message := '20.12 - отток за три месяца: ' || v_row_count::text
 		);
 
-		-- 20.15. Доля по клиенту больше 90%.
+		-- 20.13. Доля по клиенту больше 90%.
 		insert into tmp_stg_uzp_dwh_task_trigger (
 			gosb_id,
 			inn,
@@ -1299,7 +1261,7 @@ begin
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
 			p_function_name := v_function_name,
-			p_log_message := '20.15 - доля по клиенту больше 90%: ' || v_row_count::text
+			p_log_message := '20.13 - доля по клиенту больше 90%: ' || v_row_count::text
 		);
 
 		analyze tmp_stg_uzp_dwh_task_trigger;

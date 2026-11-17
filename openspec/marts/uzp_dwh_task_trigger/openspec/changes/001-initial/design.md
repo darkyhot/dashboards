@@ -11,7 +11,7 @@ Greenplum (ядро 9.4), plpgsql-функции, запуск — потоки 
 | --- | --- |
 | `uzp_dwh_company_holding_metric` | пара — `org_id` + `level_id`; `level_name` = 'gosb', `org_type` = 'inn' |
 | навигатор | `inn` — varchar |
-| `vsp_data_salary_detail_report` | `fact_inn`, `gu_inn` — bigint; `urf_code` = '<ТБ>_<ГОСБ>_<ВСП>' |
+| `vsp_data_salary_detail_report` | `fact_inn`, `gu_inn` — bigint; `urf_code` = '<ТБ>_<ГОСБ>_<ВСП>'; `credential_transferred_flag` — тип заявления |
 | `uzp_dim_gosb` | `tb_id` + `old_gosb_id` → один `new_gosb_id` |
 | `uzp_data_epk_consolidation` | несколько ЕПК на ИНН; `status_name`, `is_parent` бывают null |
 | `mis_data_payroll_d` | партиции по `report_dt` помесячно |

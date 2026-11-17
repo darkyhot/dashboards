@@ -33,7 +33,7 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** отрасль — из неголовной
 
 ### Requirement: Ср чек ниже среднего
-'ср чек ниже среднего' SHALL срабатывать, если `client_salary` ≤ 0,8 × `avg_salary`. Обе величины — сумма `current_fot_amt` / сумма `current_fl_qty` за T-5…T при `current_fl_qty` <> 0: `client_salary` — по паре, `avg_salary` — по всем парам ГОСБ + отрасли. Пары без отрасли не проверяются.
+'Ср чек ниже среднего' SHALL срабатывать, если `client_salary` ≤ 0,8 × `avg_salary`. Обе величины — сумма `current_fot_amt` / сумма `current_fl_qty` за T-5…T при `current_fl_qty` <> 0: `client_salary` — по паре, `avg_salary` — по всем парам ГОСБ + отрасли. Пары без отрасли не проверяются.
 
 #### Scenario: Ниже на 40%
 - **WHEN** `avg_salary` = 55000, `client_salary` = 33000
@@ -44,7 +44,7 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** строки нет
 
 ### Requirement: Отрицательный потенциал
-'отрицательный потенциал' SHALL срабатывать, если в hm за T `np_cnt > emp_potential_qty`. JSON: `np_cnt`.
+'Отрицательный потенциал' SHALL срабатывать, если в hm за T `np_cnt > emp_potential_qty`. JSON: `np_cnt`.
 
 #### Scenario: НП больше потенциала
 - **WHEN** `np_cnt` = 55, `emp_potential_qty` = 40
@@ -55,7 +55,7 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** строки нет
 
 ### Requirement: Кп первое зачисление
-'кп первое зачисление' SHALL срабатывать, если в hm у пары `current_fot_amt > 0` за T и `current_fot_amt = 0` за каждый месяц T-12…T-1. JSON: `fl_cnt` = `current_fl_qty` за T.
+'Кп первое зачисление' SHALL срабатывать, если в hm у пары `current_fot_amt > 0` за T и `current_fot_amt = 0` за каждый месяц T-12…T-1. JSON: `fl_cnt` = `current_fl_qty` за T.
 
 #### Scenario: Первое за год
 - **WHEN** ФОТ > 0 за T, ФОТ = 0 за T-12…T-1, получателей 12
@@ -66,7 +66,7 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** строки нет
 
 ### Requirement: Сезонный тип деятельности
-'сезонный тип деятельности' SHALL срабатывать, если портфель `current_fl_qty` вырос на 10% и более из T+1 в T+2 год назад и два года назад: `(T+2−12)/(T+1−12) − 1 ≥ 0,1` и `(T+2−24)/(T+1−24) − 1 ≥ 0,1`. База 0 — роста нет. JSON: `fl_uplift` — средний за 2 года прирост портфеля.
+'Сезонный тип деятельности' SHALL срабатывать, если портфель `current_fl_qty` вырос на 10% и более из T+1 в T+2 год назад и два года назад: `(T+2−12)/(T+1−12) − 1 ≥ 0,1` и `(T+2−24)/(T+1−24) − 1 ≥ 0,1`. База 0 — роста нет. JSON: `fl_uplift` — средний за 2 года прирост портфеля.
 
 #### Scenario: Рост в обоих годах
 - **WHEN** T = 2026-10-31; портфель ноя-25 = 100, дек-25 = 112; ноя-24 = 100, дек-24 = 112
@@ -77,7 +77,7 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** строки нет
 
 ### Requirement: Высокая текучка
-'высокая текучка' SHALL срабатывать, если за T `new_fl_cnt > 0`, `np_cnt < 0,2 × new_fl_cnt` и портфель `current_fl_qty` за T меньше, чем за T-1. JSON: `nfl_cnt` = `new_fl_cnt`, `np_cnt`, `portf_last_m` и `portf_cur_m` = `current_fl_qty` за T-1 и T.
+'Высокая текучка' SHALL срабатывать, если за T `new_fl_cnt > 0`, `np_cnt < 0,2 × new_fl_cnt` и портфель `current_fl_qty` за T меньше, чем за T-1. JSON: `nfl_cnt` = `new_fl_cnt`, `np_cnt`, `portf_last_m` и `portf_cur_m` = `current_fl_qty` за T-1 и T.
 
 #### Scenario: Текучка
 - **WHEN** `new_fl_cnt` = 12, `np_cnt` = 2, портфель 145 → 140
@@ -95,7 +95,7 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** действующего договора нет
 
 ### Requirement: Есть договор нет зачисления
-'есть договор нет зачисления' SHALL срабатывать по паре hm за T, если у ИНН действующий договор с `start_dt <= current_date - 6 мес` и `current_fot_amt = 0` за каждый месяц T-5…T. JSON: только `month`.
+'Есть договор нет зачисления' SHALL срабатывать по паре hm за T, если у ИНН действующий договор с `start_dt <= current_date - 6 мес` и `current_fot_amt = 0` за каждый месяц T-5…T. JSON: только `month`.
 
 #### Scenario: Полгода без зачислений
 - **WHEN** договор с `start_dt` год назад, ФОТ = 0 за T-5…T
@@ -106,7 +106,7 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** строки нет
 
 ### Requirement: Контактная политика 4 месяца
-'контактная политика 4 месяца' SHALL срабатывать по паре hm за T, если в `uzp_dwh_sale_funnel_task` по паре нет задачи: `is_task_closed`, `role_code` = 'МЗП', `src_task_as_code not in ('ИСУ', 'ПРБР')`, `fact_close_task_dttm` ≥ 1-го числа месяца T-3. Верхней границы нет. JSON: `task_close_date` — последняя такая задача за всё время, иначе `null`.
+'Контактная политика 4 месяца' SHALL срабатывать по паре hm за T, если в `uzp_dwh_sale_funnel_task` по паре нет задачи: `is_task_closed`, `role_code` = 'МЗП', `src_task_as_code not in ('ИСУ', 'ПРБР')`, `fact_close_task_dttm` ≥ 1-го числа месяца T-3. Верхней границы нет. JSON: `task_close_date` — последняя такая задача за всё время, иначе `null`.
 
 #### Scenario: Последняя задача в декабре
 - **WHEN** T = 2026-04-30, задача 2025-12-20
@@ -125,11 +125,17 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** строка с `task_close_date` = null
 
 ### Requirement: Заявление ВСП
-Заявление SHALL браться из `vsp_data_salary_detail_report` с `is_asm` = 1. ИНН = `coalesce(fact_inn, gu_inn)`, пустой — заявление не берётся. ГОСБ = `uzp_dim_gosb.new_gosb_id` по `tb_id` и `old_gosb_id` из 1-й и 2-й части `urf_code`. Дата — `report_dt`. Дубли не убираются.
+Заявление SHALL браться из `vsp_data_salary_detail_report` с `is_asm` = 1. ИНН = `coalesce(fact_inn, gu_inn)`, пустой — заявление не берётся. ГОСБ = `uzp_dim_gosb.new_gosb_id` по `tb_id` и `old_gosb_id` из 1-й и 2-й части `urf_code`. Дата — `report_dt`. Дубли не убираются. Тип: электронное — `credential_transferred_flag` = 1, бумажное — остальные.
 
 #### Scenario: ГОСБ
 - **WHEN** `urf_code` = '044_8558_062'
 - **THEN** ГОСБ — `new_gosb_id` при `tb_id` = 44, `old_gosb_id` = 8558
+
+#### Scenario: Тип заявления
+- **WHEN** `credential_transferred_flag` = 1
+- **THEN** заявление электронное
+- **WHEN** `credential_transferred_flag` = 0 или null
+- **THEN** заявление бумажное
 
 ### Requirement: Зачисление по заявлению
 Заявление SHALL считаться с зачислением, если в `mis_data_payroll_d` у его `epk_id` есть строка с `report_dt` ≥ даты заявления и ЗП-кодом (`uzp_dim_enrollment_type.is_fot_enrollment`). Организация любая, порога нет.
@@ -138,37 +144,27 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **WHEN** после заявления пришло ЗП-зачисление 1 500 руб. от другого ИНН
 - **THEN** заявление с зачислением
 
-### Requirement: Подано заявлений за прошлый месяц
-'Подано заявлений в ВСП или МП СБОЛ за прошлый месяц' SHALL срабатывать, если у пары есть заявления с `report_m_dt` = T. JSON: `app_cnt` — число заявлений, `first_app_date` — первая дата.
-
-#### Scenario: 10 заявлений
-- **WHEN** 10 заявлений, первое 2026-09-01
-- **THEN** `app_cnt` = 10, `first_app_date` = '2026-09-01'
-
-### Requirement: Заявлений с зачислениями за прошлый месяц
-'Заявлений с зачислениями из ВСП или МП СБОЛ за прошлый месяц' SHALL срабатывать, если у пары есть заявления с `report_m_dt` = T, в том числе без зачислений. JSON: `app_with_zachisl_cnt` — число заявлений с зачислением.
+### Requirement: Заявления за прошлый месяц
+'Бумажные заявления из ВСП или МП СБОЛ за прошлый месяц' и 'Электронные заявления из ВСП или МП СБОЛ за прошлый месяц' SHALL срабатывать, если у пары есть заявления этого типа с `report_m_dt` = T. JSON: `app_cnt` — число заявлений, `app_with_zachisl_cnt` — из них с зачислением, `first_app_date` — первая дата заявления.
 
 #### Scenario: 3 из 10
-- **WHEN** 10 заявлений, 3 с зачислением
-- **THEN** `app_with_zachisl_cnt` = 3
+- **WHEN** 10 бумажных заявлений за T, первое 2026-09-01, 3 с зачислением
+- **THEN** строка 'Бумажные…' с `app_cnt` = 10, `app_with_zachisl_cnt` = 3, `first_app_date` = '2026-09-01'
 
-#### Scenario: 0 из 4
-- **WHEN** 4 заявления, все без зачислений
-- **THEN** строка с `app_with_zachisl_cnt` = 0
+#### Scenario: 0 с зачислением
+- **WHEN** 4 электронных заявления за T, все без зачислений
+- **THEN** строка 'Электронные…' с `app_cnt` = 4, `app_with_zachisl_cnt` = 0
 
-### Requirement: Подано заявлений за три месяца
-'Подано заявлений в ВСП или МП СБОЛ за последние три месяца' SHALL срабатывать, если у пары есть заявления с `report_m_dt` в T-2…T. JSON: `app_cnt_3m`, `first_app_date`.
+#### Scenario: Оба типа
+- **WHEN** у пары за T есть бумажные и электронные заявления
+- **THEN** две строки, в каждой — заявления своего типа
 
-#### Scenario: 27 заявлений
-- **WHEN** 27 заявлений за T-2…T, первое 2026-07-04
-- **THEN** `app_cnt_3m` = 27, `first_app_date` = '2026-07-04'
-
-### Requirement: Заявлений с зачислениями за три месяца
-'Заявлений с зачислениями из ВСП или МП СБОЛ за последние три месяца' SHALL срабатывать, если у пары есть заявления с `report_m_dt` в T-2…T, в том числе без зачислений. JSON: `app_with_zachisl_cnt_3m`.
+### Requirement: Заявления за три месяца
+'Бумажные заявления из ВСП или МП СБОЛ за последние три месяца' и 'Электронные заявления из ВСП или МП СБОЛ за последние три месяца' SHALL срабатывать, если у пары есть заявления этого типа с `report_m_dt` в T-2…T. JSON: `app_cnt_3m`, `app_with_zachisl_cnt_3m`, `first_app_date`.
 
 #### Scenario: 9 из 27
-- **WHEN** 27 заявлений за T-2…T, 9 с зачислением
-- **THEN** `app_with_zachisl_cnt_3m` = 9
+- **WHEN** 27 бумажных заявлений за T-2…T, первое 2026-07-04, 9 с зачислением
+- **THEN** строка 'Бумажные…' с `app_cnt_3m` = 27, `app_with_zachisl_cnt_3m` = 9, `first_app_date` = '2026-07-04'
 
 ### Requirement: Отток за месяц
 'По клиенту был отток в прошлом месяце, численность' SHALL срабатывать, если в `uzp_dwh_fact_outflow` за T `outflow_qty ≥ 3` и `fact_payee_qty < prev_m_fl_val`. JSON: `portf_last_m` = `prev_m_fl_val`, `portf_cur_m` = `fact_payee_qty`, `churn_cnt` = их разность, `churn_pct` = `churn_cnt / prev_m_fl_val`.
