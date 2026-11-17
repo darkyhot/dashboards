@@ -296,8 +296,9 @@ begin
 		);
 
 		-- 40. Сбор статистики.
+		-- Имя без схемы: схему функция добавляет сама.
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_table_analyze(
-			tbl := 's_grnplm_ld_salesntwrk_pcap_sn_uzp.<витрина>'
+			tbl := '<витрина>'
 		);
 
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(

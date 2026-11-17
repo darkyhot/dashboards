@@ -577,7 +577,7 @@ begin
 
 		-- 40. Сбор статистики.
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_table_analyze(
-			tbl := 's_grnplm_ld_salesntwrk_pcap_sn_t_uzp.uzp_dwh_task_trigger'
+			tbl := 'uzp_dwh_task_trigger'
 		);
 
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
