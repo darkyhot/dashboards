@@ -148,13 +148,13 @@ def main():
     msg = cur.fetchone()
     check(msg is not None and "uzp_dwh_company_holding_metric" in msg[0] and "последняя дата" in msg[0], f"98: лог {msg}")
 
-    # 97: дубль строки holding_metric даёт дубль ключа
+    # 98: дубль строки holding_metric даёт дубль ключа
     cur.execute(f"insert into {UZP}.uzp_dwh_company_holding_metric (report_dt, level_name, level_id, org_type, org_id, "
                 "current_fot_amt, current_fl_qty, np_cnt, emp_potential_qty, total_emp_qty, new_fl_cnt, zp_fl_perc) "
                 "values ('2026-10-31', 'gosb', 9001, 'inn', 990000000001, 100, 1, 55, 40, 10, 0, 0)")
     st = run(cur, "uzp_dwh_task_trigger_month_calc", 9004, "2026-10-31")
-    check(st == 97, f"97: статус {st}")
-    check(len(rows(cur, "2026-10-01", "2026-10-31")) == n1, "97: витрина изменилась")
+    check(st == 98, f"98 дубли: статус {st}")
+    check(len(rows(cur, "2026-10-01", "2026-10-31")) == n1, "98 дубли: витрина изменилась")
     cur.execute(f"delete from {UZP}.uzp_dwh_company_holding_metric where org_id = 990000000001 and report_dt = '2026-10-31'")
     cur.execute(f"insert into {UZP}.uzp_dwh_company_holding_metric (report_dt, level_name, level_id, org_type, org_id, "
                 "current_fot_amt, current_fl_qty, np_cnt, emp_potential_qty, total_emp_qty, new_fl_cnt, zp_fl_perc) "
@@ -172,6 +172,17 @@ def main():
     check(len(rows(cur, "2026-11-09", "2026-11-15")) == len(wk), "неделя: повтор изменил число строк")
     month_after = sorted((r[0], r[2], r[5]) for r in rows(cur, "2026-10-01", "2026-10-31"))
     check(month_before == month_after, "неделя изменила строки месяца")
+
+    # 98: пустой стейджинг и пустая tmp-таблица — витрина не меняется
+    for load_id, dt, tbl in [(9007, "2026-11-20", "tmp_stg_uzp_dwh_task_trigger"), (9008, "2026-11-25", "tmp_app")]:
+        cur.execute(f"select count(*) from {TBL}")
+        before = cur.fetchone()[0]
+        st = run(cur, "uzp_dwh_task_trigger_week_calc", load_id, dt)
+        cur.execute(f"select log_message from {T_UZP}.etl_log where etl_load_id = {load_id} and log_message like '98%'")
+        msg = cur.fetchone()
+        cur.execute(f"select count(*) from {TBL}")
+        check(st == 98 and msg is not None and tbl in msg[0] and cur.fetchone()[0] == before,
+              f"98 {tbl}: статус {st}, лог {msg}")
 
     print(f"месяц: {n1} строк, неделя: {len(wk)} строк")
     if errors:

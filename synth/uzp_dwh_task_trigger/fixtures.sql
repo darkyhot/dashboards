@@ -198,3 +198,16 @@ values
 	(9900034000, '2026-11-15', 1, 1000),
 	(9900034001, '2026-11-15', 1, 1000),
 	(9900036000, '2026-11-09', 1, 1000);
+
+-- 98 по пустым данным. Неделя 2026-11-16…22: одно заявление 034 (есть договор), зачисление
+-- после него — триггеров нет, стейджинг пуст. Неделя 2026-11-23…29: только заявление не АСМ —
+-- tmp_app пуста.
+insert into s_grnplm_ld_salesntwrk_pcap_sn_uzp.vsp_data_salary_detail_report
+	(report_m_dt, report_dt, urf_code, epk_id, is_asm, fact_inn, gu_inn)
+values
+	(date '2026-11-30', date '2026-11-16', '044_8558_062', 9900034100, 1, 990000000034, null::int8),
+	(date '2026-11-30', date '2026-11-23', '044_8558_062', 9900037000, 0, 990000000037, null::int8);
+insert into s_grnplm_ld_salesntwrk_pcap_sn_uzp.mis_data_payroll_d (epk_id, report_dt, enrollment_type, amt)
+values
+	(9900034100, date '2026-11-17', 1, 1000),
+	(9900037000, date '2026-11-24', 1, 1000);

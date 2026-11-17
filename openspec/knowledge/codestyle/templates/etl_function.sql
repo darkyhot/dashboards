@@ -31,6 +31,7 @@ declare
 	v_function_name text := '<витрина>_<глагол>';
 	v_etl_load_id int8 := p_etl_load_id;
 	v_row_count int8 := 0;
+	v_dup_qty int8 := 0;
 
 	v_report_dt date;
 
@@ -246,6 +247,50 @@ begin
 			p_function_name := v_function_name,
 			p_log_message := '20 - Вставлено строк в tmp_stg_<витрина>: ' || v_row_count::text
 		);
+
+		-- 21. Обязательные проверки ККД перед обновлением таргета: стейджинг не пуст,
+		-- дублей по ключу нет. Иначе статус 98, в таргете остаются старые данные.
+		if v_row_count = 0 then
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
+				p_etl_load_id := v_etl_load_id,
+				p_function_name := v_function_name,
+				p_log_message := '98 - Нет данных: 0 строк в tmp_stg_<витрина>, витрина не изменена'
+			);
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(
+				p_etl_load_id := v_etl_load_id,
+				p_state_id := 98::int2
+			);
+			return;
+		end if;
+
+		select
+			count(*)
+		into
+			v_dup_qty
+		from (
+				select
+					stg.<ключ>
+				from
+					tmp_stg_<витрина> stg
+				group by
+					stg.<ключ>
+				having
+					count(*) > 1
+			) dup;
+
+		if v_dup_qty > 0 then
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
+				p_etl_load_id := v_etl_load_id,
+				p_function_name := v_function_name,
+				p_log_message := '98 - Проверка ККД не пройдена: дублей ключа в стейджинге '
+					|| v_dup_qty::text
+			);
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(
+				p_etl_load_id := v_etl_load_id,
+				p_state_id := 98::int2
+			);
+			return;
+		end if;
 	exception
 		when others then
 			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(

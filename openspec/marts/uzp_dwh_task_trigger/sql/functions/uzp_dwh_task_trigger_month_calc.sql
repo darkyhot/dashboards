@@ -346,6 +346,19 @@ begin
 		get diagnostics v_row_count = row_count;
 		analyze tmp_hm;
 
+		if v_row_count = 0 then
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
+				p_etl_load_id := v_etl_load_id,
+				p_function_name := v_function_name,
+				p_log_message := '98 - Нет данных: 0 строк в tmp_hm, витрина не изменена'
+			);
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(
+				p_etl_load_id := v_etl_load_id,
+				p_state_id := 98::int2
+			);
+			return;
+		end if;
+
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
 			p_function_name := v_function_name,
@@ -404,6 +417,19 @@ begin
 		get diagnostics v_row_count = row_count;
 		analyze tmp_industry;
 
+		if v_row_count = 0 then
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
+				p_etl_load_id := v_etl_load_id,
+				p_function_name := v_function_name,
+				p_log_message := '98 - Нет данных: 0 строк в tmp_industry, витрина не изменена'
+			);
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(
+				p_etl_load_id := v_etl_load_id,
+				p_state_id := 98::int2
+			);
+			return;
+		end if;
+
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
 			p_function_name := v_function_name,
@@ -448,6 +474,19 @@ begin
 
 		get diagnostics v_row_count = row_count;
 		analyze tmp_agrmnt;
+
+		if v_row_count = 0 then
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
+				p_etl_load_id := v_etl_load_id,
+				p_function_name := v_function_name,
+				p_log_message := '98 - Нет данных: 0 строк в tmp_agrmnt, витрина не изменена'
+			);
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(
+				p_etl_load_id := v_etl_load_id,
+				p_state_id := 98::int2
+			);
+			return;
+		end if;
 
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
@@ -512,6 +551,19 @@ begin
 		get diagnostics v_row_count = row_count;
 		analyze tmp_app;
 
+		if v_row_count = 0 then
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
+				p_etl_load_id := v_etl_load_id,
+				p_function_name := v_function_name,
+				p_log_message := '98 - Нет данных: 0 строк в tmp_app, витрина не изменена'
+			);
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(
+				p_etl_load_id := v_etl_load_id,
+				p_state_id := 98::int2
+			);
+			return;
+		end if;
+
 		select min(app.app_dt) into v_min_app_dt from tmp_app app;
 
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
@@ -567,6 +619,19 @@ begin
 
 		get diagnostics v_row_count = row_count;
 		analyze tmp_enrl;
+
+		if v_row_count = 0 then
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
+				p_etl_load_id := v_etl_load_id,
+				p_function_name := v_function_name,
+				p_log_message := '98 - Нет данных: 0 строк в tmp_enrl, витрина не изменена'
+			);
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(
+				p_etl_load_id := v_etl_load_id,
+				p_state_id := 98::int2
+			);
+			return;
+		end if;
 
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 			p_etl_load_id := v_etl_load_id,
@@ -780,9 +845,15 @@ begin
 				select
 					cl.gosb_id,
 					cl.inn,
-					cl.fot_amt / cl.fl_qty as client_salary,
-					sum(cl.fot_amt) over(partition by cl.gosb_id, cl.industry_name)
-						/ sum(cl.fl_qty) over(partition by cl.gosb_id, cl.industry_name) as avg_salary
+					case
+						when cl.fl_qty <> 0
+							then cl.fot_amt / cl.fl_qty
+					end as client_salary,
+					case
+						when sum(cl.fl_qty) over(partition by cl.gosb_id, cl.industry_name) <> 0
+							then sum(cl.fot_amt) over(partition by cl.gosb_id, cl.industry_name)
+								/ sum(cl.fl_qty) over(partition by cl.gosb_id, cl.industry_name)
+					end as avg_salary
 				from (
 						select
 							hm.gosb_id,
@@ -936,10 +1007,14 @@ begin
 					hm.inn
 			) ss
 		where
-			ss.fl_y1_base_qty > 0
-			and ss.fl_y2_base_qty > 0
-			and ss.fl_y1_qty / ss.fl_y1_base_qty - 1 >= 0.1
-			and ss.fl_y2_qty / ss.fl_y2_base_qty - 1 >= 0.1;
+			case
+				when ss.fl_y1_base_qty > 0
+					then ss.fl_y1_qty / ss.fl_y1_base_qty - 1
+			end >= 0.1
+			and case
+				when ss.fl_y2_base_qty > 0
+					then ss.fl_y2_qty / ss.fl_y2_base_qty - 1
+			end >= 0.1;
 
 		get diagnostics v_row_count = row_count;
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
@@ -1171,7 +1246,10 @@ begin
 				'portf_last_m', fo.prev_m_fl_val,
 				'portf_cur_m', fo.fact_payee_qty,
 				'churn_cnt', fo.prev_m_fl_val - fo.fact_payee_qty,
-				'churn_pct', round((fo.prev_m_fl_val - fo.fact_payee_qty)::numeric / fo.prev_m_fl_val, 2)
+				'churn_pct', case
+					when fo.prev_m_fl_val <> 0
+						then round((fo.prev_m_fl_val - fo.fact_payee_qty)::numeric / fo.prev_m_fl_val, 2)
+				end
 			)
 		from
 			s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_fact_outflow fo
@@ -1204,7 +1282,10 @@ begin
 				'month', v_month_txt,
 				'portf_3m_ago', o3.portf_3m_ago,
 				'portf_cur_m', o3.portf_cur_m,
-				'churn_pct_3m', round((o3.portf_3m_ago - o3.portf_cur_m)::numeric / o3.portf_3m_ago, 2)
+				'churn_pct_3m', case
+					when o3.portf_3m_ago <> 0
+						then round((o3.portf_3m_ago - o3.portf_cur_m)::numeric / o3.portf_3m_ago, 2)
+				end
 			)
 		from (
 				select
@@ -1266,7 +1347,22 @@ begin
 
 		analyze tmp_stg_uzp_dwh_task_trigger;
 
-		-- 21. Проверка ККД: ключ витрины в стейджинге уникален.
+		-- 21. Проверка ККД: стейджинг не пуст и ключ витрины в нём уникален.
+		-- Иначе статус 98, в витрине остаются старые данные.
+		select count(*) into v_row_count from tmp_stg_uzp_dwh_task_trigger;
+		if v_row_count = 0 then
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
+				p_etl_load_id := v_etl_load_id,
+				p_function_name := v_function_name,
+				p_log_message := '98 - Нет данных: 0 строк в tmp_stg_uzp_dwh_task_trigger, витрина не изменена'
+			);
+			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(
+				p_etl_load_id := v_etl_load_id,
+				p_state_id := 98::int2
+			);
+			return;
+		end if;
+
 		select
 			count(*)
 		into
@@ -1288,12 +1384,12 @@ begin
 			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
 				p_etl_load_id := v_etl_load_id,
 				p_function_name := v_function_name,
-				p_log_message := '97 - Проверка ККД не пройдена: дублей ключа в стейджинге '
+				p_log_message := '98 - Проверка ККД не пройдена: дублей ключа в стейджинге '
 					|| v_dup_qty::text
 			);
 			perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_state_update(
 				p_etl_load_id := v_etl_load_id,
-				p_state_id := 97::int2
+				p_state_id := 98::int2
 			);
 			return;
 		end if;
