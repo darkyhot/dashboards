@@ -44,7 +44,7 @@ MONTH_EXPECT = [
     (12, "contact", {"task_close_date": "2026-06-20"}), (13, "contact", None),
     (14, "contact", None), (15, "contact", {"task_close_date": None}),
     (16, "check", {"avg_salary": 55000, "client_salary": 33000}), (17, "check", None),
-    (19, "share", {"fl_cnt": None, "fl_dolay": None}), (20, "share", None),
+    (19, "share", {"fl_cnt": 12, "fl_dolay": 0.93}), (20, "share", None),
     (21, "out1", {"portf_last_m": 400, "portf_cur_m": 388, "churn_cnt": 12, "churn_pct": 0.03}),
     (22, "out1", None),
     (23, "out3", {"portf_3m_ago": 430, "portf_cur_m": 388, "churn_pct_3m": 0.1}),

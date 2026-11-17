@@ -46,10 +46,6 @@
 | `uzp_dim_gosb` | ГОСБ заявления |
 | `uzp_dwh_fact_outflow` | отток |
 
-## Открытые вопросы
-
-1. «Доля по клиенту больше 90%»: что передавать в `fl_cnt` и `fl_dolay`?
-
 ## Impact
 
 - Лаборатория `s_grnplm_ld_salesntwrk_pcap_sn_t_uzp`: таблица и функции

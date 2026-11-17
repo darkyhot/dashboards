@@ -191,11 +191,11 @@ T-k — конец месяца на k раньше. hm — `uzp_dwh_company_hol
 - **THEN** строки нет
 
 ### Requirement: Доля по клиенту больше 90%
-'Доля по клиенту больше 90%' SHALL срабатывать, если в hm за T `zp_fl_perc > 0,9`. JSON: `fl_cnt`, `fl_dolay` (открытый вопрос 1).
+'Доля по клиенту больше 90%' SHALL срабатывать, если в hm за T `zp_fl_perc > 0,9`. JSON: `fl_cnt` = `current_fl_qty` за T, `fl_dolay` = `zp_fl_perc` за T (дробь, не проценты).
 
 #### Scenario: 93%
-- **WHEN** `zp_fl_perc` = 0.93
-- **THEN** строка
+- **WHEN** `current_fl_qty` = 12, `zp_fl_perc` = 0.93
+- **THEN** строка, `fl_cnt` = 12, `fl_dolay` = 0.93
 
 #### Scenario: 90%
 - **WHEN** `zp_fl_perc` = 0.9

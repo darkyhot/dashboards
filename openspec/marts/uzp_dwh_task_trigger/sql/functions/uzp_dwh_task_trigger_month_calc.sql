@@ -1274,7 +1274,7 @@ begin
 			p_log_message := '20.14 - отток за три месяца: ' || v_row_count::text
 		);
 
-		-- 20.15. Доля по клиенту больше 90%. fl_cnt и fl_dolay — открытый вопрос, пока null.
+		-- 20.15. Доля по клиенту больше 90%.
 		insert into tmp_stg_uzp_dwh_task_trigger (
 			gosb_id,
 			inn,
@@ -1289,8 +1289,8 @@ begin
 			'Вспомогательный',
 			json_build_object(
 				'month', v_month_txt,
-				'fl_cnt', null,
-				'fl_dolay', null
+				'fl_cnt', hm.current_fl_qty,
+				'fl_dolay', round(hm.zp_fl_perc, 2)
 			)
 		from
 			tmp_hm hm
