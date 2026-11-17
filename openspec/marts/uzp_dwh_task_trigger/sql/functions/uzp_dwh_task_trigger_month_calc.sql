@@ -84,7 +84,7 @@ begin
 		-- 01. Период — месяц p_end_dttm, T = v_end_dt. Отдельно считаем только даты
 		-- для фильтров по источникам: T-2 (заявления, отток) и T-23 (сезонность).
 		v_end_dt := s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.last_day(p_end_dttm::date);
-		v_start_dt := s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.trunc(v_end_dt, 'mm');
+		v_start_dt := date_trunc('month', v_end_dt)::date;
 		v_t2_dt := s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.last_day((v_end_dt - interval '2 month')::date);
 		v_hm_from_dt := s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.last_day((v_end_dt - interval '23 month')::date);
 		v_month_txt := to_char(v_end_dt, 'YYYY-MM-DD');

@@ -141,12 +141,22 @@ order by
 
 ```sql
 select s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.last_day('2022-11-29'::date);      -- 2022-11-30
-select s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.add_months('2022-11-29'::date, 1); -- 2022-12-29
 select s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.next_day('2022-11-29'::date, 'monday');
-select s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.trunc('2022-11-29'::date, 'mm');   -- аналог date_trunc
 select s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.end_of_month('2022-11-29'::date);
 select s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.try_cast('a23', null::bigint);     -- NULL вместо ошибки
 ```
+
+Даты месяца и недели:
+
+- Начало месяца или недели — стандартная `date_trunc`: `date_trunc('month', v_end_dt)::date`,
+  `date_trunc('week', p_end_dttm)::date`. Помощник `trunc` не использовать.
+- Сдвиг на N месяцев — `interval`: `v_end_dt - interval '2 month'`. Помощник `add_months`
+  не использовать.
+- Конец месяца после сдвига — `last_day`: `last_day((v_end_dt - interval '2 month')::date)`.
+  Сдвиг от 31-го числа даёт 30-е или 28-е, `last_day` возвращает последнее число месяца.
+- Переменная — только для даты, которая нужна в фильтре по источнику. Номер месяца
+  относительно T считают колонкой (`month_ago`) и сравнивают с ней, а не заводят переменную
+  на каждый месяц.
 
 Ограничения:
 
