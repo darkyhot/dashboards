@@ -306,7 +306,6 @@ begin
 			np_cnt int8,
 			new_fl_cnt int8,
 			emp_potential_qty numeric,
-			total_emp_qty numeric,
 			zp_fl_perc numeric
 		)
 		with (
@@ -324,7 +323,6 @@ begin
 			np_cnt,
 			new_fl_cnt,
 			emp_potential_qty,
-			total_emp_qty,
 			zp_fl_perc
 		)
 		select
@@ -337,7 +335,6 @@ begin
 			hm.np_cnt,
 			hm.new_fl_cnt,
 			hm.emp_potential_qty,
-			hm.total_emp_qty,
 			hm.zp_fl_perc
 		from
 			s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_company_holding_metric hm
@@ -893,7 +890,7 @@ begin
 			p_log_message := '20.04 - кп первое зачисление: ' || v_row_count::text
 		);
 
-		-- 20.05. Сезонный тип: численность выросла на 10%+ из T+1 в T+2 год назад
+		-- 20.05. Сезонный тип: портфель вырос на 10%+ из T+1 в T+2 год назад
 		-- (11 → 10 месяцев назад) и два года назад (23 → 22). База 0 — роста нет.
 		insert into tmp_stg_uzp_dwh_task_trigger (
 			gosb_id,
@@ -910,18 +907,18 @@ begin
 			json_build_object(
 				'month', v_month_txt,
 				'fl_uplift', round((
-					(ss.emp_y1_qty - ss.emp_y1_base_qty)
-					+ (ss.emp_y2_qty - ss.emp_y2_base_qty)
+					(ss.fl_y1_qty - ss.fl_y1_base_qty)
+					+ (ss.fl_y2_qty - ss.fl_y2_base_qty)
 				) / 2, 2)
 			)
 		from (
 				select
 					hm.gosb_id,
 					hm.inn,
-					max(case when hm.month_ago = 11 then hm.total_emp_qty end) as emp_y1_base_qty,
-					max(case when hm.month_ago = 10 then hm.total_emp_qty end) as emp_y1_qty,
-					max(case when hm.month_ago = 23 then hm.total_emp_qty end) as emp_y2_base_qty,
-					max(case when hm.month_ago = 22 then hm.total_emp_qty end) as emp_y2_qty
+					max(case when hm.month_ago = 11 then hm.current_fl_qty end)::numeric as fl_y1_base_qty,
+					max(case when hm.month_ago = 10 then hm.current_fl_qty end)::numeric as fl_y1_qty,
+					max(case when hm.month_ago = 23 then hm.current_fl_qty end)::numeric as fl_y2_base_qty,
+					max(case when hm.month_ago = 22 then hm.current_fl_qty end)::numeric as fl_y2_qty
 				from
 					tmp_hm hm
 				where
@@ -931,10 +928,10 @@ begin
 					hm.inn
 			) ss
 		where
-			ss.emp_y1_base_qty > 0
-			and ss.emp_y2_base_qty > 0
-			and ss.emp_y1_qty / ss.emp_y1_base_qty - 1 >= 0.1
-			and ss.emp_y2_qty / ss.emp_y2_base_qty - 1 >= 0.1;
+			ss.fl_y1_base_qty > 0
+			and ss.fl_y2_base_qty > 0
+			and ss.fl_y1_qty / ss.fl_y1_base_qty - 1 >= 0.1
+			and ss.fl_y2_qty / ss.fl_y2_base_qty - 1 >= 0.1;
 
 		get diagnostics v_row_count = row_count;
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(
@@ -943,7 +940,7 @@ begin
 			p_log_message := '20.05 - сезонный тип деятельности: ' || v_row_count::text
 		);
 
-		-- 20.06. Высокая текучка: НФЛ есть, НП меньше 20% от НФЛ, численность снизилась к T-1.
+		-- 20.06. Высокая текучка: НФЛ есть, НП меньше 20% от НФЛ, портфель снизился к T-1.
 		insert into tmp_stg_uzp_dwh_task_trigger (
 			gosb_id,
 			inn,
@@ -960,8 +957,8 @@ begin
 				'month', v_month_txt,
 				'nfl_cnt', cur.new_fl_cnt,
 				'np_cnt', cur.np_cnt,
-				'portf_last_m', round(prv.total_emp_qty, 2),
-				'portf_cur_m', round(cur.total_emp_qty, 2)
+				'portf_last_m', prv.current_fl_qty,
+				'portf_cur_m', cur.current_fl_qty
 			)
 		from
 			tmp_hm cur
@@ -974,7 +971,7 @@ begin
 			cur.month_ago = 0
 			and cur.new_fl_cnt > 0
 			and cur.np_cnt < 0.2 * cur.new_fl_cnt
-			and cur.total_emp_qty < prv.total_emp_qty;
+			and cur.current_fl_qty < prv.current_fl_qty;
 
 		get diagnostics v_row_count = row_count;
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_data_etl_log_write(

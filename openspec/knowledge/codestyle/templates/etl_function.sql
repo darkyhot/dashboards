@@ -270,16 +270,17 @@ begin
 		);
 
 		-- Замена 20% и более записей: стейджинг содержит таблицу целиком, целевую транкейтим.
+		-- sys_table_*: имя без схемы, схему функция дописывает сама.
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_table_truncate(
-			tbl := 's_grnplm_ld_salesntwrk_pcap_sn_uzp.<витрина>'
+			tbl := '<витрина>'
 		);
 
 		-- Замена менее 20% записей: вместо транкеята удаляй только подлежащие замене строки:
-		-- 	delete from s_grnplm_ld_salesntwrk_pcap_sn_uzp.<витрина> target
+		-- 	delete from s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.<витрина> target
 		-- 	where
 		-- 		target.report_dt = v_report_dt;
 
-		insert into s_grnplm_ld_salesntwrk_pcap_sn_uzp.<витрина> (
+		insert into s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.<витрина> (
 			<поле целевой витрины>
 		)
 		select
@@ -296,7 +297,6 @@ begin
 		);
 
 		-- 40. Сбор статистики.
-		-- Имя без схемы: схему функция добавляет сама.
 		perform s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_table_analyze(
 			tbl := '<витрина>'
 		);

@@ -8,8 +8,8 @@
 
 | Схема | Назначение |
 | --- | --- |
-| `s_grnplm_ld_salesntwrk_pcap_sn_uzp` | прод: витрины УЗП; источник данных для аналитики и смежных расчётов |
-| `s_grnplm_ld_salesntwrk_pcap_sn_t_uzp` | лабораторная (тестовая) область УЗП: здесь считают новые витрины до вывода в прод; отсюда вызывают системные функции (`sys_*`) и функции-помощники (`last_day`, `try_cast`) |
+| `s_grnplm_ld_salesntwrk_pcap_sn_uzp` | прод: витрины УЗП; только чтение — источник данных |
+| `s_grnplm_ld_salesntwrk_pcap_sn_t_uzp` | лабораторная (тестовая) область УЗП: здесь создают и заполняют витрины; отсюда вызывают системные функции (`sys_*`) и функции-помощники (`last_day`, `try_cast`) |
 
 Схему в вызовах системных функций и функций-помощников указывают явно.
 
@@ -35,8 +35,10 @@
 - После заполнения — `analyze` таблицы. Перед созданием — `drop table if exists`.
 - Для `truncate` и сбора статистики на постоянных таблицах — только системные функции
   `sys_table_truncate` и `sys_table_analyze`; на временных таблицах они не нужны.
-  В `sys_table_analyze` имя таблицы передают без схемы: `tbl := 'uzp_dwh_task_trigger'`.
-  Со схемой будет ошибка `cross-database references are not implemented`.
+  Функции работают только с таблицами своей схемы `s_grnplm_ld_salesntwrk_pcap_sn_t_uzp`
+  и дописывают её к имени сами. Имя передают без схемы:
+  `s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.sys_table_analyze(tbl := '<витрина>')`.
+  Имя со схемой даёт ошибку `cross-database references are not implemented`.
 - Стейджинг под целевую витрину называют `tmp_stg_<целевая витрина>`
   (`tmp_stg_uzp_dwh_key_clients_scoring`).
 - Если временную таблицу планируют использовать несколько процессов — согласуют с владельцем
@@ -140,7 +142,7 @@
 | `sys_data_etl_state_update` | `p_etl_load_id int8`, `p_state_id int2` | изменить статус экземпляра процесса |
 | `sys_data_etl_log_write` | `p_etl_load_id int8`, `p_log_message text`, `p_error_code text` | запись в лог |
 | `sys_data_etl_log_write` | `p_etl_load_id int8`, `p_function_name text`, `p_log_message text`, `p_error_code text` | запись в лог с именем функции |
-| `sys_table_truncate` | `tbl text` | truncate постоянной таблицы |
-| `sys_table_analyze` | `tbl text` | сбор статистики по постоянной таблице; `tbl` — имя без схемы, схему `s_grnplm_ld_salesntwrk_pcap_sn_t_uzp` функция добавляет сама |
+| `sys_table_truncate` | `tbl text` — имя без схемы | truncate постоянной таблицы схемы `t_uzp` |
+| `sys_table_analyze` | `tbl text` — имя без схемы | сбор статистики по постоянной таблице схемы `t_uzp` |
 
 Функции работы с датами и `try_cast` — в `sql-style.md`, раздел «Даты и функции-помощники».
