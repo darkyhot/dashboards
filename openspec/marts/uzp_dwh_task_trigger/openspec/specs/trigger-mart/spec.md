@@ -10,6 +10,12 @@
 - [Месячные триггеры](../monthly-triggers/spec.md#purpose)
 - [Недельные триггеры](../weekly-triggers/spec.md#purpose)
 
+**Бизнес-запросы**
+
+| Интент | Что реализовано | Изменение OpenSpec |
+| --- | --- | --- |
+| [001 — Требования на витрину триггеров](../../../intents/001-требования%20на%20витрину%20триггеров.md) · UZPPZPS1-422 | Создана витрина `uzp_dwh_task_trigger` для формирования задач УЗП. Добавлены функции `uzp_dwh_task_trigger_month_calc` (15 месячных триггеров) и `uzp_dwh_task_trigger_week_calc` (2 недельных триггера). | [001-initial](../../changes/archive/2026-11-17-001-initial/proposal.md) |
+
 ## Requirements
 
 ### Requirement: Состав полей
