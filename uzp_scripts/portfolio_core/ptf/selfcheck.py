@@ -17,7 +17,7 @@ from . import REPORT_DIR, db
 from . import sql as Q
 
 ALLOWED_IMPORTS = {"__future__", "argparse", "calendar", "collections", "contextlib", "dataclasses", "datetime", "hashlib", "html",
-                   "functools", "inspect", "io", "json", "os", "pathlib", "re", "statistics", "sys", "textwrap", "time", "warnings",
+                   "functools", "inspect", "itertools", "io", "json", "os", "pathlib", "re", "statistics", "sys", "textwrap", "time", "warnings",
                    "typing", "numpy", "pandas", "sqlalchemy"}
 
 
@@ -25,6 +25,7 @@ def _sql_texts() -> list[tuple[str, str]]:
     out = [(n, v) for n, v in vars(Q).items() if isinstance(v, str) and n.isupper()]
     out.append(("final_select()", Q.final_select()))
     out.append(("row_checks()", Q.row_checks()))
+    out.append(("latest_daily_triples()", Q.latest_daily_triples()))
     return out
 
 
