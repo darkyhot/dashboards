@@ -29,8 +29,8 @@ Greenplum (ядро 9.4), plpgsql-функции, запуск — потоки 
 
 ## Decisions
 
-**Таблица.** Поля — по интенту, без `inserted_dttm` / `author_login` шаблона: время расчёта
-есть в `modified_dttm`. Хранение:
+**Таблица.** Состав полей — в [спеке витрины](specs/trigger-mart/spec.md#requirement-состав-полей).
+Время расчёта хранится в `modified_dttm`. Хранение:
 - `appendonly=true, compresstype=zstd, compresslevel=1`;
 - `partition by range(start_dt)` помесячно, 2026-01-01…2031-01-01, без default;
 - `distributed by (inn)`: по ИНН идут соединения, строк меньше 10 млн;
@@ -70,8 +70,9 @@ Greenplum (ядро 9.4), plpgsql-функции, запуск — потоки 
   источники не пусты;
 - неделя: заявления за неделю; `payroll_d` с `start_dt`; справочники и договоры не пусты.
 
-Шаг `30` — `delete`, не `truncate`: запуск меняет один период (< 20% таблицы). Фильтр по
-`trigger_name` нужен: февраль-2027 (Пн–Вс) совпадает с неделей по `start_dt` и `end_dt`.
+На шаге `30` функция удаляет строки за точный интервал `start_dt`…`end_dt` и только по своему
+списку `trigger_name`, затем записывает новый результат. Так соблюдается правило
+[перерасчёта](specs/trigger-mart/spec.md#requirement-перерасчёт).
 
 **Отрасль.** `row_number() over (partition by inn order by coalesce(status_name = 'Активна', false) desc,
 (industry_name is not null) desc, coalesce(is_parent, false) desc, epk_create_dttm desc, epk_id desc) = 1`.
@@ -85,7 +86,9 @@ Greenplum (ядро 9.4), plpgsql-функции, запуск — потоки 
 `tmp_enrl` хранит `max(report_dt)` по `epk_id`. Заявление с зачислением, если
 `max(report_dt)` ≥ даты заявления. `exists` на каждое заявление читал бы таблицу много раз.
 
-**JSON.** `json_build_object`. Даты — строкой 'ГГГГ-ММ-ДД', числа — числом.
+**JSON.** `json_build_object`. Даты — строки `ГГГГ-ММ-ДД`, числовые параметры — числа.
+Ключи и правила расчёта описаны в спеках [месячной](specs/monthly-triggers/spec.md)
+и [недельной](specs/weekly-triggers/spec.md) функций.
 
 **ИНН навигатора.** `try_cast` varchar → int8. Не число — строка не берётся.
 
