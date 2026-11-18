@@ -77,30 +77,79 @@ def _choose_month(journal, month):
     return selected, latest, slots
 
 
+def _monthly_audit(source, saved, journal, dates):
+    if not (source.index.is_unique and saved.index.is_unique and journal.index.is_unique):
+        raise ValueError("Месяцы в контрольных итогах дублируются.")
+
+    def difference(left, right):
+        return None if pd.isna(left) or pd.isna(right) else left - right
+
+    audit = []
+    for index, month in enumerate(dates):
+        if index not in source.index or pd.isna(source.loc[index, "n"]) or source.loc[index, "n"] <= 0:
+            raise ValueError(f"Нет портфельных получателей в ведомостях за {M.label(month)}.")
+        a = source.loc[index]
+        b = saved.loc[month] if month in saved.index else {}
+        j = journal.loc[month]
+        rub = difference(a.amount, b.get("amount"))
+        fot = difference(a.fot, b.get("fot"))
+        journal_fot = difference(b.get("fot"), j.fot_amt)
+        version = j.def_ver
+        audit.append({
+            "month": month, "live_n": a.n, "saved_n": b.get("n"), "journal_n": j.pf_recip,
+            "amount_delta": rub, "fot_delta": fot, "journal_fot_delta": journal_fot, "version": version,
+            "ok": (a.n == b.get("n") == j.pf_recip and version == Q.DEF_VER
+                   and all(v is not None and abs(v) <= MIN_RUB_SYNC for v in (rub, fot, journal_fot))),
+        })
+    return audit
+
+
+def audit_table(audit):
+    """Одна строка на месяц, только банковские итоги для сверки."""
+    def signed(n):
+        if n is None or pd.isna(n):
+            return "—"
+        return f"{n:+,.2f}".replace(",", " ")
+
+    return pd.DataFrame([{
+        "Месяц": M.label(r["month"]), "Ведомости, чел.": _number(r["live_n"]),
+        "Сводка, чел.": _number(r["saved_n"]), "Журнал, чел.": _number(r["journal_n"]),
+        "Зачисления В−С, ₽": signed(r["amount_delta"]), "ФОТ В−С, ₽": signed(r["fot_delta"]),
+        "ФОТ С−Ж, ₽": signed(r["journal_fot_delta"]),
+        "Версия Ж/отчёт": f"{_number(r['version'])}/{Q.DEF_VER}",
+    } for r in audit if not r["ok"]])
+
+
+def previous_monthly_audit(traceback):
+    """Получить банковские итоги из старой проверки в том же ядре Jupyter."""
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_globals.get("__name__") == __name__ and frame.f_code.co_name == "_check_monthly":
+            values = frame.f_locals
+            if {"source", "saved", "journal", "dates"} <= values.keys():
+                return _monthly_audit(values["source"], values["saved"], values["journal"], values["dates"])
+        traceback = traceback.tb_next
+    return []
+
+
 def _check_monthly(conn, dates, journal):
-    """Проверка, что текущие определения и входы воспроизводят успешную сводку."""
     source = db.read_sql(conn, Q.LATEST_TOTALS).set_index("mi")
     saved = db.read_sql(conn, Q.LATEST_MONTHLY_TOTALS, {f"m{i}": d for i, d in enumerate(dates)})
-    saved["month"] = saved["report_dt"].map(M.iso)
-    saved = saved.set_index("month")
+    saved = saved.assign(month=saved["report_dt"].map(M.iso)).set_index("month")
     journal = journal.assign(month=journal["report_dt"].map(M.iso)).set_index("month")
-    if not saved.index.is_unique or not journal.index.is_unique:
-        raise ValueError("Месяцы в контрольных итогах дублируются.")
-    for index, month in enumerate(dates):
-        if index not in source.index or month not in saved.index:
-            raise ValueError(f"Нет данных ведомостей или сводки за {M.label(month)}.")
-        a, b, j = source.loc[index], saved.loc[month], journal.loc[month]
-        if (a.n != b.n or b.n != j.pf_recip or int(j.def_ver) != Q.DEF_VER
-                or abs(a.amount - b.amount) > MIN_RUB_SYNC or abs(a.fot - b.fot) > MIN_RUB_SYNC
-                or abs(b.fot - j.fot_amt) > MIN_RUB_SYNC):
-            raise ValueError(f"Ведомости, сводка и журнал не сошлись за {M.label(month)}. "
-                             "Проверьте определение портфеля и актуальность сводки.")
+    audit = _monthly_audit(source, saved, journal, dates)
+    differences = audit_table(audit)
+    if differences.empty:
+        progress.done("Сверка ведомостей, сводки и журнала: все месяцы сошлись")
+    else:
+        progress.warn("Сверка ведомостей, сводки и журнала: найдены расхождения")
+        print(differences.to_string(index=False), flush=True)
+    return audit
 
 
 def _coverage(conn, dates):
-    params = {f"m{i}": dates[i] for i in COMPARE}
-    frame = db.read_sql(conn, Q.LATEST_TB_COVERAGE, params)
-    frame["month"] = frame["report_dt"].map(M.iso)
+    frame = db.read_sql(conn, Q.LATEST_TB_COVERAGE)
+    frame["month"] = frame["mi"].map(dict(enumerate(dates)))
     table = frame.pivot(index="tb_id", columns="month", values="n").reindex(
         columns=[dates[i] for i in COMPARE]).fillna(0)
     actual, prev, year_actual, year_prev = (table[dates[i]] for i in COMPARE)
@@ -120,7 +169,7 @@ def _monthly(conn, gp, dates, journal, params):
     _load_triples(conn, "ptf_latest_tr", gp, Q.T_TR_MONTH, [
         {**params, "mi": i, "m": m} for i, m in enumerate(dates)
     ])
-    _check_monthly(conn, dates, journal)
+    audit = _check_monthly(conn, dates, journal)
     doubtful = _coverage(conn, dates)
     for name, sql in (("jobs", Q.LATEST_JOBS), ("locations", Q.LATEST_LOCATIONS),
                       ("org_locations", Q.LATEST_ORG_LOCATIONS)):
@@ -138,7 +187,13 @@ def _monthly(conn, gp, dates, journal, params):
     _temp(conn, "ptf_latest_shortlist", Q.latest_shortlist(), gp, "org_id, gosb_id", params)
     cards = db.read_sql(conn, Q.latest_cards(), params)
     totals["checked_cards"] = len(cards)
-    return totals, cards, doubtful
+    stale_pairs = set()
+    if not cards.empty and not all(r["ok"] for r in audit):
+        pair_params = {**params, "sync_rub": MIN_RUB_SYNC, **{f"m{i}": d for i, d in enumerate(dates)}}
+        stale = db.read_sql(conn, Q.LATEST_CHANGED_PAIRS, pair_params)
+        stale_pairs = set(stale["pair_code"])
+        progress.done(f"Расхождение со сводкой подтвердилось у {len(stale_pairs)} отобранных пар")
+    return totals, cards, doubtful, audit, stale_pairs
 
 
 def _calendar(conn, gp, dates, params):
@@ -207,14 +262,18 @@ def _group(row):
     return " · ".join(dict.fromkeys(parts)) if parts else "Вся пара"
 
 
-def _make_cards(rows, calendar, doubtful, min_change, calendar_expected):
+def _make_cards(rows, calendar, doubtful, min_change, calendar_expected, stale_pairs):
     daily_rows = {} if calendar.empty else {
         key: frame.set_index("mi") for key, frame in calendar.groupby(list(KEY))
     }
     cards = []
     for row in rows.to_dict("records"):
         key = tuple(row[k] for k in KEY)
-        result = _calendar_values(row, daily_rows.get(key), doubtful, min_change, calendar_expected)
+        stale = row["pair_code"] in stale_pairs
+        result = _calendar_values(row, None if stale else daily_rows.get(key),
+                                  doubtful, min_change, calendar_expected)
+        if stale:
+            result["state"] = "Ведомости расходятся со сводкой по паре"
         lifecycle = ""
         if row["n_prior"] == 0 and row["n_actual"] > 0:
             lifecycle = "Появились выплаты в паре"
@@ -265,11 +324,12 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
         calendar = pd.DataFrame()
         calendar_warning = f"Дневная проверка завершилась ошибкой ({code})."
         progress.warn(calendar_warning)
-    totals, rows, doubtful = monthly
-    cards = _make_cards(rows, calendar, doubtful, min_change, check_calendar)
+    totals, rows, doubtful, audit, stale_pairs = monthly
+    cards = _make_cards(rows, calendar, doubtful, min_change, check_calendar, stale_pairs)
     return {"month": selected, "latest": latest, "closed": closed, "dates": dates,
             "run_id": int(journal["run_id"].iloc[0]), "totals": totals, "cards": cards,
             "doubtful_tb": sorted(doubtful), "calendar_warning": calendar_warning,
+            "monthly_audit": audit, "stale_pairs": len(stale_pairs),
             "min_people": min_people, "min_change": min_change, "max_pairs": max_pairs, "max_groups": max_groups}
 
 
@@ -304,6 +364,11 @@ def overview(report):
     if report["latest"] < report["closed"]:
         text.append(f"Сводка пока заканчивается на {M.label(report['latest'])}; "
                     f"последний календарно закрытый месяц — {M.label(report['closed'])}.")
+    drift = [M.label(r["month"]) for r in report["monthly_audit"] if not r["ok"]]
+    if drift:
+        text.append(f"Ведомости, сводка или журнал расходятся за {', '.join(drift)}. "
+                    f"Суммы отчёта рассчитаны по ведомостям. У {report['stale_pairs']} отобранных пар "
+                    "расходятся портфельные показатели, причины по ним остаются открытыми.")
     if report["doubtful_tb"]:
         text.append(f"Требуется сверка полноты по ТБ: {', '.join(map(str, report['doubtful_tb']))}.")
     if report["calendar_warning"]:
@@ -328,6 +393,7 @@ def write_html(report, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     paragraphs = "".join(f"<p>{escape(line)}</p>" for line in overview(report))
     table = card_table(report)
+    audit = audit_table(report["monthly_audit"])
     detail = []
     for c in report["cards"]:
         title = escape(f"Орг. {c['org']} · ГОСБ {c['gosb']} · Пара {c['pair']} · {c['group']}")
@@ -343,6 +409,7 @@ def write_html(report, path):
         '<style>body{font:15px system-ui;margin:2rem;color:#19252e}table{border-collapse:collapse}'
         'td,th{padding:.45rem;border-bottom:1px solid #d4dde1;text-align:left}'
         'th{background:#eef3f5}details{margin:.6rem 0}</style><h1>Последний месяц</h1>'
-        + paragraphs + (table.to_html(index=False) if len(table) else "<p>Карточек по условиям отбора нет.</p>")
+        + paragraphs + (audit.to_html(index=False) if len(audit) else "")
+        + (table.to_html(index=False) if len(table) else "<p>Карточек по условиям отбора нет.</p>")
         + "".join(detail) + "</html>", encoding="utf-8")
     return path

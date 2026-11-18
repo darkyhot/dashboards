@@ -1203,10 +1203,40 @@ GROUP BY report_dt
 """
 
 LATEST_TB_COVERAGE = """
-SELECT report_dt, sys_tb_id AS tb_id, sum(any_recip) AS n
-FROM {schema_t}.yva_ptf_month_org
-WHERE report_dt IN (CAST(:m0 AS date), CAST(:m1 AS date), CAST(:m3 AS date), CAST(:m4 AS date))
-GROUP BY 1, 2
+SELECT mi, tb_id, count(*) AS n
+FROM ptf_latest_tr
+WHERE mi IN (0, 1, 3, 4)
+GROUP BY mi, tb_id
+"""
+
+LATEST_CHANGED_PAIRS = """
+WITH pairs AS (
+    SELECT org_id, gosb_id FROM ptf_latest_shortlist GROUP BY 1, 2
+), dates AS (
+    SELECT mi, CAST(report_dt AS date) AS report_dt
+    FROM (VALUES (0, :m0), (1, :m1), (2, :m2), (3, :m3), (4, :m4), (5, :m5)) d(mi, report_dt)
+), figures AS (
+    SELECT t.mi, t.org_id, t.gosb_id,
+           sum(CASE WHEN t.st = 'P' THEN 1 ELSE 0 END) AS live_n, sum(t.pf_amt) AS live_rub,
+           0 AS saved_n, 0 AS saved_rub
+    FROM ptf_latest_tr t JOIN pairs p ON p.org_id = t.org_id AND p.gosb_id = t.gosb_id
+    GROUP BY 1, 2, 3
+    UNION ALL
+    SELECT d.mi, t.org_id, t.sys_gosb_id, 0, 0, sum(t.pf_recip), sum(t.pf_amt)
+    FROM {schema_t}.yva_ptf_month_org t
+    JOIN pairs p ON p.org_id = t.org_id AND p.gosb_id = t.sys_gosb_id
+    JOIN dates d ON d.report_dt = t.report_dt
+    WHERE t.report_dt IN (CAST(:m0 AS date), CAST(:m1 AS date), CAST(:m2 AS date),
+                          CAST(:m3 AS date), CAST(:m4 AS date), CAST(:m5 AS date))
+    GROUP BY 1, 2, 3
+), changed AS (
+    SELECT org_id, gosb_id FROM figures
+    GROUP BY mi, org_id, gosb_id
+    HAVING sum(live_n) <> sum(saved_n) OR abs(sum(live_rub) - sum(saved_rub)) > :sync_rub
+)
+SELECT DISTINCT substr(md5(CAST(org_id AS text) || ':' || CAST(gosb_id AS text) || ':' || :salt), 1, 12)
+    AS pair_code
+FROM changed
 """
 
 LATEST_JOBS = """

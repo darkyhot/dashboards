@@ -130,6 +130,38 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(replay["latest"], "2026-09-30")
         self.assertEqual(replay["cards"], report["cards"])
 
+    def test_stale_monthly_totals_keep_the_report_and_flag_only_changed_pairs(self):
+        update = text(f"""UPDATE {SCHEMA}.yva_ptf_month_org
+            SET pf_recip = pf_recip - 1, pf_amt = pf_amt - 42000, fot_amt = fot_amt - 42000
+            WHERE report_dt = :month AND org_id = :org""")
+        restore = text(f"""UPDATE {SCHEMA}.yva_ptf_month_org
+            SET pf_recip = pf_recip + 1, pf_amt = pf_amt + 42000, fot_amt = fot_amt + 42000
+            WHERE report_dt = :month AND org_id = :org""")
+        params = {"month": MONTH, "org": ORG_A}
+        with self.engine.begin() as c:
+            c.execute(update, params)
+        try:
+            with db.session(self.engine) as c:
+                report = latest.run(c, today=date(2026, 9, 15), alias_salt=TEST_SALT)
+        finally:
+            with self.engine.begin() as c:
+                c.execute(restore, params)
+        audit = report["monthly_audit"][0]
+        self.assertFalse(audit["ok"])
+        self.assertEqual(audit["live_n"] - audit["saved_n"], 1)
+        self.assertEqual(audit["live_n"], audit["journal_n"])
+        self.assertEqual(audit["amount_delta"], 42000)
+        self.assertEqual(audit["journal_fot_delta"], -42000)
+        self.assertEqual(len(latest.audit_table(report["monthly_audit"])), 1)
+        self.assertEqual(report["stale_pairs"], 1)
+        a = latest.pair_alias(ORG_A, 8601, TEST_SALT)
+        affected = [card for card in report["cards"] if card["pair"] == a]
+        self.assertTrue(affected)
+        self.assertTrue(all(card["confirmed"] is None and "расходятся" in card["state"] for card in affected))
+        b = latest.pair_alias(ORG_B, 8601, TEST_SALT)
+        calendar = next(card for card in report["cards"] if card["pair"] == b and card["group"] == "Вся пара")
+        self.assertEqual(calendar["boundary"], -4_000_000)
+
     def test_missing_daily_keeps_monthly_findings(self):
         with db.session(self.engine) as c:
             config.setup(payroll_d="absent_daily_table")
