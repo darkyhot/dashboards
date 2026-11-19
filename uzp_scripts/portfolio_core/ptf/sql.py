@@ -1209,25 +1209,46 @@ WHERE mi IN (0, 1, 3, 4)
 GROUP BY mi, tb_id
 """
 
-LATEST_CHANGED_PAIRS = """
+# Суммы четырёх месяцев уже есть в строках «вся пара». К тройкам возвращаемся
+# только при банковском расхождении в одном из двух месяцев истории выплат.
+def latest_changed_pairs(slots):
+    measures = {0: ("n_actual", "actual"), 1: ("n_prior", "prior"),
+                3: ("n_year_actual", "year_actual"), 4: ("n_year_prior", "year_prior")}
+    dates = ", ".join(f"({i}, CAST(:m{i} AS date))" for i in slots)
+    dates_list = ", ".join(f"CAST(:m{i} AS date)" for i in slots)
+    history = [i for i in slots if i not in measures]
+    fields = {kind: " ".join(f"WHEN {i} THEN g.{cols[pos]}" for i, cols in measures.items())
+              for pos, kind in enumerate(("n", "rub"))}
+    live = f"""
+    SELECT d.mi, g.org_id, g.gosb_id,
+           CASE d.mi {fields["n"]} END AS live_n,
+           CASE d.mi {fields["rub"]} END AS live_rub,
+           0 AS saved_n, 0 AS saved_rub
+    FROM ptf_latest_groups g JOIN pairs p ON p.org_id = g.org_id AND p.gosb_id = g.gosb_id
+    CROSS JOIN dates d
+    WHERE g.income = -1 AND g.history = -1 AND g.jobs = -1 AND d.mi IN (0, 1, 3, 4)
+    """
+    if history:
+        live += f"""
+    UNION ALL
+    SELECT t.mi, t.org_id, t.gosb_id, count(*), sum(t.pf_amt), 0, 0
+    FROM ptf_latest_tr t JOIN pairs p ON p.org_id = t.org_id AND p.gosb_id = t.gosb_id
+    WHERE t.st = 'P' AND t.mi IN ({", ".join(map(str, history))})
+    GROUP BY 1, 2, 3
+    """
+    return f"""
 WITH pairs AS (
     SELECT org_id, gosb_id FROM ptf_latest_shortlist GROUP BY 1, 2
 ), dates AS (
-    SELECT mi, CAST(report_dt AS date) AS report_dt
-    FROM (VALUES (0, :m0), (1, :m1), (2, :m2), (3, :m3), (4, :m4), (5, :m5)) d(mi, report_dt)
+    SELECT mi, report_dt FROM (VALUES {dates}) d(mi, report_dt)
 ), figures AS (
-    SELECT t.mi, t.org_id, t.gosb_id,
-           sum(CASE WHEN t.st = 'P' THEN 1 ELSE 0 END) AS live_n, sum(t.pf_amt) AS live_rub,
-           0 AS saved_n, 0 AS saved_rub
-    FROM ptf_latest_tr t JOIN pairs p ON p.org_id = t.org_id AND p.gosb_id = t.gosb_id
-    GROUP BY 1, 2, 3
+    {live}
     UNION ALL
     SELECT d.mi, t.org_id, t.sys_gosb_id, 0, 0, sum(t.pf_recip), sum(t.pf_amt)
-    FROM {schema_t}.yva_ptf_month_org t
+    FROM {{schema_t}}.yva_ptf_month_org t
     JOIN pairs p ON p.org_id = t.org_id AND p.gosb_id = t.sys_gosb_id
     JOIN dates d ON d.report_dt = t.report_dt
-    WHERE t.report_dt IN (CAST(:m0 AS date), CAST(:m1 AS date), CAST(:m2 AS date),
-                          CAST(:m3 AS date), CAST(:m4 AS date), CAST(:m5 AS date))
+    WHERE t.report_dt IN ({dates_list})
     GROUP BY 1, 2, 3
 ), changed AS (
     SELECT org_id, gosb_id FROM figures
@@ -1238,6 +1259,7 @@ SELECT DISTINCT substr(md5(CAST(org_id AS text) || ':' || CAST(gosb_id AS text) 
     AS pair_code
 FROM changed
 """
+
 
 LATEST_JOBS = """
 SELECT mi, epk_id, count(*) AS n FROM (

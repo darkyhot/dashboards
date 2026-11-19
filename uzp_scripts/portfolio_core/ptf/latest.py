@@ -190,13 +190,18 @@ def _monthly(conn, gp, dates, journal, params):
     _temp(conn, "ptf_latest_shortlist", Q.latest_shortlist(), gp, "org_id, gosb_id", params)
     cards = db.read_sql(conn, Q.latest_cards(), params)
     totals["checked_cards"] = len(cards)
-    stale_pairs = set()
-    if not cards.empty and not all(r["ok"] for r in audit):
-        pair_params = {**params, "sync_rub": MIN_RUB_SYNC, **{f"m{i}": d for i, d in enumerate(dates)}}
-        stale = db.read_sql(conn, Q.LATEST_CHANGED_PAIRS, pair_params)
-        stale_pairs = set(stale["pair_code"])
-        progress.done(f"Расхождение со сводкой подтвердилось у {len(stale_pairs)} отобранных пар")
-    return totals, cards, doubtful, audit, stale_pairs
+    return totals, cards, doubtful, audit
+
+
+def _check_pairs(conn, dates, audit, params):
+    # По четырём базовым месяцам сравнение не требует сканировать таблицу троек.
+    slots = tuple(i for i, row in enumerate(audit) if i in COMPARE or not row["ok"])
+    query = Q.latest_changed_pairs(slots)
+    pair_params = {**params, "sync_rub": MIN_RUB_SYNC, **{f"m{i}": dates[i] for i in slots}}
+    progress.step("Сверка отобранных пар с готовой сводкой")
+    stale = set(db.read_sql(conn, query, pair_params)["pair_code"])
+    progress.done(f"Расхождение со сводкой подтвердилось у {len(stale)} отобранных пар")
+    return stale
 
 
 def _check_stopped_organizations(conn, params):
@@ -278,10 +283,12 @@ def _make_cards(rows, calendar, doubtful, min_change, calendar_expected, stale_p
     cards = []
     for row in rows.to_dict("records"):
         key = tuple(row[k] for k in KEY)
-        stale = row["pair_code"] in stale_pairs
-        result = _calendar_values(row, None if stale else daily_rows.get(key),
-                                  doubtful, min_change, calendar_expected, min_base_ratio)
-        if stale:
+        stale = stale_pairs is not None and row["pair_code"] in stale_pairs
+        windows = None if stale or stale_pairs is None else daily_rows.get(key)
+        result = _calendar_values(row, windows, doubtful, min_change, calendar_expected, min_base_ratio)
+        if stale_pairs is None:
+            result["state"] = "Сверка со сводкой по паре не закончилась"
+        elif stale:
             result["state"] = "Ведомости расходятся со сводкой по паре"
         group = _group(row)
         lifecycle = ""
@@ -319,10 +326,10 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
               "amt_min": amt_min, "exc_holding": exc_holding,
               "salt": alias_salt or urandom(16).hex()}
     calendar = pd.DataFrame()
-    calendar_warning = None
-    organization_warning = None
-    organization_checks = {}
-    checking_organizations = False
+    checks = {}
+    warnings = {}
+    stale_pairs = set()
+    stage = None
     monthly = None
     try:
         with connection.begin():
@@ -331,36 +338,73 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
             progress.done(f"Отчёт: {M.long(selected)}. Последний месяц успешной сводки: {M.long(latest)}")
             monthly = _monthly(connection, gp, dates, journal, params)
             card_rows = monthly[1]
+            if not card_rows.empty and not all(r["ok"] for r in monthly[3]):
+                stale_pairs = None
             stopped = card_rows["n_prior"].gt(0) & card_rows["n_actual"].eq(0)
             whole = card_rows[list(Q.LATEST_FEATURES)].eq(-1).all(axis=1)
             if (stopped & whole).any():
-                checking_organizations = True
-                organization_checks = _check_stopped_organizations(connection, params)
-                checking_organizations = False
+                stage = "organization_warning"
+                checks = _check_stopped_organizations(connection, params)
+            if stale_pairs is None:
+                stage = "pair_audit_warning"
+                stale_pairs = _check_pairs(connection, dates, monthly[3], params)
             if check_calendar and not card_rows.empty:
+                stage = "calendar_warning"
                 calendar = _calendar(connection, gp, dates, params)
     except DBAPIError as exc:
         if monthly is None:
             raise
         code = getattr(exc.orig, "pgcode", None) or "без SQLSTATE"
-        # Greenplum может отменить всю транзакцию при ошибке дневного чтения.
-        # Месячные агрегаты уже в памяти, поэтому их можно показать с явным статусом.
-        if checking_organizations:
-            organization_warning = f"Проверка выплат по всем ГОСБ завершилась ошибкой ({code})."
-            progress.warn(organization_warning)
-        else:
-            calendar = pd.DataFrame()
-            calendar_warning = f"Дневная проверка завершилась ошибкой ({code})."
-            progress.warn(calendar_warning)
-    totals, rows, doubtful, audit, stale_pairs = monthly
-    cards = _make_cards(rows, calendar, doubtful, min_change, check_calendar, stale_pairs, min_base_ratio)
-    return {"month": selected, "latest": latest, "closed": closed, "dates": dates,
-            "run_id": int(journal["run_id"].iloc[0]), "totals": totals, "cards": cards,
-            "doubtful_tb": sorted(doubtful), "calendar_warning": calendar_warning,
-            "organization_checks": organization_checks, "organization_warning": organization_warning,
-            "monthly_audit": audit, "stale_pairs": len(stale_pairs),
-            "min_people": min_people, "min_change": min_change, "min_base_ratio": min_base_ratio,
-            "max_pairs": max_pairs, "max_groups": max_groups}
+        messages = {"organization_warning": "Проверка выплат по всем ГОСБ",
+                    "pair_audit_warning": "Сверка отобранных пар",
+                    "calendar_warning": "Дневная проверка"}
+        key = stage or "pair_audit_warning"
+        warnings[key] = f"{messages[key]} завершилась ошибкой ({code})."
+        progress.warn(warnings[key])
+    return _assemble_report(monthly, journal, dates, closed, params, calendar, stale_pairs,
+                            check_calendar, checks, warnings)
+
+
+def _assemble_report(monthly, journal, dates, closed, params, calendar, stale_pairs,
+                     check_calendar, organization_checks, warnings):
+    totals, rows, doubtful, audit = monthly
+    cards = _make_cards(rows, calendar, doubtful, params["min_change"], check_calendar,
+                        stale_pairs, params["min_base_ratio"])
+    return {"month": dates[0], "latest": max(M.iso(d) for d in journal["report_dt"]),
+            "closed": closed, "dates": dates, "run_id": int(journal["run_id"].iloc[0]),
+            "totals": totals, "cards": cards, "doubtful_tb": sorted(doubtful),
+            "calendar_warning": warnings.get("calendar_warning"),
+            "organization_checks": organization_checks, "organization_warning": warnings.get("organization_warning"),
+            "pair_audit_warning": warnings.get("pair_audit_warning"),
+            "monthly_audit": audit, "stale_pairs": None if stale_pairs is None else len(stale_pairs),
+            "min_people": params["min_people"], "min_change": params["min_change"],
+            "min_base_ratio": params["min_base_ratio"], "max_pairs": params["max_pairs"], "max_groups": params["max_groups"]}
+
+
+def recover_pair_audit_report(traceback, month=None):
+    """В старом запуске карточки уже могли доехать в Python до ошибки сверки."""
+    pending = None
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_globals.get("__name__") == __name__ and frame.f_code.co_name == "_monthly":
+            values = frame.f_locals
+            required = {"totals", "cards", "doubtful", "audit", "params", "dates", "journal"}
+            if required <= values.keys():
+                pending = values
+        query = frame.f_locals.get("sql") if frame.f_code.co_name == "read_sql" else None
+        if pending and isinstance(query, str) and "FROM ptf_latest_tr" in query and "FROM changed" in query:
+            dates = pending["dates"]
+            if month and M.iso(month) != dates[0]:
+                return None
+            current = datetime.now(timezone(timedelta(hours=3))).date()
+            closed = M.iso(M.shift(current, -1))
+            monthly = tuple(pending[k] for k in ("totals", "cards", "doubtful", "audit"))
+            return _assemble_report(monthly, pending["journal"], dates, closed, pending["params"],
+                                    pd.DataFrame(), None, True, {},
+                                    {"pair_audit_warning": "Сверка отобранных пар не закончилась. "
+                                                           "Восстановлены месячные карточки предыдущего запуска."})
+        traceback = traceback.tb_next
+    return None
 
 
 def pair_alias(org, gosb, salt):
@@ -401,14 +445,20 @@ def overview(report):
     drift = [M.label(r["month"]) for r in report["monthly_audit"] if not r["ok"]]
     if drift:
         text.append(f"Ведомости, сводка или журнал расходятся за {', '.join(drift)}. "
-                    f"Суммы отчёта рассчитаны по ведомостям. У {report['stale_pairs']} отобранных пар "
-                    "расходятся портфельные показатели, причины по ним остаются открытыми.")
+                    "Суммы отчёта рассчитаны по ведомостям.")
+        if report["stale_pairs"] is None:
+            text.append("Сверка по отобранным парам осталась открытой. Отчёт предварительный.")
+        else:
+            text.append(f"У {report['stale_pairs']} отобранных пар расходятся портфельные показатели. "
+                        "Причины по ним остаются открытыми.")
     if report["doubtful_tb"]:
         text.append(f"Требуется сверка полноты по ТБ: {', '.join(map(str, report['doubtful_tb']))}.")
     if report["calendar_warning"]:
         text.append(report["calendar_warning"])
     if report.get("organization_warning"):
         text.append(report["organization_warning"])
+    if report.get("pair_audit_warning"):
+        text.append(report["pair_audit_warning"])
     text.append("Возвраты в следующем месяце пока неизвестны. Группы пересекаются, суммы карточек не складываются.")
     return text
 

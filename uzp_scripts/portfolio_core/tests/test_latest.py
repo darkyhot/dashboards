@@ -10,6 +10,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 from ptf import config, db, latest, months as M, sql as Q, synth
 from test_daily import ORG_A, ORG_B, ORG_T, payments
@@ -175,6 +176,25 @@ class Pipeline(unittest.TestCase):
             replay = latest.run(c, "2026-08", today=date(2026, 10, 1), alias_salt=TEST_SALT)
         self.assertEqual(replay["latest"], "2026-09-30")
         self.assertEqual(replay["cards"], report["cards"])
+
+    def test_pair_audit_disconnect_returns_the_monthly_report_without_confirming_causes(self):
+        def read_sql(connection, query, params=None):
+            if "FROM changed" in query:
+                self.assertNotIn("FROM ptf_latest_tr", query)
+                raise OperationalError(query, None, Exception("server closed the connection unexpectedly"))
+            frame = read_actual(connection, query, params)
+            if query == Q.LATEST_MONTHS:
+                frame.loc[frame["report_dt"].map(M.iso).eq(MONTH), "fot_amt"] += 99
+            return frame
+
+        read_actual = db.read_sql
+        with db.session(self.engine) as c, patch.object(db, "read_sql", side_effect=read_sql):
+            report = latest.run(c, month=MONTH, today=date(2026, 9, 15), alias_salt=TEST_SALT)
+        self.assertIsNone(report["stale_pairs"])
+        self.assertIn("Сверка отобранных пар", report["pair_audit_warning"])
+        self.assertTrue(report["organization_checks"])
+        self.assertTrue(report["cards"])
+        self.assertTrue(all(c["confirmed"] is None and "не закончилась" in c["state"] for c in report["cards"]))
 
     def test_stale_monthly_totals_keep_the_report_and_flag_only_changed_pairs(self):
         update = text(f"""UPDATE {SCHEMA}.yva_ptf_month_org
