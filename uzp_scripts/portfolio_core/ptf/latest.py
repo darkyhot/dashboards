@@ -4,8 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from hashlib import md5
 from html import escape
+from html.parser import HTMLParser
 from os import urandom
 from pathlib import Path
+import re
 
 import pandas as pd
 from sqlalchemy import text
@@ -400,6 +402,98 @@ def _card_table(cards):
 
 def card_table(report, limit=None):
     return _card_table(report["cards"][:limit])
+
+
+class _SavedReportParser(HTMLParser):
+    """Строки таблиц и текст раскрывающихся карточек из HTML отчёта."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self.details = []
+        self._table = self._row = self._detail = None
+        self._tag = None
+        self._parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag == "details":
+            self._detail = []
+        elif ((tag in ("td", "th") and self._row is not None)
+              or (tag in ("summary", "p", "li") and self._detail is not None)):
+            self._tag, self._parts = tag, []
+
+    def handle_data(self, data):
+        if self._tag is not None:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == self._tag:
+            value = "".join(self._parts).strip()
+            if tag in ("td", "th"):
+                self._row.append(value)
+            else:
+                self._detail.append((tag, value))
+            self._tag = None
+        elif tag == "tr" and self._row is not None:
+            self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            self.tables.append(self._table)
+            self._table = None
+        elif tag == "details" and self._detail is not None:
+            self.details.append(self._detail)
+            self._detail = None
+
+
+def read_saved_review(path):
+    """Восстановить просмотр из старого или нового latest.html без БД."""
+    html = Path(path).read_text(encoding="utf-8")
+    parser = _SavedReportParser()
+    parser.feed(html)
+    parser.close()
+    numbers = {
+        "amount": "Факт, ₽", "expected": "Ожидание, ₽", "raw": "Исходное, ₽",
+        "boundary": "Граница окна, ₽", "moved": "Между ГОСБ, ₽",
+        "confirmed": "Те же получатели, ₽", "residual": "Остаток, ₽", "people": "Получатели",
+    }
+    required = {"Пара", "ГОСБ", "Группа", "Статус", *numbers.values()}
+    table = next((t for t in parser.tables if t and required <= set(t[0])), None)
+    if table is None:
+        if "<h1>Последний месяц</h1>" in html and "Карточек по условиям отбора нет." in html:
+            return {"cards": []}
+        raise ValueError("В HTML нет полной таблицы карточек отчёта «Последний месяц».")
+
+    def number(value):
+        return None if value == "—" else int("".join(value.split()))
+
+    cards = {}
+    for cells in table[1:]:
+        if len(cells) != len(table[0]):
+            raise ValueError("В сохранённой таблице есть неполная строка.")
+        record = dict(zip(table[0], cells))
+        card = {name: number(record[label]) for name, label in numbers.items()}
+        card.update(pair=record["Пара"], gosb=record["ГОСБ"], group=record["Группа"],
+                    state=record["Статус"], lifecycle="", expected_people=None, flows={})
+        cards[(card["pair"], card["group"])] = card
+    for detail in parser.details:
+        title = next((value for tag, value in detail if tag == "summary"), "")
+        parts = title.split(" · ", 3)
+        if len(parts) != 4 or not parts[2].startswith("Пара "):
+            continue
+        card = cards.get((parts[2][len("Пара "):], parts[3]))
+        if card is None:
+            continue
+        for tag, value in detail:
+            if tag == "p" and (matched := re.match(r"Получатели: [\d\s—]+, ожидание ([\d\s—]+)\.", value)):
+                card["expected_people"] = number(matched[1])
+            if tag == "li" and (matched := re.fullmatch(
+                    r"(.+) — ([\d\s]+) чел\., ([\d\s—]+) ₽ в прошлом месяце", value)):
+                card["flows"][matched[1]] = {"people": number(matched[2]), "previous": number(matched[3])}
+    return {"cards": list(cards.values())}
 
 
 def review_tables(report, limit=6):

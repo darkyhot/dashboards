@@ -2,6 +2,10 @@
 import os
 import unittest
 from datetime import date
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -31,6 +35,36 @@ class Period(unittest.TestCase):
         dates.remove(M.parse("2025-06"))
         with self.assertRaisesRegex(ValueError, "сопоставимая сводка"):
             latest._choose_month(pd.DataFrame({"report_dt": dates}), None)
+
+
+class SavedReview(unittest.TestCase):
+    def test_notebook_recovers_the_saved_report_in_a_new_kernel(self):
+        card = {
+            "pair": "abc123", "gosb": 8369, "group": "Вся пара", "amount": 100000,
+            "expected": 200000, "raw": -100000, "boundary": 0, "moved": None,
+            "confirmed": -10000, "residual": -90000, "people": 30,
+            "state": "Проверено", "lifecycle": "",
+        }
+        original = latest.card_table({"cards": [card]}).to_html(index=False)
+        details = ("<details><summary>Орг. masked · ГОСБ 8369 · Пара abc123 · Вся пара</summary>"
+                   "<p>Получатели: 30, ожидание 33. Выплаты в обоих месяцах получили 25.</p>"
+                   "<ul><li>Нет портфельных выплат в банке — 3 чел., 90 000 ₽ в прошлом месяце</li></ul></details>")
+        notebook = json.loads((Path(__file__).resolve().parents[1] / "portfolio_core.ipynb").read_text())
+        source = next("".join(c["source"]) for c in notebook["cells"]
+                      if "ПРОСМОТР ГОТОВОГО ОТЧЁТА" in "".join(c["source"]))
+        with TemporaryDirectory() as tmp, patch.object(config, "OUTPUT_DIR", Path(tmp)):
+            path = Path(tmp) / "latest" / "latest.html"
+            path.parent.mkdir()
+            path.write_text(original + details, encoding="utf-8")
+            displays = []
+            with patch.object(db, "get_engine", side_effect=AssertionError("Просмотр обратился к БД")):
+                exec(compile(source, "просмотр", "exec"), {"display": displays.append})
+            self.assertEqual(len(displays), 3)
+            self.assertEqual(displays[0].iloc[0]["Те же получатели, ₽"], "-10 000")
+            self.assertEqual(displays[1].iloc[0]["Остаток, ₽"], "-90 000")
+            self.assertEqual(displays[2].iloc[0]["Выплаты в прошлом месяце, ₽"], "90 000")
+            path.write_text("<h1>Последний месяц</h1><p>Карточек по условиям отбора нет.</p>", encoding="utf-8")
+            self.assertEqual(latest.read_saved_review(path), {"cards": []})
 
 
 @unittest.skipUnless(PG_URL, "PTF_TEST_PG_URL не задан")
