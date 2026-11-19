@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import md5
 from html import escape
 from html.parser import HTMLParser
+import json
 from os import urandom
 from pathlib import Path
 import re
@@ -198,6 +199,12 @@ def _monthly(conn, gp, dates, journal, params):
     return totals, cards, doubtful, audit, stale_pairs
 
 
+def _check_stopped_organizations(conn, params):
+    progress.step("Остановившиеся пары: выплаты организации во всех ГОСБ")
+    frame = db.read_sql(conn, Q.LATEST_STOPPED_ORGANIZATIONS, params)
+    return {key: part.drop(columns="pair_code").to_dict("records") for key, part in frame.groupby("pair_code")}
+
+
 def _calendar(conn, gp, dates, params):
     progress.step("Дневные ведомости: проверка границы месяца для отобранных пар")
     _temp(conn, "ptf_latest_pairs", Q.LATEST_CHOSEN_PAIRS, gp, "org_id, gosb_id")
@@ -313,6 +320,9 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
               "salt": alias_salt or urandom(16).hex()}
     calendar = pd.DataFrame()
     calendar_warning = None
+    organization_warning = None
+    organization_checks = {}
+    checking_organizations = False
     monthly = None
     try:
         with connection.begin():
@@ -320,7 +330,14 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
             selected, latest, dates = _choose_month(journal, month)
             progress.done(f"Отчёт: {M.long(selected)}. Последний месяц успешной сводки: {M.long(latest)}")
             monthly = _monthly(connection, gp, dates, journal, params)
-            if check_calendar and not monthly[1].empty:
+            card_rows = monthly[1]
+            stopped = card_rows["n_prior"].gt(0) & card_rows["n_actual"].eq(0)
+            whole = card_rows[list(Q.LATEST_FEATURES)].eq(-1).all(axis=1)
+            if (stopped & whole).any():
+                checking_organizations = True
+                organization_checks = _check_stopped_organizations(connection, params)
+                checking_organizations = False
+            if check_calendar and not card_rows.empty:
                 calendar = _calendar(connection, gp, dates, params)
     except DBAPIError as exc:
         if monthly is None:
@@ -328,14 +345,19 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
         code = getattr(exc.orig, "pgcode", None) or "без SQLSTATE"
         # Greenplum может отменить всю транзакцию при ошибке дневного чтения.
         # Месячные агрегаты уже в памяти, поэтому их можно показать с явным статусом.
-        calendar = pd.DataFrame()
-        calendar_warning = f"Дневная проверка завершилась ошибкой ({code})."
-        progress.warn(calendar_warning)
+        if checking_organizations:
+            organization_warning = f"Проверка выплат по всем ГОСБ завершилась ошибкой ({code})."
+            progress.warn(organization_warning)
+        else:
+            calendar = pd.DataFrame()
+            calendar_warning = f"Дневная проверка завершилась ошибкой ({code})."
+            progress.warn(calendar_warning)
     totals, rows, doubtful, audit, stale_pairs = monthly
     cards = _make_cards(rows, calendar, doubtful, min_change, check_calendar, stale_pairs, min_base_ratio)
     return {"month": selected, "latest": latest, "closed": closed, "dates": dates,
             "run_id": int(journal["run_id"].iloc[0]), "totals": totals, "cards": cards,
             "doubtful_tb": sorted(doubtful), "calendar_warning": calendar_warning,
+            "organization_checks": organization_checks, "organization_warning": organization_warning,
             "monthly_audit": audit, "stale_pairs": len(stale_pairs),
             "min_people": min_people, "min_change": min_change, "min_base_ratio": min_base_ratio,
             "max_pairs": max_pairs, "max_groups": max_groups}
@@ -385,6 +407,8 @@ def overview(report):
         text.append(f"Требуется сверка полноты по ТБ: {', '.join(map(str, report['doubtful_tb']))}.")
     if report["calendar_warning"]:
         text.append(report["calendar_warning"])
+    if report.get("organization_warning"):
+        text.append(report["organization_warning"])
     text.append("Возвраты в следующем месяце пока неизвестны. Группы пересекаются, суммы карточек не складываются.")
     return text
 
@@ -455,6 +479,10 @@ def read_saved_review(path):
     parser = _SavedReportParser()
     parser.feed(html)
     parser.close()
+    heading = re.search(r"<p>([А-Яа-яЁё]+) (\d{4}) · сводка \d+</p>", html)
+    month = None
+    if heading and heading[1].lower() in M.RU_FULL:
+        month = M.month_end(int(heading[2]), M.RU_FULL.index(heading[1].lower()) + 1).isoformat()
     numbers = {
         "amount": "Факт, ₽", "expected": "Ожидание, ₽", "raw": "Исходное, ₽",
         "boundary": "Граница окна, ₽", "moved": "Между ГОСБ, ₽",
@@ -493,7 +521,9 @@ def read_saved_review(path):
             if tag == "li" and (matched := re.fullmatch(
                     r"(.+) — ([\d\s]+) чел\., ([\d\s—]+) ₽ в прошлом месяце", value)):
                 card["flows"][matched[1]] = {"people": number(matched[2]), "previous": number(matched[3])}
-    return {"cards": list(cards.values())}
+    stored = re.search(r'<script id="ptf-organization-checks" type="application/json">(.*?)</script>', html, re.S)
+    checks = json.loads(stored[1]) if stored else {}
+    return {"month": month, "cards": list(cards.values()), "organization_checks": checks}
 
 
 def review_tables(report, limit=6):
@@ -519,20 +549,79 @@ def review_tables(report, limit=6):
     return pages
 
 
-def review_movements(report):
-    """Движения по крупнейшему отрицательному остатку среди карточек всей пары."""
-    worst = min((c for c in report["cards"] if c["group"] == "Вся пара"
-                 and c["residual"] is not None and c["residual"] < 0),
-                key=lambda c: (c["residual"], c["pair"]), default=None)
-    if worst is None:
-        return None
-    title = (f"Крупнейший отрицательный остаток по паре {worst['pair']}, ГОСБ {worst['gosb']}. "
-             f"{_number(worst['residual'])} ₽. Получателей {_number(worst['people'])}, "
-             f"ожидали {_number(worst['expected_people'])}.")
-    table = pd.DataFrame([{"Наблюдение по выбывшим": label, "Получатели": item["people"],
-                           "Выплаты в прошлом месяце, ₽": _number(item["previous"])}
-                          for label, item in worst["flows"].items()])
-    return title, table
+def _worst_residual(report, whole):
+    return min((c for c in report["cards"] if (c["group"] == "Вся пара") == whole
+                and c["residual"] is not None and c["residual"] < 0),
+               key=lambda c: (c["residual"], c["pair"]), default=None)
+
+
+def _movement_table(card):
+    return pd.DataFrame([{"Наблюдение по выбывшим": label, "Получатели": item["people"],
+                          "Выплаты в прошлом месяце, ₽": _number(item["previous"])}
+                         for label, item in card["flows"].items()])
+
+
+def review_two_cases(report):
+    """Отдельный разбор сильнейшего отрицательного остатка пары и группы."""
+    results = []
+    for whole in (True, False):
+        card = _worst_residual(report, whole)
+        if card is None:
+            continue
+        money = {
+            "Факт": card["amount"], "Ожидание": card["expected"], "Исходное отклонение": card["raw"],
+            "Граница окна": card["boundary"], "Между ГОСБ": card["moved"],
+            "Выплаты тем же получателям": card["confirmed"], "Остаток": card["residual"],
+        }
+        title = (f"Пара {card['pair']} · ГОСБ {card['gosb']} · {card['group']}. "
+                 f"Получателей {_number(card['people'])}, ожидали {_number(card['expected_people'])}. "
+                 f"{card['state']}")
+        breakdown = pd.DataFrame({"Показатель": list(money), "Сумма, ₽": [_number(n) for n in money.values()]})
+        results.append((title, breakdown, _movement_table(card)))
+    return results
+
+
+def _organization_summary(report, limit):
+    rows = []
+    for pair, branches in report.get("organization_checks", {}).items():
+        origin = next(branch for branch in branches if branch["gosb"] == branch["stopped_gosb"])
+        prior = sum(branch["previous_amount"] for branch in branches)
+        actual = sum(branch["current_amount"] for branch in branches)
+        rows.append((origin["previous_amount"], {
+            "Пара": pair, "ГОСБ": origin["gosb"], "Было в паре, ₽": _number(origin["previous_amount"]),
+            "Было по организации, ₽": _number(prior), "Стало по организации, ₽": _number(actual),
+            "Изменение по организации, ₽": _number(actual - prior),
+            "Статус выплат": ("Продолжились в других ГОСБ" if actual > 0 else "Зачислений по организации нет"),
+        }))
+    return pd.DataFrame([row for _, row in sorted(rows, key=lambda item: (-item[0], item[1]["Пара"]))[:limit]])
+
+
+def _organization_table(branches, month):
+    months = M.label(M.shift(month, -1)), M.label(month)
+    rows = []
+    fields = ("previous_n", "current_n", "previous_amount", "current_amount")
+    totals = {name: sum(b[name] for b in branches) for name in fields}
+    for b in [*branches, {"gosb": "Итого", **totals}]:
+        rows.append({"ГОСБ": b["gosb"], f"Получатели {months[0]}": _number(b["previous_n"]),
+                     f"Получатели {months[1]}": _number(b["current_n"]),
+                     f"Зачисления {months[0]}, ₽": _number(b["previous_amount"]),
+                     f"Зачисления {months[1]}, ₽": _number(b["current_amount"])})
+    return pd.DataFrame(rows)
+
+
+def notebook_tables(report):
+    """Один набор итогов для расчётной ячейки и открытия сохранённого отчёта."""
+    yield from review_tables(report)
+    summary = _organization_summary(report, limit=6)
+    if not summary.empty:
+        yield "Выплаты организаций по всем ГОСБ при остановке пары", summary
+        first = summary.iloc[0]
+        yield (f"ГОСБ организации по паре {first['Пара']} · получатели посчитаны по парам",
+               _organization_table(report["organization_checks"][first["Пара"]], report["month"]))
+    for title, breakdown, flows in review_two_cases(report):
+        yield title, breakdown
+        if not flows.empty:
+            yield "Движения выбывших получателей", flows
 
 
 def write_html(report, path):
@@ -543,17 +632,22 @@ def write_html(report, path):
     audit = audit_table(report["monthly_audit"])
     pages = "".join(f"<h2>{escape(title)}</h2>"
                     + (page.to_html(index=False) if len(page) else "<p>Среди отобранных карточек таких случаев нет.</p>")
-                    for title, page in review_tables(report))
+                    for title, page in notebook_tables(report))
+    checks = report.get("organization_checks", {})
+    stored_checks = json.dumps(checks, ensure_ascii=False, allow_nan=False).replace("<", r"\u003c")
     detail = []
     for c in report["cards"]:
         title = escape(f"Орг. {c['org']} · ГОСБ {c['gosb']} · Пара {c['pair']} · {c['group']}")
         flows = "".join(f"<li>{escape(label)} — {_number(v['people'])} чел., "
                         f"{_number(v['previous'])} ₽ в прошлом месяце</li>" for label, v in c["flows"].items())
+        branches = checks.get(c["pair"]) if c["group"] == "Вся пара" else None
+        branch_table = ("<p>Выплаты организации во всех ГОСБ. Получатели посчитаны по парам.</p>"
+                        + _organization_table(branches, report["month"]).to_html(index=False)) if branches else ""
         detail.append(f"<details><summary>{title}</summary><p>Получатели: {_number(c['people'])}, "
                       f"ожидание {_number(c['expected_people'])}. Выплаты в обоих месяцах получили "
                       f"{_number(c['stay_people'])}. {escape(c['state'])}.</p>"
                       + (f"<ul>{flows}</ul>" if flows else "<p>Выбывших из пары в группе нет.</p>")
-                      + "</details>")
+                      + branch_table + "</details>")
     path.write_text(
         '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Последний месяц</title>'
         '<style>body{font:15px system-ui;margin:2rem;color:#19252e}table{border-collapse:collapse}'
@@ -562,5 +656,6 @@ def write_html(report, path):
         + paragraphs + (audit.to_html(index=False) if len(audit) else "") + pages
         + "<h2>Все отобранные карточки</h2>"
         + (table.to_html(index=False) if len(table) else "<p>Карточек по условиям отбора нет.</p>")
-        + "".join(detail) + "</html>", encoding="utf-8")
+        + "".join(detail) + '<script id="ptf-organization-checks" type="application/json">'
+        + stored_checks + "</script></html>", encoding="utf-8")
     return path

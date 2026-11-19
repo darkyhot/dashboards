@@ -1540,3 +1540,26 @@ FROM ptf_latest_shortlist s CROSS JOIN (VALUES (0), (1), (2), (3), (4), (5), (6)
 LEFT JOIN totals t ON t.org_id = s.org_id AND t.gosb_id = s.gosb_id AND t.mi = w.mi
     AND t.income = s.income AND t.history = s.history AND t.jobs = s.jobs
 """
+
+
+# Выплаты организации во всех ГОСБ для отобранных пар, где пропали выплаты.
+# Используются уже рассчитанные агрегаты из тех же ведомостей.
+LATEST_STOPPED_ORGANIZATIONS = """
+WITH places AS (
+    SELECT org_id, gosb_id, n_prior, n_actual, prior, actual
+    FROM ptf_latest_groups
+    WHERE income = -1 AND history = -1 AND jobs = -1 AND (n_prior > 0 OR n_actual > 0)
+), stopped AS (
+    SELECT p.org_id, p.gosb_id
+    FROM places p JOIN ptf_latest_shortlist s ON s.org_id = p.org_id AND s.gosb_id = p.gosb_id
+    WHERE s.income = -1 AND s.history = -1 AND s.jobs = -1
+      AND p.n_prior > 0 AND p.n_actual = 0
+)
+SELECT substr(md5(CAST(s.org_id AS text) || ':' || CAST(s.gosb_id AS text) || ':' || :salt), 1, 12)
+           AS pair_code,
+       s.gosb_id AS stopped_gosb, p.gosb_id AS gosb,
+       p.n_prior AS previous_n, p.n_actual AS current_n,
+       p.prior AS previous_amount, p.actual AS current_amount
+FROM stopped s JOIN places p ON p.org_id = s.org_id
+ORDER BY 1, 3
+"""

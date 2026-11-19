@@ -59,10 +59,10 @@ class SavedReview(unittest.TestCase):
             displays = []
             with patch.object(db, "get_engine", side_effect=AssertionError("Просмотр обратился к БД")):
                 exec(compile(source, "просмотр", "exec"), {"display": displays.append})
-            self.assertEqual(len(displays), 3)
+            self.assertEqual(len(displays), 4)
             self.assertEqual(displays[0].iloc[0]["Те же получатели, ₽"], "-10 000")
             self.assertEqual(displays[1].iloc[0]["Остаток, ₽"], "-90 000")
-            self.assertEqual(displays[2].iloc[0]["Выплаты в прошлом месяце, ₽"], "90 000")
+            self.assertEqual(displays[3].iloc[0]["Выплаты в прошлом месяце, ₽"], "90 000")
             path.write_text("<h1>Последний месяц</h1><p>Карточек по условиям отбора нет.</p>", encoding="utf-8")
             self.assertEqual(latest.read_saved_review(path), {"cards": []})
 
@@ -150,6 +150,15 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(outgoing["moved"], -1_650_000)
         self.assertEqual(incoming["moved"], 1_650_000)
         self.assertEqual(outgoing["org"], incoming["org"])
+        checked = report["organization_checks"][outgoing["pair"]]
+        self.assertEqual({int(b["gosb"]): b["current_amount"] for b in checked}, {8601: 0, 8602: 1650000})
+        with TemporaryDirectory() as tmp:
+            path = latest.write_html(report, Path(tmp) / "latest.html")
+            recovered = latest.read_saved_review(path)
+            self.assertEqual(recovered["organization_checks"], report["organization_checks"])
+            tables = dict(latest.notebook_tables(recovered))
+            self.assertIn("Выплаты организаций по всем ГОСБ при остановке пары", tables)
+
         self.assertEqual(outgoing["residual"], 0)
         self.assertIsNone(incoming["expected"])
         self.assertNotIn(str(ORG_A), str(report))
@@ -241,4 +250,5 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertIsNotNone(report["calendar_warning"])
         self.assertGreater(len(report["cards"]), 0)
+        self.assertTrue(report["organization_checks"])
         self.assertTrue(all(c["confirmed"] is None for c in report["cards"]))
