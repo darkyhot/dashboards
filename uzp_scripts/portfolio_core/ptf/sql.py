@@ -194,7 +194,7 @@ SELECT x.mi, x.epk_id, x.org_id, x.gosb_id, x.tb_id,
             THEN x.a_t2 + CASE WHEN x.exc OR x.sum_pf > :amt_min THEN x.a_pf ELSE 0 END
             ELSE 0 END                                        AS pf_amt,
        x.a_t2 + CASE WHEN x.exc OR x.sum_fot > :amt_min THEN x.a_fot ELSE 0 END AS fot_amt,
-       x.n_rows, x.n_pay
+       x.n_rows, x.n_pay@org_output@
 FROM (
   SELECT a.*,
          (e.inn_exc IS NOT NULL)                                          AS exc,
@@ -218,7 +218,7 @@ FROM (
                      AND NOT COALESCE(d.enrollment_type_id = 2, false)
                     THEN p.amt ELSE 0 END)                                      AS a_fot,
            count(*)                                                             AS n_rows,
-           sum(CASE WHEN p.amt > 0 THEN COALESCE(p.transaction_qty, 1) ELSE 0 END) AS n_pay
+           sum(CASE WHEN p.amt > 0 THEN COALESCE(p.transaction_qty, 1) ELSE 0 END) AS n_pay@org_input@
     FROM {schema}.@source@ p
     @joins@
     LEFT JOIN {schema}.uzp_dim_enrollment_type d ON d.enrollment_type_id = p.{code_col}
@@ -235,12 +235,15 @@ FROM (
 WHERE x.pos_any
 """
 
-def _triples(source, period, dates, joins=""):
+def _triples(source, period, dates, joins="", org_digits=False):
     return (_TRIPLES.replace("@source@", source).replace("@period@", period)
-            .replace("@dates@", dates).replace("@joins@", joins))
+            .replace("@dates@", dates).replace("@joins@", joins)
+            .replace("@org_output@", ", x.org_digits" if org_digits else "")
+            .replace("@org_input@", ", CAST(max(length(p.inn)) AS smallint) AS org_digits" if org_digits else ""))
 
 
 T_TR_MONTH = _triples("{payroll}", "CAST(:mi AS integer)", "p.report_dt = CAST(:m AS date)")
+LATEST_TR_MONTH = _triples("{payroll}", "CAST(:mi AS integer)", "p.report_dt = CAST(:m AS date)", org_digits=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -1262,19 +1265,41 @@ FROM changed
 
 
 LATEST_JOBS = """
-SELECT mi, epk_id, count(*) AS n FROM (
-    SELECT mi, epk_id, org_id FROM ptf_latest_tr
+SELECT mi, epk_id, count(*) AS n, sum(amount) AS amount FROM (
+    SELECT mi, epk_id, org_id, sum(pf_amt) AS amount FROM ptf_latest_tr
     WHERE mi IN (1, 4) AND st = 'P' GROUP BY mi, epk_id, org_id
 ) jobs GROUP BY mi, epk_id
 """
 
 LATEST_LOCATIONS = """
-SELECT t.mi, t.epk_id, bool_or(old.epk_id IS NULL) AS new_place
+SELECT t.mi, t.epk_id, bool_or(old.epk_id IS NULL) AS new_place, sum(t.pf_amt) AS amount
 FROM ptf_latest_tr t
 LEFT JOIN ptf_latest_tr old ON old.mi = t.mi + 1 AND old.st = 'P'
     AND old.epk_id = t.epk_id AND old.org_id = t.org_id AND old.gosb_id = t.gosb_id
 WHERE t.mi IN (0, 3) AND t.st = 'P'
 GROUP BY t.mi, t.epk_id
+"""
+
+# Один человек попадает в одну полосу по сумме портфельных зачислений
+# от всех работодателей. Таблицы уже посчитаны для классификации движений.
+LATEST_PORTFOLIO_BANDS = """
+SELECT mi, CASE WHEN amount < 30000 THEN 1 WHEN amount < 60000 THEN 2
+                WHEN amount < 100000 THEN 3 WHEN amount < 200000 THEN 4 ELSE 5 END AS band,
+       count(*) AS people, sum(amount) AS amount
+FROM (
+    SELECT mi, amount FROM ptf_latest_jobs
+    UNION ALL
+    SELECT mi, amount FROM ptf_latest_locations
+) people
+GROUP BY 1, 2
+"""
+
+LATEST_PORTFOLIO_GOSB = """
+SELECT gosb_id, sum(actual) AS actual, sum(prior) AS prior
+FROM ptf_latest_groups
+WHERE income = -1 AND history = -1 AND jobs = -1 AND (actual > 0 OR prior > 0)
+GROUP BY gosb_id
+ORDER BY 2 DESC, 1
 """
 
 LATEST_ORG_LOCATIONS = """
@@ -1305,7 +1330,7 @@ SELECT pair.*,
 FROM (
     SELECT coalesce(a.epk_id, b.epk_id) AS epk_id,
            coalesce(a.org_id, b.org_id) AS org_id, coalesce(a.gosb_id, b.gosb_id) AS gosb_id,
-           coalesce(a.tb_id, b.tb_id) AS tb_id,
+           coalesce(a.tb_id, b.tb_id) AS tb_id, coalesce(a.org_digits, b.org_digits) AS org_digits,
            CASE WHEN a.st = 'P' THEN 1 ELSE 0 END AS in_curr,
            CASE WHEN b.st = 'P' THEN 1 ELSE 0 END AS in_prev,
            a.st AS curr_state, coalesce(a.pf_amt, 0) AS curr_rub, coalesce(b.pf_amt, 0) AS prev_rub,
@@ -1348,6 +1373,7 @@ def latest_groups():
     )
     return f"""
 SELECT org_id, gosb_id, income, history, jobs, min(tb_id) AS tb_id,
+       coalesce(max(CASE WHEN period = 0 AND in_curr = 1 THEN org_digits END), max(org_digits)) AS org_digits,
        sum(CASE WHEN period = 0 THEN curr_rub ELSE 0 END) AS actual,
        sum(CASE WHEN period = 0 THEN prev_rub ELSE 0 END) AS prior,
        sum(CASE WHEN period = 1 THEN curr_rub ELSE 0 END) AS year_actual,
@@ -1364,7 +1390,7 @@ SELECT org_id, gosb_id, income, history, jobs, min(tb_id) AS tb_id,
        sum(CASE WHEN period = 1 AND movement = 'continuing' THEN 1 ELSE 0 END) AS stay_year_n,
        {reasons}
 FROM (
-    SELECT e.org_id, e.gosb_id, e.tb_id, e.period, e.curr_rub, e.prev_rub, e.in_curr, e.in_prev,
+    SELECT e.org_id, e.gosb_id, e.tb_id, e.org_digits, e.period, e.curr_rub, e.prev_rub, e.in_curr, e.in_prev,
            e.movement, {keys}
     FROM ptf_latest_events e {cross}
 ) expanded
@@ -1482,6 +1508,7 @@ def latest_cards():
 SELECT substr(md5(CAST(s.org_id AS text) || ':' || CAST(s.gosb_id AS text) || ':' || :salt), 1, 12)
            AS pair_code,
        substr(md5(CAST(s.org_id AS text) || ':org:' || :salt), 1, 10) AS org_code,
+       lpad(CAST(s.org_id AS text), greatest(length(CAST(s.org_id AS text)), s.org_digits), '0') AS org_original,
        s.gosb_id, s.tb_id, s.income, s.history, s.jobs, s.actual, s.prior, s.year_actual, s.year_prior,
        s.n_actual, s.n_prior, s.n_year_actual, s.n_year_prior, s.stay_actual, s.stay_prior,
        s.stay_year_actual, s.stay_year_prior, s.stay_n, s.stay_year_n,
@@ -1504,7 +1531,8 @@ LATEST_MATCHED_MOVES = """
 WITH paired AS (
     SELECT period, epk_id, org_id,
            max(CASE WHEN movement = 'same_org' THEN gosb_id END) AS source,
-           max(CASE WHEN movement = 'added' THEN gosb_id END) AS target
+           max(CASE WHEN movement = 'added' THEN gosb_id END) AS target,
+           sum(prev_rub) AS amount
     FROM ptf_latest_events e
     WHERE movement IN ('same_org', 'added')
       AND EXISTS (SELECT 1 FROM ptf_latest_pairs p WHERE p.org_id = e.org_id)
@@ -1513,8 +1541,24 @@ WITH paired AS (
        AND count(CASE WHEN movement = 'added' THEN 1 END) = 1
        AND sum(curr_rub) = sum(prev_rub) AND sum(prev_rub) > 0
 )
-SELECT period, epk_id, org_id, CASE WHEN edge.kind = 0 THEN source ELSE target END AS gosb_id
+SELECT period, epk_id, org_id, CASE WHEN edge.kind = 0 THEN source ELSE target END AS gosb_id,
+       source AS source_gosb, target AS target_gosb, amount
 FROM paired CROSS JOIN (VALUES (0), (1)) edge(kind)
+"""
+
+LATEST_CURRENT_ROUTES = """
+WITH counts AS (
+    SELECT org_id, source_gosb, target_gosb, count(*) AS people, sum(amount) AS amount
+    FROM ptf_latest_moves WHERE period = 0 AND gosb_id = source_gosb
+    GROUP BY 1, 2, 3
+)
+SELECT min(substr(md5(CAST(p.org_id AS text) || ':' || CAST(p.gosb_id AS text) || ':' || :salt), 1, 12))
+           AS pair_code,
+       c.source_gosb, c.target_gosb, c.people, c.amount
+FROM counts c JOIN ptf_latest_pairs p
+    ON p.org_id = c.org_id AND p.gosb_id IN (c.source_gosb, c.target_gosb)
+GROUP BY c.org_id, c.source_gosb, c.target_gosb, c.people, c.amount
+ORDER BY c.amount DESC, 1, 2, 3
 """
 
 
@@ -1584,4 +1628,42 @@ SELECT substr(md5(CAST(s.org_id AS text) || ':' || CAST(s.gosb_id AS text) || ':
        p.prior AS previous_amount, p.actual AS current_amount
 FROM stopped s JOIN places p ON p.org_id = s.org_id
 ORDER BY 1, 3
+"""
+
+
+# Физлицо с портфельными выплатами в предыдущем месяце и без них в текущем.
+# Переходы между организациями и ГОСБ не выводят человека из портфеля банка.
+LATEST_BANK_LEAVERS = """
+SELECT j.epk_id
+FROM ptf_latest_jobs j
+LEFT JOIN ptf_latest_locations loc ON loc.mi = 0 AND loc.epk_id = j.epk_id
+WHERE j.mi = 1 AND loc.epk_id IS NULL
+"""
+
+LATEST_BANK_LEAVER_COUNT = "SELECT count(*) AS n FROM ptf_latest_bank_leavers"
+
+LATEST_BANK_EARLY_DAY = _triples(
+    "{payroll_d}", "CAST(:mi AS integer)",
+    "p.report_dt >= CAST(:s_from AS date) AND p.report_dt <= CAST(:c_to AS date)",
+    "JOIN ptf_latest_bank_leavers leavers ON leavers.epk_id = p.epk_id",
+)
+
+# Только совпавшие платежи первого числа в двух предыдущих месяцах и такой
+# же платёж в последний будний день перед выходным первым числом. Прежняя
+# месячная ведомость должна содержать оба платежа в той же паре.
+LATEST_BANK_EARLY_COUNT = """
+SELECT count(*) AS n FROM (
+    SELECT a.epk_id
+    FROM ptf_latest_bank_days a
+    JOIN ptf_latest_bank_days b ON b.mi = 1 AND b.st = 'P' AND b.epk_id = a.epk_id
+        AND b.org_id = a.org_id AND b.gosb_id = a.gosb_id AND b.pf_amt = a.pf_amt
+    JOIN ptf_latest_bank_days c ON c.mi = 2 AND c.st = 'P' AND c.epk_id = a.epk_id
+        AND c.org_id = a.org_id AND c.gosb_id = a.gosb_id AND c.pf_amt = a.pf_amt
+    JOIN ptf_latest_tr p ON p.mi = 1 AND p.st = 'P' AND p.epk_id = a.epk_id
+        AND p.org_id = a.org_id AND p.gosb_id = a.gosb_id AND p.pf_amt >= 2 * a.pf_amt
+    JOIN ptf_latest_tr q ON q.mi = 2 AND q.st = 'P' AND q.epk_id = a.epk_id
+        AND q.org_id = a.org_id AND q.gosb_id = a.gosb_id AND q.pf_amt >= a.pf_amt
+    WHERE a.mi = 0 AND a.st = 'P' AND a.pf_amt > 0
+    GROUP BY a.epk_id
+) matched
 """

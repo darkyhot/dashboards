@@ -19,6 +19,7 @@ PG_URL = os.environ.get("PTF_TEST_PG_URL", "")
 SCHEMA = "test_latest_month"
 MONTH = "2026-08-31"
 ORG_C = 7_000_000_004
+ORG_D = 7_000_000_005
 TEST_SALT = "fixture"
 
 
@@ -62,8 +63,9 @@ class SavedReview(unittest.TestCase):
                 exec(compile(source, "просмотр", "exec"), {"display": displays.append})
             self.assertEqual(len(displays), 4)
             self.assertEqual(displays[0].iloc[0]["Те же получатели, ₽"], "-10 000")
-            self.assertEqual(displays[1].iloc[0]["Остаток, ₽"], "-90 000")
+            self.assertEqual(displays[1].iloc[0]["Пока без объяснения, ₽"], "-90 000")
             self.assertEqual(displays[3].iloc[0]["Выплаты в прошлом месяце, ₽"], "90 000")
+            self.assertEqual(displays[3].iloc[0]["Доля выплат выбывшим"], "100.0%")
             path.write_text("<h1>Последний месяц</h1><p>Карточек по условиям отбора нет.</p>", encoding="utf-8")
             self.assertEqual(latest.read_saved_review(path), {"cards": []})
 
@@ -84,12 +86,16 @@ class Pipeline(unittest.TestCase):
         d["gosb_id"] = 8601
         moved = d[is_a & d["epk_id"].between(1050, 1079)].copy()
         moved["org"] = ORG_C
-        moved["epk_id"] += 3000
         moved["amt"] = 55000
         moved.loc[moved["pay_dt"].map(M.iso) >= MONTH, "gosb_id"] = 8602
-        d = pd.concat([d, moved], ignore_index=True)
+        gone = d[is_a & d["epk_id"].between(1080, 1082) & ~august].copy()
+        gone["org"] = ORG_D
+        gone["epk_id"] += 4000
+        gone["amt"] = 45000
+        d = pd.concat([d, moved, gone], ignore_index=True)
         raw = pd.DataFrame({
-            "report_dt": d["pay_dt"], "inn": d["org"].astype(str), "epk_id": d["epk_id"],
+            "report_dt": d["pay_dt"], "inn": d["org"].map(lambda org: f"{org:012d}" if org == ORG_C else str(org)),
+            "epk_id": d["epk_id"],
             "amt": d["amt"], "sys_tb_id": 52, "sys_gosb_id": d["gosb_id"], "enrollment_type": 1,
             "segment_name": "Средний бизнес", "enrollment_kind_descr": d["kind"],
             "market_share_flag_name": "Прочие", "transaction_qty": 1,
@@ -134,7 +140,12 @@ class Pipeline(unittest.TestCase):
         with db.session(self.engine) as c:
             report = latest.run(c, today=date(2026, 9, 15), alias_salt=TEST_SALT)
         self.assertEqual(report["month"], MONTH)
-        self.assertEqual(report["totals"]["pairs"], 4)
+        self.assertEqual(report["totals"]["pairs"], 5)
+        changes = report["portfolio"]["changes"]
+        self.assertEqual((changes["net"], changes["left"], changes["entered"], changes["early"]), (-53, 53, 0, 50))
+        self.assertEqual(changes["early_date"], "2026-07-31")
+        route = next(r for r in report["routes"] if r["source_gosb"] == 8601 and r["target_gosb"] == 8602)
+        self.assertEqual((route["people"], route["amount"]), (30, 1650000))
 
         def whole_pair(org, gosb):
             key = latest.pair_alias(org, gosb, TEST_SALT)
@@ -156,14 +167,29 @@ class Pipeline(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = latest.write_html(report, Path(tmp) / "latest.html")
             recovered = latest.read_saved_review(path)
+            body = path.read_text(encoding="utf-8")
+            self.assertIn(f"{ORG_C:012d}", body)
+            self.assertIn("ФОТ по ведомостям", body)
+            self.assertIn("Как изменилась структура", body)
+            self.assertIn("Почему изменилось число людей", body)
+            self.assertIn("найден перенос выплат на 31.07", body)
+            real = body.split('<section id="findings">', 1)[1].split("</section>", 1)[0]
+            self.assertNotIn(f"{ORG_C:012d}", real)
+            self.assertIn(f"{ORG_C:012d}", body.split('<section id="explanations">', 1)[1])
+            self.assertNotIn("organization_ids", recovered)
+            self.assertNotIn(str(ORG_C), str(recovered))
             self.assertEqual(recovered["organization_checks"], report["organization_checks"])
             tables = dict(latest.notebook_tables(recovered))
             self.assertIn("Выплаты организаций по всем ГОСБ при остановке пары", tables)
 
         self.assertEqual(outgoing["residual"], 0)
         self.assertIsNone(incoming["expected"])
-        self.assertNotIn(str(ORG_A), str(report))
-        self.assertNotIn(str(ORG_B), str(report))
+        self.assertNotIn(str(ORG_A), str(report["cards"]))
+        self.assertNotIn(str(ORG_B), str(report["cards"]))
+        self.assertTrue(all(str(ORG_C) not in str(table) for _, table in latest.notebook_tables(report)))
+        current_bands = [b for b in report["portfolio"]["bands"] if b["mi"] == 0]
+        self.assertEqual(sum(b["people"] for b in current_bands), 100)
+        self.assertEqual(sum(b["amount"] for b in current_bands), report["portfolio"]["periods"][0]["amount"])
         self.assertTrue(any("·" in card["group"] for card in report["cards"]))
         _, decreases = latest.review_tables(report)[0]
         self.assertIn("От 200 тыс. ₽", set(decreases["Группа"]))
@@ -176,6 +202,7 @@ class Pipeline(unittest.TestCase):
             replay = latest.run(c, "2026-08", today=date(2026, 10, 1), alias_salt=TEST_SALT)
         self.assertEqual(replay["latest"], "2026-09-30")
         self.assertEqual(replay["cards"], report["cards"])
+        self.assertEqual(replay["portfolio"]["changes"], changes)
 
     def test_pair_audit_disconnect_returns_the_monthly_report_without_confirming_causes(self):
         def read_sql(connection, query, params=None):

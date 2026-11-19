@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from hashlib import md5
-from html import escape
 from html.parser import HTMLParser
 import json
 from os import urandom
@@ -61,8 +60,11 @@ def _load_triples(conn, name, gp, query, slots):
             _temp(conn, name, query, gp, "epk_id", params)
         else:
             _execute(conn, f"INSERT INTO {name}\n{query}", params)
-        progress.done(f"{M.label(params['m'])}: месячные тройки" if name == "ptf_latest_tr"
-                      else f"{M.label(params['m'])}: дневные окна для проверки")
+        label = {"ptf_latest_tr": "месячные тройки", "ptf_latest_days": "дневные окна для проверки"}
+        if name == "ptf_latest_bank_days":
+            progress.done(f"{params['m']}: выплаты для проверки переноса")
+        else:
+            progress.done(f"{M.label(params['m'])}: {label[name]}")
     _execute(conn, f"ANALYZE {name}")
 
 
@@ -100,6 +102,7 @@ def _monthly_audit(source, saved, journal, dates):
         version = j.def_ver
         audit.append({
             "month": month, "live_n": a.n, "saved_n": b.get("n"), "journal_n": j.pf_recip,
+            "live_amount": a.amount, "live_fot": a.fot,
             "amount_delta": rub, "fot_delta": fot, "journal_fot_delta": journal_fot, "version": version,
             "ok": (a.n == b.get("n") == j.pf_recip and version == Q.DEF_VER
                    and all(v is not None and abs(v) <= MIN_RUB_SYNC for v in (rub, fot, journal_fot))),
@@ -169,7 +172,7 @@ def _monthly(conn, gp, dates, journal, params):
     progress.step("Месячные ведомости: получатели, группы и сопоставление с прошлым годом")
     _temp(conn, "t_tik", Q.T_TIK, gp, "inn")
     _temp(conn, "t_exc", Q.T_EXC, gp, "inn_exc", params)
-    _load_triples(conn, "ptf_latest_tr", gp, Q.T_TR_MONTH, [
+    _load_triples(conn, "ptf_latest_tr", gp, Q.LATEST_TR_MONTH, [
         {**params, "mi": i, "m": m} for i, m in enumerate(dates)
     ])
     audit = _check_monthly(conn, dates, journal)
@@ -191,6 +194,48 @@ def _monthly(conn, gp, dates, journal, params):
     cards = db.read_sql(conn, Q.latest_cards(), params)
     totals["checked_cards"] = len(cards)
     return totals, cards, doubtful, audit
+
+
+def _portfolio_context(conn, gp, audit):
+    progress.step("Итоги зарплатного портфеля и структура зачислений")
+    bands = db.read_sql(conn, Q.LATEST_PORTFOLIO_BANDS).to_dict("records")
+    counts = {i: sum(int(row["people"]) for row in bands if row["mi"] == i) for i in (0, 1)}
+    _temp(conn, "ptf_latest_bank_leavers", Q.LATEST_BANK_LEAVERS, gp, "epk_id")
+    left = int(db.scalar(conn, Q.LATEST_BANK_LEAVER_COUNT))
+    return {
+        "periods": [{"month": audit[i]["month"], "amount": audit[i]["live_amount"], "fot": audit[i]["live_fot"]}
+                    for i in COMPARE],
+        "bands": bands,
+        "gosb": db.read_sql(conn, Q.LATEST_PORTFOLIO_GOSB).to_dict("records"),
+        "changes": {"previous": counts[1], "current": counts[0],
+                    "net": counts[0] - counts[1], "left": left, "entered": counts[0] - counts[1] + left,
+                    "early": None, "early_status": "not_checked"},
+    }
+
+
+def _bank_early_dates(month):
+    first = M.parse(month).replace(day=1)
+    references = [M.shift(first, offset).replace(day=1) for offset in (-1, -2)]
+    if first.weekday() < 5:
+        return "weekday", []
+    if any(d.weekday() >= 5 for d in references):
+        return "no_reference", []
+    early = first - timedelta(days=first.weekday() - 4)
+    return "scheduled", [d.isoformat() for d in (early, *references)]
+
+
+def _check_bank_early(conn, gp, month, params, changes):
+    status, days = _bank_early_dates(month)
+    changes["early_status"] = status
+    if not days or not changes["left"]:
+        return
+    progress.step("Проверка переноса первого числа по всему банку")
+    changes["early_status"] = "not_checked"
+    _load_triples(conn, "ptf_latest_bank_days", gp, Q.LATEST_BANK_EARLY_DAY, [
+        {**params, "mi": i, "m": day, "s_from": day, "c_to": day} for i, day in enumerate(days)
+    ])
+    early = int(db.scalar(conn, Q.LATEST_BANK_EARLY_COUNT))
+    changes.update(early_status="checked", early=early, early_date=days[0])
 
 
 def _check_pairs(conn, dates, audit, params):
@@ -217,7 +262,9 @@ def _calendar(conn, gp, dates, params):
     _load_triples(conn, "ptf_latest_days", gp, Q.latest_daily_triples(), [
         {**params, **daily.windows(dates[i]), "mi": j} for j, i in enumerate(COMPARE)
     ])
-    return db.read_sql(conn, Q.latest_daily_groups(), params)
+    groups = db.read_sql(conn, Q.latest_daily_groups(), params)
+    routes = db.read_sql(conn, Q.LATEST_CURRENT_ROUTES, params).to_dict("records")
+    return groups, routes
 
 
 def _delta(values):
@@ -261,12 +308,11 @@ def _calendar_values(row, windows, doubtful, min_change, calendar_expected, min_
     elif comparable_rub:
         state = "Отклонение осталось после проверки границы окна"
     elif moved:
-        state = "Найден переход выплат между ГОСБ одной организации"
+        state = "Учтена поправка на перераспределение выплат между ГОСБ"
     else:
         state = "Нет сопоставимой сезонной базы зачислений"
     if moved and comparable_rub and confirmed is None and abs(after - moved) < abs(after):
-        state = ("Отклонение объясняется переходом между ГОСБ" if abs(after - moved) <= MIN_RUB_SYNC
-                 else "Часть отклонения объясняет переход между ГОСБ")
+        state = "Учтена поправка на перераспределение выплат между ГОСБ"
     return {"raw": monthly_delta, "boundary": boundary, "moved": moved, "confirmed": confirmed,
             "residual": after - moved - (confirmed or 0) if comparable_rub else None, "state": state}
 
@@ -327,6 +373,8 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
               "salt": alias_salt or urandom(16).hex()}
     calendar = pd.DataFrame()
     checks = {}
+    portfolio = {}
+    routes = []
     warnings = {}
     stale_pairs = set()
     stage = None
@@ -340,6 +388,8 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
             card_rows = monthly[1]
             if not card_rows.empty and not all(r["ok"] for r in monthly[3]):
                 stale_pairs = None
+            stage = "portfolio_warning"
+            portfolio = _portfolio_context(connection, gp, monthly[3])
             stopped = card_rows["n_prior"].gt(0) & card_rows["n_actual"].eq(0)
             whole = card_rows[list(Q.LATEST_FEATURES)].eq(-1).all(axis=1)
             if (stopped & whole).any():
@@ -350,30 +400,42 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
                 stale_pairs = _check_pairs(connection, dates, monthly[3], params)
             if check_calendar and not card_rows.empty:
                 stage = "calendar_warning"
-                calendar = _calendar(connection, gp, dates, params)
+                calendar, routes = _calendar(connection, gp, dates, params)
+            if check_calendar:
+                stage = "bank_timing"
+                _check_bank_early(connection, gp, selected, params, portfolio["changes"])
     except DBAPIError as exc:
         if monthly is None:
             raise
         code = getattr(exc.orig, "pgcode", None) or "без SQLSTATE"
-        messages = {"organization_warning": "Проверка выплат по всем ГОСБ",
+        messages = {"portfolio_warning": "Сбор структуры портфеля",
+                    "organization_warning": "Проверка выплат по всем ГОСБ",
                     "pair_audit_warning": "Сверка отобранных пар",
-                    "calendar_warning": "Дневная проверка"}
+                    "calendar_warning": "Дневная проверка",
+                    "bank_timing": "Проверка переноса выплат по банку"}
         key = stage or "pair_audit_warning"
-        warnings[key] = f"{messages[key]} завершилась ошибкой ({code})."
-        progress.warn(warnings[key])
-    return _assemble_report(monthly, journal, dates, closed, params, calendar, stale_pairs,
-                            check_calendar, checks, warnings)
+        warning = f"{messages[key]} завершилась ошибкой ({code})."
+        warnings["calendar_warning" if key == "bank_timing" else key] = warning
+        progress.warn(warning)
+    report = _assemble_report((*monthly, portfolio), journal, dates, closed, params, calendar, stale_pairs,
+                              check_calendar, checks, warnings)
+    report["routes"] = [r for r in routes if stale_pairs is not None and r["pair_code"] not in stale_pairs]
+    return report
 
 
 def _assemble_report(monthly, journal, dates, closed, params, calendar, stale_pairs,
                      check_calendar, organization_checks, warnings):
-    totals, rows, doubtful, audit = monthly
+    totals, rows, doubtful, audit = monthly[:4]
+    portfolio = monthly[4] if len(monthly) > 4 else {}
+    organization_ids = (dict(zip(rows["pair_code"], rows["org_original"])) if "org_original" in rows else {})
     cards = _make_cards(rows, calendar, doubtful, params["min_change"], check_calendar,
                         stale_pairs, params["min_base_ratio"])
     return {"month": dates[0], "latest": max(M.iso(d) for d in journal["report_dt"]),
             "closed": closed, "dates": dates, "run_id": int(journal["run_id"].iloc[0]),
-            "totals": totals, "cards": cards, "doubtful_tb": sorted(doubtful),
+            "totals": totals, "cards": cards, "portfolio": portfolio, "organization_ids": organization_ids,
+            "doubtful_tb": sorted(doubtful),
             "calendar_warning": warnings.get("calendar_warning"),
+            "portfolio_warning": warnings.get("portfolio_warning"),
             "organization_checks": organization_checks, "organization_warning": warnings.get("organization_warning"),
             "pair_audit_warning": warnings.get("pair_audit_warning"),
             "monthly_audit": audit, "stale_pairs": None if stale_pairs is None else len(stale_pairs),
@@ -437,7 +499,7 @@ def overview(report):
         f"отобрано карточек {_number(totals['checked_cards'])}. "
         f"Отбор: от {report['min_people']} получателей в базах, относительное отклонение от "
         f"{report['min_change']:.0%}. Появление и прекращение выплат учитываются отдельно. "
-        "Отсечки в рублях нет.",
+        "Рублёвая отсечка задаётся при просмотре HTML.",
     ]
     if report["latest"] < report["closed"]:
         text.append(f"Сводка пока заканчивается на {M.label(report['latest'])}; "
@@ -457,6 +519,8 @@ def overview(report):
         text.append(report["calendar_warning"])
     if report.get("organization_warning"):
         text.append(report["organization_warning"])
+    if report.get("portfolio_warning"):
+        text.append(report["portfolio_warning"])
     if report.get("pair_audit_warning"):
         text.append(report["pair_audit_warning"])
     text.append("Возвраты в следующем месяце пока неизвестны. Группы пересекаются, суммы карточек не складываются.")
@@ -526,6 +590,9 @@ class _SavedReportParser(HTMLParser):
 def read_saved_review(path):
     """Восстановить просмотр из старого или нового latest.html без БД."""
     html = Path(path).read_text(encoding="utf-8")
+    payload = re.search(r'<script id="ptf-review" type="application/json">(.*?)</script>', html, re.S)
+    if payload:
+        return json.loads(payload[1])
     parser = _SavedReportParser()
     parser.feed(html)
     parser.close()
@@ -606,29 +673,41 @@ def _worst_residual(report, whole):
 
 
 def _movement_table(card):
-    return pd.DataFrame([{"Наблюдение по выбывшим": label, "Получатели": item["people"],
-                          "Выплаты в прошлом месяце, ₽": _number(item["previous"])}
-                         for label, item in card["flows"].items()])
+    flows = card["flows"]
+    previous = [item["previous"] for item in flows.values()]
+    total = sum(previous) if all(n is not None and pd.notna(n) for n in previous) else None
+    return pd.DataFrame([
+        {"Наблюдение по выбывшим": label, "Получатели": item["people"],
+         "Выплаты в прошлом месяце, ₽": _number(item["previous"]),
+         "Доля выплат выбывшим": f"{item['previous'] / total:.1%}" if total else "—"}
+        for label, item in flows.items()
+    ])
 
 
-def review_two_cases(report):
-    """Отдельный разбор сильнейшего отрицательного остатка пары и группы."""
-    results = []
-    for whole in (True, False):
-        card = _worst_residual(report, whole)
-        if card is None:
+def _review_cases(report):
+    """Разбирает крупнейшее подтверждённое снижение и два крупнейших остатка."""
+    largest_drop = min((c for c in report["cards"] if c["confirmed"] is not None and c["confirmed"] < 0),
+                       key=lambda c: (c["confirmed"], c["pair"], c["group"]), default=None)
+    seen = set()
+    cases = (
+        ("Наибольшее подтверждённое снижение", largest_drop),
+        ("Крупнейшее необъяснённое снижение по организации в ГОСБ", _worst_residual(report, whole=True)),
+        ("Крупнейшее необъяснённое снижение по группе", _worst_residual(report, whole=False)),
+    )
+    for caption, card in cases:
+        if card is None or (card["pair"], card["group"]) in seen:
             continue
+        seen.add((card["pair"], card["group"]))
         money = {
             "Факт": card["amount"], "Ожидание": card["expected"], "Исходное отклонение": card["raw"],
             "Граница окна": card["boundary"], "Между ГОСБ": card["moved"],
-            "Выплаты тем же получателям": card["confirmed"], "Остаток": card["residual"],
+            "Выплаты тем же получателям": card["confirmed"], "Пока без объяснения": card["residual"],
         }
-        title = (f"Пара {card['pair']} · ГОСБ {card['gosb']} · {card['group']}. "
+        title = (f"{caption}. Пара {card['pair']} · ГОСБ {card['gosb']} · {card['group']}. "
                  f"Получателей {_number(card['people'])}, ожидали {_number(card['expected_people'])}. "
                  f"{card['state']}")
         breakdown = pd.DataFrame({"Показатель": list(money), "Сумма, ₽": [_number(n) for n in money.values()]})
-        results.append((title, breakdown, _movement_table(card)))
-    return results
+        yield title, breakdown, _movement_table(card)
 
 
 def _organization_summary(report, limit):
@@ -649,9 +728,8 @@ def _organization_summary(report, limit):
 def _organization_table(branches, month):
     months = M.label(M.shift(month, -1)), M.label(month)
     rows = []
-    fields = ("previous_n", "current_n", "previous_amount", "current_amount")
-    totals = {name: sum(b[name] for b in branches) for name in fields}
-    for b in [*branches, {"gosb": "Итого", **totals}]:
+    money = {name: sum(b[name] for b in branches) for name in ("previous_amount", "current_amount")}
+    for b in [*branches, {"gosb": "Итого по выплатам", "previous_n": None, "current_n": None, **money}]:
         rows.append({"ГОСБ": b["gosb"], f"Получатели {months[0]}": _number(b["previous_n"]),
                      f"Получатели {months[1]}": _number(b["current_n"]),
                      f"Зачисления {months[0]}, ₽": _number(b["previous_amount"]),
@@ -661,51 +739,37 @@ def _organization_table(branches, month):
 
 def notebook_tables(report):
     """Один набор итогов для расчётной ячейки и открытия сохранённого отчёта."""
-    yield from review_tables(report)
+    changes = report.get("portfolio", {}).get("changes")
+    if changes:
+        rows = [("Людей в прошлом месяце", changes["previous"]),
+                ("Людей в текущем месяце", changes["current"]),
+                ("Изменение за месяц", changes["net"]),
+                ("Появились портфельные выплаты", changes["entered"]),
+                ("В этом месяце без портфельных выплат", changes["left"])]
+        if changes.get("early") is not None:
+            rows.append(("Из них найден перенос выплаты", changes["early"]))
+            rows.append(("Изменение с учётом переноса", changes["net"] + changes["early"]))
+        yield "Почему изменилось число людей в банке", pd.DataFrame(
+            [(label, _number(value)) for label, value in rows], columns=["Что произошло", "Людей"])
+    labels = ("Снизились выплаты тем же людям", "Снижение, причины которого уточняются", "Выросли выплаты тем же людям")
+    for name, (_, table) in zip(labels, review_tables(report)):
+        yield name, table.rename(columns={"Исходное, ₽": "Отклонение, ₽", "Остаток, ₽": "Пока без объяснения, ₽"})
     summary = _organization_summary(report, limit=6)
     if not summary.empty:
         yield "Выплаты организаций по всем ГОСБ при остановке пары", summary
         first = summary.iloc[0]
-        yield (f"ГОСБ организации по паре {first['Пара']} · получатели посчитаны по парам",
+        yield (f"ГОСБ организации по паре {first['Пара']} · выплаты и получатели по каждому ГОСБ",
                _organization_table(report["organization_checks"][first["Пара"]], report["month"]))
-    for title, breakdown, flows in review_two_cases(report):
+    for title, breakdown, flows in _review_cases(report):
         yield title, breakdown
         if not flows.empty:
             yield "Движения выбывших получателей", flows
 
 
 def write_html(report, path):
+    from .latest_html import render
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    paragraphs = "".join(f"<p>{escape(line)}</p>" for line in overview(report))
-    table = card_table(report)
-    audit = audit_table(report["monthly_audit"])
-    pages = "".join(f"<h2>{escape(title)}</h2>"
-                    + (page.to_html(index=False) if len(page) else "<p>Среди отобранных карточек таких случаев нет.</p>")
-                    for title, page in notebook_tables(report))
-    checks = report.get("organization_checks", {})
-    stored_checks = json.dumps(checks, ensure_ascii=False, allow_nan=False).replace("<", r"\u003c")
-    detail = []
-    for c in report["cards"]:
-        title = escape(f"Орг. {c['org']} · ГОСБ {c['gosb']} · Пара {c['pair']} · {c['group']}")
-        flows = "".join(f"<li>{escape(label)} — {_number(v['people'])} чел., "
-                        f"{_number(v['previous'])} ₽ в прошлом месяце</li>" for label, v in c["flows"].items())
-        branches = checks.get(c["pair"]) if c["group"] == "Вся пара" else None
-        branch_table = ("<p>Выплаты организации во всех ГОСБ. Получатели посчитаны по парам.</p>"
-                        + _organization_table(branches, report["month"]).to_html(index=False)) if branches else ""
-        detail.append(f"<details><summary>{title}</summary><p>Получатели: {_number(c['people'])}, "
-                      f"ожидание {_number(c['expected_people'])}. Выплаты в обоих месяцах получили "
-                      f"{_number(c['stay_people'])}. {escape(c['state'])}.</p>"
-                      + (f"<ul>{flows}</ul>" if flows else "<p>Выбывших из пары в группе нет.</p>")
-                      + branch_table + "</details>")
-    path.write_text(
-        '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Последний месяц</title>'
-        '<style>body{font:15px system-ui;margin:2rem;color:#19252e}table{border-collapse:collapse}'
-        'td,th{padding:.45rem;border-bottom:1px solid #d4dde1;text-align:left}'
-        'th{background:#eef3f5}details{margin:.6rem 0}</style><h1>Последний месяц</h1>'
-        + paragraphs + (audit.to_html(index=False) if len(audit) else "") + pages
-        + "<h2>Все отобранные карточки</h2>"
-        + (table.to_html(index=False) if len(table) else "<p>Карточек по условиям отбора нет.</p>")
-        + "".join(detail) + '<script id="ptf-organization-checks" type="application/json">'
-        + stored_checks + "</script></html>", encoding="utf-8")
+    path.write_text(render(report), encoding="utf-8")
     return path
