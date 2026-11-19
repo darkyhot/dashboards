@@ -195,13 +195,6 @@ def _followup(card):
     return "Проверить крупные выплаты и изменения состава получателей."
 
 
-def _unique(cards, limit):
-    selected = {}
-    for card in cards:
-        selected.setdefault(card["pair"], card)
-    return list(selected.values())[:limit]
-
-
 RUB_THRESHOLDS = (
     ("0", "Все суммы"), ("100000", "От 100 тыс. руб."), ("200000", "От 200 тыс. руб."),
     ("500000", "От 500 тыс. руб."), ("1000000", "От 1 млн руб."),
@@ -237,11 +230,18 @@ FILTER_SCRIPT = """
 
 def _findings(report):
     cards = report["cards"]
+    totals = report["totals"]
+    n_pairs = len({card["pair"] for card in cards})
+    coverage = (
+        f'<p>По месячным данным найдено {_number(totals["signals"])} сигналов по организациям и группам. '
+        f'На подробную проверку отобрано {_number(len(cards))} карточек по {_number(n_pairs)} парам {ORG_LABEL} × ГОСБ. '
+        'Для остальных сигналов подробная проверка причин не проводилась.</p>'
+    )
     drops = sorted((c for c in cards if c["confirmed"] is not None and c["confirmed"] < 0),
                    key=lambda c: (c["confirmed"], c["pair"]))
     gains = sorted((c for c in cards if c["confirmed"] is not None and c["confirmed"] > 0),
                    key=lambda c: (-c["confirmed"], c["pair"]))
-    visible = _unique(drops, len(drops)) + _unique(gains, len(gains))
+    visible = drops + gains
     if not visible:
         confirmed_html = '<p class="note">Среди проверенных карточек подтверждённых изменений выплат нет.</p>'
     else:
@@ -250,14 +250,18 @@ def _findings(report):
                  "Уточнить состав начислений." if c["confirmed"] < 0 else "Проверить, повторяется ли прирост.")
                 for c in visible]
         confirmed_html = (
+            '<p class="note">Строки по одной организации могут относиться к пересекающимся группам. '
+            'Их суммы нельзя складывать.</p>'
             '<div class="controls"><label for="amount-limit">Показывать изменения на сумму</label>'
             f'<select id="amount-limit">{options}</select><span id="amount-status" role="status"></span></div>'
             + _table((ORG_LABEL, "ГОСБ", "Группа получателей", "Изменение выплат", "Действие"), rows,
                      numeric=(3,), thresholds=[c["confirmed"] for c in visible])
         )
     return (
-        '<section id="findings"><h2>Подтверждённые отклонения</h2>'
-        '<p>Выплаты тем же людям выросли или снизились относительно ожидания с учётом сезона и календаря.</p>'
+        '<section id="findings"><h2>Отклонения</h2>'
+        + coverage
+        + '<h3>Подтверждённые изменения выплат тем же людям</h3>'
+        '<p>Выплаты без размеченных премий отличаются от сезонного ожидания после сверки дневных данных и учёта календаря.</p>'
         + confirmed_html + '</section>'
     )
 
@@ -273,7 +277,10 @@ def _explanations(report):
     open_cases = sorted((c for c in cards if c["residual"] is not None and c["residual"] < 0),
                         key=lambda c: (c["residual"], c["pair"]))
     open_rows = [(_org(report, c), str(c["gosb"]), _group(c), _change(c["residual"], currency=True), _followup(c))
-                 for c in _unique(open_cases, 6)]
+                 for c in open_cases]
+    bonus_cases = sorted((c for c in cards if c.get("bonus")), key=lambda c: (-abs(c["bonus"]), c["pair"]))
+    bonus_rows = [(_org(report, c), str(c["gosb"]), _group(c), _change(c["bonus"], currency=True),
+                   _change(c["residual"], currency=True)) for c in bonus_cases]
     stopped = []
     for key, branches in report.get("organization_checks", {}).items():
         organization = report.get("organization_ids", {}).get(key)
@@ -291,20 +298,25 @@ def _explanations(report):
             continue
         seen.add(organization)
         rows.append((escape(organization), str(gosb), _money(previous), _money(actual), _change(delta, currency=True), action))
-    if not (transfer_rows or rows or open_rows):
+    if not (transfer_rows or rows or open_rows or bonus_rows):
         return ""
     return (
         '<section id="explanations"><h2>Пояснения и открытые вопросы</h2>'
-        + ('<details><summary>Выплаты перешли между ГОСБ</summary>'
+        + (f'<details><summary>Выплаты перешли между ГОСБ ({_number(len(transfer_rows))})</summary>'
            '<p>Получатели остались в портфеле банка.</p>'
            + _table((ORG_LABEL, "Раньше платили через ГОСБ", "Теперь платят через ГОСБ", "Людей", "Выплаты"),
                     transfer_rows, numeric=(3, 4))
            + '</details>' if transfer_rows else "")
-        + ('<details><summary>В одном из ГОСБ прекратились выплаты</summary>'
-           '<p>Суммы по всей организации за два месяца. Причину остановки ещё нужно подтвердить.</p>'
+        + (f'<details><summary>Изменились премии у тех же получателей ({_number(len(bonus_rows))})</summary>'
+           '<p>Вклад выплат, которые в ведомости отмечены как премии.</p>'
+           + _table((ORG_LABEL, "ГОСБ", "Группа", "Вклад премий", "Пока без объяснения"), bonus_rows, numeric=(3, 4))
+           + '</details>' if bonus_rows else "")
+        + (f'<details><summary>Организации с остановкой выплат в ГОСБ ({_number(len(rows))})</summary>'
+           '<p>Среди отобранных организаций сверены выплаты по всем ГОСБ. '
+           'В таблице суммы по организации за два месяца. Причину остановки ещё нужно подтвердить.</p>'
            + _table((ORG_LABEL, "ГОСБ, где выплаты прекратились", "Прошлый месяц", "Текущий месяц", "Разница", "Действие"),
-                    rows[:6], numeric=(2, 3, 4)) + '</details>' if rows else "")
-        + ('<details><summary>Причину снижения ещё предстоит проверить</summary>'
+                    rows, numeric=(2, 3, 4)) + '</details>' if rows else "")
+        + (f'<details><summary>Причину снижения ещё предстоит проверить ({_number(len(open_rows))})</summary>'
            + _table((ORG_LABEL, "ГОСБ", "Группа", "Пока без объяснения", "Действие"), open_rows, numeric=(3,))
            + '</details>' if open_rows else "")
         + '</section>'
@@ -316,15 +328,23 @@ def _details(report):
     checks = report.get("organization_checks", {})
     for c in report["cards"]:
         title = f'{ORG_LABEL} {_org(report, c)} · ГОСБ {escape(str(c["gosb"]))} · {_group(c)}'
-        rows = (
+        rows = [
             ("Зачисления за месяц", _money(c["amount"])),
             ("Ожидаемые зачисления", _money(c["expected"])),
             ("Отклонение от ожидания", _change(c["raw"], currency=True)),
             ("Эффект границы расчётного месяца", _change(c["boundary"], currency=True)),
             ("Поправка на распределение выплат по ГОСБ", _change(c["moved"], currency=True)),
-            ("Изменение выплат тем же людям", _change(c["confirmed"], currency=True)),
+        ]
+        bonus_note = ""
+        if c.get("bonus"):
+            rows.append(("Вклад премий у тех же людей", _change(c["bonus"], currency=True)))
+            months = [M.label(M.shift(report["month"], offset)) for offset in (0, -1, -12, -13)]
+            amounts = ", ".join(f"{month} — {_money(amount)}" for month, amount in zip(months, c["bonus_months"]))
+            bonus_note = f'<p>Премии по календарным месяцам у получателей с выплатами в обоих месяцах сравнения. {amounts}.</p>'
+        rows.extend([
+            ("Изменение выплат без размеченных премий тем же людям", _change(c["confirmed"], currency=True)),
             ("Часть без подтверждённой причины", _change(c["residual"], currency=True)),
-        )
+        ])
         flows = c["flows"]
         previous = [v["previous"] for v in flows.values()]
         total = sum(previous) if all(v is not None for v in previous) else None
@@ -340,13 +360,14 @@ def _details(report):
         cards.append(
             f'<details><summary>{title}</summary><p>Получателей в этом ГОСБ или группе: {_number(c["people"])}{expected}.</p>'
             f'<p>{escape(c["state"])}</p>' + _table(("Показатель", "Сумма"), rows, numeric=(1,))
+            + bonus_note
             + ('<h3 class="block">Что видно по выбывшим</h3>' + _table(
                 ("Наблюдение", "Людей", "Их выплаты в прошлом месяце", "Доля прошлых выплат выбывшим"),
                 movements, numeric=(1, 2, 3)) if movements else "")
             + paid + '</details>'
         )
     return (
-        f'<section><details><summary>Расчёты и проверки по всем случаям ({len(cards)})</summary>'
+        f'<section><details><summary>Все отобранные карточки ({_number(len(cards))})</summary>'
         '<p>Группы могут пересекаться. Суммы отдельных карточек отражают разные срезы одних зачислений.</p>'
         + "".join(cards) + '</details></section>'
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from hashlib import md5
 from html.parser import HTMLParser
+from itertools import product
 import json
 from os import urandom
 from pathlib import Path
@@ -20,8 +21,10 @@ COMPARE = (0, 1, 3, 4)
 CURRENCIES = ("actual", "prior", "year_actual", "year_prior")
 COUNTS = tuple(f"n_{k}" for k in CURRENCIES)
 STAYS = tuple(f"stay_{k}" for k in CURRENCIES)
+BONUSES = tuple(f"bonus_{k}" for k in CURRENCIES)
 KEY = ("pair_code", *Q.LATEST_FEATURES)
 MIN_RUB_SYNC = 1.0  # только сверка равенства денежных сумм
+ANOMALY_METHOD_VERSION = 1
 LABELS = {
     "income": ("Новые в паре", "До 30 тыс. ₽", "30–60 тыс. ₽", "60–100 тыс. ₽", "100–200 тыс. ₽", "От 200 тыс. ₽"),
     "history": ("Новые в паре", "Были только в предыдущем месяце", "Были в двух предыдущих месяцах"),
@@ -60,7 +63,7 @@ def _load_triples(conn, name, gp, query, slots):
             _temp(conn, name, query, gp, "epk_id", params)
         else:
             _execute(conn, f"INSERT INTO {name}\n{query}", params)
-        label = {"ptf_latest_tr": "месячные тройки", "ptf_latest_days": "дневные окна для проверки"}
+        label = {"ptf_latest_tr": "месячные тройки", "ptf_latest_day_halves": "дневные суммы по половинам месяца"}
         if name == "ptf_latest_bank_days":
             progress.done(f"{params['m']}: выплаты для проверки переноса")
         else:
@@ -168,7 +171,7 @@ def _coverage(conn, dates):
     return {int(t) for t in table.index[bad] if pd.notna(t)}
 
 
-def _monthly(conn, gp, dates, journal, params):
+def _monthly(conn, gp, dates, journal, params, *, collect_cards=True):
     progress.step("Месячные ведомости: получатели, группы и сопоставление с прошлым годом")
     _temp(conn, "t_tik", Q.T_TIK, gp, "inn")
     _temp(conn, "t_exc", Q.T_EXC, gp, "inn_exc", params)
@@ -180,14 +183,17 @@ def _monthly(conn, gp, dates, journal, params):
     for name, sql in (("jobs", Q.LATEST_JOBS), ("locations", Q.LATEST_LOCATIONS),
                       ("org_locations", Q.LATEST_ORG_LOCATIONS)):
         _temp(conn, f"ptf_latest_{name}", sql, gp, "epk_id")
-    _temp(conn, "ptf_latest_events", Q.LATEST_EVENTS, gp, "epk_id",
+    events = Q.LATEST_EVENTS if collect_cards else Q.ANOMALY_EVENTS
+    _temp(conn, "ptf_latest_events", events, gp, "epk_id",
           {"period": 0, "curr": 0, "prev": 1, "earlier": 2})
-    _execute(conn, "INSERT INTO ptf_latest_events\n" + Q.LATEST_EVENTS,
+    _execute(conn, "INSERT INTO ptf_latest_events\n" + events,
              {"period": 1, "curr": 3, "prev": 4, "earlier": 5})
     _execute(conn, "ANALYZE ptf_latest_events")
     progress.step("Поиск по всем парам и сочетаниям признаков")
-    _temp(conn, "ptf_latest_groups", Q.latest_groups(), gp, "org_id, gosb_id")
+    _temp(conn, "ptf_latest_groups", Q.latest_groups(include_fot=not collect_cards), gp, "org_id, gosb_id")
     _temp(conn, "ptf_latest_scored", Q.LATEST_SCORED, gp, "org_id, gosb_id", params)
+    if not collect_cards:
+        return doubtful, audit
     totals = db.read_sql(conn, Q.LATEST_SUMMARY, params).iloc[0].to_dict()
     totals.update(db.read_sql(conn, Q.LATEST_SIGNAL_COUNTS, params).iloc[0].to_dict())
     _temp(conn, "ptf_latest_shortlist", Q.latest_shortlist(), gp, "org_id, gosb_id", params)
@@ -255,13 +261,24 @@ def _check_stopped_organizations(conn, params):
     return {key: part.drop(columns="pair_code").to_dict("records") for key, part in frame.groupby("pair_code")}
 
 
-def _calendar(conn, gp, dates, params):
-    progress.step("Дневные ведомости: проверка границы месяца для отобранных пар")
+def _prepare_calendar(conn, gp, dates, params, *, include_fot=False):
+    progress.step("Дневные ведомости: подготовка временных сумм по банку")
+    slots = []
+    for i, month in enumerate(dates):
+        window = daily.windows(month)
+        start = window["c_from"] if i in COMPARE else M.parse(month).replace(day=16).isoformat()
+        slots.append({**params, **window, "mi": i, "s_from": start})
+    halves = Q.ANOMALY_DAILY_HALVES if include_fot else Q.LATEST_DAILY_HALVES
+    _load_triples(conn, "ptf_latest_day_halves", gp, halves, slots)
+    progress.step("Дневные ведомости: сверка календарных и сдвинутых окон для отобранных пар")
     _temp(conn, "ptf_latest_pairs", Q.LATEST_CHOSEN_PAIRS, gp, "org_id, gosb_id")
     _temp(conn, "ptf_latest_moves", Q.LATEST_MATCHED_MOVES, gp, "epk_id")
-    _load_triples(conn, "ptf_latest_days", gp, Q.latest_daily_triples(), [
-        {**params, **daily.windows(dates[i]), "mi": j} for j, i in enumerate(COMPARE)
-    ])
+    _temp(conn, "ptf_latest_days", Q.latest_daily_triples(COMPARE, include_fot=include_fot), gp, "epk_id", params)
+    _execute(conn, "DROP TABLE ptf_latest_day_halves")
+
+
+def _calendar(conn, gp, dates, params):
+    _prepare_calendar(conn, gp, dates, params)
     groups = db.read_sql(conn, Q.latest_daily_groups(), params)
     routes = db.read_sql(conn, Q.LATEST_CURRENT_ROUTES, params).to_dict("records")
     return groups, routes
@@ -275,7 +292,7 @@ def _delta(values):
 def _calendar_values(row, windows, doubtful, min_change, calendar_expected, min_base_ratio):
     comparable_rub = pd.notna(row["rub_change"])
     monthly_delta = _delta([row[f] for f in CURRENCIES]) if comparable_rub else None
-    result = {"raw": monthly_delta, "boundary": None, "moved": None, "confirmed": None,
+    result = {"raw": monthly_delta, "boundary": None, "moved": None, "bonus": None, "confirmed": None,
               "residual": monthly_delta, "state": "Дневная проверка недоступна" if calendar_expected else "Дневная проверка отключена"}
     if row["tb_id"] in doubtful:
         result["state"] = "Нужна сверка полноты данных ТБ"
@@ -285,14 +302,16 @@ def _calendar_values(row, windows, doubtful, min_change, calendar_expected, min_
     whole = windows.loc[[0, 2, 4, 6]]
     if (any(whole.n.to_numpy() != [row[f] for f in COUNTS])
             or any(abs(whole.amount.to_numpy() - [row[f] for f in CURRENCIES]) > MIN_RUB_SYNC)
-            or any(abs(whole.stay.to_numpy() - [row[f] for f in STAYS]) > MIN_RUB_SYNC)):
+            or any(abs(whole.stay.to_numpy() - [row[f] for f in STAYS]) > MIN_RUB_SYNC)
+            or any(abs(whole.bonus.to_numpy() - [row[f] for f in BONUSES]) > MIN_RUB_SYNC)):
         result["state"] = "Дневная и месячная витрины расходятся"
         return result
     shifted = windows.loc[[1, 3, 5, 7]]
     after = _delta(shifted.amount) if comparable_rub else None
     boundary = monthly_delta - after if comparable_rub else None
     moved = _delta(shifted.moved)
-    curr, prev, year, year_prev = shifted.stay
+    bonus = _delta(shifted.bonus)
+    curr, prev, year, year_prev = shifted.stay - shifted.bonus
     confirmed = None
     if pd.notna(row["stay_change"]) and abs(row["stay_change"]) >= min_change:
         expected = prev + (year - year_prev) * row["stay_n"] / row["stay_year_n"]
@@ -313,8 +332,11 @@ def _calendar_values(row, windows, doubtful, min_change, calendar_expected, min_
         state = "Нет сопоставимой сезонной базы зачислений"
     if moved and comparable_rub and confirmed is None and abs(after - moved) < abs(after):
         state = "Учтена поправка на перераспределение выплат между ГОСБ"
-    return {"raw": monthly_delta, "boundary": boundary, "moved": moved, "confirmed": confirmed,
-            "residual": after - moved - (confirmed or 0) if comparable_rub else None, "state": state}
+    residual = after - moved - bonus - (confirmed or 0) if comparable_rub else None
+    if bonus and comparable_rub and confirmed is None and abs(residual) < abs(after - moved):
+        state = "Разницу в зачислениях объясняют премии" if abs(residual) <= MIN_RUB_SYNC else "Часть разницы объясняют премии"
+    return {"raw": monthly_delta, "boundary": boundary, "moved": moved, "bonus": bonus, "confirmed": confirmed,
+            "residual": residual, "state": state}
 
 
 def _group(row):
@@ -348,12 +370,13 @@ def _make_cards(rows, calendar, doubtful, min_change, calendar_expected, stale_p
                       "amount": row["actual"], "expected": row["expected"] if pd.notna(row["rub_change"]) else None,
                       "people": row["n_actual"], "expected_people": row["expected_n"] if pd.notna(row["n_change"]) else None,
                       "stay_people": row["stay_n"], "lifecycle": lifecycle,
+                      "bonus_months": [row.get(f) for f in BONUSES],
                       "flows": {label: {"people": int(row[f]), "previous": row[f"{f}_rub"]}
                                 for f, label in MOVEMENTS.items() if row[f] > 0}})
     return sorted(cards, key=lambda c: (c["confirmed"] is None, (c["confirmed"] or 0) > 0,
                                         -(abs(c["confirmed"]) if c["confirmed"] is not None
-                                          else max(abs(c["residual"] or 0), abs(c["boundary"] or 0),
-                                                   abs(c["moved"] or 0))),
+                                     else max(abs(c["residual"] or 0), abs(c["boundary"] or 0),
+                                              abs(c["moved"] or 0), abs(c["bonus"] or 0))),
                                         c["pair"], c["group"]))
 
 
@@ -421,6 +444,75 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
                               check_calendar, checks, warnings)
     report["routes"] = [r for r in routes if stale_pairs is not None and r["pair_code"] not in stale_pairs]
     return report
+
+
+def write_anomaly_month(connection, month=None, *, min_people=10, min_change=0.15,
+                        min_base_ratio=0.5, amt_min=Q.AMT_MIN, exc_holding=Q.EXC_HOLDING, today=None):
+    """Рассчитать закрытый месяц и атомарно записать агрегаты в схему проекта."""
+    if min_people < 1 or not 0 < min_change <= 1 or not 0 < min_base_ratio < 1:
+        raise ValueError("Проверьте минимальный размер, относительное отклонение и допустимую базу.")
+    gp = db.is_greenplum(connection)
+    today = today or datetime.now(timezone(timedelta(hours=3))).date()
+    params = {"min_people": min_people, "min_change": min_change, "min_base_ratio": min_base_ratio,
+              "amt_min": amt_min, "exc_holding": exc_holding,
+              "salt": urandom(16).hex(), "closed": M.iso(M.shift(today, -1)),
+              "method_version": ANOMALY_METHOD_VERSION, "sync_rub": MIN_RUB_SYNC}
+    with connection.begin():
+        journal = db.read_sql(connection, Q.LATEST_MONTHS, params)
+        selected, _, dates = _choose_month(journal, month)
+        params.update(report_dt=selected, source_run_id=int(journal["run_id"].iloc[0]))
+        progress.step(f"Витрина отклонений за {M.long(selected)}")
+        doubtful, audit = _monthly(connection, gp, dates, journal, params, collect_cards=False)
+        _temp(connection, "ptf_anomaly_metrics", Q.ANOMALY_METRICS, gp, "org_id, gosb_id", params)
+        _stage_anomaly_evidence(connection, gp, dates, audit, doubtful, params)
+        _stage_anomaly_labels(connection)
+        _temp(connection, "ptf_anomaly_signals", Q.ANOMALY_SIGNALS, gp, "org_id, gosb_id", params)
+
+        progress.step("Запись сигналов в витрину отклонений")
+        _execute(connection, Q.CREATE_ANOMALY_MART + ("\nDISTRIBUTED BY (org_id)" if gp else ""))
+        _execute(connection, Q.LOCK_ANOMALY_MONTH)
+        stored_run = db.scalar(connection, Q.LATEST_ANOMALY_SOURCE, params)
+        if stored_run is not None and stored_run > params["source_run_id"]:
+            raise ValueError("В витрине уже записан этот месяц по более свежей сводке.")
+        _execute(connection, Q.DELETE_ANOMALY_MONTH, params)
+        _execute(connection, Q.insert_anomaly_month(), params)
+        progress.step("Контроль записи и сверка денежных кейсов по ведомостям")
+        totals = db.read_sql(connection, Q.CHECK_ANOMALY_MONTH, params).iloc[0]
+        expected_rows = db.scalar(connection, Q.COUNT_ANOMALY_SIGNALS)
+        if totals["signals"] != expected_rows or totals["mismatched"]:
+            raise RuntimeError("Контроль витрины не прошёл. Проверьте число строк и разложение сумм.")
+        cases = db.read_sql(connection, Q.CHECK_ANOMALY_EXAMPLES, params).to_dict("records")
+        failed = sum(not case["matches"] for case in cases)
+        if failed:
+            raise RuntimeError(f"Контроль по ведомостям не прошёл в {failed} из {len(cases)} примеров.")
+    return {"month": selected, "table": db.render(Q.ANOMALY_MART),
+            **{k: int(totals[k]) for k in ("signals", "confirmed", "explained", "open_cases", "pending")},
+            "checked_examples": cases}
+
+
+def _stage_anomaly_evidence(conn, gp, dates, audit, doubtful, params):
+    _temp(conn, "ptf_latest_shortlist", Q.ANOMALY_CHECK_SCOPE, gp, "org_id, gosb_id", params)
+    if not db.scalar(conn, Q.ANOMALY_HAS_CHECKS):
+        _execute(conn, Q.CREATE_ANOMALY_EVIDENCE)
+        return
+    slots = tuple(i for i, row in enumerate(audit) if i in COMPARE or not row["ok"])
+    stale_sql = (Q.latest_changed_pairs(slots) if any(not r["ok"] for r in audit)
+                 else Q.EMPTY_ANOMALY_STALE)
+    extra = {**params, **{f"m{i}": dates[i] for i in slots}, "doubtful": sorted(doubtful)}
+    _temp(conn, "ptf_anomaly_stale", stale_sql, gp, "pair_code", extra)
+    _prepare_calendar(conn, gp, dates, params, include_fot=True)
+    _temp(conn, "ptf_anomaly_evidence", Q.anomaly_evidence(), gp, "org_id, gosb_id", extra)
+
+
+def _stage_anomaly_labels(conn):
+    labels = []
+    for values in product(*(range(-1, len(LABELS[f])) for f in Q.LATEST_FEATURES)):
+        group = dict(zip(Q.LATEST_FEATURES, values))
+        whole = all(value == -1 for value in values)
+        labels.append({**group, "group_key": "all" if whole else ":".join(map(str, values)),
+                       "group_name": None if whole else _group(group)})
+    _execute(conn, Q.CREATE_ANOMALY_LABELS)
+    conn.execute(text(Q.INSERT_ANOMALY_LABEL), labels)
 
 
 def _assemble_report(monthly, journal, dates, closed, params, calendar, stale_pairs,
@@ -701,8 +793,10 @@ def _review_cases(report):
         money = {
             "Факт": card["amount"], "Ожидание": card["expected"], "Исходное отклонение": card["raw"],
             "Граница окна": card["boundary"], "Между ГОСБ": card["moved"],
-            "Выплаты тем же получателям": card["confirmed"], "Пока без объяснения": card["residual"],
         }
+        if card.get("bonus"):
+            money["Изменение премий у тех же получателей"] = card["bonus"]
+        money.update({"Выплаты тем же получателям": card["confirmed"], "Пока без объяснения": card["residual"]})
         title = (f"{caption}. Пара {card['pair']} · ГОСБ {card['gosb']} · {card['group']}. "
                  f"Получателей {_number(card['people'])}, ожидали {_number(card['expected_people'])}. "
                  f"{card['state']}")

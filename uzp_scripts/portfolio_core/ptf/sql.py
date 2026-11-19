@@ -187,19 +187,30 @@ def t_months(months: list[str]) -> str:
 #   n_pay — число положительных выплат (transaction_qty, пусто → 1): «одна выплата в
 #   месяц» — главный носитель календарного сдвига выплат через границу месяца.
 # --------------------------------------------------------------------------- #
-_TRIPLES = """
+_IN_PORTFOLIO = "(a.pos_t2 OR (a.pos_pf AND (e.inn_exc IS NOT NULL OR a.sum_pf > :amt_min)))"
+_PORTFOLIO_AMOUNT = "x.a_t2 + CASE WHEN x.exc OR x.sum_pf > :amt_min THEN x.a_pf ELSE 0 END"
+_PORTFOLIO_BONUS = "CASE WHEN x.exc OR x.sum_pf > :amt_min THEN x.a_bonus ELSE 0 END"
+_FOT_AMOUNT = "x.a_t2 + CASE WHEN x.exc OR x.sum_fot > :amt_min THEN x.a_fot ELSE 0 END"
+
+_TRIPLES = f"""
 SELECT x.mi, x.epk_id, x.org_id, x.gosb_id, x.tb_id,
        CASE WHEN x.in_pf THEN 'P' WHEN x.pos_pf THEN 'Z' ELSE 'N' END AS st,
-       CASE WHEN x.in_pf
-            THEN x.a_t2 + CASE WHEN x.exc OR x.sum_pf > :amt_min THEN x.a_pf ELSE 0 END
-            ELSE 0 END                                        AS pf_amt,
-       x.a_t2 + CASE WHEN x.exc OR x.sum_fot > :amt_min THEN x.a_fot ELSE 0 END AS fot_amt,
-       x.n_rows, x.n_pay@org_output@
+       CASE WHEN x.in_pf THEN {_PORTFOLIO_AMOUNT} ELSE 0 END AS pf_amt,
+       {_FOT_AMOUNT} AS fot_amt,
+       x.n_rows, x.n_pay@org_output@@bonus_output@
 FROM (
   SELECT a.*,
          (e.inn_exc IS NOT NULL)                                          AS exc,
-         (a.pos_t2 OR (a.pos_pf AND (e.inn_exc IS NOT NULL OR a.sum_pf > :amt_min))) AS in_pf
+         {_IN_PORTFOLIO} AS in_pf
   FROM (
+    @amounts@
+  ) a
+  LEFT JOIN t_exc e ON e.inn_exc = a.org_id
+) x
+WHERE x.pos_any
+"""
+
+_TRIPLE_AMOUNTS = """
     SELECT @period@ AS mi, p.epk_id,
            """ + org_num("p.inn") + """ AS org_id,
            COALESCE(""" + gosb_fix("p.sys_gosb_id", "p.sys_tb_id", "p.segment_name") + """, -1) AS gosb_id,
@@ -218,7 +229,7 @@ FROM (
                      AND NOT COALESCE(d.enrollment_type_id = 2, false)
                     THEN p.amt ELSE 0 END)                                      AS a_fot,
            count(*)                                                             AS n_rows,
-           sum(CASE WHEN p.amt > 0 THEN COALESCE(p.transaction_qty, 1) ELSE 0 END) AS n_pay@org_input@
+           sum(CASE WHEN p.amt > 0 THEN COALESCE(p.transaction_qty, 1) ELSE 0 END) AS n_pay@org_input@@bonus_input@
     FROM {schema}.@source@ p
     @joins@
     LEFT JOIN {schema}.uzp_dim_enrollment_type d ON d.enrollment_type_id = p.{code_col}
@@ -229,21 +240,27 @@ FROM (
       AND p.inn ~ """ + MASK + """
       AND """ + RELEV + """
     GROUP BY 1, 2, 3, 4
-  ) a
-  LEFT JOIN t_exc e ON e.inn_exc = a.org_id
-) x
-WHERE x.pos_any
 """
 
-def _triples(source, period, dates, joins="", org_digits=False):
-    return (_TRIPLES.replace("@source@", source).replace("@period@", period)
+
+def _triple_amounts(source, period, dates, joins, org_digits, bonus=False):
+    bonus_amount = (", sum(CASE WHEN p.amt > 0 AND d.enrollment_type_id = 18 "
+                    "AND d.is_portfolio_enrollment THEN p.amt ELSE 0 END) AS a_bonus")
+    return (_TRIPLE_AMOUNTS.replace("@source@", source).replace("@period@", period)
             .replace("@dates@", dates).replace("@joins@", joins)
+            .replace("@org_input@", ", CAST(max(length(p.inn)) AS smallint) AS org_digits" if org_digits else "")
+            .replace("@bonus_input@", bonus_amount if bonus else ""))
+
+
+def _triples(source, period, dates, joins="", org_digits=False, bonus=False):
+    return (_TRIPLES.replace("@amounts@", _triple_amounts(source, period, dates, joins, org_digits, bonus))
             .replace("@org_output@", ", x.org_digits" if org_digits else "")
-            .replace("@org_input@", ", CAST(max(length(p.inn)) AS smallint) AS org_digits" if org_digits else ""))
+            .replace("@bonus_output@", f", {_PORTFOLIO_BONUS} AS bonus_rub" if bonus else ""))
 
 
 T_TR_MONTH = _triples("{payroll}", "CAST(:mi AS integer)", "p.report_dt = CAST(:m AS date)")
-LATEST_TR_MONTH = _triples("{payroll}", "CAST(:mi AS integer)", "p.report_dt = CAST(:m AS date)", org_digits=True)
+LATEST_TR_MONTH = _triples("{payroll}", "CAST(:mi AS integer)", "p.report_dt = CAST(:m AS date)",
+                           org_digits=True, bonus=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -1307,7 +1324,11 @@ SELECT mi, epk_id, org_id FROM ptf_latest_tr
 WHERE mi IN (0, 3) AND st = 'P' GROUP BY mi, epk_id, org_id
 """
 
-LATEST_EVENTS = """
+def latest_events(*, include_fot=False):
+    prior_eligible = "(st = 'P' OR fot_amt > 0)" if include_fot else "st = 'P'"
+    current_fot = " OR a.fot_amt > 0" if include_fot else ""
+    fot_amounts = ", coalesce(a.fot_amt, 0) AS curr_fot, coalesce(b.fot_amt, 0) AS prev_fot" if include_fot else ""
+    return f"""
 SELECT pair.*,
        CASE
          WHEN pair.in_prev = 0 THEN 0
@@ -1320,6 +1341,7 @@ SELECT pair.*,
             WHEN earlier.epk_id IS NOT NULL THEN 2 ELSE 1 END AS history,
        CASE WHEN pair.in_prev = 0 THEN 0 ELSE least(jobs.n, 4) END AS jobs,
        CASE WHEN pair.in_prev = 1 AND pair.in_curr = 1 THEN 'continuing'
+            WHEN pair.in_prev = 0 AND pair.in_curr = 0 THEN 'outside_portfolio'
             WHEN pair.in_prev = 0 THEN 'added'
             WHEN pair.curr_state = 'Z' THEN 'threshold'
             WHEN pair.curr_state = 'N' THEN 'code'
@@ -1334,11 +1356,12 @@ FROM (
            CASE WHEN a.st = 'P' THEN 1 ELSE 0 END AS in_curr,
            CASE WHEN b.st = 'P' THEN 1 ELSE 0 END AS in_prev,
            a.st AS curr_state, coalesce(a.pf_amt, 0) AS curr_rub, coalesce(b.pf_amt, 0) AS prev_rub,
+           coalesce(a.bonus_rub, 0) AS curr_bonus, coalesce(b.bonus_rub, 0) AS prev_bonus{fot_amounts},
            :period AS period
     FROM (SELECT * FROM ptf_latest_tr WHERE mi = :curr) a
-    FULL JOIN (SELECT * FROM ptf_latest_tr WHERE mi = :prev AND st = 'P') b
+    FULL JOIN (SELECT * FROM ptf_latest_tr WHERE mi = :prev AND {prior_eligible}) b
         ON a.epk_id = b.epk_id AND a.org_id = b.org_id AND a.gosb_id = b.gosb_id
-    WHERE a.st = 'P' OR b.epk_id IS NOT NULL
+    WHERE a.st = 'P' OR b.epk_id IS NOT NULL{current_fot}
 ) pair
 LEFT JOIN ptf_latest_tr earlier ON earlier.mi = :earlier AND earlier.st = 'P'
     AND earlier.epk_id = pair.epk_id AND earlier.org_id = pair.org_id AND earlier.gosb_id = pair.gosb_id
@@ -1348,6 +1371,8 @@ LEFT JOIN ptf_latest_org_locations org ON org.mi = :curr AND org.epk_id = pair.e
     AND org.org_id = pair.org_id
 """
 
+LATEST_EVENTS = latest_events()
+ANOMALY_EVENTS = latest_events(include_fot=True)
 # Добавление признака расширяет поиск всеми сочетаниями до двух признаков
 # одним и тем же способом для общего отбора и проверки дневной витрины.
 LATEST_FEATURES = ("income", "history", "jobs")
@@ -1365,8 +1390,18 @@ def _latest_group_keys(alias):
 LATEST_MOVEMENTS = ("threshold", "code", "same_org", "new_place", "other_job", "missing")
 
 
-def latest_groups():
+def latest_groups(*, include_fot=False):
     keys, cross = _latest_group_keys("e")
+    fot_inputs = ", e.curr_fot, e.prev_fot" if include_fot else ""
+    fot_amounts = """
+       sum(CASE WHEN period = 0 THEN curr_fot ELSE 0 END) AS fot_actual,
+       sum(CASE WHEN period = 0 THEN prev_fot ELSE 0 END) AS fot_prior,
+       sum(CASE WHEN period = 1 THEN curr_fot ELSE 0 END) AS fot_year_actual,
+       sum(CASE WHEN period = 1 THEN prev_fot ELSE 0 END) AS fot_year_prior,
+       count(CASE WHEN period = 0 AND prev_fot > 0 THEN 1 END) AS fot_n_prior,
+       count(CASE WHEN period = 1 AND prev_fot > 0 THEN 1 END) AS fot_n_year_prior,
+       bool_and(curr_fot = curr_rub AND prev_fot = prev_rub) AS fot_matches_pf,
+    """ if include_fot else ""
     reasons = ",\n".join(
         f"sum(CASE WHEN movement = '{label}' AND period = 0 THEN {value} ELSE 0 END) AS {label}{suffix}"
         for label in LATEST_MOVEMENTS for suffix, value in (("", "1"), ("_rub", "prev_rub"))
@@ -1386,11 +1421,16 @@ SELECT org_id, gosb_id, income, history, jobs, min(tb_id) AS tb_id,
        sum(CASE WHEN period = 0 AND movement = 'continuing' THEN prev_rub ELSE 0 END) AS stay_prior,
        sum(CASE WHEN period = 1 AND movement = 'continuing' THEN curr_rub ELSE 0 END) AS stay_year_actual,
        sum(CASE WHEN period = 1 AND movement = 'continuing' THEN prev_rub ELSE 0 END) AS stay_year_prior,
+       sum(CASE WHEN period = 0 AND movement = 'continuing' THEN curr_bonus ELSE 0 END) AS bonus_actual,
+       sum(CASE WHEN period = 0 AND movement = 'continuing' THEN prev_bonus ELSE 0 END) AS bonus_prior,
+       sum(CASE WHEN period = 1 AND movement = 'continuing' THEN curr_bonus ELSE 0 END) AS bonus_year_actual,
+       sum(CASE WHEN period = 1 AND movement = 'continuing' THEN prev_bonus ELSE 0 END) AS bonus_year_prior,
        sum(CASE WHEN period = 0 AND movement = 'continuing' THEN 1 ELSE 0 END) AS stay_n,
        sum(CASE WHEN period = 1 AND movement = 'continuing' THEN 1 ELSE 0 END) AS stay_year_n,
-       {reasons}
+       {fot_amounts}{reasons}
 FROM (
     SELECT e.org_id, e.gosb_id, e.tb_id, e.org_digits, e.period, e.curr_rub, e.prev_rub, e.in_curr, e.in_prev,
+           e.curr_bonus, e.prev_bonus{fot_inputs},
            e.movement, {keys}
     FROM ptf_latest_events e {cross}
 ) expanded
@@ -1402,8 +1442,10 @@ LATEST_COMPARED = """
 SELECT g.*,
     prior + year_actual - year_prior AS expected,
     n_prior + n_year_actual - n_year_prior AS expected_n,
-    stay_prior + (stay_year_actual - stay_year_prior) * CAST(stay_n AS numeric)
-        / nullif(stay_year_n, 0) AS expected_stay
+    stay_actual - bonus_actual AS stay_without_bonus,
+    stay_prior - bonus_prior AS prior_without_bonus,
+    stay_prior - bonus_prior + (stay_year_actual - bonus_year_actual - stay_year_prior + bonus_year_prior)
+        * CAST(stay_n AS numeric) / nullif(stay_year_n, 0) AS expected_stay
 FROM ptf_latest_groups g
 """
 
@@ -1420,8 +1462,8 @@ SELECT c.*,
           AND {_latest_supported("expected_n", "n_prior")}
          THEN CAST(n_actual - expected_n AS numeric) / greatest(expected_n, n_prior) END AS n_change,
     CASE WHEN stay_n >= :min_people AND stay_year_n >= :min_people
-          AND {_latest_supported("expected_stay", "stay_prior")}
-         THEN (stay_actual - expected_stay) / greatest(expected_stay, stay_prior) END AS stay_change
+          AND {_latest_supported("expected_stay", "prior_without_bonus")}
+         THEN (stay_without_bonus - expected_stay) / greatest(expected_stay, prior_without_bonus) END AS stay_change
 FROM ({LATEST_COMPARED}) c
 """
 
@@ -1467,7 +1509,7 @@ WITH candidates AS (
                CASE WHEN abs(d.direction) = 1 AND n_change * d.direction >= :min_change
                     THEN (n_actual - expected_n) * d.direction * prior / nullif(n_prior, 0) END,
                CASE WHEN abs(d.direction) = 1 AND stay_change * d.direction >= :min_change
-                    THEN (stay_actual - expected_stay) * d.direction END,
+                    THEN (stay_without_bonus - expected_stay) * d.direction END,
                CASE WHEN level = 'pair' AND d.direction = -2 AND n_actual = 0 AND n_prior >= :min_people
                     THEN prior END,
                CASE WHEN level = 'pair' AND d.direction = 2 AND n_prior = 0 AND n_actual >= :min_people
@@ -1502,18 +1544,337 @@ WHERE rub_change IS NOT NULL OR n_change IS NOT NULL OR stay_change IS NOT NULL
 """
 
 
-def latest_cards():
+ANOMALY_MART = "{schema_t}.yva_ptf_anomaly_month"
+CREATE_ANOMALY_MART = f"""
+CREATE TABLE IF NOT EXISTS {ANOMALY_MART} (
+    report_dt date NOT NULL, org_id bigint NOT NULL, org_number varchar(12) NOT NULL,
+    tb_id integer, gosb_id integer NOT NULL, metric_code varchar(24) NOT NULL,
+    group_key varchar(24) NOT NULL, detected_scope varchar(8) NOT NULL,
+    detected_group text, contributor_group text, contributor_impact_rub numeric, contributor_people bigint,
+    pair_has_deviation boolean, has_deviation boolean NOT NULL, check_status varchar(24) NOT NULL,
+    prior_value numeric, actual_value numeric NOT NULL, expected_value numeric NOT NULL,
+    delta_value numeric NOT NULL, delta_pct numeric, baseline_code varchar(24) NOT NULL,
+    raw_impact_rub numeric, adjustment_rub numeric,
+    confirmed_impact_rub numeric, open_impact_rub numeric, impact_method varchar(24),
+    case_text text NOT NULL, source_run_id bigint NOT NULL, method_version integer NOT NULL,
+    calculated_at timestamptz NOT NULL,
+    PRIMARY KEY (report_dt, org_id, gosb_id, metric_code, group_key),
+    CHECK ((detected_scope = 'pair' AND group_key = 'all' AND detected_group IS NULL)
+        OR (detected_scope = 'group' AND group_key <> 'all' AND detected_group IS NOT NULL)),
+    CHECK (has_deviation = (coalesce(confirmed_impact_rub, 0) <> 0))
+)
+"""
+
+CREATE_ANOMALY_LABELS = """
+CREATE TEMP TABLE ptf_anomaly_labels (
+    income integer, history integer, jobs integer, group_key varchar(24), group_name text
+) ON COMMIT DROP
+"""
+INSERT_ANOMALY_LABEL = """
+INSERT INTO ptf_anomaly_labels VALUES (:income, :history, :jobs, :group_key, :group_name)
+"""
+CREATE_ANOMALY_EVIDENCE = """
+CREATE TEMP TABLE ptf_anomaly_evidence (
+    org_id bigint, gosb_id integer, income integer, history integer, jobs integer,
+    calendar_rub numeric, transfer_rub numeric, bonus_rub numeric, confirmed_rub numeric,
+    checked boolean, fot_matches_pf boolean, state text
+) ON COMMIT DROP
+"""
+
+ANOMALY_METRICS = f"""
+WITH measures AS (
+    SELECT s.org_id, s.gosb_id, s.tb_id, s.org_digits, s.income, s.history, s.jobs,
+           m.metric_code,
+           CASE m.kind WHEN 1 THEN s.prior WHEN 2 THEN s.n_prior WHEN 3 THEN s.prior_without_bonus END AS prior,
+           CASE m.kind WHEN 1 THEN s.actual WHEN 2 THEN s.n_actual WHEN 3 THEN s.stay_without_bonus
+               WHEN 4 THEN 100.0 * (s.n_prior - s.stay_n) / nullif(s.n_prior, 0) END AS actual,
+           CASE m.kind WHEN 1 THEN s.expected WHEN 2 THEN s.expected_n WHEN 3 THEN s.expected_stay
+               WHEN 4 THEN 100.0 * (s.n_year_prior - s.stay_year_n) / nullif(s.n_year_prior, 0) END AS expected,
+           CASE m.kind WHEN 1 THEN s.rub_change WHEN 2 THEN s.n_change WHEN 3 THEN s.stay_change
+               WHEN 4 THEN CASE WHEN s.n_prior >= :min_people AND s.n_year_prior >= :min_people THEN greatest(0,
+                   CAST(s.n_prior - s.stay_n AS numeric) / s.n_prior
+                   - CAST(s.n_year_prior - s.stay_year_n AS numeric) / s.n_year_prior) END END AS score,
+           CASE WHEN m.kind IN (2, 4) THEN CAST(s.prior AS numeric) / nullif(s.n_prior, 0) END AS rub_per_person,
+           s.n_prior, s.stay_n
+    FROM ptf_latest_scored s
+    CROSS JOIN (VALUES (1, 'portfolio_credits'), (2, 'recipients'), (3, 'continuing_pay'), (4, 'turnover')) m(kind, metric_code)
+    UNION ALL
+    SELECT f.org_id, f.gosb_id, f.tb_id, f.org_digits, f.income, f.history, f.jobs,
+           'fot', f.fot_prior, f.fot_actual, f.fot_expected,
+           CASE WHEN f.fot_n_prior >= :min_people AND f.fot_n_year_prior >= :min_people
+                AND {_latest_supported('f.fot_expected', 'f.fot_prior')}
+                THEN CAST(f.fot_actual - f.fot_expected AS numeric) / greatest(f.fot_expected, f.fot_prior) END,
+           NULL, f.fot_n_prior, f.stay_n
+    FROM (SELECT g.*, fot_prior + fot_year_actual - fot_year_prior AS fot_expected FROM ptf_latest_groups g) f
+    WHERE f.income <> 0 AND f.history <> 0 AND f.jobs <> 0
+)
+SELECT * FROM measures
+WHERE (income = -1 AND history = -1 AND jobs = -1) OR abs(score) >= :min_change
+"""
+
+ANOMALY_CHECK_SCOPE = """
+SELECT org_id, gosb_id, income, history, jobs
+FROM ptf_anomaly_metrics
+WHERE metric_code IN ('portfolio_credits', 'continuing_pay', 'fot') AND abs(score) >= :min_change
+GROUP BY 1, 2, 3, 4, 5
+"""
+ANOMALY_HAS_CHECKS = "SELECT EXISTS (SELECT 1 FROM ptf_latest_shortlist)"
+EMPTY_ANOMALY_STALE = "SELECT CAST(NULL AS text) AS pair_code WHERE false"
+
+
+def anomaly_evidence():
+    # Дневные окна и контрольные суммы карточек те же, что в интерактивном разборе.
+    months = ("actual", "prior", "year_actual", "year_prior")
+    mismatches = " OR ".join(
+        f"(d.mi = {2 * i} AND (d.n <> c.n_{name} OR abs(d.amount - c.{name}) > :sync_rub "
+        f"OR abs(d.stay - c.stay_{name}) > :sync_rub OR abs(d.bonus - c.bonus_{name}) > :sync_rub))"
+        for i, name in enumerate(months)
+    )
+    shifted = ",\n           ".join(
+        f"sum(CASE WHEN d.mi IN (1, 7) THEN d.{col} WHEN d.mi IN (3, 5) THEN -d.{col} ELSE 0 END) AS {col}_delta"
+        for col in ("amount", "moved", "bonus")
+    )
+    stays = ",\n           ".join(
+        f"sum(CASE WHEN d.mi = {2 * i + 1} THEN d.stay - d.bonus ELSE 0 END) AS regular_{name}"
+        for i, name in enumerate(months)
+    )
+    keys = " AND ".join(f"d.{field} = c.{field}" for field in ("pair_code", *LATEST_FEATURES))
+    return f"""
+WITH cards AS ({latest_cards(include_fot=True)}), days AS ({latest_daily_groups(include_fot=True)}),
+changes AS (
+    SELECT c.org_id, c.gosb_id, c.income, c.history, c.jobs, c.tb_id, c.pair_code,
+           c.actual - c.expected AS raw_delta, c.rub_change, c.stay_change, c.stay_n, c.stay_year_n,
+           count(d.mi) = 8 AND NOT bool_or({mismatches}) AS matches,
+           count(d.mi) = 8 AND c.fot_matches_pf AND bool_and(d.fot_matches_pf) AS fot_matches_pf,
+           {shifted},
+           {stays}
+    FROM cards c LEFT JOIN days d ON {keys}
+    GROUP BY c.org_id, c.gosb_id, c.income, c.history, c.jobs, c.tb_id, c.pair_code,
+             c.actual - c.expected, c.rub_change, c.stay_change, c.stay_n, c.stay_year_n, c.fot_matches_pf
+), quality AS (
+    SELECT c.*,
+           c.regular_prior + (c.regular_year_actual - c.regular_year_prior) * CAST(c.stay_n AS numeric)
+               / nullif(c.stay_year_n, 0) AS expected_regular,
+           CASE WHEN s.pair_code IS NOT NULL THEN 'Ведомости расходятся со сводкой по паре'
+                WHEN c.tb_id = ANY(CAST(:doubtful AS integer[])) THEN 'Нужна сверка полноты данных ТБ'
+                WHEN NOT c.matches THEN 'Дневная и месячная витрины расходятся' END AS state
+    FROM changes c LEFT JOIN ptf_anomaly_stale s ON c.pair_code = s.pair_code
+)
+SELECT org_id, gosb_id, income, history, jobs,
+       CASE WHEN state IS NULL AND rub_change IS NOT NULL THEN raw_delta - amount_delta END AS calendar_rub,
+       CASE WHEN state IS NULL THEN moved_delta END AS transfer_rub,
+       CASE WHEN state IS NULL THEN bonus_delta END AS bonus_rub,
+       CASE WHEN state IS NULL AND abs(stay_change) >= :min_change
+             AND regular_actual > 0 AND regular_prior > 0
+             AND {_latest_supported('expected_regular', 'regular_prior')}
+             AND abs(regular_actual - expected_regular) >= :min_change * greatest(expected_regular, regular_prior)
+             AND (regular_actual - expected_regular) * stay_change > 0
+            THEN regular_actual - expected_regular END AS confirmed_rub,
+       state IS NULL AS checked, fot_matches_pf, state
+FROM quality
+"""
+
+ANOMALY_SIGNALS = """
+WITH reviewed AS (
+    SELECT c.*, c.actual - c.expected AS delta,
+           CASE WHEN c.metric_code = 'turnover' THEN -(c.actual - c.expected) * c.n_prior * c.rub_per_person / 100
+                WHEN c.metric_code = 'recipients' THEN (c.actual - c.expected) * c.rub_per_person
+                ELSE c.actual - c.expected END AS raw_rub,
+           CASE WHEN c.metric_code IN ('portfolio_credits', 'fot') AND e.checked
+                THEN e.calendar_rub + e.transfer_rub + e.bonus_rub END AS adjustment,
+           e.calendar_rub, e.transfer_rub, e.bonus_rub, e.confirmed_rub, e.checked, e.state
+    FROM ptf_anomaly_metrics c
+    LEFT JOIN ptf_anomaly_evidence e ON c.org_id = e.org_id AND c.gosb_id = e.gosb_id
+        AND c.income = e.income AND c.history = e.history AND c.jobs = e.jobs
+        AND c.metric_code IN ('portfolio_credits', 'continuing_pay', 'fot')
+        AND (c.metric_code <> 'fot' OR e.fot_matches_pf)
+    WHERE abs(c.score) >= :min_change
+)
+SELECT r.*,
+       CASE WHEN metric_code = 'continuing_pay' THEN confirmed_rub
+            WHEN metric_code IN ('portfolio_credits', 'fot') AND (delta - adjustment) * confirmed_rub > 0
+                 THEN sign(confirmed_rub) * least(abs(delta - adjustment), abs(confirmed_rub)) END AS confirmed,
+       CASE WHEN metric_code = 'continuing_pay' AND confirmed_rub IS NOT NULL
+            THEN delta - confirmed_rub
+            WHEN metric_code IN ('portfolio_credits', 'fot') AND checked THEN
+                 delta - adjustment - CASE WHEN (delta - adjustment) * confirmed_rub > 0
+                     THEN sign(confirmed_rub) * least(abs(delta - adjustment), abs(confirmed_rub)) ELSE 0 END
+            ELSE raw_rub END AS open_rub
+FROM reviewed r
+"""
+
+def insert_anomaly_month():
+    def money(value):
+        return f"round(CAST(abs({value}) AS numeric), 2) || ' ₽'"
+
+    return f"""
+INSERT INTO {ANOMALY_MART} (
+    report_dt, org_id, org_number, tb_id, gosb_id, metric_code, group_key,
+    detected_scope, detected_group, contributor_group, contributor_impact_rub, contributor_people,
+    pair_has_deviation, has_deviation, check_status, prior_value, actual_value, expected_value, delta_value,
+    delta_pct, baseline_code,
+    raw_impact_rub, adjustment_rub, confirmed_impact_rub, open_impact_rub, impact_method,
+    case_text, source_run_id, method_version, calculated_at
+)
+WITH ranked AS (
+    SELECT p.org_id, p.gosb_id, p.metric_code, p.income, p.history, p.jobs,
+           c.income AS child_income, c.history AS child_history, c.jobs AS child_jobs,
+           CASE WHEN p.confirmed IS NOT NULL THEN c.confirmed ELSE c.raw_rub END AS contribution,
+           CASE WHEN p.confirmed IS NOT NULL THEN c.stay_n ELSE c.n_prior END AS people,
+           row_number() OVER (PARTITION BY p.org_id, p.gosb_id, p.metric_code, p.income, p.history, p.jobs
+               ORDER BY abs(CASE WHEN p.confirmed IS NOT NULL THEN c.confirmed ELSE c.raw_rub END) DESC,
+                        c.income, c.history, c.jobs) AS pos
+    FROM ptf_anomaly_signals p JOIN ptf_anomaly_signals c
+      ON p.org_id = c.org_id AND p.gosb_id = c.gosb_id AND p.metric_code = c.metric_code
+     AND (p.income = -1 OR p.income = c.income)
+     AND (p.history = -1 OR p.history = c.history)
+     AND (p.jobs = -1 OR p.jobs = c.jobs)
+     AND (p.income <> c.income OR p.history <> c.history OR p.jobs <> c.jobs)
+    WHERE p.metric_code IN ('portfolio_credits', 'continuing_pay', 'fot')
+      AND c.expected > 0 AND c.expected < p.expected
+      AND CASE WHEN p.confirmed IS NOT NULL THEN p.confirmed * c.confirmed > 0
+            AND abs(c.confirmed) <= abs(p.confirmed)
+            AND abs(c.confirmed) * p.expected > abs(p.confirmed) * c.expected
+          ELSE p.raw_rub * c.raw_rub > 0 AND abs(c.raw_rub) <= abs(p.raw_rub)
+            AND abs(c.raw_rub) * p.expected > abs(p.raw_rub) * c.expected END
+)
+SELECT CAST(:report_dt AS date), s.org_id,
+       lpad(CAST(s.org_id AS text), greatest(length(CAST(s.org_id AS text)), s.org_digits), '0'),
+       s.tb_id, s.gosb_id, s.metric_code, g.group_key,
+       CASE WHEN g.group_key = 'all' THEN 'pair' ELSE 'group' END,
+       g.group_name, contributor.group_name, r.contribution, r.people,
+       abs(p.score) >= :min_change,
+       coalesce(s.confirmed, 0) <> 0,
+       CASE WHEN coalesce(s.confirmed, 0) <> 0 THEN 'confirmed'
+            WHEN s.checked AND abs(s.open_rub) <= 1 THEN 'explained'
+            WHEN s.checked THEN 'open'
+            WHEN s.state IS NOT NULL THEN 'check_unavailable' ELSE 'awaiting_checks' END,
+       s.prior, s.actual, s.expected, s.delta, 100.0 * s.delta / nullif(s.expected, 0),
+       CASE WHEN s.metric_code = 'turnover' THEN 'prior_year_rate'
+            WHEN s.metric_code = 'continuing_pay' THEN 'seasonal_per_recipient' ELSE 'seasonal_delta' END,
+       s.raw_rub, s.adjustment, s.confirmed, s.open_rub,
+       CASE WHEN s.metric_code IN ('recipients', 'turnover') THEN 'prior_average' ELSE 'direct_amount' END,
+       concat(CASE s.metric_code WHEN 'fot' THEN 'ФОТ' WHEN 'portfolio_credits' THEN 'Зачисления портфеля'
+                    WHEN 'recipients' THEN 'Число получателей' WHEN 'turnover' THEN 'Доля выбывших получателей'
+                    ELSE 'Выплаты тем же людям без размеченных премий' END,
+              CASE WHEN g.group_name IS NOT NULL THEN ' в группе «' || g.group_name || '»' END,
+              CASE WHEN s.delta < 0 THEN ' ниже ожидания на ' ELSE ' выше ожидания на ' END,
+              CASE s.metric_code WHEN 'recipients' THEN round(CAST(abs(s.delta) AS numeric), 0) || ' чел.'
+                  WHEN 'turnover' THEN round(CAST(abs(s.delta) AS numeric), 2) || ' п. п.'
+                  ELSE {money('s.delta')} || '.' END,
+              CASE WHEN s.metric_code IN ('portfolio_credits', 'fot') AND abs(s.calendar_rub) > 1
+                   THEN ' Вклад границы месяца — ' || CASE WHEN s.calendar_rub < 0 THEN '−' ELSE '+' END || {money('s.calendar_rub')} || '.' END,
+              CASE WHEN s.metric_code IN ('portfolio_credits', 'fot') AND abs(s.transfer_rub) > 1
+                   THEN ' Вклад переходов между ГОСБ — ' || CASE WHEN s.transfer_rub < 0 THEN '−' ELSE '+' END || {money('s.transfer_rub')} || '.' END,
+              CASE WHEN s.metric_code IN ('portfolio_credits', 'fot') AND abs(s.bonus_rub) > 1
+                   THEN ' Вклад размеченных премий — ' || CASE WHEN s.bonus_rub < 0 THEN '−' ELSE '+' END || {money('s.bonus_rub')} || '.' END,
+              CASE WHEN coalesce(s.confirmed, 0) <> 0 THEN ' Подтверждено '
+                   || CASE WHEN s.confirmed < 0 THEN 'снижение' ELSE 'повышение' END
+                   || ' выплат тем же людям на ' || {money('s.confirmed')} || '.' END,
+              CASE WHEN contributor.group_name IS NOT NULL THEN
+                   CASE WHEN s.confirmed IS NULL THEN ' По месячному сравнению ' ELSE ' В подтверждённой сумме ' END
+                   || {money('r.contribution')} || ' приходится на группу «' || contributor.group_name || '». '
+                   || 'В группе ' || r.people || CASE WHEN s.confirmed IS NULL THEN ' получателей в базе.'
+                         ELSE ' получателей с выплатами в обоих месяцах.' END END,
+              CASE WHEN s.checked AND abs(s.open_rub) > 1 THEN ' Пока без объяснения — ' || {money('s.open_rub')} || '.'
+                   WHEN s.state IS NOT NULL AND NOT s.checked THEN ' ' || s.state || '.'
+                   WHEN NOT coalesce(s.checked, false) THEN ' Подробная проверка причины пока не выполнена.' END),
+       :source_run_id, :method_version, CURRENT_TIMESTAMP
+FROM ptf_anomaly_signals s
+JOIN ptf_anomaly_labels g ON s.income = g.income AND s.history = g.history AND s.jobs = g.jobs
+LEFT JOIN ptf_anomaly_metrics p ON p.org_id = s.org_id AND p.gosb_id = s.gosb_id AND p.metric_code = s.metric_code
+     AND p.income = -1 AND p.history = -1 AND p.jobs = -1
+LEFT JOIN ranked r ON r.org_id = s.org_id AND r.gosb_id = s.gosb_id AND r.metric_code = s.metric_code
+     AND r.income = s.income AND r.history = s.history AND r.jobs = s.jobs AND r.pos = 1
+LEFT JOIN ptf_anomaly_labels contributor ON contributor.income = r.child_income
+     AND contributor.history = r.child_history AND contributor.jobs = r.child_jobs
+"""
+
+LOCK_ANOMALY_MONTH = f"LOCK TABLE {ANOMALY_MART} IN SHARE ROW EXCLUSIVE MODE"
+LATEST_ANOMALY_SOURCE = f"SELECT max(source_run_id) FROM {ANOMALY_MART} WHERE report_dt = CAST(:report_dt AS date)"
+DELETE_ANOMALY_MONTH = f"DELETE FROM {ANOMALY_MART} WHERE report_dt = CAST(:report_dt AS date)"
+CHECK_ANOMALY_MONTH = f"""
+SELECT count(*) AS signals, count(CASE WHEN has_deviation THEN 1 END) AS confirmed,
+       count(CASE WHEN check_status = 'explained' THEN 1 END) AS explained,
+       count(CASE WHEN check_status = 'open' THEN 1 END) AS open_cases,
+       count(CASE WHEN check_status IN ('awaiting_checks', 'check_unavailable') THEN 1 END) AS pending,
+       count(CASE WHEN abs(actual_value - expected_value - delta_value) > :sync_rub
+                    OR abs(raw_impact_rub - coalesce(adjustment_rub, 0)
+                           - coalesce(confirmed_impact_rub, 0) - open_impact_rub) > :sync_rub THEN 1 END) AS mismatched
+FROM {ANOMALY_MART} WHERE report_dt = CAST(:report_dt AS date)
+"""
+COUNT_ANOMALY_SIGNALS = "SELECT count(*) FROM ptf_anomaly_signals"
+
+CHECK_ANOMALY_EXAMPLES = f"""
+WITH month_cases AS (
+    SELECT org_id, gosb_id, metric_code, group_key, check_status, has_deviation,
+           prior_value, actual_value, expected_value, raw_impact_rub, confirmed_impact_rub, case_text
+    FROM {ANOMALY_MART}
+    WHERE report_dt = CAST(:report_dt AS date) AND impact_method = 'direct_amount'
+), confirmed AS (
+    SELECT 1 AS priority, c.* FROM month_cases c WHERE has_deviation
+    ORDER BY abs(confirmed_impact_rub) DESC, org_id, gosb_id, metric_code, group_key LIMIT 5
+), explained AS (
+    SELECT 2 AS priority, c.* FROM month_cases c WHERE check_status = 'explained'
+    ORDER BY abs(raw_impact_rub) DESC NULLS LAST, org_id, gosb_id, metric_code, group_key LIMIT 1
+), unresolved AS (
+    SELECT 3 AS priority, c.* FROM month_cases c
+    WHERE check_status IN ('open', 'awaiting_checks', 'check_unavailable')
+    ORDER BY abs(raw_impact_rub) DESC NULLS LAST, org_id, gosb_id, metric_code, group_key LIMIT 1
+), sample AS (
+    SELECT * FROM confirmed UNION ALL SELECT * FROM explained UNION ALL SELECT * FROM unresolved
+), recipient_amounts AS (
+    SELECT s.org_id, s.gosb_id, s.metric_code, s.group_key, e.period, e.movement,
+           CASE s.metric_code WHEN 'fot' THEN e.curr_fot
+                WHEN 'portfolio_credits' THEN e.curr_rub
+                ELSE CASE WHEN e.movement = 'continuing' THEN e.curr_rub - e.curr_bonus ELSE 0 END END AS actual,
+           CASE s.metric_code WHEN 'fot' THEN e.prev_fot
+                WHEN 'portfolio_credits' THEN e.prev_rub
+                ELSE CASE WHEN e.movement = 'continuing' THEN e.prev_rub - e.prev_bonus ELSE 0 END END AS prior
+    FROM sample s JOIN ptf_anomaly_labels g ON s.group_key = g.group_key
+    JOIN ptf_latest_events e ON e.org_id = s.org_id AND e.gosb_id = s.gosb_id
+        AND (g.income = -1 OR e.income = g.income)
+        AND (g.history = -1 OR e.history = g.history)
+        AND (g.jobs = -1 OR e.jobs = g.jobs)
+), figures AS (
+    SELECT org_id, gosb_id, metric_code, group_key,
+           sum(CASE WHEN period = 0 THEN actual ELSE 0 END) AS actual,
+           sum(CASE WHEN period = 0 THEN prior ELSE 0 END) AS prior,
+           sum(CASE WHEN period = 1 THEN actual - prior ELSE 0 END) AS prior_year_change,
+           count(CASE WHEN period = 0 AND movement = 'continuing' THEN 1 END) AS current_stayed,
+           count(CASE WHEN period = 1 AND movement = 'continuing' THEN 1 END) AS prior_year_stayed
+    FROM recipient_amounts GROUP BY 1, 2, 3, 4
+), compared AS (
+    SELECT s.*, f.actual AS source_actual, f.prior AS source_prior,
+           f.prior + CASE WHEN s.metric_code = 'continuing_pay'
+                THEN CAST(f.prior_year_change AS numeric) * f.current_stayed / nullif(f.prior_year_stayed, 0)
+                ELSE f.prior_year_change END AS source_expected
+    FROM sample s LEFT JOIN figures f USING (org_id, gosb_id, metric_code, group_key)
+)
+SELECT gosb_id, metric_code, check_status, coalesce(
+       abs(source_actual - actual_value) <= :sync_rub AND abs(source_prior - prior_value) <= :sync_rub
+           AND abs(source_expected - expected_value) <= :sync_rub, false) AS matches,
+       case_text
+FROM compared ORDER BY priority, abs(coalesce(confirmed_impact_rub, raw_impact_rub)) DESC,
+                       org_id, gosb_id, metric_code, group_key
+"""
+
+
+def latest_cards(*, include_fot=False):
     fields = ", ".join(f"s.{label}{suffix}" for label in LATEST_MOVEMENTS for suffix in ("", "_rub"))
+    fot = "s.fot_matches_pf, " if include_fot else ""
     return f"""
 SELECT substr(md5(CAST(s.org_id AS text) || ':' || CAST(s.gosb_id AS text) || ':' || :salt), 1, 12)
            AS pair_code,
        substr(md5(CAST(s.org_id AS text) || ':org:' || :salt), 1, 10) AS org_code,
+       s.org_id,
        lpad(CAST(s.org_id AS text), greatest(length(CAST(s.org_id AS text)), s.org_digits), '0') AS org_original,
        s.gosb_id, s.tb_id, s.income, s.history, s.jobs, s.actual, s.prior, s.year_actual, s.year_prior,
        s.n_actual, s.n_prior, s.n_year_actual, s.n_year_prior, s.stay_actual, s.stay_prior,
        s.stay_year_actual, s.stay_year_prior, s.stay_n, s.stay_year_n,
+       s.bonus_actual, s.bonus_prior, s.bonus_year_actual, s.bonus_year_prior,
        s.expected, s.expected_n, s.expected_stay, s.rub_change, s.n_change, s.stay_change,
-       {fields}
+       {fot}{fields}
 FROM ptf_latest_shortlist a JOIN ptf_latest_scored s
     ON a.org_id = s.org_id AND a.gosb_id = s.gosb_id
     AND a.income = s.income AND a.history = s.history AND a.jobs = s.jobs
@@ -1562,46 +1923,89 @@ ORDER BY c.amount DESC, 1, 2, 3
 """
 
 
-def latest_daily_triples():
-    gosb = gosb_fix("p.sys_gosb_id", "p.sys_tb_id", "p.segment_name")
-    joins = f"""
-    JOIN ptf_latest_pairs target ON target.org_id = {org_num('p.inn')}
-        AND target.gosb_id = coalesce({gosb}, -1)
-    CROSS JOIN (VALUES (0), (1)) w(kind)
-    """
-    dates = """
-    p.report_dt >= CAST(:s_from AS date) AND p.report_dt <= CAST(:c_to AS date)
-    AND ((w.kind = 0 AND p.report_dt >= CAST(:c_from AS date))
-         OR (w.kind = 1 AND p.report_dt <= CAST(:s_to AS date)))
-    """
-    return _triples("{payroll_d}", "CAST(:mi AS integer) * 2 + w.kind", dates, joins)
+_LATEST_DAILY_HALVES_AMOUNTS = _triple_amounts(
+    "{payroll_d}", "CAST(:mi AS integer) * 2 + CASE WHEN p.report_dt > CAST(:s_to AS date) THEN 1 ELSE 0 END",
+    "p.report_dt >= CAST(:s_from AS date) AND p.report_dt <= CAST(:c_to AS date)", "", False, bonus=True,
+)
+LATEST_DAILY_HALVES = f"""
+SELECT mi, epk_id, org_id, gosb_id, sum_pf, pos_pf, pos_t2, a_t2, a_pf, a_bonus
+FROM ({_LATEST_DAILY_HALVES_AMOUNTS}) amounts
+WHERE pos_pf OR pos_t2 OR sum_pf <> 0
+"""
+ANOMALY_DAILY_HALVES = f"""
+SELECT mi, epk_id, org_id, gosb_id, sum_pf, pos_pf, pos_t2, a_t2, a_pf, a_bonus, sum_fot, a_fot
+FROM ({_LATEST_DAILY_HALVES_AMOUNTS}) amounts
+WHERE pos_pf OR pos_t2 OR sum_pf <> 0 OR sum_fot <> 0 OR a_fot > 0
+"""
 
 
-def latest_daily_groups():
+def latest_daily_triples(compare, *, include_fot=False):
+    # Четыре сравнения: календарный месяц и окно с 16-го предыдущего месяца.
+    mapping = []
+    for j, i in enumerate(compare):
+        mapping.extend(((2 * j, 2 * i), (2 * j, 2 * i + 1),
+                        (2 * j + 1, 2 * i + 3), (2 * j + 1, 2 * i)))
+    values = ", ".join(f"({window}, {half})" for window, half in mapping)
+    fot_inputs = ", sum(h.sum_fot) AS sum_fot, sum(h.a_fot) AS a_fot" if include_fot else ""
+    fot_output = f", {_FOT_AMOUNT} AS fot_amt" if include_fot else ""
+    candidate = f"x.in_pf OR {_FOT_AMOUNT} > 0" if include_fot else "x.in_pf"
+    # Применяем порог только к сумме двух половин. Сохраняем и отрицательные
+    # строки, которые влияют на прохождение порога в другом полумесяце.
+    return f"""
+SELECT x.mi, x.epk_id, x.org_id, x.gosb_id,
+       CASE WHEN x.in_pf THEN {_PORTFOLIO_AMOUNT} ELSE 0 END AS pf_amt,
+       CASE WHEN x.in_pf THEN {_PORTFOLIO_BONUS} ELSE 0 END AS bonus_rub{fot_output}
+FROM (
+    SELECT a.*, (e.inn_exc IS NOT NULL) AS exc, {_IN_PORTFOLIO} AS in_pf
+    FROM (
+        SELECT w.mi, h.epk_id, h.org_id, h.gosb_id, sum(h.sum_pf) AS sum_pf,
+               bool_or(h.pos_pf) AS pos_pf, bool_or(h.pos_t2) AS pos_t2,
+               sum(h.a_t2) AS a_t2, sum(h.a_pf) AS a_pf, sum(h.a_bonus) AS a_bonus{fot_inputs}
+        FROM ptf_latest_day_halves h
+        JOIN ptf_latest_pairs target ON target.org_id = h.org_id AND target.gosb_id = h.gosb_id
+        JOIN (VALUES {values}) w(mi, half) ON w.half = h.mi
+        GROUP BY 1, 2, 3, 4
+    ) a
+    LEFT JOIN t_exc e ON e.inn_exc = a.org_id
+) x
+WHERE {candidate}
+"""
+
+
+def latest_daily_groups(*, include_fot=False):
     keys, cross = _latest_group_keys("d")
+    fot_tag = ", t.pf_amt = t.fot_amt AS fot_matches_pf" if include_fot else ""
+    fot_input = ", d.fot_matches_pf" if include_fot else ""
+    fot_aggregate = ", bool_and(d.fot_matches_pf) AS fot_matches_pf" if include_fot else ""
+    fot_output = ", coalesce(t.fot_matches_pf, true) AS fot_matches_pf" if include_fot else ""
     return f"""
 WITH tagged AS (
-    SELECT t.mi, t.org_id, t.gosb_id, t.pf_amt,
+    SELECT t.mi, t.org_id, t.gosb_id, t.pf_amt, t.bonus_rub,
            coalesce(e.income, 0) AS income, coalesce(e.history, 0) AS history,
-           coalesce(e.jobs, 0) AS jobs, e.movement, m.epk_id IS NOT NULL AS matched_move
+           coalesce(e.jobs, 0) AS jobs, e.movement, m.epk_id IS NOT NULL AS matched_move{fot_tag}
     FROM ptf_latest_days t LEFT JOIN ptf_latest_events e
         ON e.epk_id = t.epk_id AND e.org_id = t.org_id AND e.gosb_id = t.gosb_id
         AND e.period = CASE WHEN t.mi < 4 THEN 0 ELSE 1 END
     LEFT JOIN ptf_latest_moves m ON e.epk_id = m.epk_id AND e.org_id = m.org_id
         AND e.gosb_id = m.gosb_id AND e.period = m.period
-    WHERE t.st = 'P'
+), expanded AS (
+    SELECT d.mi, d.org_id, d.gosb_id, d.pf_amt, d.bonus_rub, d.movement, d.matched_move, {keys}{fot_input}
+    FROM tagged d {cross}
 ), totals AS (
-    SELECT d.mi, d.org_id, d.gosb_id, {keys}, count(*) AS n,
+    SELECT d.mi, d.org_id, d.gosb_id, d.income, d.history, d.jobs, count(CASE WHEN d.pf_amt > 0 THEN 1 END) AS n,
            sum(d.pf_amt) AS amount,
            sum(CASE WHEN d.movement = 'continuing' THEN d.pf_amt ELSE 0 END) AS stay,
-           sum(CASE WHEN d.matched_move THEN d.pf_amt ELSE 0 END) AS moved
-    FROM tagged d {cross} GROUP BY 1, 2, 3, 4, 5, 6
+           sum(CASE WHEN d.movement = 'continuing' THEN d.bonus_rub ELSE 0 END) AS bonus,
+           sum(CASE WHEN d.matched_move THEN d.pf_amt ELSE 0 END) AS moved{fot_aggregate}
+    FROM expanded d JOIN ptf_latest_shortlist s ON d.org_id = s.org_id AND d.gosb_id = s.gosb_id
+        AND d.income = s.income AND d.history = s.history AND d.jobs = s.jobs
+    GROUP BY 1, 2, 3, 4, 5, 6
 )
 SELECT substr(md5(CAST(s.org_id AS text) || ':' || CAST(s.gosb_id AS text) || ':' || :salt), 1, 12)
            AS pair_code,
        s.income, s.history, s.jobs, w.mi, coalesce(t.n, 0) AS n,
        coalesce(t.amount, 0) AS amount, coalesce(t.stay, 0) AS stay,
-       coalesce(t.moved, 0) AS moved
+       coalesce(t.moved, 0) AS moved, coalesce(t.bonus, 0) AS bonus{fot_output}
 FROM ptf_latest_shortlist s CROSS JOIN (VALUES (0), (1), (2), (3), (4), (5), (6), (7)) w(mi)
 LEFT JOIN totals t ON t.org_id = s.org_id AND t.gosb_id = s.gosb_id AND t.mi = w.mi
     AND t.income = s.income AND t.history = s.history AND t.jobs = s.jobs

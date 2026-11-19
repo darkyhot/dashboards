@@ -25,7 +25,7 @@ def _sql_texts() -> list[tuple[str, str]]:
     out = [(n, v) for n, v in vars(Q).items() if isinstance(v, str) and n.isupper()]
     out.append(("final_select()", Q.final_select()))
     out.append(("row_checks()", Q.row_checks()))
-    out.append(("latest_daily_triples()", Q.latest_daily_triples()))
+    out.append(("latest_daily_triples()", Q.latest_daily_triples((0, 1, 3, 4))))
     return out
 
 

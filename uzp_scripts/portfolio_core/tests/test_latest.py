@@ -10,9 +10,9 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError, OperationalError
 
-from ptf import config, db, latest, months as M, sql as Q, synth
+from ptf import config, db, latest, latest_html, months as M, sql as Q, synth
 from test_daily import ORG_A, ORG_B, ORG_T, payments
 
 PG_URL = os.environ.get("PTF_TEST_PG_URL", "")
@@ -70,6 +70,52 @@ class SavedReview(unittest.TestCase):
             self.assertEqual(latest.read_saved_review(path), {"cards": []})
 
 
+class ReportCoverage(unittest.TestCase):
+    def setUp(self):
+        self.cards = [
+            {"pair": f"pair-{i}", "gosb": 8601, "group": "Вся пара", "state": "Нужна проверка",
+             "confirmed": -1_000_000 if i == 0 else None, "residual": -(100_000 - i)}
+            for i in range(8)
+        ]
+        self.report = {
+            "cards": self.cards,
+            "organization_ids": {c["pair"]: str(7_000_000_000 + i) for i, c in enumerate(self.cards)},
+            "totals": {"signals": 1000},
+        }
+
+    def test_confirmed_table_keeps_two_groups_of_the_same_pair(self):
+        self.cards.append({**self.cards[0], "group": "Один работодатель", "confirmed": -500_000})
+        findings = latest_html._findings(self.report)
+        self.assertIn("найдено 1 000 сигналов", findings)
+        self.assertIn("9 карточек по 8 парам", findings)
+        self.assertEqual(findings.count("<tr data-impact="), 2)
+        self.assertIn('data-impact="500000"', findings)
+
+    def test_open_and_stopped_tables_keep_more_than_six_rows(self):
+        self.report["organization_checks"] = {
+            c["pair"]: [{"stopped_gosb": 8601, "previous_amount": 100_000 - i, "current_amount": 0}]
+            for i, c in enumerate(self.cards)
+        }
+        explanations = latest_html._explanations(self.report)
+        self.assertIn("Организации с остановкой выплат в ГОСБ (8)", explanations)
+        self.assertIn("Причину снижения ещё предстоит проверить (8)", explanations)
+        self.assertEqual(explanations.count("<td>7000000007</td>"), 2)
+
+
+class BonusTiming(unittest.TestCase):
+    def test_same_bonus_in_a_different_month_is_not_a_pay_change(self):
+        amounts = (1_000_000, 800_000, 800_000, 1_000_000)
+        bonuses = (200_000, 0, 0, 200_000)
+        row = dict(zip(latest.CURRENCIES + latest.STAYS + latest.BONUSES, amounts + amounts + bonuses))
+        row.update({name: 10 for name in latest.COUNTS})
+        row.update(tb_id=52, rub_change=0.5, stay_change=0, stay_n=10, stay_year_n=10)
+        windows = pd.DataFrame([(10, amt, amt, 0, bonus) for amt, bonus in zip(amounts, bonuses) for _ in range(2)],
+                               columns=["n", "amount", "stay", "moved", "bonus"])
+        result = latest._calendar_values(row, windows, set(), 0.15, True, 0.5)
+        self.assertEqual((result["raw"], result["bonus"], result["confirmed"], result["residual"]),
+                         (400_000, 400_000, None, 0))
+
+
 @unittest.skipUnless(PG_URL, "PTF_TEST_PG_URL не задан")
 class Pipeline(unittest.TestCase):
     @classmethod
@@ -100,6 +146,9 @@ class Pipeline(unittest.TestCase):
             "segment_name": "Средний бизнес", "enrollment_kind_descr": d["kind"],
             "market_share_flag_name": "Прочие", "transaction_qty": 1,
         })
+        bonus = raw[(raw["inn"] == str(ORG_A)) & raw["epk_id"].lt(1020)
+                    & raw["report_dt"].map(M.iso).isin(["2025-07-31", MONTH])]
+        raw = pd.concat([raw, bonus.assign(amt=100_000, enrollment_type=18)], ignore_index=True)
         monthly = raw.assign(report_dt=raw["report_dt"].map(M.iso))
         monthly = monthly[monthly["report_dt"] >= "2024-01-31"]
         portfolio = monthly.groupby(["report_dt", "inn", "sys_gosb_id"], as_index=False).agg(
@@ -123,7 +172,8 @@ class Pipeline(unittest.TestCase):
                 report_dt date, org_id bigint, sys_gosb_id integer, sys_tb_id integer,
                 pf_recip bigint, pf_amt numeric, fot_amt numeric, any_recip bigint)"""))
             c.execute(text(db.render(Q.CREATE_JOURNAL)))
-            c.execute(text(f"INSERT INTO {SCHEMA}.uzp_dim_enrollment_type VALUES (1, 'Зарплата', true, true)"))
+            c.execute(text(f"INSERT INTO {SCHEMA}.uzp_dim_enrollment_type VALUES "
+                           "(1, 'Зарплата', true, true), (18, 'Премия', true, true)"))
             synth._copy(c, raw, f"{SCHEMA}.mis_data_payroll_d")
             synth._copy(c, monthly, f"{SCHEMA}.mis_data_payroll_m")
             portfolio = portfolio.rename(columns={"n": "pf_recip", "rub": "pf_amt", "tb": "sys_tb_id",
@@ -135,6 +185,71 @@ class Pipeline(unittest.TestCase):
     def tearDownClass(cls):
         config.setup(cls.saved[0], cls.saved[1], cls.saved[2], payroll_d=cls.saved[3])
         cls.engine.dispose()
+
+    def test_daily_halves_apply_portfolio_threshold_after_joining_windows(self):
+        with self.engine.connect() as c, c.begin():
+            c.execute(text("CREATE TEMP TABLE t_exc (inn_exc bigint) ON COMMIT DROP"))
+            c.execute(text("""CREATE TEMP TABLE ptf_latest_pairs ON COMMIT DROP AS
+                            SELECT 10 AS org_id, 8601 AS gosb_id"""))
+            c.execute(text("""
+                CREATE TEMP TABLE ptf_latest_day_halves ON COMMIT DROP AS
+                SELECT *, 10 AS org_id, 8601 AS gosb_id, false AS pos_t2, 0 AS a_t2, 0 AS a_bonus
+                FROM (VALUES (0, 1, 1500, true, 1500), (1, 1, 1500, true, 1500),
+                             (0, 2, 3500, true, 3500), (1, 2, -1500, false, 0),
+                             (0, 3, 1500, true, 1500), (3, 3, 1500, true, 1500))
+                    h(mi, epk_id, sum_pf, pos_pf, a_pf)
+            """))
+            result = c.execute(text(Q.latest_daily_triples((0,))), {"amt_min": 2500})
+            actual = {(r.mi, r.epk_id): r.pf_amt for r in result}
+        self.assertEqual(actual, {(0, 1): 3000, (1, 2): 3500, (1, 3): 3000})
+
+    def test_anomaly_mart_preserves_scope_and_replaces_the_month(self):
+        def run():
+            with db.session(self.engine) as c:
+                return latest.write_anomaly_month(c, today=date(2026, 9, 15))
+
+        result = run()
+        self.assertEqual(result["month"], MONTH)
+        self.assertGreater(result["confirmed"], 0)
+        self.assertEqual(len(result["checked_examples"]), 7)
+        self.assertTrue(all(case["matches"] for case in result["checked_examples"]))
+        self.assertTrue(all("org_id" not in case and "org_number" not in case for case in result["checked_examples"]))
+        with db.session(self.engine) as c:
+            stored = db.read_sql(c, f"SELECT * FROM {SCHEMA}.yva_ptf_anomaly_month")
+        self.assertNotIn("epk_id", stored.columns)
+        self.assertTrue(stored.loc[stored["detected_scope"] == "pair", "detected_group"].isna().all())
+        self.assertTrue(stored.loc[stored["detected_scope"] == "group", "detected_group"].notna().all())
+        top = stored[(stored["org_id"] == ORG_A) & (stored["metric_code"] == "continuing_pay")
+                     & (stored["group_key"] == "5:-1:-1")].iloc[0]
+        self.assertEqual(top["confirmed_impact_rub"], -2_000_000)
+        self.assertTrue(top["has_deviation"])
+        self.assertEqual(top["detected_scope"], "group")
+        self.assertFalse(top["pair_has_deviation"])
+        self.assertTrue(pd.isna(top["contributor_group"]))
+        self.assertIn("Подтверждено", top["case_text"])
+        pair = stored[(stored["org_id"] == ORG_A) & (stored["metric_code"] == "fot")
+                      & (stored["group_key"] == "all")].iloc[0]
+        self.assertTrue(pair["pair_has_deviation"])
+        self.assertEqual(pair["detected_scope"], "pair")
+        self.assertEqual(pair["contributor_group"], "Один работодатель")
+        self.assertGreater(pair["contributor_people"], 0)
+        moved = stored[(stored["org_id"] == ORG_C) & (stored["gosb_id"] == 8601)
+                       & (stored["metric_code"] == "portfolio_credits") & (stored["group_key"] == "all")].iloc[0]
+        self.assertEqual(moved["org_number"], f"{ORG_C:012d}")
+        self.assertEqual(moved["check_status"], "explained")
+        self.assertFalse(moved["has_deviation"])
+        self.assertIn("Вклад переходов между ГОСБ", moved["case_text"])
+        self.assertEqual(set(stored["metric_code"]), {"fot", "portfolio_credits", "recipients", "continuing_pay", "turnover"})
+        self.assertEqual(run(), result)
+        before = len(stored)
+        with patch.object(Q, "insert_anomaly_month", return_value="SELECT 1 / 0"):
+            with self.assertRaises(DBAPIError):
+                run()
+        with patch.object(Q, "CHECK_ANOMALY_EXAMPLES", "SELECT false AS matches"):
+            with self.assertRaisesRegex(RuntimeError, "Контроль по ведомостям не прошёл"):
+                run()
+        with db.session(self.engine) as c:
+            self.assertEqual(db.scalar(c, f"SELECT count(*) FROM {SCHEMA}.yva_ptf_anomaly_month"), before)
 
     def test_latest_from_ready_data_with_no_future_and_two_mechanisms(self):
         with db.session(self.engine) as c:
@@ -157,6 +272,8 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(boundary["residual"], 0)
         top = next(card for card in report["cards"] if card["group"] == "От 200 тыс. ₽")
         self.assertEqual(top["confirmed"], -2_000_000)
+        self.assertEqual(top["bonus"], 4_000_000)
+        self.assertEqual(top["bonus_months"], [2_000_000, 0, 0, 2_000_000])
         self.assertEqual(top["residual"], 0)
         outgoing, incoming = whole_pair(ORG_C, 8601), whole_pair(ORG_C, 8602)
         self.assertEqual(outgoing["moved"], -1_650_000)
@@ -173,6 +290,8 @@ class Pipeline(unittest.TestCase):
             self.assertIn("Как изменилась структура", body)
             self.assertIn("Почему изменилось число людей", body)
             self.assertIn("найден перенос выплат на 31.07", body)
+            self.assertIn("Изменились премии у тех же получателей", body)
+            self.assertIn("Премии по календарным месяцам", body)
             real = body.split('<section id="findings">', 1)[1].split("</section>", 1)[0]
             self.assertNotIn(f"{ORG_C:012d}", real)
             self.assertIn(f"{ORG_C:012d}", body.split('<section id="explanations">', 1)[1])
@@ -197,7 +316,7 @@ class Pipeline(unittest.TestCase):
         for card in report["cards"]:
             if card["raw"] is not None:
                 self.assertAlmostEqual(card["raw"], (card["boundary"] or 0) + (card["moved"] or 0)
-                                       + (card["confirmed"] or 0) + card["residual"])
+                                       + (card["bonus"] or 0) + (card["confirmed"] or 0) + card["residual"])
         with db.session(self.engine) as c:
             replay = latest.run(c, "2026-08", today=date(2026, 10, 1), alias_salt=TEST_SALT)
         self.assertEqual(replay["latest"], "2026-09-30")
@@ -269,6 +388,7 @@ class Pipeline(unittest.TestCase):
                        CASE WHEN org_id = 5 THEN 1600000 ELSE 0 END AS stay_actual,
                        CASE WHEN org_id = 5 THEN 1000000 ELSE 0 END AS stay_prior,
                        0 AS stay_year_actual, 0 AS stay_year_prior,
+                       0 AS bonus_actual, 0 AS bonus_prior, 0 AS bonus_year_actual, 0 AS bonus_year_prior,
                        CASE WHEN org_id = 5 THEN 85 ELSE 0 END AS stay_n,
                        CASE WHEN org_id = 5 THEN 85 ELSE 0 END AS stay_year_n
                 FROM (VALUES (1, 1000000, 1000000, 2000, 1000000),
