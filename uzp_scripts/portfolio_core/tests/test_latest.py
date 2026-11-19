@@ -121,6 +121,9 @@ class Pipeline(unittest.TestCase):
         self.assertNotIn(str(ORG_A), str(report))
         self.assertNotIn(str(ORG_B), str(report))
         self.assertTrue(any("·" in card["group"] for card in report["cards"]))
+        _, decreases = latest.review_tables(report)[0]
+        self.assertIn("От 200 тыс. ₽", set(decreases["Группа"]))
+        self.assertTrue(decreases["Пара"].is_unique)
         for card in report["cards"]:
             if card["raw"] is not None:
                 self.assertAlmostEqual(card["raw"], (card["boundary"] or 0) + (card["moved"] or 0)
@@ -161,6 +164,36 @@ class Pipeline(unittest.TestCase):
         b = latest.pair_alias(ORG_B, 8601, TEST_SALT)
         calendar = next(card for card in report["cards"] if card["pair"] == b and card["group"] == "Вся пара")
         self.assertEqual(calendar["boundary"], -4_000_000)
+
+    def test_shortlist_favors_money_and_ignores_collapsed_seasonal_base(self):
+        # Пара 1 раньше получала миллион, старая формула сводила ожидание к 2 тыс.
+        # У пары 2 сильнее процент, у пары 3 сильнее просадка в деньгах.
+        # У пары 5 снизилась численность, но рост выплат больше, чем у пары 4.
+        with self.engine.begin() as c:
+            c.execute(text("""
+                CREATE TEMP TABLE ptf_latest_groups ON COMMIT DROP AS
+                SELECT org_id, 100 AS gosb_id, -1 AS income, -1 AS history, -1 AS jobs,
+                       actual, prior, year_actual, year_prior,
+                       CASE WHEN org_id = 5 THEN 85 ELSE 100 END AS n_actual,
+                       100 AS n_prior, 100 AS n_year_actual, 100 AS n_year_prior,
+                       CASE WHEN org_id = 5 THEN 1600000 ELSE 0 END AS stay_actual,
+                       CASE WHEN org_id = 5 THEN 1000000 ELSE 0 END AS stay_prior,
+                       0 AS stay_year_actual, 0 AS stay_year_prior,
+                       CASE WHEN org_id = 5 THEN 85 ELSE 0 END AS stay_n,
+                       CASE WHEN org_id = 5 THEN 85 ELSE 0 END AS stay_year_n
+                FROM (VALUES (1, 1000000, 1000000, 2000, 1000000),
+                             (2, 10000, 100000, 100000, 100000),
+                             (3, 750000, 1000000, 1000000, 1000000),
+                             (4, 1500000, 1000000, 1000000, 1000000),
+                             (5, 1600000, 1600000, 1600000, 1600000))
+                       x(org_id, actual, prior, year_actual, year_prior)
+            """))
+            params = {"min_people": 10, "min_change": 0.15, "min_base_ratio": 0.5, "max_pairs": 1, "max_groups": 1}
+            c.execute(text("CREATE TEMP TABLE ptf_latest_scored ON COMMIT DROP AS " + Q.LATEST_SCORED), params)
+            scored = db.read_sql(c, "SELECT org_id, rub_change FROM ptf_latest_scored").set_index("org_id")
+            chosen = db.read_sql(c, Q.latest_shortlist(), params)
+        self.assertTrue(pd.isna(scored.at[1, "rub_change"]))
+        self.assertEqual(set(chosen["org_id"]), {3, 5})
 
     def test_missing_daily_keeps_monthly_findings(self):
         with db.session(self.engine) as c:

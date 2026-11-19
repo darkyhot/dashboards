@@ -211,7 +211,7 @@ def _delta(values):
     return (current - prev) - (year - year_prev)
 
 
-def _calendar_values(row, windows, doubtful, min_change, calendar_expected):
+def _calendar_values(row, windows, doubtful, min_change, calendar_expected, min_base_ratio):
     comparable_rub = pd.notna(row["rub_change"])
     monthly_delta = _delta([row[f] for f in CURRENCIES]) if comparable_rub else None
     result = {"raw": monthly_delta, "boundary": None, "moved": None, "confirmed": None,
@@ -235,12 +235,12 @@ def _calendar_values(row, windows, doubtful, min_change, calendar_expected):
     confirmed = None
     if pd.notna(row["stay_change"]) and abs(row["stay_change"]) >= min_change:
         expected = prev + (year - year_prev) * row["stay_n"] / row["stay_year_n"]
-        if expected > 0 and curr > 0 and prev > 0:
-            change = (curr - expected) / expected
+        if curr > 0 and prev > 0 and prev * min_base_ratio <= expected <= prev / min_base_ratio:
+            change = (curr - expected) / max(expected, prev)
             if abs(change) >= min_change and change * row["stay_change"] > 0:
                 confirmed = curr - expected
     if confirmed is not None:
-        state = "Подтверждено изменение выплат у тех же получателей"
+        state = "Снижение выплат у тех же получателей" if confirmed < 0 else "Рост выплат у тех же получателей"
     elif monthly_delta and abs(after) < abs(monthly_delta) and abs(boundary) > MIN_RUB_SYNC:
         state = ("Отклонение объясняется границей окна выплат" if abs(after) <= MIN_RUB_SYNC
                  else "Часть отклонения объясняет граница окна выплат")
@@ -262,7 +262,7 @@ def _group(row):
     return " · ".join(dict.fromkeys(parts)) if parts else "Вся пара"
 
 
-def _make_cards(rows, calendar, doubtful, min_change, calendar_expected, stale_pairs):
+def _make_cards(rows, calendar, doubtful, min_change, calendar_expected, stale_pairs, min_base_ratio):
     daily_rows = {} if calendar.empty else {
         key: frame.set_index("mi") for key, frame in calendar.groupby(list(KEY))
     }
@@ -271,16 +271,18 @@ def _make_cards(rows, calendar, doubtful, min_change, calendar_expected, stale_p
         key = tuple(row[k] for k in KEY)
         stale = row["pair_code"] in stale_pairs
         result = _calendar_values(row, None if stale else daily_rows.get(key),
-                                  doubtful, min_change, calendar_expected)
+                                  doubtful, min_change, calendar_expected, min_base_ratio)
         if stale:
             result["state"] = "Ведомости расходятся со сводкой по паре"
+        group = _group(row)
         lifecycle = ""
         if row["n_prior"] == 0 and row["n_actual"] > 0:
             lifecycle = "Появились выплаты в паре"
         elif row["n_prior"] > 0 and row["n_actual"] == 0:
-            lifecycle = "В этом месяце выплат в паре нет"
+            lifecycle = ("В этом месяце выплат в паре нет" if group == "Вся пара"
+                         else "В этом месяце в группе выплат нет")
         cards.append({**result, "pair": row["pair_code"], "org": row["org_code"],
-                      "gosb": row["gosb_id"], "group": _group(row),
+                      "gosb": row["gosb_id"], "group": group,
                       "amount": row["actual"], "expected": row["expected"] if pd.notna(row["rub_change"]) else None,
                       "people": row["n_actual"], "expected_people": row["expected_n"] if pd.notna(row["n_change"]) else None,
                       "stay_people": row["stay_n"], "lifecycle": lifecycle,
@@ -294,15 +296,18 @@ def _make_cards(rows, calendar, doubtful, min_change, calendar_expected, stale_p
 
 
 def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12, max_groups=3,
-        amt_min=Q.AMT_MIN, exc_holding=Q.EXC_HOLDING, check_calendar=True, today=None, alias_salt=None):
+        amt_min=Q.AMT_MIN, exc_holding=Q.EXC_HOLDING, check_calendar=True, today=None, alias_salt=None,
+        min_base_ratio=0.5):
     """Один месяц без наблюдений после конца отчёта, даже при историческом повторе."""
-    if min_people < 1 or not 0 < min_change <= 1 or not 1 <= max_pairs <= 100 or not 1 <= max_groups <= 10:
+    if (min_people < 1 or not 0 < min_change <= 1 or not 0 < min_base_ratio < 1
+            or not 1 <= max_pairs <= 100 or not 1 <= max_groups <= 10):
         raise ValueError("Проверьте минимальный размер, относительное отклонение и лимиты карточек.")
     gp = db.is_greenplum(connection)
     today = today or datetime.now(timezone(timedelta(hours=3))).date()
     closed = M.iso(M.shift(today, -1))
     params = {"min_people": min_people, "min_change": min_change, "max_pairs": max_pairs,
-              "max_groups": max_groups, "amt_min": amt_min, "exc_holding": exc_holding,
+              "max_groups": max_groups, "min_base_ratio": min_base_ratio,
+              "amt_min": amt_min, "exc_holding": exc_holding,
               "salt": alias_salt or urandom(16).hex()}
     calendar = pd.DataFrame()
     calendar_warning = None
@@ -325,12 +330,13 @@ def run(connection, month=None, *, min_people=10, min_change=0.15, max_pairs=12,
         calendar_warning = f"Дневная проверка завершилась ошибкой ({code})."
         progress.warn(calendar_warning)
     totals, rows, doubtful, audit, stale_pairs = monthly
-    cards = _make_cards(rows, calendar, doubtful, min_change, check_calendar, stale_pairs)
+    cards = _make_cards(rows, calendar, doubtful, min_change, check_calendar, stale_pairs, min_base_ratio)
     return {"month": selected, "latest": latest, "closed": closed, "dates": dates,
             "run_id": int(journal["run_id"].iloc[0]), "totals": totals, "cards": cards,
             "doubtful_tb": sorted(doubtful), "calendar_warning": calendar_warning,
             "monthly_audit": audit, "stale_pairs": len(stale_pairs),
-            "min_people": min_people, "min_change": min_change, "max_pairs": max_pairs, "max_groups": max_groups}
+            "min_people": min_people, "min_change": min_change, "min_base_ratio": min_base_ratio,
+            "max_pairs": max_pairs, "max_groups": max_groups}
 
 
 def pair_alias(org, gosb, salt):
@@ -344,13 +350,17 @@ def _number(n):
 
 def overview(report):
     totals = report["totals"]
+    pair_share = totals["comparable"] / totals["pairs"] if totals["pairs"] else 0
+    amount_share = totals["comparable_actual"] / totals["actual"] if totals["actual"] else 0
     text = [
         f"{M.long(report['month']).capitalize()} · сводка {report['run_id']}",
         f"Пары с выплатой в текущем или предыдущем месяце: {_number(totals['pairs'])}. "
         f"Получатели в парах: {_number(totals['n_actual'])}. Зачисления портфеля: {_number(totals['actual'])} ₽.",
-        f"Сопоставимая денежная база: {_number(totals['comparable'])} пар. "
+        f"Сопоставимая денежная база: {_number(totals['comparable'])} пар "
+        f"({pair_share:.1%} пар и {amount_share:.1%} зачислений). "
         f"Зачисления {_number(totals['comparable_actual'])} ₽ при ожидании "
-        f"{_number(totals['comparable_expected'])} ₽.",
+        f"{_number(totals['comparable_expected'])} ₽. "
+        f"Сезонная денежная база не прошла проверку у {_number(totals.get('weak_rub_base'))} пар.",
         f"В сопоставимых парах просадки {_number(totals['gross_down'])} ₽, "
         f"рост {_number(totals['gross_up'])} ₽ до проверки причин. "
         f"Пар с появлением выплат {_number(totals['added'])}, с прекращением выплат {_number(totals['stopped'])}. "
@@ -377,7 +387,7 @@ def overview(report):
     return text
 
 
-def card_table(report, limit=None):
+def _card_table(cards):
     return pd.DataFrame([{
         "Пара": c["pair"], "ГОСБ": c["gosb"], "Группа": c["group"],
         "Факт, ₽": _number(c["amount"]), "Ожидание, ₽": _number(c["expected"]),
@@ -385,7 +395,50 @@ def card_table(report, limit=None):
         "Между ГОСБ, ₽": _number(c["moved"]), "Те же получатели, ₽": _number(c["confirmed"]), "Остаток, ₽": _number(c["residual"]),
         "Получатели": _number(c["people"]),
         "Статус": ". ".join(filter(None, (c["lifecycle"], c["state"]))),
-    } for c in report["cards"][:limit]])
+    } for c in cards])
+
+
+def card_table(report, limit=None):
+    return _card_table(report["cards"][:limit])
+
+
+def review_tables(report, limit=6):
+    """Короткие списки с раздельным ранжированием, в том числе для старого отчёта в памяти."""
+    selections = (
+        ("Подтверждённое снижение выплат у тех же получателей", "confirmed", -1),
+        ("Отрицательный остаток после доступных проверок", "residual", -1),
+        ("Подтверждённый рост выплат у тех же получателей", "confirmed", 1),
+    )
+    pages = []
+    for title, field, sign in selections:
+        ordered = sorted(
+            (c for c in report["cards"] if c[field] is not None and c[field] * sign > 0),
+            key=lambda c: (-c[field] * sign, c["group"] != "Вся пара", c["pair"], c["group"]),
+        )
+        best_by_pair = {}
+        for card in ordered:
+            best_by_pair.setdefault(card["pair"], card)
+        table = _card_table(list(best_by_pair.values())[:limit])
+        if not table.empty:
+            table = table[["Пара", "ГОСБ", "Группа", "Исходное, ₽", "Те же получатели, ₽", "Остаток, ₽"]]
+        pages.append((title, table))
+    return pages
+
+
+def review_movements(report):
+    """Движения по крупнейшему отрицательному остатку среди карточек всей пары."""
+    worst = min((c for c in report["cards"] if c["group"] == "Вся пара"
+                 and c["residual"] is not None and c["residual"] < 0),
+                key=lambda c: (c["residual"], c["pair"]), default=None)
+    if worst is None:
+        return None
+    title = (f"Крупнейший отрицательный остаток по паре {worst['pair']}, ГОСБ {worst['gosb']}. "
+             f"{_number(worst['residual'])} ₽. Получателей {_number(worst['people'])}, "
+             f"ожидали {_number(worst['expected_people'])}.")
+    table = pd.DataFrame([{"Наблюдение по выбывшим": label, "Получатели": item["people"],
+                           "Выплаты в прошлом месяце, ₽": _number(item["previous"])}
+                          for label, item in worst["flows"].items()])
+    return title, table
 
 
 def write_html(report, path):
@@ -394,6 +447,9 @@ def write_html(report, path):
     paragraphs = "".join(f"<p>{escape(line)}</p>" for line in overview(report))
     table = card_table(report)
     audit = audit_table(report["monthly_audit"])
+    pages = "".join(f"<h2>{escape(title)}</h2>"
+                    + (page.to_html(index=False) if len(page) else "<p>Среди отобранных карточек таких случаев нет.</p>")
+                    for title, page in review_tables(report))
     detail = []
     for c in report["cards"]:
         title = escape(f"Орг. {c['org']} · ГОСБ {c['gosb']} · Пара {c['pair']} · {c['group']}")
@@ -409,7 +465,8 @@ def write_html(report, path):
         '<style>body{font:15px system-ui;margin:2rem;color:#19252e}table{border-collapse:collapse}'
         'td,th{padding:.45rem;border-bottom:1px solid #d4dde1;text-align:left}'
         'th{background:#eef3f5}details{margin:.6rem 0}</style><h1>Последний месяц</h1>'
-        + paragraphs + (audit.to_html(index=False) if len(audit) else "")
+        + paragraphs + (audit.to_html(index=False) if len(audit) else "") + pages
+        + "<h2>Все отобранные карточки</h2>"
         + (table.to_html(index=False) if len(table) else "<p>Карточек по условиям отбора нет.</p>")
         + "".join(detail) + "</html>", encoding="utf-8")
     return path

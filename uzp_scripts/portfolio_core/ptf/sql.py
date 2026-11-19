@@ -1359,21 +1359,30 @@ SELECT g.*,
 FROM ptf_latest_groups g
 """
 
-LATEST_SCORED = """
+def _latest_supported(column, prior):
+    return f"{column} BETWEEN {prior} * :min_base_ratio AND {prior} / :min_base_ratio AND {column} > 0"
+
+
+LATEST_SCORED = f"""
 SELECT c.*,
-    CASE WHEN n_prior >= :min_people AND n_year_prior >= :min_people AND expected > 0
-         THEN (actual - expected) / expected END AS rub_change,
-    CASE WHEN n_prior >= :min_people AND n_year_prior >= :min_people AND expected_n > 0
-         THEN CAST(n_actual - expected_n AS numeric) / expected_n END AS n_change,
-    CASE WHEN stay_n >= :min_people AND stay_year_n >= :min_people AND expected_stay > 0
-         THEN (stay_actual - expected_stay) / expected_stay END AS stay_change
-FROM ({compared}) c
-""".replace("{compared}", LATEST_COMPARED)
+    CASE WHEN n_prior >= :min_people AND n_year_prior >= :min_people
+          AND {_latest_supported("expected", "prior")}
+         THEN CAST(actual - expected AS numeric) / greatest(expected, prior) END AS rub_change,
+    CASE WHEN n_prior >= :min_people AND n_year_prior >= :min_people
+          AND {_latest_supported("expected_n", "n_prior")}
+         THEN CAST(n_actual - expected_n AS numeric) / greatest(expected_n, n_prior) END AS n_change,
+    CASE WHEN stay_n >= :min_people AND stay_year_n >= :min_people
+          AND {_latest_supported("expected_stay", "stay_prior")}
+         THEN (stay_actual - expected_stay) / greatest(expected_stay, stay_prior) END AS stay_change
+FROM ({LATEST_COMPARED}) c
+"""
 
 LATEST_SUMMARY = """
 SELECT count(*) AS pairs, sum(n_actual) AS n_actual, sum(actual) AS actual,
        sum(CASE WHEN rub_change IS NOT NULL THEN 1 ELSE 0 END) AS comparable,
        sum(CASE WHEN rub_change IS NOT NULL THEN actual ELSE 0 END) AS comparable_actual,
+       count(CASE WHEN n_prior >= :min_people AND n_year_prior >= :min_people
+                  AND rub_change IS NULL THEN 1 END) AS weak_rub_base,
        sum(CASE WHEN rub_change IS NOT NULL THEN expected ELSE 0 END) AS comparable_expected,
        sum(CASE WHEN rub_change < 0 THEN expected - actual ELSE 0 END) AS gross_down,
        sum(CASE WHEN rub_change > 0 THEN actual - expected ELSE 0 END) AS gross_up,
@@ -1392,36 +1401,40 @@ _LATEST_SIGNAL_FILTER = """
 
 
 def latest_shortlist():
-    # Раздельные очереди для роста и просадок сохраняют оба сигнала в устойчивой паре.
-    # Полное появление / прекращение выплат видно и без сопоставимой сезонной базы.
+    # Относительное отклонение определяет кандидата. В бюджет дневной проверки
+    # идут крупнейшие рублёвые сигналы отдельно по причинам знака и зерну.
     return f"""
-WITH directions AS (
+WITH candidates AS (
     SELECT s.*, CASE WHEN income = -1 AND history = -1 AND jobs = -1
                      THEN 'pair' ELSE 'group' END AS level,
-           CASE WHEN least(rub_change, n_change, stay_change) <= -:min_change THEN 'down'
-                WHEN greatest(rub_change, n_change, stay_change) >= :min_change THEN 'up'
-                WHEN n_actual = 0 THEN 'stopped' ELSE 'appeared' END AS direction,
            (CASE WHEN income >= 0 THEN 1 ELSE 0 END + CASE WHEN history >= 0 THEN 1 ELSE 0 END
             + CASE WHEN jobs >= 0 THEN 1 ELSE 0 END) AS depth
     FROM ptf_latest_scored s WHERE {_LATEST_SIGNAL_FILTER}
     OR (income = -1 AND history = -1 AND jobs = -1
         AND ((n_prior = 0 AND n_actual >= :min_people) OR (n_actual = 0 AND n_prior >= :min_people)))
-), signals AS (
-    SELECT directions.*,
-           CASE WHEN direction = 'down' THEN -least(rub_change, n_change, stay_change)
-                WHEN direction = 'up' THEN greatest(rub_change, n_change, stay_change)
-                ELSE 0 END AS severity
-    FROM directions
+), valued AS (
+    SELECT s.*, d.direction,
+           greatest(
+               CASE WHEN abs(d.direction) = 1 AND rub_change * d.direction >= :min_change THEN (actual - expected) * d.direction END,
+               CASE WHEN abs(d.direction) = 1 AND n_change * d.direction >= :min_change
+                    THEN (n_actual - expected_n) * d.direction * prior / nullif(n_prior, 0) END,
+               CASE WHEN abs(d.direction) = 1 AND stay_change * d.direction >= :min_change
+                    THEN (stay_actual - expected_stay) * d.direction END,
+               CASE WHEN level = 'pair' AND d.direction = -2 AND n_actual = 0 AND n_prior >= :min_people
+                    THEN prior END,
+               CASE WHEN level = 'pair' AND d.direction = 2 AND n_prior = 0 AND n_actual >= :min_people
+                    THEN actual END
+           ) AS priority
+    FROM candidates s CROSS JOIN (VALUES (-1), (1), (-2), (2)) d(direction)
+    WHERE abs(d.direction) = 1 OR NOT coalesce(({_LATEST_SIGNAL_FILTER}), false)
 ), per_pair AS (
-    SELECT signals.*,
+    SELECT valued.*,
            row_number() OVER (PARTITION BY level, direction, org_id, gosb_id
-                              ORDER BY severity DESC, depth, income, history, jobs) AS within_pair
-    FROM signals
+                              ORDER BY priority DESC, depth, income, history, jobs) AS within_pair
+    FROM valued WHERE priority > 0
 ), ranked AS (
     SELECT per_pair.*,
-           row_number() OVER (PARTITION BY level, direction
-                              ORDER BY severity DESC, greatest(n_prior, n_actual) DESC,
-                                       org_id, gosb_id) AS pos
+           row_number() OVER (PARTITION BY level, direction ORDER BY priority DESC, org_id, gosb_id) AS pos
     FROM per_pair WHERE within_pair = 1
 ), chosen AS (
     SELECT org_id, gosb_id FROM ranked WHERE pos <= :max_pairs GROUP BY 1, 2
@@ -1429,6 +1442,7 @@ WITH directions AS (
 SELECT s.org_id, s.gosb_id, s.income, s.history, s.jobs
 FROM per_pair s JOIN chosen c ON c.org_id = s.org_id AND c.gosb_id = s.gosb_id
 WHERE s.within_pair <= :max_groups
+GROUP BY 1, 2, 3, 4, 5
 """
 
 
