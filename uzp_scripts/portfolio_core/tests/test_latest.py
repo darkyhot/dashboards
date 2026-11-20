@@ -242,13 +242,21 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(set(stored["metric_code"]), {"fot", "portfolio_credits", "recipients", "continuing_pay", "turnover"})
         self.assertEqual(run(), result)
         before = len(stored)
+        insert_sql = Q.insert_anomaly_month()
+        with patch.object(Q, "insert_anomaly_month", return_value=insert_sql + "; DROP TABLE ptf_latest_events"):
+            self.assertEqual(run(), result)
         with patch.object(Q, "insert_anomaly_month", return_value="SELECT 1 / 0"):
             with self.assertRaises(DBAPIError):
                 run()
-        with patch.object(Q, "CHECK_ANOMALY_EXAMPLES", "SELECT false AS matches"):
-            with self.assertRaisesRegex(RuntimeError, "Контроль по ведомостям не прошёл"):
+        alter_example = f""";
+            UPDATE {Q.ANOMALY_MART}
+            SET actual_value = actual_value + 100, expected_value = expected_value + 100
+            WHERE report_dt = CAST(:report_dt AS date) AND has_deviation
+        """
+        with patch.object(Q, "insert_anomaly_month", return_value=insert_sql + alter_example):
+            with self.assertRaisesRegex(RuntimeError, "Контроль по месячным агрегатам не прошёл"):
                 run()
-        duplicate_insert = Q.insert_anomaly_month() + f""";
+        duplicate_insert = insert_sql + f""";
             INSERT INTO {Q.ANOMALY_MART}
             SELECT * FROM {Q.ANOMALY_MART} WHERE report_dt = CAST(:report_dt AS date) LIMIT 1
         """
@@ -256,7 +264,12 @@ class Pipeline(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ключей с дублями"):
                 run()
         with db.session(self.engine) as c:
-            self.assertEqual(db.scalar(c, f"SELECT count(*) FROM {SCHEMA}.yva_ptf_anomaly_month"), before)
+            restored = db.read_sql(c, f"SELECT * FROM {SCHEMA}.yva_ptf_anomaly_month")
+        self.assertEqual(len(restored), before)
+        key = ["report_dt", "org_id", "gosb_id", "metric_code", "group_key"]
+        for field in ("actual_value", "expected_value"):
+            pd.testing.assert_series_equal(stored.set_index(key)[field].sort_index(),
+                                           restored.set_index(key)[field].sort_index())
 
     def test_anomaly_mart_creation_failure_stops_before_reading_payroll(self):
         with patch.object(Q, "CREATE_ANOMALY_MART", "SELECT 1 / 0"), patch.object(latest, "_monthly") as monthly:

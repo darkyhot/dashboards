@@ -476,7 +476,7 @@ def write_anomaly_month(connection, month=None, *, min_people=10, min_change=0.1
             raise ValueError("В витрине уже записан этот месяц по более свежей сводке.")
         _execute(connection, Q.DELETE_ANOMALY_MONTH, params)
         _execute(connection, Q.insert_anomaly_month(), params)
-        progress.step("Контроль записи и сверка денежных кейсов по ведомостям")
+        progress.step("Контроль записи и сверка денежных кейсов по месячным агрегатам")
         totals = db.read_sql(connection, Q.CHECK_ANOMALY_MONTH, params).iloc[0]
         if totals["duplicate_keys"]:
             raise RuntimeError(f"Контроль витрины: найдено ключей с дублями — {int(totals['duplicate_keys'])}.")
@@ -486,7 +486,7 @@ def write_anomaly_month(connection, month=None, *, min_people=10, min_change=0.1
         cases = db.read_sql(connection, Q.CHECK_ANOMALY_EXAMPLES, params).to_dict("records")
         failed = sum(not case["matches"] for case in cases)
         if failed:
-            raise RuntimeError(f"Контроль по ведомостям не прошёл в {failed} из {len(cases)} примеров.")
+            raise RuntimeError(f"Контроль по месячным агрегатам не прошёл в {failed} из {len(cases)} примеров.")
     return {"month": selected, "table": db.render(Q.ANOMALY_MART),
             **{k: int(totals[k]) for k in ("signals", "confirmed", "explained", "open_cases", "pending")},
             "checked_examples": cases}

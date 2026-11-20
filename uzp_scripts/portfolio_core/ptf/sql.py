@@ -1815,7 +1815,7 @@ COUNT_ANOMALY_SIGNALS = "SELECT count(*) FROM ptf_anomaly_signals"
 CHECK_ANOMALY_EXAMPLES = f"""
 WITH month_cases AS (
     SELECT org_id, gosb_id, metric_code, group_key, check_status, has_deviation,
-           prior_value, actual_value, expected_value, raw_impact_rub, confirmed_impact_rub, case_text
+           raw_impact_rub, confirmed_impact_rub
     FROM {ANOMALY_MART}
     WHERE report_dt = CAST(:report_dt AS date) AND impact_method = 'direct_amount'
 ), confirmed AS (
@@ -1830,33 +1830,25 @@ WITH month_cases AS (
     ORDER BY abs(raw_impact_rub) DESC NULLS LAST, org_id, gosb_id, metric_code, group_key LIMIT 1
 ), sample AS (
     SELECT * FROM confirmed UNION ALL SELECT * FROM explained UNION ALL SELECT * FROM unresolved
-), recipient_amounts AS (
-    SELECT s.org_id, s.gosb_id, s.metric_code, s.group_key, e.period, e.movement,
-           CASE s.metric_code WHEN 'fot' THEN e.curr_fot
-                WHEN 'portfolio_credits' THEN e.curr_rub
-                ELSE CASE WHEN e.movement = 'continuing' THEN e.curr_rub - e.curr_bonus ELSE 0 END END AS actual,
-           CASE s.metric_code WHEN 'fot' THEN e.prev_fot
-                WHEN 'portfolio_credits' THEN e.prev_rub
-                ELSE CASE WHEN e.movement = 'continuing' THEN e.prev_rub - e.prev_bonus ELSE 0 END END AS prior
-    FROM sample s JOIN ptf_anomaly_labels g ON s.group_key = g.group_key
-    JOIN ptf_latest_events e ON e.org_id = s.org_id AND e.gosb_id = s.gosb_id
-        AND (g.income = -1 OR e.income = g.income)
-        AND (g.history = -1 OR e.history = g.history)
-        AND (g.jobs = -1 OR e.jobs = g.jobs)
-), figures AS (
-    SELECT org_id, gosb_id, metric_code, group_key,
-           sum(CASE WHEN period = 0 THEN actual ELSE 0 END) AS actual,
-           sum(CASE WHEN period = 0 THEN prior ELSE 0 END) AS prior,
-           sum(CASE WHEN period = 1 THEN actual - prior ELSE 0 END) AS prior_year_change,
-           count(CASE WHEN period = 0 AND movement = 'continuing' THEN 1 END) AS current_stayed,
-           count(CASE WHEN period = 1 AND movement = 'continuing' THEN 1 END) AS prior_year_stayed
-    FROM recipient_amounts GROUP BY 1, 2, 3, 4
 ), compared AS (
-    SELECT s.*, f.actual AS source_actual, f.prior AS source_prior,
-           f.prior + CASE WHEN s.metric_code = 'continuing_pay'
-                THEN CAST(f.prior_year_change AS numeric) * f.current_stayed / nullif(f.prior_year_stayed, 0)
-                ELSE f.prior_year_change END AS source_expected
-    FROM sample s LEFT JOIN figures f USING (org_id, gosb_id, metric_code, group_key)
+    SELECT s.*, m.actual_value, m.prior_value, m.expected_value, m.case_text,
+           CASE s.metric_code WHEN 'fot' THEN g.fot_actual
+                WHEN 'portfolio_credits' THEN g.actual
+                WHEN 'continuing_pay' THEN g.stay_actual - g.bonus_actual END AS source_actual,
+           CASE s.metric_code WHEN 'fot' THEN g.fot_prior
+                WHEN 'portfolio_credits' THEN g.prior
+                WHEN 'continuing_pay' THEN g.stay_prior - g.bonus_prior END AS source_prior,
+           CASE s.metric_code WHEN 'fot' THEN g.fot_prior + (g.fot_year_actual - g.fot_year_prior)
+                WHEN 'portfolio_credits' THEN g.prior + (g.year_actual - g.year_prior)
+                WHEN 'continuing_pay' THEN g.stay_prior - g.bonus_prior
+                    + CAST(g.stay_n AS numeric) / nullif(g.stay_year_n, 0) *
+                      ((g.stay_year_actual - g.bonus_year_actual) - (g.stay_year_prior - g.bonus_year_prior)) END AS source_expected
+    FROM sample s
+    JOIN {ANOMALY_MART} m ON m.report_dt = CAST(:report_dt AS date)
+        AND m.org_id = s.org_id AND m.gosb_id = s.gosb_id AND m.metric_code = s.metric_code AND m.group_key = s.group_key
+    LEFT JOIN ptf_anomaly_labels l ON s.group_key = l.group_key
+    LEFT JOIN ptf_latest_groups g ON g.org_id = s.org_id AND g.gosb_id = s.gosb_id
+        AND g.income = l.income AND g.history = l.history AND g.jobs = l.jobs
 )
 SELECT gosb_id, metric_code, check_status, coalesce(
        abs(source_actual - actual_value) <= :sync_rub AND abs(source_prior - prior_value) <= :sync_rub
