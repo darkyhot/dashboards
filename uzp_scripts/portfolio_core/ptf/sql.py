@@ -1558,7 +1558,6 @@ CREATE TABLE IF NOT EXISTS {ANOMALY_MART} (
     confirmed_impact_rub numeric, open_impact_rub numeric, impact_method varchar(24),
     case_text text NOT NULL, source_run_id bigint NOT NULL, method_version integer NOT NULL,
     calculated_at timestamptz NOT NULL,
-    PRIMARY KEY (report_dt, org_id, gosb_id, metric_code, group_key),
     CHECK ((detected_scope = 'pair' AND group_key = 'all' AND detected_group IS NULL)
         OR (detected_scope = 'group' AND group_key <> 'all' AND detected_group IS NOT NULL)),
     CHECK (has_deviation = (coalesce(confirmed_impact_rub, 0) <> 0))
@@ -1794,14 +1793,22 @@ LOCK_ANOMALY_MONTH = f"LOCK TABLE {ANOMALY_MART} IN SHARE ROW EXCLUSIVE MODE"
 LATEST_ANOMALY_SOURCE = f"SELECT max(source_run_id) FROM {ANOMALY_MART} WHERE report_dt = CAST(:report_dt AS date)"
 DELETE_ANOMALY_MONTH = f"DELETE FROM {ANOMALY_MART} WHERE report_dt = CAST(:report_dt AS date)"
 CHECK_ANOMALY_MONTH = f"""
-SELECT count(*) AS signals, count(CASE WHEN has_deviation THEN 1 END) AS confirmed,
-       count(CASE WHEN check_status = 'explained' THEN 1 END) AS explained,
-       count(CASE WHEN check_status = 'open' THEN 1 END) AS open_cases,
-       count(CASE WHEN check_status IN ('awaiting_checks', 'check_unavailable') THEN 1 END) AS pending,
-       count(CASE WHEN abs(actual_value - expected_value - delta_value) > :sync_rub
-                    OR abs(raw_impact_rub - coalesce(adjustment_rub, 0)
-                           - coalesce(confirmed_impact_rub, 0) - open_impact_rub) > :sync_rub THEN 1 END) AS mismatched
-FROM {ANOMALY_MART} WHERE report_dt = CAST(:report_dt AS date)
+WITH by_key AS (
+    SELECT count(*) AS signals, count(CASE WHEN has_deviation THEN 1 END) AS confirmed,
+           count(CASE WHEN check_status = 'explained' THEN 1 END) AS explained,
+           count(CASE WHEN check_status = 'open' THEN 1 END) AS open_cases,
+           count(CASE WHEN check_status IN ('awaiting_checks', 'check_unavailable') THEN 1 END) AS pending,
+           count(CASE WHEN abs(actual_value - expected_value - delta_value) > :sync_rub
+                        OR abs(raw_impact_rub - coalesce(adjustment_rub, 0)
+                               - coalesce(confirmed_impact_rub, 0) - open_impact_rub) > :sync_rub THEN 1 END) AS mismatched
+    FROM {ANOMALY_MART} WHERE report_dt = CAST(:report_dt AS date)
+    GROUP BY org_id, gosb_id, metric_code, group_key
+)
+SELECT coalesce(sum(signals), 0) AS signals, coalesce(sum(confirmed), 0) AS confirmed,
+       coalesce(sum(explained), 0) AS explained, coalesce(sum(open_cases), 0) AS open_cases,
+       coalesce(sum(pending), 0) AS pending, coalesce(sum(mismatched), 0) AS mismatched,
+       count(CASE WHEN signals > 1 THEN 1 END) AS duplicate_keys
+FROM by_key
 """
 COUNT_ANOMALY_SIGNALS = "SELECT count(*) FROM ptf_anomaly_signals"
 

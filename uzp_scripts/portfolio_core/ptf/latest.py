@@ -462,6 +462,7 @@ def write_anomaly_month(connection, month=None, *, min_people=10, min_change=0.1
         selected, _, dates = _choose_month(journal, month)
         params.update(report_dt=selected, source_run_id=int(journal["run_id"].iloc[0]))
         progress.step(f"Витрина отклонений за {M.long(selected)}")
+        _execute(connection, Q.CREATE_ANOMALY_MART + ("\nDISTRIBUTED BY (org_id)" if gp else ""))
         doubtful, audit = _monthly(connection, gp, dates, journal, params, collect_cards=False)
         _temp(connection, "ptf_anomaly_metrics", Q.ANOMALY_METRICS, gp, "org_id, gosb_id", params)
         _stage_anomaly_evidence(connection, gp, dates, audit, doubtful, params)
@@ -469,7 +470,6 @@ def write_anomaly_month(connection, month=None, *, min_people=10, min_change=0.1
         _temp(connection, "ptf_anomaly_signals", Q.ANOMALY_SIGNALS, gp, "org_id, gosb_id", params)
 
         progress.step("Запись сигналов в витрину отклонений")
-        _execute(connection, Q.CREATE_ANOMALY_MART + ("\nDISTRIBUTED BY (org_id)" if gp else ""))
         _execute(connection, Q.LOCK_ANOMALY_MONTH)
         stored_run = db.scalar(connection, Q.LATEST_ANOMALY_SOURCE, params)
         if stored_run is not None and stored_run > params["source_run_id"]:
@@ -478,6 +478,8 @@ def write_anomaly_month(connection, month=None, *, min_people=10, min_change=0.1
         _execute(connection, Q.insert_anomaly_month(), params)
         progress.step("Контроль записи и сверка денежных кейсов по ведомостям")
         totals = db.read_sql(connection, Q.CHECK_ANOMALY_MONTH, params).iloc[0]
+        if totals["duplicate_keys"]:
+            raise RuntimeError(f"Контроль витрины: найдено ключей с дублями — {int(totals['duplicate_keys'])}.")
         expected_rows = db.scalar(connection, Q.COUNT_ANOMALY_SIGNALS)
         if totals["signals"] != expected_rows or totals["mismatched"]:
             raise RuntimeError("Контроль витрины не прошёл. Проверьте число строк и разложение сумм.")

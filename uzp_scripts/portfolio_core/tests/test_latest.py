@@ -248,8 +248,21 @@ class Pipeline(unittest.TestCase):
         with patch.object(Q, "CHECK_ANOMALY_EXAMPLES", "SELECT false AS matches"):
             with self.assertRaisesRegex(RuntimeError, "Контроль по ведомостям не прошёл"):
                 run()
+        duplicate_insert = Q.insert_anomaly_month() + f""";
+            INSERT INTO {Q.ANOMALY_MART}
+            SELECT * FROM {Q.ANOMALY_MART} WHERE report_dt = CAST(:report_dt AS date) LIMIT 1
+        """
+        with patch.object(Q, "insert_anomaly_month", return_value=duplicate_insert):
+            with self.assertRaisesRegex(RuntimeError, "ключей с дублями"):
+                run()
         with db.session(self.engine) as c:
             self.assertEqual(db.scalar(c, f"SELECT count(*) FROM {SCHEMA}.yva_ptf_anomaly_month"), before)
+
+    def test_anomaly_mart_creation_failure_stops_before_reading_payroll(self):
+        with patch.object(Q, "CREATE_ANOMALY_MART", "SELECT 1 / 0"), patch.object(latest, "_monthly") as monthly:
+            with db.session(self.engine) as c, self.assertRaises(DBAPIError):
+                latest.write_anomaly_month(c, today=date(2026, 9, 15))
+            monthly.assert_not_called()
 
     def test_latest_from_ready_data_with_no_future_and_two_mechanisms(self):
         with db.session(self.engine) as c:
