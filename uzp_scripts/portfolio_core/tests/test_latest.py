@@ -243,7 +243,15 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(run(), result)
         before = len(stored)
         insert_sql = Q.insert_anomaly_month()
-        with patch.object(Q, "insert_anomaly_month", return_value=insert_sql + "; DROP TABLE ptf_latest_events"):
+        read_sql = db.read_sql
+
+        def read_with_staged_examples_only(c, sql, params=None):
+            if sql == Q.CHECK_ANOMALY_EXAMPLES:
+                c.execute(text("DROP TABLE ptf_latest_groups"))
+            return read_sql(c, sql, params)
+
+        with patch.object(Q, "insert_anomaly_month", return_value=insert_sql + "; DROP TABLE ptf_latest_events"), \
+                patch.object(db, "read_sql", side_effect=read_with_staged_examples_only):
             self.assertEqual(run(), result)
         with patch.object(Q, "insert_anomaly_month", return_value="SELECT 1 / 0"):
             with self.assertRaises(DBAPIError):

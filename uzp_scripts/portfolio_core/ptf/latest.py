@@ -462,6 +462,7 @@ def write_anomaly_month(connection, month=None, *, min_people=10, min_change=0.1
         selected, _, dates = _choose_month(journal, month)
         params.update(report_dt=selected, source_run_id=int(journal["run_id"].iloc[0]))
         progress.step(f"Витрина отклонений за {M.long(selected)}")
+        progress.done(f"Лимит одного SQL-запроса в этой сессии — {db.scalar(connection, 'SHOW statement_timeout')}")
         _execute(connection, Q.CREATE_ANOMALY_MART + ("\nDISTRIBUTED BY (org_id)" if gp else ""))
         doubtful, audit = _monthly(connection, gp, dates, journal, params, collect_cards=False)
         _temp(connection, "ptf_anomaly_metrics", Q.ANOMALY_METRICS, gp, "org_id, gosb_id", params)
@@ -476,20 +477,38 @@ def write_anomaly_month(connection, month=None, *, min_people=10, min_change=0.1
             raise ValueError("В витрине уже записан этот месяц по более свежей сводке.")
         _execute(connection, Q.DELETE_ANOMALY_MONTH, params)
         _execute(connection, Q.insert_anomaly_month(), params)
-        progress.step("Контроль записи и сверка денежных кейсов по месячным агрегатам")
+        progress.step("Контроль числа строк, дублей и сумм витрины")
         totals = db.read_sql(connection, Q.CHECK_ANOMALY_MONTH, params).iloc[0]
         if totals["duplicate_keys"]:
             raise RuntimeError(f"Контроль витрины: найдено ключей с дублями — {int(totals['duplicate_keys'])}.")
         expected_rows = db.scalar(connection, Q.COUNT_ANOMALY_SIGNALS)
         if totals["signals"] != expected_rows or totals["mismatched"]:
             raise RuntimeError("Контроль витрины не прошёл. Проверьте число строк и разложение сумм.")
-        cases = db.read_sql(connection, Q.CHECK_ANOMALY_EXAMPLES, params).to_dict("records")
+        cases = _check_anomaly_examples(connection, gp, params)
         failed = sum(not case["matches"] for case in cases)
         if failed:
             raise RuntimeError(f"Контроль по месячным агрегатам не прошёл в {failed} из {len(cases)} примеров.")
     return {"month": selected, "table": db.render(Q.ANOMALY_MART),
             **{k: int(totals[k]) for k in ("signals", "confirmed", "explained", "open_cases", "pending")},
             "checked_examples": cases}
+
+
+def _check_anomaly_examples(conn, gp, params):
+    (label, query), *remaining = Q.ANOMALY_EXAMPLE_SELECTIONS
+    progress.step(f"Контрольная выборка · {label}")
+    _temp(conn, "ptf_anomaly_examples", query, gp, "org_id, gosb_id", params)
+    for label, query in remaining:
+        progress.step(f"Контрольная выборка · {label}")
+        _execute(conn, "INSERT INTO ptf_anomaly_examples\n" + query, params)
+    _execute(conn, "ANALYZE ptf_anomaly_examples")
+
+    progress.step("Чтение месячных агрегатов только для ключей выборки")
+    keys = db.read_sql(conn, Q.ANOMALY_EXAMPLE_KEYS).to_dict("records")
+    key_params = {f"{field}_{i}": value for i, key in enumerate(keys) for field, value in key.items()}
+    _temp(conn, "ptf_anomaly_example_groups", Q.anomaly_example_groups(len(keys)), gp, "org_id, gosb_id", key_params)
+
+    progress.step("Сверка факта, прошлого месяца и ожидания по контрольной выборке")
+    return db.read_sql(conn, Q.CHECK_ANOMALY_EXAMPLES, params).to_dict("records")
 
 
 def _stage_anomaly_evidence(conn, gp, dates, audit, doubtful, params):

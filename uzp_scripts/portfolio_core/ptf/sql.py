@@ -1812,26 +1812,47 @@ FROM by_key
 """
 COUNT_ANOMALY_SIGNALS = "SELECT count(*) FROM ptf_anomaly_signals"
 
-CHECK_ANOMALY_EXAMPLES = f"""
-WITH month_cases AS (
-    SELECT org_id, gosb_id, metric_code, group_key, check_status, has_deviation,
-           raw_impact_rub, confirmed_impact_rub
-    FROM {ANOMALY_MART}
-    WHERE report_dt = CAST(:report_dt AS date) AND impact_method = 'direct_amount'
-), confirmed AS (
-    SELECT 1 AS priority, c.* FROM month_cases c WHERE has_deviation
-    ORDER BY abs(confirmed_impact_rub) DESC, org_id, gosb_id, metric_code, group_key LIMIT 5
-), explained AS (
-    SELECT 2 AS priority, c.* FROM month_cases c WHERE check_status = 'explained'
-    ORDER BY abs(raw_impact_rub) DESC NULLS LAST, org_id, gosb_id, metric_code, group_key LIMIT 1
-), unresolved AS (
-    SELECT 3 AS priority, c.* FROM month_cases c
-    WHERE check_status IN ('open', 'awaiting_checks', 'check_unavailable')
-    ORDER BY abs(raw_impact_rub) DESC NULLS LAST, org_id, gosb_id, metric_code, group_key LIMIT 1
-), sample AS (
-    SELECT * FROM confirmed UNION ALL SELECT * FROM explained UNION ALL SELECT * FROM unresolved
-), compared AS (
-    SELECT s.*, m.actual_value, m.prior_value, m.expected_value, m.case_text,
+def _anomaly_example_selection(priority, condition, amount, limit):
+    return f"""
+SELECT {priority} AS priority, org_id, gosb_id, metric_code, group_key, check_status,
+       actual_value, prior_value, expected_value, case_text, abs({amount}) AS rank_amount
+FROM {ANOMALY_MART}
+WHERE report_dt = CAST(:report_dt AS date) AND impact_method = 'direct_amount' AND {condition}
+ORDER BY rank_amount DESC NULLS LAST, org_id, gosb_id, metric_code, group_key
+LIMIT {limit}
+"""
+
+
+ANOMALY_EXAMPLE_SELECTIONS = (
+    ("Подтверждённые сигналы", _anomaly_example_selection(1, "has_deviation", "confirmed_impact_rub", 5)),
+    ("Объяснённые сигналы", _anomaly_example_selection(2, "check_status = 'explained'", "raw_impact_rub", 1)),
+    ("Открытые сигналы", _anomaly_example_selection(
+        3, "check_status IN ('open', 'awaiting_checks', 'check_unavailable')", "raw_impact_rub", 1)),
+)
+
+ANOMALY_EXAMPLE_KEYS = """
+SELECT s.org_id, s.gosb_id, l.income, l.history, l.jobs
+FROM ptf_anomaly_examples s JOIN ptf_anomaly_labels l ON s.group_key = l.group_key
+GROUP BY 1, 2, 3, 4, 5
+"""
+
+
+def anomaly_example_groups(size):
+    keys = ("org_id", "gosb_id", *LATEST_FEATURES)
+    predicates = ["(" + " AND ".join(f"{k} = :{k}_{i}" for k in keys) + ")" for i in range(size)]
+    return f"""
+SELECT org_id, gosb_id, income, history, jobs,
+       fot_actual, fot_prior, fot_year_actual, fot_year_prior, actual, prior, year_actual, year_prior,
+       stay_actual, stay_prior, stay_year_actual, stay_year_prior, stay_n, stay_year_n,
+       bonus_actual, bonus_prior, bonus_year_actual, bonus_year_prior
+FROM ptf_latest_groups
+WHERE {" OR ".join(predicates) if predicates else "false"}
+"""
+
+
+CHECK_ANOMALY_EXAMPLES = """
+WITH compared AS (
+    SELECT s.*,
            CASE s.metric_code WHEN 'fot' THEN g.fot_actual
                 WHEN 'portfolio_credits' THEN g.actual
                 WHEN 'continuing_pay' THEN g.stay_actual - g.bonus_actual END AS source_actual,
@@ -1843,18 +1864,16 @@ WITH month_cases AS (
                 WHEN 'continuing_pay' THEN g.stay_prior - g.bonus_prior
                     + CAST(g.stay_n AS numeric) / nullif(g.stay_year_n, 0) *
                       ((g.stay_year_actual - g.bonus_year_actual) - (g.stay_year_prior - g.bonus_year_prior)) END AS source_expected
-    FROM sample s
-    JOIN {ANOMALY_MART} m ON m.report_dt = CAST(:report_dt AS date)
-        AND m.org_id = s.org_id AND m.gosb_id = s.gosb_id AND m.metric_code = s.metric_code AND m.group_key = s.group_key
+    FROM ptf_anomaly_examples s
     LEFT JOIN ptf_anomaly_labels l ON s.group_key = l.group_key
-    LEFT JOIN ptf_latest_groups g ON g.org_id = s.org_id AND g.gosb_id = s.gosb_id
+    LEFT JOIN ptf_anomaly_example_groups g ON g.org_id = s.org_id AND g.gosb_id = s.gosb_id
         AND g.income = l.income AND g.history = l.history AND g.jobs = l.jobs
 )
 SELECT gosb_id, metric_code, check_status, coalesce(
        abs(source_actual - actual_value) <= :sync_rub AND abs(source_prior - prior_value) <= :sync_rub
            AND abs(source_expected - expected_value) <= :sync_rub, false) AS matches,
        case_text
-FROM compared ORDER BY priority, abs(coalesce(confirmed_impact_rub, raw_impact_rub)) DESC,
+FROM compared ORDER BY priority, rank_amount DESC NULLS LAST,
                        org_id, gosb_id, metric_code, group_key
 """
 
